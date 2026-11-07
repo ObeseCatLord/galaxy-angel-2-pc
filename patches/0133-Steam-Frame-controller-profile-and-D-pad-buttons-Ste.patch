@@ -1,0 +1,215 @@
+From 34004617508c0afd733cb225daf11b9ed7714d9f Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:10:16 -0600
+Subject: [PATCH] Steam Frame: controller profile and D-pad buttons, SteamVR
+ OpenXR loader fallbacks
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp        | 49 +++++++++++++++++++++++----
+ ps2xRuntime/src/lib/ga2_vr_bindings.h | 29 ++++++++++++++++
+ ps2xTest/src/ga2_vr_input_tests.cpp   | 30 ++++++++++++++++
+ 3 files changed, 102 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index c25a85c..1d567ac 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -651,6 +651,7 @@ void main() {
+             XrAction l3 = XR_NULL_HANDLE, r3 = XR_NULL_HANDLE;
+             XrAction dpad = XR_NULL_HANDLE, leftStick = XR_NULL_HANDLE, rightStick = XR_NULL_HANDLE;
+             XrAction facePad = XR_NULL_HANDLE, facePadClick = XR_NULL_HANDLE;
++            XrAction dpadUp = XR_NULL_HANDLE, dpadDown = XR_NULL_HANDLE, dpadLeft = XR_NULL_HANDLE, dpadRight = XR_NULL_HANDLE;
+             XrPath hands[2] = {XR_NULL_PATH, XR_NULL_PATH};
+             XrSpace aimSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+             int activeHand = 1;
+@@ -725,9 +726,36 @@ void main() {
+             if (lib)
+                 g_xr.getProc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(lib, "xrGetInstanceProcAddr"));
+ #else
+-            void *lib = dlopen("libopenxr_loader.so.1", RTLD_NOW | RTLD_LOCAL);
+-            if (!lib)
+-                lib = dlopen("libopenxr_loader.so", RTLD_NOW | RTLD_LOCAL);
++            // GA2_OPENXR_LOADER, the system's loader, then SteamVR's own: SteamOS on
++            // the Steam Frame has its loader in /opt/steamvr (arm64), desktop SteamVR
++            // in its install folder.
++            void *lib = nullptr;
++            std::vector<std::string> candidates;
++            if (const char *env = std::getenv("GA2_OPENXR_LOADER"); env && *env)
++                candidates.push_back(env);
++            candidates.push_back("libopenxr_loader.so.1");
++            candidates.push_back("libopenxr_loader.so");
++#if defined(__aarch64__)
++            candidates.push_back("/opt/steamvr/bin/linuxarm64/libopenxr_loader.so");
++            const char *steamArch = "linuxarm64";
++#else
++            const char *steamArch = "linux64";
++#endif
++            if (const char *home = std::getenv("HOME"))
++                for (const char *steam : {"/.steam/steam", "/.local/share/Steam"})
++                    candidates.push_back(std::string(home) + steam + "/steamapps/common/SteamVR/bin/" + steamArch +
++                                         "/libopenxr_loader.so");
++            for (const std::string &name : candidates)
++                if ((lib = dlopen(name.c_str(), RTLD_NOW | RTLD_LOCAL)) && dlsym(lib, "xrGetInstanceProcAddr"))
++                {
++                    std::fprintf(stderr, "[vr] OpenXR loader: %s\n", name.c_str());
++                    break;
++                }
++                else if (lib)
++                {
++                    dlclose(lib);
++                    lib = nullptr;
++                }
+             if (lib)
+                 g_xr.getProc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(dlsym(lib, "xrGetInstanceProcAddr"));
+ #endif
+@@ -805,7 +833,11 @@ void main() {
+                 action(g_xr.leftStick, "left_stick", "Left analog stick", kVec2) &&
+                 action(g_xr.rightStick, "right_stick", "Right analog stick (left / right is also L2 / R2)", kVec2) &&
+                 action(g_xr.facePad, "face_pad", "Face pad position (click presses a face button by direction)", kVec2) &&
+-                action(g_xr.facePadClick, "face_pad_click", "Face pad click (Circle / Cross / Square / Triangle)", kBool);
++                action(g_xr.facePadClick, "face_pad_click", "Face pad click (Circle / Cross / Square / Triangle)", kBool) &&
++                action(g_xr.dpadUp, "dpad_up", "D-pad up (button)", kBool) &&
++                action(g_xr.dpadDown, "dpad_down", "D-pad down (button)", kBool) &&
++                action(g_xr.dpadLeft, "dpad_left", "D-pad left (button)", kBool) &&
++                action(g_xr.dpadRight, "dpad_right", "D-pad right (button)", kBool);
+             if (!ok)
+                 return false;
+ 
+@@ -815,7 +847,7 @@ void main() {
+                 g_xr.aim,      g_xr.trigger,   g_xr.circle,   g_xr.cross,     g_xr.square,    g_xr.triangle,
+                 g_xr.start,    g_xr.select,    g_xr.menu,     g_xr.l1,        g_xr.r1,        g_xr.l2,
+                 g_xr.r2,       g_xr.l3,        g_xr.r3,       g_xr.dpad,      g_xr.leftStick, g_xr.rightStick,
+-                g_xr.facePad,  g_xr.facePadClick};
++                g_xr.facePad,  g_xr.facePadClick, g_xr.dpadUp, g_xr.dpadDown, g_xr.dpadLeft, g_xr.dpadRight};
+             int suggested = 0;
+             for (const ga2_vr_bindings::Profile &profile : ga2_vr_bindings::profiles())
+             {
+@@ -936,7 +968,7 @@ void main() {
+             g_xr.extensions.assign(1, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
+             static const char *const kControllerExtensions[] = {
+                 "XR_FB_touch_controller_pro", "XR_META_touch_controller_plus", "XR_EXT_hp_mixed_reality_controller",
+-                "XR_EXT_samsung_odyssey_controller", "XR_BD_controller_interaction"};
++                "XR_EXT_samsung_odyssey_controller", "XR_BD_controller_interaction", "XR_VALVE_frame_controller_interaction"};
+             if (xr.xrEnumerateInstanceExtensionProperties)
+             {
+                 uint32_t count = 0;
+@@ -1119,6 +1151,11 @@ void main() {
+             in.trigger[0] = value(g_xr.trigger, 0);
+             in.trigger[1] = value(g_xr.trigger, 1);
+             in.dpad = vector(g_xr.dpad);
++            // D-pad buttons (Steam Frame) push the D-pad all the way.
++            if (boolean(g_xr.dpadUp)) in.dpad.y = 1.0f;
++            if (boolean(g_xr.dpadDown)) in.dpad.y = -1.0f;
++            if (boolean(g_xr.dpadLeft)) in.dpad.x = -1.0f;
++            if (boolean(g_xr.dpadRight)) in.dpad.x = 1.0f;
+             in.leftStick = vector(g_xr.leftStick);
+             in.rightStick = vector(g_xr.rightStick);
+             in.facePad = vector(g_xr.facePad);
+diff --git a/ps2xRuntime/src/lib/ga2_vr_bindings.h b/ps2xRuntime/src/lib/ga2_vr_bindings.h
+index ce56dca..08bdb92 100644
+--- a/ps2xRuntime/src/lib/ga2_vr_bindings.h
++++ b/ps2xRuntime/src/lib/ga2_vr_bindings.h
+@@ -31,6 +31,10 @@ namespace ga2_vr_bindings
+         RightStick,
+         FacePad,
+         FacePadClick,
++        DPadUp, // D-pad buttons (Steam Frame's left controller); they press the D-pad too
++        DPadDown,
++        DPadLeft,
++        DPadRight,
+         Count,
+     };
+ 
+@@ -147,6 +151,31 @@ namespace ga2_vr_bindings
+                 out.push_back({"/interaction_profiles/microsoft/motion_controller", "", b});
+                 out.push_back({"/interaction_profiles/samsung/odyssey_controller", "XR_EXT_samsung_odyssey_controller", b});
+             }
++            // Steam Frame: a gamepad split in two. The right controller's A / B / X / Y
++            // are the face buttons by position (B right = Circle, A bottom = Cross,
++            // X left = Square, Y top = Triangle, as on a pad), the left controller's
++            // D-pad the D-pad, the bumpers L1 / R1, the grips L2 / R2, Menu (right)
++            // the menu action and View (left) Select.
++            {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "trigger/value");
++                thumbsticks(b);
++                b.push_back({Act::Circle, R + "b/click"});
++                b.push_back({Act::Cross, R + "a/click"});
++                b.push_back({Act::Square, R + "x/click"});
++                b.push_back({Act::Triangle, R + "y/click"});
++                shoulders(b, "bumper/click");
++                b.push_back({Act::L2, L + "squeeze/value"});
++                b.push_back({Act::R2, R + "squeeze/value"});
++                b.push_back({Act::Menu, R + "menu/click"});
++                b.push_back({Act::Select, L + "view/click"});
++                b.push_back({Act::DPadUp, L + "dpad_up/click"});
++                b.push_back({Act::DPadDown, L + "dpad_down/click"});
++                b.push_back({Act::DPadLeft, L + "dpad_left/click"});
++                b.push_back({Act::DPadRight, L + "dpad_right/click"});
++                out.push_back({"/interaction_profiles/valve/frame_controller_valve", "XR_VALVE_frame_controller_interaction", b});
++            }
+             // Vive wands: the left trackpad is the left stick and D-pad (its click L3), the
+             // right trackpad's click the face buttons by direction, the right menu button
+             // R3. No right stick, no L2 / R2.
+diff --git a/ps2xTest/src/ga2_vr_input_tests.cpp b/ps2xTest/src/ga2_vr_input_tests.cpp
+index 4b225c1..c3e21f5 100644
+--- a/ps2xTest/src/ga2_vr_input_tests.cpp
++++ b/ps2xTest/src/ga2_vr_input_tests.cpp
+@@ -151,8 +151,33 @@ namespace
+         return p;
+     }
+ 
++    // XR_VALVE_frame_controller_interaction (Steamworks: Steam Frame input).
++    Paths framePaths()
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            for (const char *i : {"system/click", "system/touch", "bumper/click", "bumper/touch", "squeeze/click",
++                                  "squeeze/touch", "trigger/click", "trigger/touch"})
++                add(p, h, i, 'b');
++            add(p, h, "squeeze/value", 'f');
++            add(p, h, "trigger/value", 'f');
++            stick(p, h, "thumbstick", true);
++        }
++        for (const char *i : {"a/click", "a/touch", "b/click", "b/touch", "x/click", "x/touch", "y/click", "y/touch",
++                              "menu/click", "menu/touch"})
++            add(p, "right", i, 'b');
++        for (const char *i : {"dpad_up/click", "dpad_up/touch", "dpad_down/click", "dpad_down/touch", "dpad_left/click",
++                              "dpad_left/touch", "dpad_right/click", "dpad_right/touch", "view/click", "view/touch"})
++            add(p, "left", i, 'b');
++        return p;
++    }
++
+     Paths specFor(const std::string &profile)
+     {
++        if (profile.find("valve/frame") != std::string::npos)
++            return framePaths();
+         if (profile.find("oculus/touch") != std::string::npos || profile.find("touch_controller_pro") != std::string::npos ||
+             profile.find("touch_controller_plus") != std::string::npos)
+             return touchPaths();
+@@ -185,6 +210,10 @@ namespace
+         case Act::LeftStick:
+         case Act::RightStick:
+         case Act::FacePad: return 'v';
++        case Act::DPadUp:
++        case Act::DPadDown:
++        case Act::DPadLeft:
++        case Act::DPadRight: return 'b';
+         default: return 'b';
+         }
+     }
+@@ -501,6 +530,7 @@ void register_ga2_vr_input_tests()
+                 {"/interaction_profiles/samsung/odyssey_controller", "XR_EXT_samsung_odyssey_controller"},
+                 {"/interaction_profiles/bytedance/pico4_controller", "XR_BD_controller_interaction"},
+                 {"/interaction_profiles/bytedance/pico_neo3_controller", "XR_BD_controller_interaction"},
++                {"/interaction_profiles/valve/frame_controller_valve", "XR_VALVE_frame_controller_interaction"},
+             };
+             std::set<std::string> seen;
+             for (const auto &profile : ga2_vr_bindings::profiles())
+-- 
+2.56.0
+

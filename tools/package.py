@@ -37,6 +37,7 @@ def main():
     shutil.copy2(SOURCE / "tools" / "assets" / "extract_skybox.py", out / "tools" / "extract_skybox.py")
     shutil.copy2(SOURCE / "docs" / "PLAYING.md", out / "README.md")
     shutil.copy2(SOURCE / "docs" / "LANGUAGE_PACKS.md", out / "LANGUAGE_PACKS.md")
+    shutil.copy2(SOURCE / "docs" / "STEAM_FRAME.md", out / "STEAM_FRAME.md")
     shutil.copy2(SOURCE / "LICENSE", out / "LICENSE.md")
     print(f"packaged {'Windows' if windows else 'Linux'} build in {out}")
 

@@ -23,6 +23,7 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -234,6 +235,42 @@ namespace
             });
         }
 
+        // Disc images in the isos folders (<data folder>/isos and isos beside the
+        // launcher) that are not added yet. For systems without drag and drop: the
+        // Steam Frame, Steam Deck game mode, a TV with a pad.
+        std::vector<std::filesystem::path> folderImages() const
+        {
+            std::set<std::filesystem::path> known;
+            std::error_code ec;
+            for (const auto &disc : m_library.discs())
+                known.insert(std::filesystem::weakly_canonical(disc.image, ec));
+            std::vector<std::filesystem::path> out;
+            for (const auto &dir : {m_library.dataDir() / "isos", m_engineDir / "isos"})
+                for (const auto &entry : std::filesystem::directory_iterator(dir, ec))
+                {
+                    std::string ext = entry.path().extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+                    if (ext == ".iso" && entry.is_regular_file(ec) &&
+                        !known.count(std::filesystem::weakly_canonical(entry.path(), ec)))
+                        out.push_back(entry.path());
+                }
+            return out;
+        }
+
+        void importFolderImages()
+        {
+            if (importing())
+                return;
+            std::vector<std::filesystem::path> images = folderImages();
+            if (images.empty())
+            {
+                std::lock_guard lock(m_mutex);
+                m_status = "No new disc images in " + ga2::pathUtf8(m_library.dataDir() / "isos");
+                return;
+            }
+            startImport(std::move(images));
+        }
+
         // Skyboxes for discs imported before the launcher rendered them.
         void startMissingSkyboxes()
         {
@@ -269,6 +306,12 @@ namespace
         const ga2::StartEntry *loop()
         {
             const auto &entries = ga2::startEntries();
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(m_library.dataDir() / "isos", ec);
+            }
+            if (!folderImages().empty())
+                importFolderImages();
             startMissingSkyboxes();
             while (!WindowShouldClose())
             {
@@ -280,6 +323,9 @@ namespace
                     UnloadDroppedFiles(dropped);
                     if (!importing()) startImport(std::move(images));
                 }
+                // R or Triangle / Y: add the images in the isos folders.
+                if (IsKeyPressed(KEY_R) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+                    importFolderImages();
                 const bool up = IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP);
                 const bool down = IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN);
                 const bool confirm = IsKeyPressed(KEY_ENTER) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) ||
@@ -295,12 +341,15 @@ namespace
                 if (down) m_select.move(1, int(entries.size()));
                 const int chosen = clicked ? hovered : confirm ? m_select.keySelection() : -1;
                 // Options screen: O key or the Options button.
-                if (IsKeyPressed(KEY_M) || (CheckCollisionPointRec(mouse, modsButton()) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
+                // Pads: Select / View opens Mods, Start / Menu Options.
+                if (IsKeyPressed(KEY_M) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_LEFT) ||
+                    (CheckCollisionPointRec(mouse, modsButton()) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
                 {
                     modsScreen();
                     continue;
                 }
-                if (IsKeyPressed(KEY_O) || (CheckCollisionPointRec(mouse, optionsButton()) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
+                if (IsKeyPressed(KEY_O) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT) ||
+                    (CheckCollisionPointRec(mouse, optionsButton()) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
                 {
                     optionsScreen();
                     continue;
@@ -355,6 +404,8 @@ namespace
                 const Vector2 mouse = GetMousePosition();
                 const Rectangle back{48.0f, float(GetScreenHeight() - 80), 160.0f, 40.0f};
                 if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) ||
+                    IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) ||
+                    IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_LEFT) ||
                     (CheckCollisionPointRec(mouse, back) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
                     break;
                 auto rowRect = [&](size_t i) {
@@ -367,8 +418,8 @@ namespace
                     for (size_t i = 0; i < list.size(); ++i)
                         if (CheckCollisionPointRec(mouse, rowRect(i))) hovered = int(i);
                     select.begin(hovered, GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f, IsMouseButtonPressed(MOUSE_BUTTON_LEFT));
-                    if (IsKeyPressed(KEY_UP)) select.move(-1, int(list.size()));
-                    if (IsKeyPressed(KEY_DOWN)) select.move(1, int(list.size()));
+                    if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP)) select.move(-1, int(list.size()));
+                    if (IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) select.move(1, int(list.size()));
                     // A click acts on the hovered row; Enter, Space and the priority keys on the row the keys chose.
                     if (hovered >= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && list[size_t(hovered)].language.empty())
                     {
@@ -379,13 +430,16 @@ namespace
                     if (chosen >= 0)
                     {
                         const ga2::ModInfo &mod = list[size_t(chosen)];
-                        if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) && mod.language.empty())
+                        if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) ||
+                             IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN)) && mod.language.empty())
                         {
                             mods.setEnabled(mod.id, !mods.enabled(mod.id));
                             changed = true;
                         }
-                        const int delta = (IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_PAGE_UP)) ? -1
-                                          : (IsKeyPressed(KEY_RIGHT_BRACKET) || IsKeyPressed(KEY_PAGE_DOWN)) ? 1 : 0;
+                        const int delta = (IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_PAGE_UP) ||
+                                           IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_TRIGGER_1)) ? -1
+                                          : (IsKeyPressed(KEY_RIGHT_BRACKET) || IsKeyPressed(KEY_PAGE_DOWN) ||
+                                             IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_TRIGGER_1)) ? 1 : 0;
                         if (delta)
                         {
                             const std::string id = mod.id;
@@ -420,7 +474,7 @@ namespace
                                                : mod.description + (mod.author.empty() ? "" : "  -  " + mod.author);
                     ui::draw(detail.c_str(), int(r.x) + 54, int(r.y) + 34, 16, mod.error.empty() ? p.dim : p.warn);
                 }
-                ui::draw("Enter / click: on or off    [ and ]: priority (top wins)    Esc: back", 60, GetScreenHeight() - 130, 20, p.dim);
+                ui::draw("Enter / A / click: on or off    [ ] or LB / RB: priority (top wins)    Esc / B: back", 60, GetScreenHeight() - 130, 20, p.dim);
                 DrawRectangleRec(back, CheckCollisionPointRec(mouse, back) ? p.panel : p.background);
                 DrawRectangleLinesEx(back, 1.0f, p.dim);
                 ui::draw("Back (Esc)", int(back.x) + 22, int(back.y) + 10, 20, p.text);
@@ -740,8 +794,8 @@ namespace
             else
             {
                 std::lock_guard lock(m_mutex);
-                footer = m_status.empty() ? "Drop your disc images (.iso) on this window to add them.  "
-                                            "Click / Enter / Circle: play   F11 in game: fullscreen   Esc: quit"
+                footer = m_status.empty() ? "Drop disc images (.iso) here, or put them in " +
+                                                ga2::pathUtf8(m_library.dataDir() / "isos") + " and press R / Triangle (Y)"
                                           : m_status;
             }
             ui::draw(footer.c_str(), 60, h - 44, 20, p.dim);

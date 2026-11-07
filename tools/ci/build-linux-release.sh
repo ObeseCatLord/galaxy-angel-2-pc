@@ -18,9 +18,13 @@ export GA2_DISC_IDS="zettai;mugen-1;mugen-2;eigou-1;eigou-2"
 export GA2_RUNTIME_BUILD="${GA2_RUNTIME_BUILD:-$PRIVATE/build/release}"
 export PKG_CONFIG_PATH="$FFMPEG/lib/pkgconfig"
 STATIC="-static-libstdc++ -static-libgcc"
-"$SOURCE/tools/configure_runtime.sh" -DCMAKE_BUILD_TYPE=Release -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF \
+# -O2 as in the tested builds (and -O3 needs much more memory on the generated code).
+"$SOURCE/tools/configure_runtime.sh" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG" \
+    "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF \
     -DPKG_CONFIG_ARGN=--static -DPS2X_LINK_DEPENDS_SHARED=ON \
     "-DCMAKE_EXE_LINKER_FLAGS=$STATIC" "-DCMAKE_SHARED_LINKER_FLAGS=$STATIC"
+# The generated VU1 programs are a few huge files: fewer at once, or GCC runs out of memory.
+cmake --build "$GA2_RUNTIME_BUILD" --target ga2_vu1_programs --parallel "${GA2_BIG_JOBS:-2}"
 cmake --build "$GA2_RUNTIME_BUILD" --target ga2 ga2_zettai ga2_mugen_1 ga2_mugen_2 ga2_eigou_1 ga2_eigou_2 \
     --parallel "${GA2_JOBS:-$(nproc)}"
 python3 "$SOURCE/tools/package.py" "$GA2_RUNTIME_BUILD" "$OUT"

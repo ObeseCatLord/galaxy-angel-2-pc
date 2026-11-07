@@ -20,7 +20,8 @@ game data is included.
 1. Download the build for your system from
    [Releases](../../releases) and extract it.
 2. Run `ga2` (`ga2.exe` on Windows).
-3. Drag your `.iso` files onto the window, then pick a game.
+3. Drag your `.iso` files onto the window (or put them in the `isos` folder
+   of the data folder), then pick a game.
 
 You need a GPU with Vulkan 1.3. Details, all options and the VR guide are in
 [docs/PLAYING.md](docs/PLAYING.md).
@@ -43,6 +44,8 @@ You need a GPU with Vulkan 1.3. Details, all options and the VR guide are in
 - Cheats menu (F1) and an in-game settings menu (F2).
 - VR through OpenXR (SteamVR, Monado). The game is shown on a big screen,
   and the 3D scenes are drawn in stereo around you.
+- Native ARM64 build for the Steam Frame, flat or in VR
+  ([docs/STEAM_FRAME.md](docs/STEAM_FRAME.md)).
 
 ## Controls
 

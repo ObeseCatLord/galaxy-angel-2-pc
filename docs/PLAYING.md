@@ -16,7 +16,10 @@ A GPU with Vulkan 1.3 (the PS2 graphics run on the GPU through paraLLEl-GS).
 
 1. Run `ga2` (`ga2.exe` on Windows).
 2. Drag your `.iso` files onto the window. Each disc is checked once and
-   remembered; the images stay where they are.
+   remembered; the images stay where they are. Without a mouse (Steam
+   Frame, Steam Deck game mode, a TV), put them in the `isos` folder of the
+   data folder (below) instead: they are added when the launcher starts, or
+   when you press R / Triangle (Y).
 3. Pick a game. Discs are never swapped by hand: the port finds the right disc
    when a game asks for one (Mugen's and Eigou's second discs, the Zettai disc
    that unlocks the Extra Route, and so on), so add every disc you own up front.
@@ -261,6 +264,7 @@ Windows:
 - `memcards/` - your saves (one memory card shared by the three games, so
   Zettai and Mugen saves carry over as on the PS2)
 - `logs/` - one log per game, useful when reporting a problem
+- `isos/` - disc images to add without drag and drop
 - `mods/` - installed mods (see Mods above)
 - `assets/skybox/` - the space skies rendered from your discs
 - `dumps/textures/` - textures saved by the Dump textures option
