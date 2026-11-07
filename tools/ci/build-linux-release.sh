@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Release build for Linux (x86-64 or ARM64): gcc-13 with libstdc++ and FFmpeg
-# linked statically, so the result needs only glibc and the X11/OpenGL
+# Release build for Linux (x86-64 or ARM64): clang (GA2_CC/GA2_CXX, default
+# clang-18) with GCC 13's libstdc++ and FFmpeg linked statically, so the result needs only glibc and the X11/OpenGL
 # libraries of the system it was built on (Ubuntu 20.04: glibc 2.31).
 # Needs the generated game code in $GA2_GENERATED_ROOT (made from the discs
 # with tools/ga2.py generate; never part of this repository).
@@ -13,7 +13,7 @@ FFMPEG="${GA2_FFMPEG_PREFIX:-$PRIVATE/ffmpeg-static}"
 [ -f "$FFMPEG/lib/libavcodec.a" ] || "$SOURCE/tools/ci/ffmpeg-static.sh" "$FFMPEG" gcc-13
 [ -d "$PRIVATE/worktrees/ga2-runtime" ] || "$SOURCE/tools/make_runtime_tree.sh"
 [ -d "$PRIVATE/third_party/parallel-gs" ] || "$SOURCE/tools/fetch_parallel_gs.sh"
-export GA2_COMPILERS="-DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13"
+export GA2_COMPILERS="-DCMAKE_C_COMPILER=${GA2_CC:-clang-18} -DCMAKE_CXX_COMPILER=${GA2_CXX:-clang++-18}"
 export GA2_DISC_IDS="zettai;mugen-1;mugen-2;eigou-1;eigou-2"
 export GA2_RUNTIME_BUILD="${GA2_RUNTIME_BUILD:-$PRIVATE/build/release}"
 export PKG_CONFIG_PATH="$FFMPEG/lib/pkgconfig"
