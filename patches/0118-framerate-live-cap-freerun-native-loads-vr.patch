@@ -1,0 +1,543 @@
+From fb4010707b40c86c1babc3625e5c5a19ed6f43f2 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:22:12 -0500
+Subject: [PATCH] framerate: live cap from 60, deterministic test runs,
+ native-equal loads, VR follows the headset
+
+- The frame rate hooks run in every run that can use them (GA2_FPS is the
+  cap the run starts with, 60 = the native cadence; the settings menu
+  raises it live up to 240; GA2_FPS_LIVE=0 restores the old behaviour).
+  Native with the hooks on matches native without them except a sub-frame
+  EE-time difference (one IOP request one iteration earlier in 560 s).
+- GA2_FREERUN=1 (test aid): host deadlines count as passed, so guest time
+  depends on EE cycles alone; scripted runs (GA2_PAD_SCRIPT) see only the
+  script, not the window's input. Two runs of the same script are
+  identical however loaded the host is.
+- Frame ticks are queued only while the game waits on the frame clock
+  (ticks in between are counted from the EE cycle): an idle EE runs the
+  IOP up to the next event, and ticks during a load made loads finish
+  earlier in EE time than natively (game time drifted 0.69 s ahead of
+  voice lines by the battle).
+- waitFrameTick(atVBlank): an iteration that overran the game's catch-up
+  limit wakes at the next VBLANK, as the native VBLANK wait does, and the
+  ticks are realigned to it: the game time lost at loads and scene
+  switches is the native amount.
+- VR: the cap follows the headset's refresh rate (median of the predicted
+  display period; stalls ignored); the window's vsync is off in VR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h  |  11 ++-
+ ps2xRuntime/include/runtime/ga2_framepace.h |  13 ++-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp  | 102 ++++++++++++++++----
+ ps2xRuntime/src/lib/ga2_framepace.cpp       |  62 ++++++++----
+ ps2xRuntime/src/lib/ga2_settings.cpp        |   5 +-
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp   |   9 +-
+ ps2xRuntime/src/lib/ga2_vr.cpp              |  29 ++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp             |   5 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp         |   9 +-
+ 9 files changed, 192 insertions(+), 53 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 3273151..b72cdf5 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -414,8 +414,10 @@ public:
+     // Change the tick rate while the clock runs (the rate governor): ticks keep counting, the next ones follow the new rate.
+     void retuneFrameClock(uint32_t fps) noexcept;
+     [[nodiscard]] uint32_t frameClockFps() const noexcept { return m_frameFps; }
+-    [[noreturn]] void waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion);
+-    [[nodiscard]] uint64_t frameTicks() const noexcept { return m_frameTicks; }
++    // atVBlank: the iteration overran its catch-up limit; wake at the next VBLANK, as the native game's VBLANK wait
++    // does, and realign the ticks to it.
++    [[noreturn]] void waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion, bool atVBlank = false);
++    [[nodiscard]] uint64_t frameTicks() const noexcept { return m_frameTicks; } // the last tick seen (fired or caught up)
+     // The game waited on the frame clock within the last few ticks: the GS
+     // scans out at ticks and not at the VBLANK.
+     [[nodiscard]] bool frameDriven() const noexcept;
+@@ -571,4 +573,9 @@ private:
+     mutable std::mutex m_snapshotMutex;
+     EeKernelSnapshot m_snapshot;
+     uint64_t m_snapshotSequence = 0;
++    // Frame clock: a tick event is queued only while the game waits on the clock (see waitFrameTick).
++    bool m_frameTickQueued = false;
++    uint64_t m_nextVBlankCycle = 0; // deadline cycle of the queued VBlankStart
++    [[nodiscard]] uint64_t frameTickAt(uint64_t cycle) const noexcept;
++    void scheduleFrameTick(uint64_t tick);
+ };
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index cd83b5d..69f2fb5 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -11,7 +11,8 @@
+ // waits on that clock the GS scans out at every tick (a frame is shown for
+ // each guest flip) instead of at the emulated VBLANK.
+ //
+-// Unset or 60 means native timing: nothing here changes behaviour then.
++// Unset or 60 means the native cadence: the hooks run the game's own path (its own step, frame limits and VBLANK
++// wait), so the guest behaves exactly as without them; the settings menu can raise the cap live.
+ #pragma once
+ 
+ #include <cstdarg>
+@@ -21,9 +22,11 @@ class PS2Runtime;
+ 
+ namespace ga2_framepace
+ {
+-    // GA2_FPS as an integer in 61..240; 0 = native (unset, 60, invalid, VR,
+-    // software GS). Read once.
++    // The highest rate this run can reach: 240 whenever the hooks can run (the settings menu raises the cap live),
++    // 0 = native only (VR, software GS; GA2_FPS_LIVE=0 limits it to GA2_FPS as before). Read once.
+     int fps();
++    // GA2_FPS: the cap the run starts with, 61..fps(); 60 = the native cadence (unset, 60, invalid).
++    int startCap();
+     inline bool enabled() { return fps() > 0; }
+     // The rate the game runs at now: fps() is the maximum, the game side's governor lowers it (down to 60, the
+     // native cadence) when the host cannot keep up and raises it again. 0 when not enabled.
+@@ -44,7 +47,9 @@ namespace ga2_framepace
+     // Game thread: sleep until the `interval`-th next frame tick (counted from
+     // the tick this game thread last woke at, like the games' own VBLANK
+     // wait), then resume at `resumePc` with v0 = 0. Never returns.
+-    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc);
++    // atVBlank: wake at the first tick at the next VBLANK instead (an iteration that overran the game's catch-up
++    // limit ends on a VBLANK as natively, so it loses the native amount of game time).
++    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc, bool atVBlank = false);
+     // Frame ticks fired so far (0 when the clock never started).
+     uint64_t ticks(const PS2Runtime &runtime);
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 64ae806..c7072a3 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -16,6 +16,24 @@
+ #include <limits>
+ #include <stdexcept>
+ 
++namespace
++{
++    // GA2_FREERUN=1 (test aid): every host deadline counts as already passed, so
++    // events fire at their EE cycle alone and guest time no longer depends on the
++    // host's speed (two runs of the same input match however loaded the host is;
++    // the game runs as fast as the host can, sound is not real time).
++    bool freeRun()
++    {
++        static const bool value = [] {
++            const char *v = std::getenv("GA2_FREERUN");
++            return v && *v && *v != '0';
++        }();
++        return value;
++    }
++    // Not time_point{}: processDueDeadlines uses that as "nothing due".
++    constexpr std::chrono::steady_clock::time_point kHostPassed{std::chrono::nanoseconds(1)};
++}
++
+ namespace
+ {
+     constexpr int KE_OK = 0;
+@@ -163,6 +181,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_frameWaitTarget = 0;
+     m_frameLastWaitTick = 0;
+     m_frameWaiting = false;
++    m_frameTickQueued = false;
+     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
+     m_runtime.memory().resetEeTimers();
+ 
+@@ -180,7 +199,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
++    m_nextVBlankCycle = m_eeCycle + kVBlankPeriodCycles;
++    scheduleEvent(m_nextVBlankCycle,
+                   std::chrono::steady_clock::now() + kVBlankPeriod,
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     m_coldLoadRequiresReset = false;
+@@ -1955,6 +1975,7 @@ void EeScheduler::retuneFrameClock(uint32_t fps) noexcept
+     if (fps == m_frameFps)
+         return;
+     // The tick already queued fires on the old schedule; the ones after it follow the new rate from here.
++    m_frameTicks = std::max(m_frameTicks, frameTickAt(m_eeCycle));
+     m_frameFps = fps;
+     m_frameBase = m_frameTicks;
+     m_frameCycle0 = m_eeCycle;
+@@ -1964,10 +1985,41 @@ void EeScheduler::retuneFrameClock(uint32_t fps) noexcept
+ bool EeScheduler::frameDriven() const noexcept
+ {
+     // The game runs a scene at the native rate (ga2_framepace::setNative): the real VBLANK drives the display.
+-    return m_frameClockOn && !ga2_framepace::nativeNow() && m_frameTicks - m_frameLastWaitTick <= 6u;
++    return m_frameClockOn && !ga2_framepace::nativeNow() && frameTickAt(m_eeCycle) - m_frameLastWaitTick <= 6u;
++}
++
++// The tick index whose time has come at `cycle` (ticks are fixed in EE cycles: tick k at
++// m_frameCycle0 + (k - m_frameBase) * numerator / fps).
++uint64_t EeScheduler::frameTickAt(uint64_t cycle) const noexcept
++{
++    if (!m_frameClockOn || cycle < m_frameCycle0)
++        return m_frameTicks;
++    const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
++    uint64_t k = m_frameBase + (cycle - m_frameCycle0) * fps / kFrameCycleNumerator;
++    while (m_frameCycle0 + (k + 1u - m_frameBase) * kFrameCycleNumerator / fps <= cycle)
++        ++k;
++    while (k > m_frameBase && m_frameCycle0 + (k - m_frameBase) * kFrameCycleNumerator / fps > cycle)
++        --k;
++    return std::max(k, m_frameTicks);
+ }
+ 
+-[[noreturn]] void EeScheduler::waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion)
++void EeScheduler::scheduleFrameTick(uint64_t tick)
++{
++    const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
++    const uint64_t since = tick > m_frameBase ? tick - m_frameBase : 1u;
++    auto host = m_frameHost0 + std::chrono::nanoseconds(since * kFrameNanosecondNumerator / fps);
++    // After a slow stretch (or a stretch without waits) rebase the host clock instead of firing ticks back to back.
++    const auto late = std::chrono::steady_clock::now() - host;
++    if (late > std::chrono::milliseconds(50))
++    {
++        m_frameHost0 += late;
++        host += late;
++    }
++    m_frameTickQueued = true;
++    scheduleEvent(m_frameCycle0 + since * kFrameCycleNumerator / fps, host, EeEvent{EeEventType::FrameTick, 0, tick});
++}
++
++[[noreturn]] void EeScheduler::waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion, bool atVBlank)
+ {
+     assertExecutor();
+     const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
+@@ -1980,13 +2032,27 @@ bool EeScheduler::frameDriven() const noexcept
+         m_frameLastWake = 0;
+         m_frameCycle0 = m_eeCycle;
+         m_frameHost0 = std::chrono::steady_clock::now();
+-        scheduleEvent(m_frameCycle0 + kFrameCycleNumerator / fps,
+-                      m_frameHost0 + std::chrono::nanoseconds(kFrameNanosecondNumerator / fps),
+-                      EeEvent{EeEventType::FrameTick, 0, 1});
+     }
++    // Ticks are only queued while the game waits on the clock: ticks that passed while it was busy (a load inside one
++    // iteration) are counted from the EE cycle, not fired, so the EE idles from VBLANK to VBLANK there exactly as in
++    // native mode (an idle EE runs the IOP up to the next event only: ticks in between finished loads earlier).
++    m_frameTicks = frameTickAt(m_eeCycle);
+     m_frameWaitTarget = std::max<uint64_t>(m_frameLastWake + std::max<uint32_t>(interval, 1u), m_frameTicks + 1u);
++    if (atVBlank && !m_frameTickQueued && m_nextVBlankCycle > m_eeCycle)
++    {
++        // Realign: the next tick falls on the next VBLANK and the game wakes there (ticks after it stay on the VBLANK
++        // grid at rates that are multiples of 60).
++        const uint64_t period = kFrameCycleNumerator / fps;
++        m_frameBase = m_frameTicks;
++        m_frameCycle0 = m_nextVBlankCycle > period ? m_nextVBlankCycle - period : 0u;
++        m_frameHost0 = std::chrono::steady_clock::now() + eeCyclesToHostDuration(m_nextVBlankCycle - m_eeCycle) -
++                       std::chrono::nanoseconds(kFrameNanosecondNumerator / fps);
++        m_frameWaitTarget = m_frameTicks + 1u;
++    }
+     m_frameWaiting = true;
+     m_frameLastWaitTick = m_frameTicks;
++    if (!m_frameTickQueued)
++        scheduleFrameTick(m_frameTicks + 1u);
+     blockCurrent(EeWaitState{EeWaitReason::External, EeExternalWait{kFrameWaitType, 0}, std::move(completion)});
+ }
+ 
+@@ -2482,23 +2548,15 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               hostBase + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
++                m_nextVBlankCycle = scheduled.deadlineCycle + kVBlankPeriodCycles;
++                scheduleEvent(m_nextVBlankCycle,
+                               hostBase + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             else if (scheduled.event.type == EeEventType::FrameTick)
+             {
+-                // Same rule as the VBLANK chain: after a slow stretch rebase
+-                // the host clock instead of firing ticks back to back.
+-                const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
+-                const uint64_t next = scheduled.event.value + 1u;
+-                const auto late = std::chrono::steady_clock::now() - scheduled.hostDeadline;
+-                if (late > std::chrono::milliseconds(50))
+-                    m_frameHost0 += late;
+-                const uint64_t since = next > m_frameBase ? next - m_frameBase : 1u;
+-                scheduleEvent(m_frameCycle0 + since * kFrameCycleNumerator / fps,
+-                              m_frameHost0 + std::chrono::nanoseconds(since * kFrameNanosecondNumerator / fps),
+-                              EeEvent{EeEventType::FrameTick, 0, next});
++                // The next tick is queued by processEvent while the game still waits.
++                m_frameTickQueued = false;
+             }
+             processEvent(scheduled.event);
+         }
+@@ -2602,7 +2660,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::FrameTick:
+     {
+-        m_frameTicks = event.value;
++        m_frameTicks = std::max(m_frameTicks, event.value);
+         if (m_frameWaiting)
+             m_frameLastWaitTick = m_frameTicks;
+         bool scannedOut = false;
+@@ -2620,6 +2678,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+             m_frameLastWake = m_frameTicks;
+             completeExternalWait(kFrameWaitType, 0, KE_OK);
+         }
++        else if (m_frameWaiting && !m_frameTickQueued)
++            scheduleFrameTick(m_frameTicks + 1u);
+         break;
+     }
+     case EeEventType::ExternalWake:
+@@ -2773,7 +2833,7 @@ void EeScheduler::waitForEvent()
+     }
+     if (hasTimerDeadline)
+     {
+-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
++        const auto timerHostDeadline = freeRun() ? kHostPassed : std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+         if (timerHostDeadline < hostDeadline)
+         {
+             deadlineCycle = m_eeCycle + timerCycles;
+@@ -2803,6 +2863,8 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
+                                 std::chrono::steady_clock::time_point hostDeadline,
+                                 EeEvent event)
+ {
++    if (freeRun())
++        hostDeadline = kHostPassed;
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index 01c7aa3..d83d0e0 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -22,35 +22,55 @@ namespace ga2_framepace
+ {
+     namespace
+     {
+-        int parseFps()
++        // GA2_FPS: the frame rate cap the run starts with (61..240), 60 = the native cadence (also unset/invalid).
++        int parseAsked()
+         {
+             const char *v = std::getenv("GA2_FPS");
+             if (!v || !*v)
+-                return 0;
+-            const double asked = std::atof(v);
+-            const int n = int(std::lround(asked));
++                return 60;
++            const int n = int(std::lround(std::atof(v)));
+             if (n == 60 || n == 0)
+-                return 0;
++                return 60;
+             if (n < 61 || n > 240)
+             {
+                 std::fprintf(stderr, "[ga2 fps] GA2_FPS=%s is outside 60..240; native timing\n", v);
+-                return 0;
++                return 60;
+             }
+-            // VR presents through the headset's own frame loop and tags each
+-            // frame at the emulated VBLANK (ga2_stereo): native pacing there.
++            return n;
++        }
++
++        // The highest rate this run can reach (0: the hooks stay off). The cap can be raised live in the settings
++        // menu, so the hooks are on whenever they can be: not in VR (the headset paces the game and ga2_stereo tags
++        // each frame at the emulated VBLANK) and not with the software GS (it does not show a frame per flip).
++        // GA2_FPS_LIVE=0: the hooks only when the run starts above 60, at most that rate (the behaviour before).
++        int parseFps()
++        {
++            const int asked = parseAsked();
++            // VR: the cap follows the headset's refresh rate (ga2_vr sets it once the session runs);
++            // GA2_VR_FPS=native keeps the PS2 rate there.
+             if (const char *vr = std::getenv("GA2_VR"); vr && std::strcmp(vr, "1") == 0)
++                if (const char *v = std::getenv("GA2_VR_FPS"); v && std::strcmp(v, "native") == 0)
++                {
++                    std::fprintf(stderr, "[ga2 fps] GA2_VR_FPS=native: the PS2 rate in VR\n");
++                    return 0;
++                }
++            if (const char *gs = std::getenv("GA2_GS"); gs && std::strcmp(gs, "cpu") == 0)
+             {
+-                std::fprintf(stderr, "[ga2 fps] GA2_FPS ignored in VR (the headset paces the game); native timing\n");
++                if (asked > 60)
++                    std::fprintf(stderr, "[ga2 fps] GA2_FPS needs the GPU GS (GA2_GS=cpu); native timing\n");
+                 return 0;
+             }
+-            // Only the GPU GS shows a frame per flip.
+-            if (const char *gs = std::getenv("GA2_GS"); gs && std::strcmp(gs, "cpu") == 0)
++            const char *live = std::getenv("GA2_FPS_LIVE");
++            const int top = live && std::strcmp(live, "0") == 0 ? (asked > 60 ? asked : 0) : 240;
++            if (top > 0)
+             {
+-                std::fprintf(stderr, "[ga2 fps] GA2_FPS needs the GPU GS (GA2_GS=cpu); native timing\n");
+-                return 0;
++                if (asked > 60)
++                    std::fprintf(stderr, "[ga2 fps] frame rate cap %d fps (game step %.6f s), up to %d in the settings menu\n", asked,
++                                 1001.0 / (1000.0 * asked), top);
++                else
++                    std::fprintf(stderr, "[ga2 fps] native timing; the settings menu can raise the frame rate up to %d\n", top);
+             }
+-            std::fprintf(stderr, "[ga2 fps] high frame rate: %d fps (game step %.6f s)\n", n, 1001.0 / (1000.0 * n));
+-            return n;
++            return top;
+         }
+ 
+         std::atomic<uint64_t> g_flips{0}, g_presented{0};
+@@ -103,6 +123,12 @@ namespace ga2_framepace
+         return value;
+     }
+ 
++    int startCap()
++    {
++        static const int value = parseAsked();
++        return fps() > 0 && value > 60 ? std::min(value, fps()) : 60;
++    }
++
+     namespace
+     {
+         std::atomic<int> g_rate{0};
+@@ -119,7 +145,7 @@ namespace ga2_framepace
+     int rate()
+     {
+         const int r = g_rate.load(std::memory_order_relaxed);
+-        return r > 0 ? r : fps();
++        return r > 0 ? r : (fps() > 0 ? startCap() : 0);
+     }
+ 
+     int setRate(PS2Runtime &runtime, int value)
+@@ -140,11 +166,11 @@ namespace ga2_framepace
+ 
+     double hz() { return rate() > 0 ? rate() * 1000.0 / 1001.0 : 60000.0 / 1001.0; }
+ 
+-    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc)
++    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc, bool atVBlank)
+     {
+         EeScheduler &scheduler = runtime.eeScheduler();
+         scheduler.configureFrameClock(uint32_t(rate()));
+-        scheduler.waitFrameTick(interval, [resumePc](R5900Context &context) { context.pc = resumePc; });
++        scheduler.waitFrameTick(interval, [resumePc](R5900Context &context) { context.pc = resumePc; }, atVBlank);
+     }
+ 
+     uint64_t ticks(const PS2Runtime &runtime) { return runtime.eeScheduler().frameTicks(); }
+diff --git a/ps2xRuntime/src/lib/ga2_settings.cpp b/ps2xRuntime/src/lib/ga2_settings.cpp
+index 756be08..d2cc269 100644
+--- a/ps2xRuntime/src/lib/ga2_settings.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings.cpp
+@@ -167,8 +167,9 @@ namespace ga2_settings
+         }
+         if (key == ga2_options::Fps)
+         {
+-            // The high frame rate machinery (hooks, display pacing) is set up at the start for the rate the run
+-            // started with; the rate can move between 60 and that. VR keeps the PS2 rate.
++            // The frame rate hooks run in every run that can use them (ga2_framepace::fps(): up to 240), so the cap
++            // moves live; VR and the software GS keep the PS2 rate (fps() == 0) and GA2_FPS_LIVE=0 limits it to the
++            // rate the run started with.
+             const int wanted = std::atoi(o.choices[size_t(choice)].value);
+             const int top = ga2_framepace::fps();
+             if (wanted > 60 && wanted > top)
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index c4d29c0..222e996 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -113,9 +113,12 @@ namespace ga2_settings_menu
+                 if (ga2_vr::headsetRunning())
+                     return "In VR the headset sets the rate.";
+                 if (top <= 0)
+-                    return "This run started at the PS2's 60: higher rates apply after restart.";
+-                std::snprintf(text, sizeof(text), "Now %d fps (up to %d in this run; higher applies after restart).",
+-                              std::max(60, ga2_framepace::rate()), top);
++                    return "This run keeps the PS2's 60 (software GS): higher rates apply after restart.";
++                if (ga2_framepace::nativeNow())
++                    std::snprintf(text, sizeof(text), "Now the PS2's 60 (the PC's speed lowers the rate below the cap when needed).");
++                else
++                    std::snprintf(text, sizeof(text), "Now %d fps (the PC's speed lowers the rate below the cap when needed).",
++                                  ga2_framepace::rate());
+                 return text;
+             }
+             case ga2_options::Sides:
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 8b8edf5..c25a85c 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -8,6 +8,7 @@
+ #include "runtime/ga2_vrpointer.h"
+ #include "ga2_present.h"
+ #include "runtime/ga2_activity.h"
++#include "runtime/ga2_framepace.h"
+ #include "runtime/gs/gs_pgs.h"
+ 
+ #include "raylib.h"
+@@ -661,6 +662,9 @@ void main() {
+             Q recenterRot;
+             V3 recenterPos;
+             bool recentered = false;
++            int capHz = 0; // the headset refresh rate the game's frame rate cap was last set from
++            std::array<double, 90> periodHz{};
++            size_t periodCount = 0;
+         } g_xr;
+ 
+         Mode g_mode = Mode::Off;
+@@ -1488,6 +1492,31 @@ void main() {
+         XrFrameState frameState{XR_TYPE_FRAME_STATE};
+         if (!check(xr.xrWaitFrame(g_xr.session, &waitInfo, &frameState), "xrWaitFrame"))
+             return;
++        // The game's frame rate cap follows the headset's refresh rate (the governor still lowers the rate when
++        // the PC cannot keep up; the settings menu can lower the cap until the headset's rate changes). The rate is
++        // the median of the last 90 predicted display periods; stalls (below 50 Hz) do not count and the cap moves
++        // only when the median moves by more than 2 Hz.
++        if (frameState.predictedDisplayPeriod > 0 && ga2_framepace::fps() > 0)
++        {
++            const double hz = 1e9 / double(frameState.predictedDisplayPeriod);
++            if (hz >= 50.0 && hz <= 500.0)
++            {
++                g_xr.periodHz[g_xr.periodCount++ % g_xr.periodHz.size()] = hz;
++                if (g_xr.periodCount >= g_xr.periodHz.size())
++                {
++                    std::array<double, 90> sorted = g_xr.periodHz;
++                    std::nth_element(sorted.begin(), sorted.begin() + 45, sorted.end());
++                    const int median = int(std::lround(sorted[45]));
++                    if (g_xr.capHz == 0 || std::abs(median - g_xr.capHz) > 2)
++                    {
++                        g_xr.capHz = median;
++                        const int cap = median > 60 ? std::min(median, ga2_framepace::fps()) : 60;
++                        ga2_framepace::setUserCap(cap);
++                        std::fprintf(stderr, "[vr] headset refresh %d Hz: game frame rate cap %d\n", median, cap);
++                    }
++                }
++            }
++        }
+         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+         xr.xrBeginFrame(g_xr.session, &beginInfo);
+         if (!g_xr.recentered)
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 9f27e96..0aae9ad 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -293,8 +293,11 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ {
+     if (!data || size < 32)
+         return false;
++    // A scripted run (the timing oracle, GA2_PAD_SCRIPT) sees only the script: the window's input (keyboard, mouse
++    // menus, on-screen pad) arrives in host time and would make runs differ.
++    static const bool scriptOnly = std::getenv("GA2_PAD_SCRIPT") != nullptr;
+     std::lock_guard<std::mutex> lock(g_hostPadMutex);
+-    if (g_hostPadSampled)
++    if (g_hostPadSampled && !scriptOnly)
+         std::memcpy(data, g_hostPad.data(), 32);
+     else
+         neutralPad(data); // no window has presented yet
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ddf7b09..625362a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -965,11 +965,14 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        // GA2_FPS above 60: the window shows each frame as it arrives, paced
+-        // by the display (GA2_VSYNC=0 turns the swap interval off).
++        // The frame rate hooks on: the window shows each frame as it arrives,
++        // paced by the display (GA2_VSYNC=0 turns the swap interval off). Not
++        // in VR: the headset paces the loop and the monitor must not hold it.
+         const char *vsyncEnv = std::getenv("GA2_VSYNC");
++        const char *vrEnv = std::getenv("GA2_VR");
++        const bool vrMode = vrEnv && std::strcmp(vrEnv, "1") == 0;
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE |
+-                       (ga2_framepace::enabled() && !(vsyncEnv && *vsyncEnv == '0') ? FLAG_VSYNC_HINT : 0));
++                       (ga2_framepace::enabled() && !vrMode && !(vsyncEnv && *vsyncEnv == '0') ? FLAG_VSYNC_HINT : 0));
+         // GA2_WINDOW_SCALE: window size as a multiple of the PS2 frame (the
+         // launcher's display setting); GA2_FULLSCREEN=1 starts borderless
+         // fullscreen. F11 or Alt+Enter toggles fullscreen while playing.
+-- 
+2.55.0
+

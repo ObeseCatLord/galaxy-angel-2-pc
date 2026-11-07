@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "profile": "recomp-entry-points.json",
+  "config_sha256": "c4c9c054dbf9d909c6e20a925e67e63c7130894ceedca41c9b4916327353c37f",
+  "generation_method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+  "entry_points": [
+    "0x00222608",
+    "0x00222640",
+    "0x002226b8",
+    "0x002226c0",
+    "0x00222f98",
+    "0x00222fd0",
+    "0x00223048",
+    "0x00223050"
+  ],
+  "changed_outputs": [
+    {
+      "file": "entry_222608_0x222640.cpp",
+      "old_sha256": null,
+      "new_sha256": "a7de26ea00584d7fbb66fbdddf9e0de747ae9d9fbe6564caf6e03c1e1da8786c"
+    },
+    {
+      "file": "entry_222640_0x222660.cpp",
+      "old_sha256": null,
+      "new_sha256": "5e660da3c3f5df30b7e88ec68b4fa37f0f6c975a839170eaf1d18f612bab0d09"
+    },
+    {
+      "file": "entry_2226b8_0x2226c0.cpp",
+      "old_sha256": null,
+      "new_sha256": "b51f13bf9fd5c7e06845729d2c2279cf3f1a151347e1edc60bd4685c1dea0a4d"
+    },
+    {
+      "file": "entry_2226c0_0x2226c8.cpp",
+      "old_sha256": null,
+      "new_sha256": "afbbfc1793f118d6f70c36d1bb9c626a4d35782d6fc2ffea14ca698047675217"
+    },
+    {
+      "file": "entry_222f98_0x222fd0.cpp",
+      "old_sha256": null,
+      "new_sha256": "6c7667de22c52973934262890482b66bc5e96da941f1be2cb2f6f318b3500a47"
+    },
+    {
+      "file": "entry_222fd0_0x222ff0.cpp",
+      "old_sha256": null,
+      "new_sha256": "1759d3df63f1e2dd462c4fccf1e4050856b97012a06b6945944ca0d7fff45dbc"
+    },
+    {
+      "file": "entry_223048_0x223050.cpp",
+      "old_sha256": null,
+      "new_sha256": "0ed1972584421438ee178777b909339ea9c95186bf84fa0da16a20b177accb56"
+    },
+    {
+      "file": "entry_223050_0x223058.cpp",
+      "old_sha256": null,
+      "new_sha256": "68532f6055ea345df9f3e27ec95ff39bacb19c9cc7957d2195619e7574fca826"
+    },
+    {
+      "file": "ps2_recompiled_functions.h",
+      "old_sha256": "0116d2b7fb8b90bafddb10804cb36f0a9f8d72e74817799960b30a5ac1ac569b",
+      "new_sha256": "0627d94d38fa52b133e0adeed9f96cc7f50638859487e25bd5efa55e813cac83"
+    },
+    {
+      "file": "register_functions.cpp",
+      "old_sha256": "cd9d5609f83a45a175a6d54a27d33c4877070c651e76cd67786512cb15af6b58",
+      "new_sha256": "a0b0de0ad5a0d07dec5969f433e957c5be5c0e6f1130b62e0293a5d9ad1b9e0a"
+    }
+  ],
+  "retired_output": "entry_222608_0x222660.cpp",
+  "retired_output_prior_sha256": "2ad581713a71ed4b527c8aaa746e95d91dd456bfd131ef54b5954a3b7393431e",
+  "retired_backup_private": true,
+  "functional_instruction_encodings_verified": 49,
+  "emitted_words_including_padding_verified_by_astra": 52,
+  "review": "Astra Ultra; original descriptor/code/output provenance and native saved-return corruption accepted; allocator policy/fix not reviewed",
+  "native_build": "completed ordinary CMake target ga2_zettai",
+  "native_scene_passed": false,
+  "limits": [
+    "routine registration does not establish actual invocation",
+    "other indirect targets may remain omitted",
+    "native title/story/audio/battle/save/disc-transition gates remain open"
+  ],
+  "binary_sha256": "3a95810720457f6edc0c03f330952c36531e8158b33c5926241a1a6fc119a5cb",
+  "binary_size": 364254672,
+  "tooling_tests": {
+    "passed": 15,
+    "failed": 0
+  },
+  "runtime_unchanged": "pinned upstream plus reviewed ten-patch stack; prior460/460 runtime and9/9 IOP suites; no production runtime changes this checkpoint",
+  "native_capture": "captures/native-zettai/20261009-000411/capture.json",
+  "stack_watch_capture": "captures/native-zettai/20261009-000645/capture.json",
+  "native_entries_observed": [
+    "0x00222608",
+    "0x00222f98"
+  ],
+  "native_entries_gp": "0x004ee3f0",
+  "native_entries_ra": "0x0022f94c",
+  "visual_result": "magenta framebuffer",
+  "next_native_failure": {
+    "target": "0x00020180",
+    "original_code_region": false,
+    "startup_saved_ra_slot": "0x01ffffd8",
+    "original_saved_ra": "0x001002dc",
+    "overwriting_guest_functions": [
+      "0x00223a38",
+      "0x0020a398"
+    ],
+    "final_overwritten_value": "0x00020180",
+    "distinct_invocation_context_observed": true,
+    "first_runtime_callback_stack_top": "0x01fffff0",
+    "original_main_stack_range": [
+      "0x01fe0000",
+      "0x02000000"
+    ],
+    "actual_overwriting_store_instructions": [
+      "0x00223a58",
+      "0x0020a3cc"
+    ],
+    "original_save_instruction": "0x0026660c",
+    "original_restore_instruction": "0x00112db4"
+  },
+  "stack_watch_visual_result": "black at5.1s; bounded debugger stopped later; not a native scene"
+}

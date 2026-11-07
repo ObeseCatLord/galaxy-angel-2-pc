@@ -1,0 +1,182 @@
+From 3a200110930e8f350cde8e573ab5b3eab3693cf8 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 03:11:06 -0500
+Subject: [PATCH] vr: the active hand's aim ray for game hooks (battle
+ pointing)
+
+- runtime/ga2_vrpointer.h: ga2_vrpointer::aim() gives the aim ray of the
+  hand that last pulled its trigger (recentred play space, the frame of
+  ga2_stereo::Setup::headAnchor; metres, OpenXR axes) and whether a headset
+  session tracks it; published once per headset frame by ga2_vr. Read by
+  the game-side tactical map pointer (native/compat/ga2_battlepointer.cpp),
+  which turns it into the game's world with the view matrix the stereo hook
+  captures.
+- wantTrigger(): while the game shows the tactical map the active hand's
+  trigger presses Circle in the stereo 3D scenes (there is no screen to
+  click there); a lapse of half a second ends it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_vrpointer.h | 36 ++++++++++
+ ps2xRuntime/src/lib/ga2_vr.cpp              | 73 ++++++++++++++++++++-
+ 2 files changed, 108 insertions(+), 1 deletion(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_vrpointer.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_vrpointer.h b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+new file mode 100644
+index 0000000..5b758c6
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cstdint>
++
++// The VR hand as a pointer for game hooks (native/compat/ga2_battlepointer.cpp):
++// the aim ray of the hand that last pulled its trigger, published once per
++// headset frame by ga2_vr (main thread), read by the game thread.
++namespace ga2_vrpointer
++{
++    struct Aim
++    {
++        // A headset session is running and the active hand's aim pose is
++        // tracked this frame.
++        bool valid = false;
++        // The ray in the recentred play space (the frame of
++        // ga2_stereo::Setup::headAnchor): metres, OpenXR axes (x right,
++        // y up, -z forward); the direction is a unit vector.
++        float origin[3] = {0, 0, 0};
++        float direction[3] = {0, 0, -1};
++        float trigger = 0.0f; // 0..1
++        uint64_t serial = 0;  // grows with every published frame
++    };
++
++    // Game thread: the newest aim (valid == false without a headset).
++    Aim aim();
++
++    // Game thread: set while a game screen wants the trigger as its confirm
++    // button (the tactical map); the trigger of the active hand then presses
++    // Circle in the stereo 3D scenes, where no screen is there to click.
++    void wantTrigger(bool want);
++
++    // ga2_vr (main thread).
++    void publish(const Aim &aim);
++    void clear();
++    bool triggerWanted();
++}
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 813174d..1439f94 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,6 +1,7 @@
+ #include "ga2_vr.h"
+ #include "runtime/ga2_display.h"
+ #include "ps2_mouse.h"
++#include "runtime/ga2_vrpointer.h"
+ #include "ga2_present.h"
+ #include "runtime/ga2_activity.h"
+ #include "runtime/gs/gs_pgs.h"
+@@ -16,10 +17,13 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -1137,6 +1141,20 @@ void main() {
+             }
+         }
+         const bool stereo = stereoShowing();
++        {
++            // The active hand's aim for game hooks (the tactical map's pointing).
++            ga2_vrpointer::Aim a;
++            const Laser &hand = lasers[size_t(g_xr.activeHand)];
++            a.valid = hand.visible;
++            if (hand.visible)
++            {
++                const V3 d = normalize(hand.to - hand.from);
++                a.origin[0] = hand.from.x, a.origin[1] = hand.from.y, a.origin[2] = hand.from.z;
++                a.direction[0] = d.x, a.direction[1] = d.y, a.direction[2] = d.z;
++            }
++            a.trigger = triggers[g_xr.activeHand];
++            ga2_vrpointer::publish(a);
++        }
+         if (stereo)
+         {
+             pointerHit = false; // no screen to point at
+@@ -1151,7 +1169,8 @@ void main() {
+         }
+         ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f, false, false, 0.0f);
+         uint16_t pad = 0;
+-        if (boolean(g_xr.circle)) pad |= 0x2000;
++        if (boolean(g_xr.circle) || (stereo && ga2_vrpointer::triggerWanted() && triggers[g_xr.activeHand] > 0.6f))
++            pad |= 0x2000;
+         if (boolean(g_xr.cross)) pad |= 0x4000;
+         if (boolean(g_xr.square)) pad |= 0x8000;
+         if (boolean(g_xr.triangle)) pad |= 0x1000;
+@@ -1369,3 +1388,55 @@ void main() {
+         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     }
+ }
++
++namespace ga2_vrpointer
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        Aim g_aim;
++        std::chrono::steady_clock::time_point g_published;
++        std::atomic<bool> g_wantTrigger{false};
++        std::atomic<int64_t> g_wantedAt{0};
++        int64_t nowNanos()
++        {
++            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++                .count();
++        }
++    }
++
++    Aim aim()
++    {
++        const std::lock_guard<std::mutex> lock(g_mutex);
++        Aim a = g_aim;
++        // A session that stopped publishing is not pointing at anything.
++        if (std::chrono::steady_clock::now() - g_published > std::chrono::milliseconds(500))
++            a.valid = false;
++        return a;
++    }
++
++    void publish(const Aim &aim)
++    {
++        const std::lock_guard<std::mutex> lock(g_mutex);
++        const uint64_t serial = g_aim.serial + 1;
++        g_aim = aim;
++        g_aim.serial = serial;
++        g_published = std::chrono::steady_clock::now();
++    }
++
++    void clear()
++    {
++        const std::lock_guard<std::mutex> lock(g_mutex);
++        g_aim = Aim{};
++    }
++
++    // The game sets this every frame it shows the tactical map; a lapse of
++    // half a second (another screen, a hook not running) ends it.
++    void wantTrigger(bool want)
++    {
++        g_wantTrigger = want;
++        g_wantedAt = nowNanos();
++    }
++
++    bool triggerWanted() { return g_wantTrigger.load() && nowNanos() - g_wantedAt.load() < 500'000'000; }
++}
+-- 
+2.55.0
+

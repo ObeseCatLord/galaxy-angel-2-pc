@@ -1,0 +1,133 @@
+From 410014dc5da415323cbf4de92fe44fa7396bb1d8 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:59:13 -0500
+Subject: [PATCH] display: 16:10 play area; hor+ frames keep the shape the game
+ was set up for
+
+GA2_ASPECT gains 16:10. runtime/ga2_display.h gives the play-area shape to
+the presentation and the game-side hor+ hook; for "fit" it is the
+window's shape when first asked, so the widened 3D view matches the
+window instead of always assuming 16:9. Hor+ frames are fitted to that
+shape (bars after a later resize) instead of stretched over the area.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_display.h | 13 ++++++++
+ ps2xRuntime/src/lib/ga2_present.cpp       | 39 +++++++++++++++++++++--
+ ps2xRuntime/src/lib/ga2_vr.cpp            |  6 ++--
+ 3 files changed, 53 insertions(+), 5 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_display.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_display.h b/ps2xRuntime/include/runtime/ga2_display.h
+new file mode 100644
+index 0000000..cacf5d4
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_display.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++// The play area's shape (GA2_ASPECT 4:3 | 16:10 | 16:9 | 21:9 | fit), shared
++// by the presentation and the game-side hor+ hook (native/compat/ga2_features).
++namespace ga2_display
++{
++    // Width / height of the play area. "fit" uses the window's shape the
++    // first time this is asked (once the window exists) and keeps it, so the
++    // 3D view the game was set up for and the presentation always agree.
++    float wideAspect();
++    // Width / height for an explicit GA2_ASPECT value; 0 for "fit".
++    float parseAspect(const char *value);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index e7c4572..05ad982 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_present.h"
++#include "runtime/ga2_display.h"
+ #include "ga2_mpv_shader.h"
+ #include "runtime/ga2_activity.h"
+ 
+@@ -43,7 +44,7 @@ namespace ga2_present
+         {
+             Settings s;
+             const std::string aspect = env("GA2_ASPECT", "16:9");
+-            s.aspect = aspect == "4:3" ? 4.0f / 3.0f : aspect == "21:9" ? 64.0f / 27.0f : aspect == "fit" ? 0.0f : 16.0f / 9.0f;
++            s.aspect = ga2_display::parseAspect(aspect.c_str());
+             const std::string sides = env("GA2_SIDES", "black");
+             s.sides = sides == "blur" ? Sides::Blur : sides == "skybox" ? Sides::Skybox : Sides::Black;
+             s.skybox = env("GA2_SKYBOX", "");
+@@ -212,6 +213,38 @@ void main() {
+         const float aspect = settings().aspect;
+         return aspect > 0.0f ? aspect : 16.0f / 9.0f;
+     }
++}
++
++namespace ga2_display
++{
++    float parseAspect(const char *value)
++    {
++        const std::string a = value ? value : "16:9";
++        if (a == "4:3")
++            return 4.0f / 3.0f;
++        if (a == "16:10")
++            return 16.0f / 10.0f;
++        if (a == "21:9")
++            return 64.0f / 27.0f;
++        if (a == "fit")
++            return 0.0f;
++        return 16.0f / 9.0f;
++    }
++
++    float wideAspect()
++    {
++        static float fitted = 0.0f;
++        const float aspect = ga2_present::settings().aspect;
++        if (aspect > 0.0f)
++            return aspect;
++        if (fitted <= 0.0f && IsWindowReady() && GetScreenHeight() > 0)
++            fitted = float(GetScreenWidth()) / float(GetScreenHeight());
++        return fitted > 0.0f ? fitted : 16.0f / 9.0f;
++    }
++}
++
++namespace ga2_present
++{
+ 
+     std::string title(const std::string &program)
+     {
+@@ -300,7 +333,9 @@ void main() {
+         const Rect window{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
+         const Rect area = fitAspect(window, s.aspect);
+         // A PS2 picture is 4:3 on a TV, whatever its pixel count.
+-        Rect picture = g_wide ? area : fitAspect(area, 4.0f / 3.0f);
++        // Hor+ frames have the shape the game's cameras were set up for;
++        // anything else would stretch them (bars instead, e.g. after a resize).
++        Rect picture = g_wide ? fitAspect(area, ga2_display::wideAspect()) : fitAspect(area, 4.0f / 3.0f);
+         if (s.integer2d && !scene3d && !g_wide)
+         {
+             // Whole multiples of 640x448 (square pixels): crisp 2x, 3x...
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index c713b14..426df1b 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_vr.h"
++#include "runtime/ga2_display.h"
+ #include "ps2_mouse.h"
+ #include "ga2_present.h"
+ #include "runtime/ga2_activity.h"
+@@ -375,9 +376,8 @@ void main() {
+         {
+             ScreenGeometry s;
+             s.halfHeight = kScreenHeight * 0.5f;
+-            const char *aspect = std::getenv("GA2_ASPECT");
+-            const float wideAspect = aspect && std::strcmp(aspect, "21:9") == 0 ? 64.0f / 27.0f : 16.0f / 9.0f;
+-            s.halfWidth = s.halfHeight * (wide ? wideAspect : 4.0f / 3.0f);
++            const float wideAspect = std::max(ga2_display::parseAspect(std::getenv("GA2_ASPECT")), 4.0f / 3.0f);
++            s.halfWidth = s.halfHeight * (wide ? (wideAspect > 4.0f / 3.0f ? wideAspect : 16.0f / 9.0f) : 4.0f / 3.0f);
+             s.center = V3{0.0f, 0.0f, -kScreenDistance};
+             return s;
+         }
+-- 
+2.55.0
+

@@ -1,0 +1,2047 @@
+From b6b29af75fb955a601c6ffeef9bfe4e1b36ae260 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:55:15 -0500
+Subject: [PATCH] vr: complete controller bindings, analog sticks and shoulder
+ pressure
+
+One OpenXR action per PS2 input (face buttons, Start/Select, menu tap/hold,
+L1/R1/L2/R2, L3/R3, D-pad, both analog sticks, a face pad) so SteamVR's binding
+UI lists and rebinds them. Default bindings per interaction profile live in
+ga2_vr_bindings.h (simple, Touch, Touch Pro/Plus, Pico 4/Neo 3, HP G2, Index,
+WMR/Odyssey, Vive wands); profiles that need an instance extension are
+suggested only when the runtime offers it.
+
+The action -> pad mapping is a pure class (ga2_vr_input.h): hysteresis, menu
+tap = Start / hold = Select, both grips = recentre without L1/R1, stick as
+analog bytes and D-pad, right stick sideways = L2/R2, face pad quadrants, and
+what the triggers press by scene (click on the flat screen, Circle in 3D scenes
+and on the tactical map, Cross in the cockpit, L2/R2 in the unit camera view).
+ga2_vrpointer::setScene lets game hooks name the scene.
+
+ps2_pad hands the VR sticks and the analog L1/R1/L2/R2 pressure to the pad
+stub; the pressure bytes 16..19 now follow libpad's order (L1, R1, L2, R2; the
+games read R1/R2 as bytes 17/19 to raise and lower the battle map camera).
+Both stick clicks open the cheat menu from VR as on a gamepad.
+
+Test aids: GA2_VR_PAD_LOG, GA2_VR_INPUT_SCRIPT, GA2_PAD_TRACE shows sticks and
+pressure. Unit tests: ga2_vr_input_tests.cpp (mapper, per-profile path lists).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_vrpointer.h |  15 +
+ ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp    |  37 +-
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp      |  26 +-
+ ps2xRuntime/src/lib/ga2_vr.cpp              | 430 +++++++++++---
+ ps2xRuntime/src/lib/ga2_vr.h                |  26 +-
+ ps2xRuntime/src/lib/ga2_vr_bindings.h       | 171 ++++++
+ ps2xRuntime/src/lib/ga2_vr_input.h          | 264 +++++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp             |  28 +-
+ ps2xRuntime/src/lib/ps2_pad_input.h         |   5 +
+ ps2xTest/CMakeLists.txt                     |   1 +
+ ps2xTest/src/ga2_vr_input_tests.cpp         | 599 ++++++++++++++++++++
+ ps2xTest/src/main.cpp                       |   2 +
+ ps2xTest/src/pad_input_tests.cpp            |  21 +-
+ 13 files changed, 1512 insertions(+), 113 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ga2_vr_bindings.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_vr_input.h
+ create mode 100644 ps2xTest/src/ga2_vr_input_tests.cpp
+
+diff --git a/ps2xRuntime/include/runtime/ga2_vrpointer.h b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+index 5b758c6..a94493a 100644
+--- a/ps2xRuntime/include/runtime/ga2_vrpointer.h
++++ b/ps2xRuntime/include/runtime/ga2_vrpointer.h
+@@ -29,7 +29,22 @@ namespace ga2_vrpointer
+     // Circle in the stereo 3D scenes, where no screen is there to click.
+     void wantTrigger(bool want);
+ 
++    // What the game shows in a battle, for what the controllers' triggers press
++    // (src/lib/ga2_vr_input.h).
++    enum class Scene : uint8_t
++    {
++        Other = 0,   // anything else: in 3D scenes the trigger confirms (Circle)
++        TacticalMap, // as wantTrigger(true)
++        Cockpit,     // cockpit / attack view: the triggers fire (Cross)
++        UnitCamera,  // watching a unit through its camera: the triggers are L2 / R2 (zoom)
++    };
++
++    // Game thread: the scene the game shows now; call every frame it is shown (a
++    // lapse of half a second ends it, like wantTrigger).
++    void setScene(Scene scene);
++
+     // ga2_vr (main thread).
++    Scene scene();
+     void publish(const Aim &aim);
+     void clear();
+     bool triggerWanted();
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 9e30e97..d4c3827 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,6 +1,7 @@
+ #include <cstdlib>
+ #include "Common.h"
+ #include "Pad.h"
++#include "../../ps2_pad_input.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -42,6 +43,9 @@ namespace ps2_stubs
+             uint8_t ry = kPadAnalogCenter;
+             uint8_t lx = kPadAnalogCenter;
+             uint8_t ly = kPadAnalogCenter;
++            // Analog pressure of L1, R1, L2, R2 where the input device has it (VR
++            // controllers); 0 = derive it from the button.
++            uint8_t shoulder[4] = {0, 0, 0, 0};
+         };
+ 
+         struct PadPortState
+@@ -264,10 +268,16 @@ namespace ps2_stubs
+             data[13] = pressureValue(state, portState, kPadBtnCircle);
+             data[14] = pressureValue(state, portState, kPadBtnCross);
+             data[15] = pressureValue(state, portState, kPadBtnSquare);
+-            data[16] = pressureValue(state, portState, kPadBtnL1);
+-            data[17] = pressureValue(state, portState, kPadBtnL2);
+-            data[18] = pressureValue(state, portState, kPadBtnR1);
+-            data[19] = pressureValue(state, portState, kPadBtnR2);
++            // libpad's order: l1, r1, l2, r2 (the games read R1 / R2 as bytes 17 / 19 to
++            // raise and lower the battle map camera).
++            const uint16_t shoulderMasks[4] = {kPadBtnL1, kPadBtnR1, kPadBtnL2, kPadBtnR2};
++            for (int k = 0; k < 4; ++k)
++            {
++                uint8_t value = pressureValue(state, portState, shoulderMasks[k]);
++                if (portState.pressureEnabled && (portState.buttonMask & shoulderMasks[k]) != 0u)
++                    value = std::max(value, state.shoulder[k]);
++                data[16 + k] = value;
++            }
+         }
+ 
+         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
+@@ -310,6 +320,7 @@ namespace ps2_stubs
+                     state.ry = backendData[5];
+                     state.lx = backendData[6];
+                     state.ly = backendData[7];
++                    ps2PadHostShoulderPressure(state.shoulder);
+                     usedBackend = true;
+                 }
+                 else
+@@ -653,13 +664,19 @@ namespace ps2_stubs
+         static const bool padTrace = std::getenv("GA2_PAD_TRACE") != nullptr;
+         if (padTrace)
+         {
+-            static uint16_t last = 0xFFFFu;
+-            const uint16_t buttons = static_cast<uint16_t>(data[2] | (data[3] << 8));
+-            if (buttons != last)
++            // What the game reads: buttons, the sticks, the shoulder pressure bytes (16..19) and the pad mode.
++            static std::array<uint8_t, 12> last{};
++            const std::array<uint8_t, 12> now = {data[1], data[2], data[3], data[4], data[5], data[6],
++                                                 data[7], data[16], data[17], data[18], data[19], 0};
++            if (now != last)
+             {
+-                std::fprintf(stderr, "[pad] port=%d slot=%d buttons=0x%04x pressed=0x%04x\n", port, slot, buttons,
+-                             static_cast<uint16_t>(~buttons));
+-                last = buttons;
++                const uint16_t buttons = static_cast<uint16_t>(data[2] | (data[3] << 8));
++                std::fprintf(stderr,
++                             "[pad] port=%d slot=%d mode=0x%02x buttons=0x%04x pressed=0x%04x right=%02x,%02x left=%02x,%02x "
++                             "pressure L1 %u R1 %u L2 %u R2 %u\n",
++                             port, slot, data[1], buttons, static_cast<uint16_t>(~buttons), data[4], data[5], data[6], data[7],
++                             data[16], data[17], data[18], data[19]);
++                last = now;
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index f63c28f..a51d177 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_cheat_menu.h"
++#include "ga2_vr.h"
+ #include "runtime/ga2_cheats.h"
+ 
+ #include "raylib.h"
+@@ -44,6 +45,11 @@ namespace ga2_cheat_menu
+                     {"Stop the time limit", &s.stopTimer}};
+         }
+ 
++        // The runtime's pad bits (ga2_vr::padState().buttons).
++        constexpr uint16_t kVrL3 = 0x0002, kVrR3 = 0x0004, kVrUp = 0x0010, kVrDown = 0x0040, kVrCircle = 0x2000,
++                           kVrCross = 0x4000;
++        uint16_t g_vrPrevious = 0;
++
+         bool menuInputHeld()
+         {
+             for (int key : {KEY_F1, KEY_ESCAPE, KEY_BACKSPACE, KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_UP, KEY_DOWN,
+@@ -52,6 +58,9 @@ namespace ga2_cheat_menu
+                     return true;
+             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+                 return true;
++            // VR controllers: stick clicks, Circle, Cross, D-pad up / down.
++            if (ga2_vr::padState().buttons & (kVrL3 | kVrR3 | kVrCircle | kVrCross | kVrUp | kVrDown))
++                return true;
+             if (IsGamepadAvailable(0))
+                 for (int button : {GAMEPAD_BUTTON_LEFT_THUMB, GAMEPAD_BUTTON_RIGHT_THUMB, GAMEPAD_BUTTON_RIGHT_FACE_DOWN,
+                                    GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, GAMEPAD_BUTTON_LEFT_FACE_UP, GAMEPAD_BUTTON_LEFT_FACE_DOWN})
+@@ -109,7 +118,13 @@ namespace ga2_cheat_menu
+             return;
+         const bool padToggle = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB) &&
+                                IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_THUMB);
+-        if (IsKeyPressed(KEY_F1) || padToggle)
++        // VR controllers act as a gamepad: both stick clicks open and close it, D-pad up /
++        // down move, Circle chooses, Cross closes.
++        const uint16_t vr = ga2_vr::padState().buttons;
++        const auto vrPressed = [&](uint16_t mask) { return (vr & mask) == mask && (g_vrPrevious & mask) != mask; };
++        const bool vrToggle = vrPressed(kVrL3 | kVrR3);
++        g_vrPrevious = vr;
++        if (IsKeyPressed(KEY_F1) || padToggle || vrToggle)
+         {
+             if (g_open)
+                 close();
+@@ -120,14 +135,15 @@ namespace ga2_cheat_menu
+         if (!g_open)
+             return;
+         const int count = int(items().size());
+-        if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
++        if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) ||
++            vrPressed(kVrCross))
+         {
+             close();
+             return;
+         }
+-        if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP))
++        if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP) || vrPressed(kVrUp))
+             g_selected = (g_selected + count - 1) % count;
+-        if (IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
++        if (IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN) || vrPressed(kVrDown))
+             g_selected = (g_selected + 1) % count;
+         const Vector2 mouse = GetMousePosition();
+         for (int i = 0; i < count; ++i)
+@@ -143,7 +159,7 @@ namespace ga2_cheat_menu
+                 }
+             }
+         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
+-            IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
++            IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) || vrPressed(kVrCircle))
+             activate(g_selected, rdram);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 6938127..3bae338 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,4 +1,6 @@
+ #include "ga2_vr.h"
++#include "ga2_vr_bindings.h"
++#include "ga2_vr_input.h"
+ #include "runtime/ga2_display.h"
+ #include "ps2_mouse.h"
+ #include "runtime/ga2_vrpointer.h"
+@@ -24,6 +26,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include <sstream>
+ #include <string>
+ #include <vector>
+ 
+@@ -579,14 +582,21 @@ void main() {
+             std::vector<Eye> eyes;
+             std::vector<XrViewConfigurationView> configs;
+             XrActionSet actions = XR_NULL_HANDLE;
+-            XrAction aim = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE, grip = XR_NULL_HANDLE, stick = XR_NULL_HANDLE;
++            // One action per PS2 input (createActions lists them with their labels).
++            XrAction aim = XR_NULL_HANDLE, trigger = XR_NULL_HANDLE;
+             XrAction circle = XR_NULL_HANDLE, cross = XR_NULL_HANDLE, square = XR_NULL_HANDLE, triangle = XR_NULL_HANDLE;
+-            XrAction start = XR_NULL_HANDLE, select = XR_NULL_HANDLE;
++            XrAction start = XR_NULL_HANDLE, select = XR_NULL_HANDLE, menu = XR_NULL_HANDLE;
++            XrAction l1 = XR_NULL_HANDLE, r1 = XR_NULL_HANDLE, l2 = XR_NULL_HANDLE, r2 = XR_NULL_HANDLE;
++            XrAction l3 = XR_NULL_HANDLE, r3 = XR_NULL_HANDLE;
++            XrAction dpad = XR_NULL_HANDLE, leftStick = XR_NULL_HANDLE, rightStick = XR_NULL_HANDLE;
++            XrAction facePad = XR_NULL_HANDLE, facePadClick = XR_NULL_HANDLE;
+             XrPath hands[2] = {XR_NULL_PATH, XR_NULL_PATH};
+             XrSpace aimSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+             int activeHand = 1;
+-            double bothGripsSince = -1.0;
+-            uint16_t pad = 0;
++            ga2_vr_input::Mapper mapper;
++            PadState pad;
++            // Instance extensions that were enabled (controller profiles among them).
++            std::vector<std::string> extensions;
+             // Recentring: yaw and position of the screen's frame in LOCAL space.
+             Q recenterRot;
+             V3 recenterPos;
+@@ -631,6 +641,8 @@ void main() {
+             XR_FN(xrGetActionStateFloat);
+             XR_FN(xrGetActionStateVector2f);
+             XR_FN(xrCreateActionSpace);
++            XR_FN(xrGetCurrentInteractionProfile);
++            XR_FN(xrPathToString);
+         } xr;
+ #undef XR_FN
+ 
+@@ -681,6 +693,14 @@ void main() {
+             return p;
+         }
+ 
++        bool extensionEnabled(const char *name)
++        {
++            return std::find(g_xr.extensions.begin(), g_xr.extensions.end(), name) != g_xr.extensions.end();
++        }
++
++        // One action per PS2 input, so the runtime's binding UI (SteamVR) lists
++        // them all with clear names and lets people rebind each. The default
++        // bindings follow; docs/vr/stereo.md has them as a table.
+         bool createActions()
+         {
+             XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+@@ -690,7 +710,7 @@ void main() {
+                 return false;
+             g_xr.hands[0] = path("/user/hand/left");
+             g_xr.hands[1] = path("/user/hand/right");
+-            auto action = [&](XrAction &out, const char *name, const char *label, XrActionType type, bool perHand) {
++            auto action = [&](XrAction &out, const char *name, const char *label, XrActionType type, bool perHand = false) {
+                 XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+                 std::strcpy(info.actionName, name);
+                 std::strcpy(info.localizedActionName, label);
+@@ -702,63 +722,55 @@ void main() {
+                 }
+                 return check(xr.xrCreateAction(g_xr.actions, &info, &out), name);
+             };
+-            bool ok = action(g_xr.aim, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT, true) &&
+-                      action(g_xr.trigger, "trigger", "Point and click", XR_ACTION_TYPE_FLOAT_INPUT, true) &&
+-                      action(g_xr.grip, "grip", "L1 / R1", XR_ACTION_TYPE_FLOAT_INPUT, true) &&
+-                      action(g_xr.stick, "stick", "D-pad", XR_ACTION_TYPE_VECTOR2F_INPUT, true) &&
+-                      action(g_xr.circle, "circle", "Circle", XR_ACTION_TYPE_BOOLEAN_INPUT, false) &&
+-                      action(g_xr.cross, "cross", "Cross", XR_ACTION_TYPE_BOOLEAN_INPUT, false) &&
+-                      action(g_xr.square, "square", "Square", XR_ACTION_TYPE_BOOLEAN_INPUT, false) &&
+-                      action(g_xr.triangle, "triangle", "Triangle", XR_ACTION_TYPE_BOOLEAN_INPUT, false) &&
+-                      action(g_xr.start, "start", "Start", XR_ACTION_TYPE_BOOLEAN_INPUT, false) &&
+-                      action(g_xr.select, "select", "Select", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
++            constexpr XrActionType kBool = XR_ACTION_TYPE_BOOLEAN_INPUT, kFloat = XR_ACTION_TYPE_FLOAT_INPUT,
++                                   kVec2 = XR_ACTION_TYPE_VECTOR2F_INPUT;
++            const bool ok =
++                action(g_xr.aim, "aim", "Aim (pointer)", XR_ACTION_TYPE_POSE_INPUT, true) &&
++                action(g_xr.trigger, "trigger", "Point and click (trigger: confirm / fire)", kFloat, true) &&
++                action(g_xr.circle, "circle", "Circle (confirm)", kBool) &&
++                action(g_xr.cross, "cross", "Cross (cancel)", kBool) &&
++                action(g_xr.square, "square", "Square", kBool) &&
++                action(g_xr.triangle, "triangle", "Triangle", kBool) &&
++                action(g_xr.start, "start", "Start", kBool) &&
++                action(g_xr.select, "select", "Select (system menu)", kBool) &&
++                action(g_xr.menu, "menu", "Menu (tap: Start, hold: Select)", kBool) &&
++                action(g_xr.l1, "l1", "L1", kFloat) && action(g_xr.r1, "r1", "R1", kFloat) &&
++                action(g_xr.l2, "l2", "L2", kFloat) && action(g_xr.r2, "r2", "R2", kFloat) &&
++                action(g_xr.l3, "l3", "L3 (left stick click)", kBool) && action(g_xr.r3, "r3", "R3 (right stick click)", kBool) &&
++                action(g_xr.dpad, "dpad", "D-pad", kVec2) &&
++                action(g_xr.leftStick, "left_stick", "Left analog stick", kVec2) &&
++                action(g_xr.rightStick, "right_stick", "Right analog stick (left / right is also L2 / R2)", kVec2) &&
++                action(g_xr.facePad, "face_pad", "Face pad position (click presses a face button by direction)", kVec2) &&
++                action(g_xr.facePadClick, "face_pad_click", "Face pad click (Circle / Cross / Square / Triangle)", kBool);
+             if (!ok)
+                 return false;
+ 
+-            struct B
++            // The default bindings (ga2_vr_bindings.h). A profile whose instance
++            // extension is off is not suggested (the runtime would reject it).
++            const XrAction byAct[size_t(ga2_vr_bindings::Act::Count)] = {
++                g_xr.aim,      g_xr.trigger,   g_xr.circle,   g_xr.cross,     g_xr.square,    g_xr.triangle,
++                g_xr.start,    g_xr.select,    g_xr.menu,     g_xr.l1,        g_xr.r1,        g_xr.l2,
++                g_xr.r2,       g_xr.l3,        g_xr.r3,       g_xr.dpad,      g_xr.leftStick, g_xr.rightStick,
++                g_xr.facePad,  g_xr.facePadClick};
++            int suggested = 0;
++            for (const ga2_vr_bindings::Profile &profile : ga2_vr_bindings::profiles())
+             {
+-                XrAction action;
+-                const char *path;
+-            };
+-            auto suggest = [&](const char *profile, std::vector<B> bindings) {
++                if (!profile.extension.empty() && !extensionEnabled(profile.extension.c_str()))
++                    continue;
+                 std::vector<XrActionSuggestedBinding> list;
+-                for (const B &b : bindings)
+-                    list.push_back({b.action, path(b.path)});
++                for (const ga2_vr_bindings::Binding &b : profile.bindings)
++                    list.push_back({byAct[size_t(b.action)], path(b.path.c_str())});
+                 XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+-                info.interactionProfile = path(profile);
++                info.interactionProfile = path(profile.name.c_str());
+                 info.countSuggestedBindings = uint32_t(list.size());
+                 info.suggestedBindings = list.data();
+                 const XrResult r = xr.xrSuggestInteractionProfileBindings(g_xr.instance, &info);
+-                if (!XR_SUCCEEDED(r))
+-                    std::fprintf(stderr, "[vr] bindings for %s rejected (%d)\n", profile, int(r));
+-            };
+-            suggest("/interaction_profiles/khr/simple_controller",
+-                    {{g_xr.aim, "/user/hand/left/input/aim/pose"}, {g_xr.aim, "/user/hand/right/input/aim/pose"},
+-                     {g_xr.trigger, "/user/hand/left/input/select/click"}, {g_xr.trigger, "/user/hand/right/input/select/click"},
+-                     {g_xr.start, "/user/hand/left/input/menu/click"}, {g_xr.cross, "/user/hand/right/input/menu/click"}});
+-            suggest("/interaction_profiles/oculus/touch_controller",
+-                    {{g_xr.aim, "/user/hand/left/input/aim/pose"}, {g_xr.aim, "/user/hand/right/input/aim/pose"},
+-                     {g_xr.trigger, "/user/hand/left/input/trigger/value"}, {g_xr.trigger, "/user/hand/right/input/trigger/value"},
+-                     {g_xr.grip, "/user/hand/left/input/squeeze/value"}, {g_xr.grip, "/user/hand/right/input/squeeze/value"},
+-                     {g_xr.stick, "/user/hand/left/input/thumbstick"}, {g_xr.stick, "/user/hand/right/input/thumbstick"},
+-                     {g_xr.circle, "/user/hand/right/input/a/click"}, {g_xr.cross, "/user/hand/right/input/b/click"},
+-                     {g_xr.square, "/user/hand/left/input/x/click"}, {g_xr.triangle, "/user/hand/left/input/y/click"},
+-                     {g_xr.start, "/user/hand/left/input/menu/click"}, {g_xr.select, "/user/hand/left/input/thumbstick/click"},
+-                     {g_xr.select, "/user/hand/right/input/thumbstick/click"}});
+-            suggest("/interaction_profiles/valve/index_controller",
+-                    {{g_xr.aim, "/user/hand/left/input/aim/pose"}, {g_xr.aim, "/user/hand/right/input/aim/pose"},
+-                     {g_xr.trigger, "/user/hand/left/input/trigger/value"}, {g_xr.trigger, "/user/hand/right/input/trigger/value"},
+-                     {g_xr.grip, "/user/hand/left/input/squeeze/value"}, {g_xr.grip, "/user/hand/right/input/squeeze/value"},
+-                     {g_xr.stick, "/user/hand/left/input/thumbstick"}, {g_xr.stick, "/user/hand/right/input/thumbstick"},
+-                     {g_xr.circle, "/user/hand/right/input/a/click"}, {g_xr.cross, "/user/hand/right/input/b/click"},
+-                     {g_xr.square, "/user/hand/left/input/a/click"}, {g_xr.triangle, "/user/hand/left/input/b/click"},
+-                     {g_xr.start, "/user/hand/left/input/thumbstick/click"}, {g_xr.select, "/user/hand/right/input/thumbstick/click"}});
+-            suggest("/interaction_profiles/htc/vive_controller",
+-                    {{g_xr.aim, "/user/hand/left/input/aim/pose"}, {g_xr.aim, "/user/hand/right/input/aim/pose"},
+-                     {g_xr.trigger, "/user/hand/left/input/trigger/value"}, {g_xr.trigger, "/user/hand/right/input/trigger/value"},
+-                     {g_xr.stick, "/user/hand/left/input/trackpad"}, {g_xr.stick, "/user/hand/right/input/trackpad"},
+-                     {g_xr.circle, "/user/hand/right/input/trackpad/click"}, {g_xr.cross, "/user/hand/right/input/menu/click"},
+-                     {g_xr.start, "/user/hand/left/input/menu/click"}, {g_xr.select, "/user/hand/left/input/trackpad/click"}});
++                if (XR_SUCCEEDED(r))
++                    ++suggested;
++                else
++                    std::fprintf(stderr, "[vr] bindings for %s rejected (%d)\n", profile.name.c_str(), int(r));
++            }
++            std::fprintf(stderr, "[vr] controller bindings suggested for %d interaction profiles\n", suggested);
+ 
+             for (int h = 0; h < 2; ++h)
+             {
+@@ -854,14 +866,35 @@ void main() {
+             load(XR_NULL_HANDLE, "xrCreateInstance", xr.xrCreateInstance);
+             if (!xr.xrCreateInstance)
+                 return false;
+-            const char *extensions[] = {XR_KHR_OPENGL_ENABLE_EXTENSION_NAME};
++            // OpenGL, and the controller profiles this runtime offers (suggesting
++            // bindings for a profile whose extension is off fails).
++            std::vector<const char *> extensions = {XR_KHR_OPENGL_ENABLE_EXTENSION_NAME};
++            g_xr.extensions.assign(1, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
++            static const char *const kControllerExtensions[] = {
++                "XR_FB_touch_controller_pro", "XR_META_touch_controller_plus", "XR_EXT_hp_mixed_reality_controller",
++                "XR_EXT_samsung_odyssey_controller", "XR_BD_controller_interaction"};
++            if (xr.xrEnumerateInstanceExtensionProperties)
++            {
++                uint32_t count = 0;
++                xr.xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
++                std::vector<XrExtensionProperties> available(count, {XR_TYPE_EXTENSION_PROPERTIES});
++                if (count && XR_SUCCEEDED(xr.xrEnumerateInstanceExtensionProperties(nullptr, count, &count, available.data())))
++                    for (const char *wanted : kControllerExtensions)
++                        for (const XrExtensionProperties &e : available)
++                            if (std::strcmp(e.extensionName, wanted) == 0)
++                            {
++                                extensions.push_back(wanted);
++                                g_xr.extensions.push_back(wanted);
++                                break;
++                            }
++            }
+             XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
+             std::strcpy(info.applicationInfo.applicationName, "Galaxy Angel II");
+             info.applicationInfo.applicationVersion = 1;
+             std::strcpy(info.applicationInfo.engineName, "ga2");
+             info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+-            info.enabledExtensionCount = 1;
+-            info.enabledExtensionNames = extensions;
++            info.enabledExtensionCount = uint32_t(extensions.size());
++            info.enabledExtensionNames = extensions.data();
+             if (!check(xr.xrCreateInstance(&info, &g_xr.instance), "xrCreateInstance (is a VR runtime active?)"))
+                 return false;
+             XrInstance i = g_xr.instance;
+@@ -886,7 +919,9 @@ void main() {
+                       load(i, "xrGetActionStateBoolean", xr.xrGetActionStateBoolean) &&
+                       load(i, "xrGetActionStateFloat", xr.xrGetActionStateFloat) &&
+                       load(i, "xrGetActionStateVector2f", xr.xrGetActionStateVector2f) &&
+-                      load(i, "xrCreateActionSpace", xr.xrCreateActionSpace);
++                      load(i, "xrCreateActionSpace", xr.xrCreateActionSpace) &&
++                      load(i, "xrGetCurrentInteractionProfile", xr.xrGetCurrentInteractionProfile) &&
++                      load(i, "xrPathToString", xr.xrPathToString);
+             if (!ok)
+                 return false;
+             XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
+@@ -946,6 +981,20 @@ void main() {
+                         std::fprintf(stderr, "[vr] session ended; continuing on the monitor\n");
+                     }
+                 }
++                else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED)
++                {
++                    // Which controllers the runtime found (and so which suggested bindings apply).
++                    for (int h = 0; h < 2; ++h)
++                    {
++                        XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
++                        char text[XR_MAX_PATH_LENGTH] = "none";
++                        uint32_t length = 0;
++                        if (XR_SUCCEEDED(xr.xrGetCurrentInteractionProfile(g_xr.session, g_xr.hands[h], &profile)) &&
++                            profile.interactionProfile != XR_NULL_PATH)
++                            xr.xrPathToString(g_xr.instance, profile.interactionProfile, sizeof(text), &length, text);
++                        std::fprintf(stderr, "[vr] %s hand controller profile: %s\n", h ? "right" : "left", text);
++                    }
++                }
+                 event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
+             }
+         }
+@@ -967,15 +1016,188 @@ void main() {
+             return XR_SUCCEEDED(xr.xrGetActionStateFloat(g_xr.session, &info, &state)) && state.isActive ? state.currentState : 0.0f;
+         }
+ 
+-        XrVector2f vector(XrAction action, int hand)
++        // Actions without subaction paths (every PS2 input except the pointer).
++        float scalar(XrAction action)
++        {
++            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
++            info.action = action;
++            XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
++            return XR_SUCCEEDED(xr.xrGetActionStateFloat(g_xr.session, &info, &state)) && state.isActive ? state.currentState : 0.0f;
++        }
++
++        ga2_vr_input::Vec2 vector(XrAction action)
+         {
+             XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+             info.action = action;
+-            info.subactionPath = g_xr.hands[hand];
+             XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+             if (XR_SUCCEEDED(xr.xrGetActionStateVector2f(g_xr.session, &info, &state)) && state.isActive)
+-                return state.currentState;
+-            return XrVector2f{0, 0};
++                return {state.currentState.x, state.currentState.y};
++            return {};
++        }
++
++        // The PS2 inputs from the OpenXR actions (no scene, no pointing hand).
++        ga2_vr_input::Inputs sampleActions()
++        {
++            ga2_vr_input::Inputs in;
++            in.circle = boolean(g_xr.circle);
++            in.cross = boolean(g_xr.cross);
++            in.square = boolean(g_xr.square);
++            in.triangle = boolean(g_xr.triangle);
++            in.start = boolean(g_xr.start);
++            in.select = boolean(g_xr.select);
++            in.menu = boolean(g_xr.menu);
++            in.l3 = boolean(g_xr.l3);
++            in.r3 = boolean(g_xr.r3);
++            in.l1 = scalar(g_xr.l1);
++            in.r1 = scalar(g_xr.r1);
++            in.l2 = scalar(g_xr.l2);
++            in.r2 = scalar(g_xr.r2);
++            in.trigger[0] = value(g_xr.trigger, 0);
++            in.trigger[1] = value(g_xr.trigger, 1);
++            in.dpad = vector(g_xr.dpad);
++            in.leftStick = vector(g_xr.leftStick);
++            in.rightStick = vector(g_xr.rightStick);
++            in.facePad = vector(g_xr.facePad);
++            in.facePadClick = boolean(g_xr.facePadClick);
++            return in;
++        }
++
++        // GA2_VR_PAD_LOG=1: which actions the runtime has bound to a controller input (active), once.
++        void logActiveActions()
++        {
++            struct Entry
++            {
++                const char *name;
++                XrAction action;
++                char type; // b bool, f float, v vector2
++                bool perHand;
++            };
++            const Entry entries[] = {
++                {"trigger", g_xr.trigger, 'f', true}, {"circle", g_xr.circle, 'b', false}, {"cross", g_xr.cross, 'b', false},
++                {"square", g_xr.square, 'b', false}, {"triangle", g_xr.triangle, 'b', false}, {"start", g_xr.start, 'b', false},
++                {"select", g_xr.select, 'b', false}, {"menu", g_xr.menu, 'b', false}, {"l1", g_xr.l1, 'f', false},
++                {"r1", g_xr.r1, 'f', false}, {"l2", g_xr.l2, 'f', false}, {"r2", g_xr.r2, 'f', false},
++                {"l3", g_xr.l3, 'b', false}, {"r3", g_xr.r3, 'b', false}, {"dpad", g_xr.dpad, 'v', false},
++                {"left_stick", g_xr.leftStick, 'v', false}, {"right_stick", g_xr.rightStick, 'v', false},
++                {"face_pad", g_xr.facePad, 'v', false}, {"face_pad_click", g_xr.facePadClick, 'b', false}};
++            std::string active, inactive;
++            for (const Entry &e : entries)
++            {
++                for (int h = 0; h < (e.perHand ? 2 : 1); ++h)
++                {
++                    XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
++                    info.action = e.action;
++                    if (e.perHand)
++                        info.subactionPath = g_xr.hands[h];
++                    XrBool32 isActive = XR_FALSE;
++                    if (e.type == 'b')
++                    {
++                        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
++                        if (XR_SUCCEEDED(xr.xrGetActionStateBoolean(g_xr.session, &info, &state)))
++                            isActive = state.isActive;
++                    }
++                    else if (e.type == 'f')
++                    {
++                        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
++                        if (XR_SUCCEEDED(xr.xrGetActionStateFloat(g_xr.session, &info, &state)))
++                            isActive = state.isActive;
++                    }
++                    else
++                    {
++                        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
++                        if (XR_SUCCEEDED(xr.xrGetActionStateVector2f(g_xr.session, &info, &state)))
++                            isActive = state.isActive;
++                    }
++                    std::string &list = isActive ? active : inactive;
++                    list += std::string(list.empty() ? "" : " ") + e.name + (e.perHand ? (h ? ":right" : ":left") : "");
++                }
++            }
++            std::fprintf(stderr, "[vr] bound actions: %s\n[vr] unbound actions: %s\n", active.c_str(), inactive.c_str());
++        }
++
++        // GA2_VR_INPUT_SCRIPT=<file>: scripted controller input for tests without a
++        // headset's hands. Each line "<seconds> name=value ..." sets every input from
++        // that time (since the first headset frame) until the next line; unnamed
++        // inputs are 0. Names: circle cross square triangle start select menu l3 r3
++        // fpclick (0/1), l1 r1 l2 r2 trigl trigr (0..1), dpadx dpady lx ly rx ry fpx fpy.
++        struct ScriptStep
++        {
++            double at = 0.0;
++            ga2_vr_input::Inputs in;
++        };
++
++        const std::vector<ScriptStep> &inputScript()
++        {
++            static const std::vector<ScriptStep> steps = [] {
++                std::vector<ScriptStep> out;
++                const char *file = std::getenv("GA2_VR_INPUT_SCRIPT");
++                FILE *f = file && *file ? std::fopen(file, "r") : nullptr;
++                if (!f)
++                    return out;
++                char line[512];
++                while (std::fgets(line, sizeof(line), f))
++                {
++                    std::istringstream words(line);
++                    std::string word;
++                    if (!(words >> word) || word[0] == '#')
++                        continue;
++                    ScriptStep step;
++                    step.at = std::atof(word.c_str());
++                    while (words >> word)
++                    {
++                        const size_t eq = word.find('=');
++                        if (eq == std::string::npos)
++                            continue;
++                        const std::string key = word.substr(0, eq);
++                        const float v = float(std::atof(word.c_str() + eq + 1));
++                        ga2_vr_input::Inputs &in = step.in;
++                        if (key == "circle") in.circle = v != 0;
++                        else if (key == "cross") in.cross = v != 0;
++                        else if (key == "square") in.square = v != 0;
++                        else if (key == "triangle") in.triangle = v != 0;
++                        else if (key == "start") in.start = v != 0;
++                        else if (key == "select") in.select = v != 0;
++                        else if (key == "menu") in.menu = v != 0;
++                        else if (key == "l3") in.l3 = v != 0;
++                        else if (key == "r3") in.r3 = v != 0;
++                        else if (key == "fpclick") in.facePadClick = v != 0;
++                        else if (key == "l1") in.l1 = v;
++                        else if (key == "r1") in.r1 = v;
++                        else if (key == "l2") in.l2 = v;
++                        else if (key == "r2") in.r2 = v;
++                        else if (key == "trigl") in.trigger[0] = v;
++                        else if (key == "trigr") in.trigger[1] = v;
++                        else if (key == "dpadx") in.dpad.x = v;
++                        else if (key == "dpady") in.dpad.y = v;
++                        else if (key == "lx") in.leftStick.x = v;
++                        else if (key == "ly") in.leftStick.y = v;
++                        else if (key == "rx") in.rightStick.x = v;
++                        else if (key == "ry") in.rightStick.y = v;
++                        else if (key == "fpx") in.facePad.x = v;
++                        else if (key == "fpy") in.facePad.y = v;
++                        else
++                            std::fprintf(stderr, "[vr] input script: unknown input '%s'\n", key.c_str());
++                    }
++                    out.push_back(step);
++                }
++                std::fclose(f);
++                std::fprintf(stderr, "[vr] input script: %zu steps from %s\n", out.size(), file);
++                return out;
++            }();
++            return steps;
++        }
++
++        // The scripted inputs now, or nullptr.
++        const ga2_vr_input::Inputs *scriptedInputs(double seconds)
++        {
++            static double start = -1.0;
++            if (start < 0.0)
++                start = seconds;
++            const ScriptStep *current = nullptr;
++            for (const ScriptStep &step : inputScript())
++                if (seconds - start >= step.at)
++                    current = &step;
++            return current ? &current->in : nullptr;
+         }
+ 
+         // Recentring: the screen goes straight ahead of the head (yaw only).
+@@ -1178,7 +1400,10 @@ void main() {
+ 
+     bool headsetRunning() { return mode() == Mode::Headset && g_xr.session != XR_NULL_HANDLE; }
+ 
+-    uint16_t padButtons() { return g_xr.pad; }
++    // A session that is not running presses nothing.
++    PadState padState() { return g_xr.running ? g_xr.pad : PadState{}; }
++
++    uint16_t padButtons() { return padState().buttons; }
+ 
+     void setEyeFrame(int eye, uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight,
+                      const ga2_stereo::Setup &setup, bool uiSplit)
+@@ -1217,11 +1442,19 @@ void main() {
+         sync.countActiveActionSets = 1;
+         sync.activeActionSets = &active;
+         xr.xrSyncActions(g_xr.session, &sync);
++        {
++            static const bool padLog = std::getenv("GA2_VR_PAD_LOG") != nullptr;
++            static int frames = 0;
++            if (padLog && ++frames == 200)
++                logActiveActions();
++        }
+         const M4 world = worldFromLocal();
+         std::array<Laser, 2> lasers{};
+         float pointerX = 0, pointerY = 0;
+         bool pointerHit = false;
+-        float triggers[2] = {value(g_xr.trigger, 0), value(g_xr.trigger, 1)};
++        const ga2_vr_input::Inputs *script = scriptedInputs(GetTime());
++        float triggers[2] = {script ? script->trigger[0] : value(g_xr.trigger, 0),
++                             script ? script->trigger[1] : value(g_xr.trigger, 1)};
+         for (int h = 0; h < 2; ++h)
+         {
+             if (triggers[h] > 0.6f)
+@@ -1279,36 +1512,36 @@ void main() {
+                 }
+         }
+         ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f, false, false, 0.0f);
+-        uint16_t pad = 0;
+-        if (boolean(g_xr.circle) || (stereo && ga2_vrpointer::triggerWanted() && triggers[g_xr.activeHand] > 0.6f))
+-            pad |= 0x2000;
+-        if (boolean(g_xr.cross)) pad |= 0x4000;
+-        if (boolean(g_xr.square)) pad |= 0x8000;
+-        if (boolean(g_xr.triangle)) pad |= 0x1000;
+-        if (boolean(g_xr.start)) pad |= 0x0008;
+-        if (boolean(g_xr.select)) pad |= 0x0001;
+-        if (value(g_xr.grip, 0) > 0.6f) pad |= 0x0400;
+-        if (value(g_xr.grip, 1) > 0.6f) pad |= 0x0800;
+-        const XrVector2f stick = vector(g_xr.stick, 0);
+-        if (stick.y > 0.6f) pad |= 0x0010;
+-        if (stick.y < -0.6f) pad |= 0x0040;
+-        if (stick.x < -0.6f) pad |= 0x0080;
+-        if (stick.x > 0.6f) pad |= 0x0020;
+-        // Both grips held for a second: recentre (and do not press L1/R1).
+-        if ((pad & 0x0C00) == 0x0C00)
+-        {
+-            if (g_xr.bothGripsSince < 0)
+-                g_xr.bothGripsSince = GetTime();
+-            else if (GetTime() - g_xr.bothGripsSince > 1.0)
+-            {
++        {
++            ga2_vr_input::Inputs in = script ? *script : sampleActions();
++            in.trigger[0] = triggers[0];
++            in.trigger[1] = triggers[1];
++            in.activeHand = g_xr.activeHand;
++            if (stereo)
++                switch (ga2_vrpointer::scene())
++                {
++                case ga2_vrpointer::Scene::TacticalMap: in.scene = ga2_vr_input::Scene::TacticalMap; break;
++                case ga2_vrpointer::Scene::Cockpit: in.scene = ga2_vr_input::Scene::Cockpit; break;
++                case ga2_vrpointer::Scene::UnitCamera: in.scene = ga2_vr_input::Scene::UnitCamera; break;
++                default: in.scene = ga2_vr_input::Scene::Stereo; break;
++                }
++            const ga2_vr_input::Output out = g_xr.mapper.step(in, GetTime());
++            if (out.recenter)
+                 recenter(frameState.predictedDisplayTime);
+-                g_xr.bothGripsSince = GetTime() + 1e9;
+-            }
+-            pad &= ~0x0C00;
++            PadState pad;
++            pad.buttons = out.buttons;
++            pad.leftStick = out.leftActive;
++            pad.rightStick = out.rightActive;
++            pad.lx = out.lx, pad.ly = out.ly, pad.rx = out.rx, pad.ry = out.ry;
++            std::memcpy(pad.shoulder, out.pressure, sizeof(pad.shoulder));
++            static const bool log = std::getenv("GA2_VR_PAD_LOG") != nullptr;
++            if (log && (pad.buttons != g_xr.pad.buttons || pad.lx != g_xr.pad.lx || pad.ly != g_xr.pad.ly ||
++                        pad.rx != g_xr.pad.rx || pad.ry != g_xr.pad.ry || std::memcmp(pad.shoulder, g_xr.pad.shoulder, 4) != 0))
++                std::fprintf(stderr, "[vr] pad t=%.2f buttons=%04x left=%02x,%02x right=%02x,%02x pressure L1 %u R1 %u L2 %u R2 %u\n",
++                             GetTime(), pad.buttons, pad.lx, pad.ly, pad.rx, pad.ry, pad.shoulder[0], pad.shoulder[1],
++                             pad.shoulder[2], pad.shoulder[3]);
++            g_xr.pad = pad;
+         }
+-        else
+-            g_xr.bothGripsSince = -1.0;
+-        g_xr.pad = pad;
+ 
+         std::vector<XrCompositionLayerProjectionView> projected;
+         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+@@ -1510,6 +1743,8 @@ namespace ga2_vrpointer
+         Aim g_aim;
+         std::chrono::steady_clock::time_point g_published;
+         std::atomic<bool> g_wantTrigger{false};
++        std::atomic<uint8_t> g_scene{0};
++        std::atomic<int64_t> g_sceneAt{0};
+         std::atomic<int64_t> g_wantedAt{0};
+         int64_t nowNanos()
+         {
+@@ -1552,4 +1787,17 @@ namespace ga2_vrpointer
+     }
+ 
+     bool triggerWanted() { return g_wantTrigger.load() && nowNanos() - g_wantedAt.load() < 500'000'000; }
++
++    void setScene(Scene scene)
++    {
++        g_scene = uint8_t(scene);
++        g_sceneAt = nowNanos();
++    }
++
++    Scene scene()
++    {
++        if (triggerWanted())
++            return Scene::TacticalMap;
++        return nowNanos() - g_sceneAt.load() < 500'000'000 ? Scene(g_scene.load()) : Scene::Other;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.h b/ps2xRuntime/src/lib/ga2_vr.h
+index e14906c..3888ffb 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.h
++++ b/ps2xRuntime/src/lib/ga2_vr.h
+@@ -11,10 +11,14 @@
+ // skybox (GA2_SKYBOX, equirectangular; procedural stars until one exists),
+ // with blue laser pointers from both controllers. Pointing a laser at the
+ // screen moves the game's pointer like the mouse (menus follow it); the
+-// trigger clicks (Circle/confirm). Buttons: A/B = Circle/Cross, X/Y =
+-// Square/Triangle, left stick = D-pad, grips = L1/R1, menu = Start, stick
+-// clicks = Select. Hold both grips for a second to recentre the screen.
+-// The desktop window keeps showing the flat game.
++// trigger clicks. Every PS2 input is an OpenXR action of its own, so the
++// runtime's binding UI lists and rebinds them; the default bindings per
++// controller are in docs/vr/stereo.md (thumbstick controllers: A/B =
++// Circle/Cross, X/Y = Square/Triangle, sticks = the analog sticks (the left
++// one also the D-pad), grips = L1/R1, the right stick pushed sideways =
++// L2/R2, stick clicks = L3/R3, menu = Start (tap) or Select (hold)). Hold
++// both grips for a second to recentre the screen. The desktop window keeps
++// showing the flat game.
+ //
+ // GA2_VR=preview draws the same VR view into the desktop window instead
+ // (head at rest, the mouse aims a laser from the right hand), for checking
+@@ -53,6 +57,20 @@ namespace ga2_vr
+     // The newest UI layer image (RGBA with the game's alpha, 0x80 = opaque; GL texture) for the HUD panel.
+     void setUiFrame(uint32_t texture, int texWidth, int texHeight, bool uiSplit);
+ 
++    // The controllers as a PS2 pad (ga2_vr_input.h maps the actions).
++    struct PadState
++    {
++        uint16_t buttons = 0; // PS2 pad bits (active-high)
++        // The controllers deflect the left / right stick (the bytes below are 0x80 +- 127,
++        // y: 0 = up); otherwise the other input devices keep the stick.
++        bool leftStick = false, rightStick = false;
++        uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
++        // Analog pressure of L1, R1, L2, R2 (pad bytes 16..19 of the pressure
++        // mode); 0 for a button that is not pressed.
++        uint8_t shoulder[4] = {0, 0, 0, 0};
++    };
++    PadState padState();
++
+     // Controller buttons as PS2 pad bits (active-high).
+     uint16_t padButtons();
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr_bindings.h b/ps2xRuntime/src/lib/ga2_vr_bindings.h
+new file mode 100644
+index 0000000..ce56dca
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_vr_bindings.h
+@@ -0,0 +1,171 @@
++#pragma once
++
++// Default controller bindings of the VR actions (one action per PS2 input),
++// per OpenXR interaction profile. Data only, so tests can check every path
++// against the profile's path list and the coverage of each profile; ga2_vr.cpp
++// suggests them to the runtime. docs/vr/stereo.md has the same as a table.
++#include <string>
++#include <vector>
++
++namespace ga2_vr_bindings
++{
++    enum class Act
++    {
++        Aim,
++        Trigger,
++        Circle,
++        Cross,
++        Square,
++        Triangle,
++        Start,
++        Select,
++        Menu,
++        L1,
++        R1,
++        L2,
++        R2,
++        L3,
++        R3,
++        DPad,
++        LeftStick,
++        RightStick,
++        FacePad,
++        FacePadClick,
++        Count,
++    };
++
++    struct Binding
++    {
++        Act action;
++        std::string path;
++    };
++
++    struct Profile
++    {
++        std::string name;
++        // Instance extension the runtime must offer for this profile ("" = core).
++        std::string extension;
++        std::vector<Binding> bindings;
++    };
++
++    inline const std::vector<Profile> &profiles()
++    {
++        static const std::vector<Profile> all = [] {
++            using B = Binding;
++            const std::string L = "/user/hand/left/input/", R = "/user/hand/right/input/";
++            std::vector<Profile> out;
++            auto poses = [&](std::vector<B> &b) {
++                b.push_back({Act::Aim, L + "aim/pose"});
++                b.push_back({Act::Aim, R + "aim/pose"});
++            };
++            auto bothHands = [&](std::vector<B> &b, Act a, const char *input) {
++                b.push_back({a, L + input});
++                b.push_back({a, R + input});
++            };
++            auto shoulders = [&](std::vector<B> &b, const char *input) {
++                b.push_back({Act::L1, L + input});
++                b.push_back({Act::R1, R + input});
++            };
++            // Thumbstick controllers: the left stick is the left analog stick and the
++            // D-pad, the right stick the right analog stick, the stick clicks L3 / R3.
++            auto thumbsticks = [&](std::vector<B> &b) {
++                b.push_back({Act::DPad, L + "thumbstick"});
++                b.push_back({Act::LeftStick, L + "thumbstick"});
++                b.push_back({Act::RightStick, R + "thumbstick"});
++                b.push_back({Act::L3, L + "thumbstick/click"});
++                b.push_back({Act::R3, R + "thumbstick/click"});
++            };
++            // A / B on the right hand are Circle / Cross, X / Y on the left Square / Triangle.
++            auto touchFace = [&](std::vector<B> &b) {
++                b.push_back({Act::Circle, R + "a/click"});
++                b.push_back({Act::Cross, R + "b/click"});
++                b.push_back({Act::Square, L + "x/click"});
++                b.push_back({Act::Triangle, L + "y/click"});
++            };
++            auto touchLike = [&] {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "trigger/value");
++                shoulders(b, "squeeze/value");
++                thumbsticks(b);
++                touchFace(b);
++                b.push_back({Act::Menu, L + "menu/click"});
++                return b;
++            };
++
++            // Simple controllers: a pull of either select is the trigger, the left menu
++            // button Start / Select, the right one Cross. No sticks, so no D-pad.
++            {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "select/click");
++                b.push_back({Act::Menu, L + "menu/click"});
++                b.push_back({Act::Cross, R + "menu/click"});
++                out.push_back({"/interaction_profiles/khr/simple_controller", "", b});
++            }
++            // Quest, Rift (Touch), Touch Pro / Plus, Pico.
++            out.push_back({"/interaction_profiles/oculus/touch_controller", "", touchLike()});
++            out.push_back({"/interaction_profiles/facebook/touch_controller_pro", "XR_FB_touch_controller_pro", touchLike()});
++            out.push_back({"/interaction_profiles/meta/touch_controller_plus", "XR_META_touch_controller_plus", touchLike()});
++            out.push_back({"/interaction_profiles/bytedance/pico4_controller", "XR_BD_controller_interaction", touchLike()});
++            out.push_back({"/interaction_profiles/bytedance/pico_neo3_controller", "XR_BD_controller_interaction", touchLike()});
++            // HP Reverb G2: Touch's layout, and a menu button on the right hand too.
++            {
++                std::vector<B> b = touchLike();
++                b.push_back({Act::Menu, R + "menu/click"});
++                out.push_back({"/interaction_profiles/hp/mixed_reality_controller", "XR_EXT_hp_mixed_reality_controller", b});
++            }
++            // Index has no menu button: a hard press of the left trackpad is the menu
++            // action (Start on a tap, Select held), the right trackpad is Select. A / B
++            // on both hands: right = Circle / Cross, left = Square / Triangle.
++            {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "trigger/value");
++                shoulders(b, "squeeze/value");
++                thumbsticks(b);
++                b.push_back({Act::Circle, R + "a/click"});
++                b.push_back({Act::Cross, R + "b/click"});
++                b.push_back({Act::Square, L + "a/click"});
++                b.push_back({Act::Triangle, L + "b/click"});
++                b.push_back({Act::Menu, L + "trackpad/force"});
++                b.push_back({Act::Select, R + "trackpad/force"});
++                out.push_back({"/interaction_profiles/valve/index_controller", "", b});
++            }
++            // Windows Mixed Reality and Odyssey: no face buttons, so the right trackpad's
++            // click is Circle / Cross / Square / Triangle by direction; both menu buttons
++            // are the menu action.
++            {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "trigger/value");
++                shoulders(b, "squeeze/click");
++                thumbsticks(b);
++                bothHands(b, Act::Menu, "menu/click");
++                b.push_back({Act::FacePad, R + "trackpad"});
++                b.push_back({Act::FacePadClick, R + "trackpad/click"});
++                out.push_back({"/interaction_profiles/microsoft/motion_controller", "", b});
++                out.push_back({"/interaction_profiles/samsung/odyssey_controller", "XR_EXT_samsung_odyssey_controller", b});
++            }
++            // Vive wands: the left trackpad is the left stick and D-pad (its click L3), the
++            // right trackpad's click the face buttons by direction, the right menu button
++            // R3. No right stick, no L2 / R2.
++            {
++                std::vector<B> b;
++                poses(b);
++                bothHands(b, Act::Trigger, "trigger/value");
++                shoulders(b, "squeeze/click");
++                b.push_back({Act::Menu, L + "menu/click"});
++                b.push_back({Act::R3, R + "menu/click"});
++                b.push_back({Act::DPad, L + "trackpad"});
++                b.push_back({Act::LeftStick, L + "trackpad"});
++                b.push_back({Act::L3, L + "trackpad/click"});
++                b.push_back({Act::FacePad, R + "trackpad"});
++                b.push_back({Act::FacePadClick, R + "trackpad/click"});
++                out.push_back({"/interaction_profiles/htc/vive_controller", "", b});
++            }
++            return out;
++        }();
++        return all;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_vr_input.h b/ps2xRuntime/src/lib/ga2_vr_input.h
+new file mode 100644
+index 0000000..6884be7
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_vr_input.h
+@@ -0,0 +1,264 @@
++#pragma once
++
++// VR controller input -> PS2 pad (pure, no OpenXR, no raylib).
++//
++// ga2_vr.cpp samples one OpenXR action per PS2 input into `Inputs` every
++// headset frame and `Mapper::step` turns them into the pad state the game
++// reads: buttons (active-high, the runtime's own bit layout), the two analog
++// sticks and the analog pressure of the shoulder buttons. All the policy that
++// is not "this action is that button" lives here so it can be unit-tested:
++//   - analog values become digital buttons with hysteresis (grips, triggers,
++//     sticks as D-pad / shoulders);
++//   - the menu action is Start on a tap and Select when held;
++//   - both grips held for a second recentre the screen (and press neither
++//     L1 nor R1);
++//   - a face pad (a trackpad whose click is the four face buttons by
++//     quadrant) for controllers without face buttons;
++//   - what the triggers press depends on the scene the game shows (Scene).
++//
++// Which PS2 inputs the games read where is in docs/vr/stereo.md (bindings).
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++namespace ga2_vr_input
++{
++    // The runtime's pad bits (ps2_pad.cpp), active-high here.
++    enum : uint16_t
++    {
++        kSelect = 0x0001,
++        kL3 = 0x0002,
++        kR3 = 0x0004,
++        kStart = 0x0008,
++        kUp = 0x0010,
++        kRight = 0x0020,
++        kDown = 0x0040,
++        kLeft = 0x0080,
++        kL2 = 0x0100,
++        kR2 = 0x0200,
++        kL1 = 0x0400,
++        kR1 = 0x0800,
++        kTriangle = 0x1000,
++        kCircle = 0x2000,
++        kCross = 0x4000,
++        kSquare = 0x8000,
++    };
++
++    // What the game shows, as far as the triggers care.
++    enum class Scene : uint8_t
++    {
++        Flat,        // theater screen (2D scenes, menus, movies): the trigger is the mouse click
++        Stereo,      // a 3D scene around the player, no screen to point at: the trigger confirms (Circle)
++        TacticalMap, // battle map: the trigger confirms (Circle) on what the hand points at
++        Cockpit,     // battle cockpit / attack view: the triggers fire (Cross, held)
++        UnitCamera,  // battle camera view of one unit: the triggers are L2 / R2 (zoom)
++    };
++
++    struct Vec2
++    {
++        float x = 0.0f, y = 0.0f; // OpenXR: x right, y up
++    };
++
++    // One frame of sampled actions; unbound or inactive actions stay 0.
++    struct Inputs
++    {
++        bool circle = false, cross = false, square = false, triangle = false;
++        bool start = false, select = false;
++        bool menu = false; // tap = Start, hold = Select
++        bool l3 = false, r3 = false;
++        float l1 = 0.0f, r1 = 0.0f, l2 = 0.0f, r2 = 0.0f; // 0..1
++        float trigger[2] = {0.0f, 0.0f};                   // left, right hand: point / click / fire
++        Vec2 dpad, leftStick, rightStick;
++        Vec2 facePad;           // a trackpad ...
++        bool facePadClick = false; // ... whose click presses Circle / Cross / Square / Triangle by direction
++        int activeHand = 1;     // the hand that pointed last (its trigger confirms)
++        Scene scene = Scene::Flat;
++    };
++
++    struct Output
++    {
++        uint16_t buttons = 0; // active-high
++        // The controllers deflect the stick (otherwise leave the stick to the
++        // other input devices).
++        bool leftActive = false, rightActive = false;
++        uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80; // PS2 pad bytes (0x80 centre, y: 0 = up)
++        uint8_t pressure[4] = {0, 0, 0, 0};                 // L1, R1, L2, R2 (pad bytes 16..19 order)
++        bool recenter = false;                              // both grips were held long enough (one frame)
++    };
++
++    // Tunables (also what the tests exercise).
++    constexpr float kOn = 0.6f, kOff = 0.4f;              // analog -> button hysteresis
++    constexpr float kStickOn = 0.55f, kStickOff = 0.35f;  // stick -> D-pad hysteresis
++    constexpr float kStickDeadzone = 0.12f;
++    constexpr double kMenuHold = 0.6;     // seconds of holding menu for Select
++    constexpr double kTapPulse = 0.12;    // Start stays pressed this long after a tap
++    constexpr double kRecenterHold = 1.0; // seconds of both grips
++    constexpr float kFacePadDeadzone = 0.3f;
++
++    class Mapper
++    {
++    public:
++        Output step(const Inputs &in, double now)
++        {
++            Output out;
++            uint16_t &b = out.buttons;
++
++            // Face buttons: buttons, and the face pad's quadrants.
++            if (in.circle) b |= kCircle;
++            if (in.cross) b |= kCross;
++            if (in.square) b |= kSquare;
++            if (in.triangle) b |= kTriangle;
++            if (in.facePadClick && std::hypot(in.facePad.x, in.facePad.y) > kFacePadDeadzone)
++            {
++                if (std::fabs(in.facePad.x) > std::fabs(in.facePad.y))
++                    b |= in.facePad.x > 0.0f ? kCircle : kSquare;
++                else
++                    b |= in.facePad.y > 0.0f ? kTriangle : kCross;
++            }
++            if (in.l3) b |= kL3;
++            if (in.r3) b |= kR3;
++
++            // Start / Select: direct actions, and the menu action (tap, hold).
++            bool start = in.start, select = in.select;
++            if (in.menu)
++            {
++                if (menuSince_ < 0.0)
++                    menuSince_ = now;
++                if (now - menuSince_ >= kMenuHold)
++                    select = true;
++            }
++            else if (menuSince_ >= 0.0)
++            {
++                if (now - menuSince_ < kMenuHold)
++                    tapUntil_ = now + kTapPulse;
++                menuSince_ = -1.0;
++            }
++            if (now < tapUntil_)
++                start = true;
++            if (start) b |= kStart;
++            if (select) b |= kSelect;
++
++            // D-pad from the D-pad vector with hysteresis.
++            latch(up_, in.dpad.y, kStickOn, kStickOff);
++            latch(down_, -in.dpad.y, kStickOn, kStickOff);
++            latch(left_, -in.dpad.x, kStickOn, kStickOff);
++            latch(right_, in.dpad.x, kStickOn, kStickOff);
++            if (up_) b |= kUp;
++            if (down_) b |= kDown;
++            if (left_) b |= kLeft;
++            if (right_) b |= kRight;
++
++            // Analog sticks.
++            out.leftActive = stick(in.leftStick, out.lx, out.ly);
++            out.rightActive = stick(in.rightStick, out.rx, out.ry);
++
++            // Shoulders: the l1 / r1 / l2 / r2 actions. The right stick pushed left or
++            // right is also L2 / R2 (when its horizontal part dominates), except in
++            // the unit camera view, where the right stick turns the camera and
++            // R1 / R2 pressure zooms: there the triggers are L2 / R2.
++            float l1 = in.l1, r1 = in.r1, l2 = in.l2, r2 = in.r2;
++            if (in.scene != Scene::UnitCamera)
++            {
++                const float x = in.rightStick.x, y = in.rightStick.y;
++                if (std::fabs(x) > std::fabs(y))
++                {
++                    const float v = std::max(0.0f, (std::fabs(x) - 0.25f) / 0.75f);
++                    float &side = x < 0.0f ? l2 : r2;
++                    side = std::max(side, v);
++                }
++            }
++            else
++            {
++                l2 = std::max(l2, in.trigger[0]);
++                r2 = std::max(r2, in.trigger[1]);
++            }
++            latch(l1On_, l1, kOn, kOff);
++            latch(r1On_, r1, kOn, kOff);
++            latch(l2On_, l2, kOn, kOff);
++            latch(r2On_, r2, kOn, kOff);
++
++            // Both grips: recentre, no L1 / R1.
++            bool recenter = false;
++            if (l1On_ && r1On_)
++            {
++                if (bothSince_ < 0.0)
++                    bothSince_ = now;
++                else if (!recentered_ && now - bothSince_ > kRecenterHold)
++                {
++                    recenter = recentered_ = true;
++                }
++                l1 = r1 = 0.0f;
++            }
++            else
++            {
++                bothSince_ = -1.0;
++                recentered_ = false;
++            }
++            out.recenter = recenter;
++            if (!(l1On_ && r1On_))
++            {
++                if (l1On_) b |= kL1;
++                if (r1On_) b |= kR1;
++            }
++            if (l2On_) b |= kL2;
++            if (r2On_) b |= kR2;
++            out.pressure[0] = pressure(l1);
++            out.pressure[1] = pressure(r1);
++            out.pressure[2] = pressure(l2);
++            out.pressure[3] = pressure(r2);
++
++            // Triggers.
++            switch (in.scene)
++            {
++            case Scene::Flat:
++            case Scene::UnitCamera:
++                triggerOn_ = false;
++                break;
++            case Scene::Stereo:
++            case Scene::TacticalMap:
++                latch(triggerOn_, in.trigger[in.activeHand & 1], kOn, kOff);
++                if (triggerOn_) b |= kCircle;
++                break;
++            case Scene::Cockpit:
++                latch(triggerOn_, std::max(in.trigger[0], in.trigger[1]), kOn, kOff);
++                if (triggerOn_) b |= kCross;
++                break;
++            }
++            return out;
++        }
++
++    private:
++        static void latch(bool &state, float v, float on, float off)
++        {
++            if (state)
++                state = v > off;
++            else
++                state = v > on;
++        }
++
++        // A stick as PS2 bytes (radial dead zone, rescaled). true: deflected.
++        static bool stick(const Vec2 &s, uint8_t &bx, uint8_t &by)
++        {
++            const float len = std::hypot(s.x, s.y);
++            if (len <= kStickDeadzone)
++                return false;
++            const float scale = std::min(1.0f, (len - kStickDeadzone) / (1.0f - kStickDeadzone)) / len;
++            const float x = s.x * scale, y = s.y * scale;
++            bx = uint8_t(std::clamp(int(std::lround(128.0f + x * 127.0f)), 1, 255));
++            by = uint8_t(std::clamp(int(std::lround(128.0f - y * 127.0f)), 1, 255));
++            return true;
++        }
++
++        static uint8_t pressure(float v)
++        {
++            return v < 0.08f ? 0 : uint8_t(std::clamp(int(std::lround(v * 255.0f)), 0, 255));
++        }
++
++        bool up_ = false, down_ = false, left_ = false, right_ = false;
++        bool l1On_ = false, r1On_ = false, l2On_ = false, r2On_ = false;
++        bool triggerOn_ = false;
++        double menuSince_ = -1.0, tapUntil_ = -1.0;
++        double bothSince_ = -1.0;
++        bool recentered_ = false;
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index d40f899..9dd2d14 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -44,6 +44,9 @@ namespace
+     std::mutex g_hostPadMutex;
+     std::array<uint8_t, 32> g_hostPad{};
+     bool g_hostPadSampled = false;
++    // Analog pressure of L1, R1, L2, R2 from the VR controllers (0 = none).
++    std::array<uint8_t, 4> g_hostShoulder{};
++    std::array<uint8_t, 4> g_hostShoulderShared{};
+ 
+     void neutralPad(uint8_t *data)
+     {
+@@ -175,7 +178,8 @@ namespace
+ 
+         // Mouse (ps2_mouse): clicks, wheel, known menus and the on-screen pad.
+         btns &= static_cast<uint16_t>(~ps2_mouse::heldButtons());
+-        btns &= static_cast<uint16_t>(~ga2_vr::padButtons());
++        const ga2_vr::PadState vr = ga2_vr::padState();
++        btns &= static_cast<uint16_t>(~vr.buttons);
+ 
+         // Without a gamepad the D-pad (keys or on-screen) also tilts the left
+         // stick fully: some screens (the ship map) scroll only with the stick.
+@@ -187,6 +191,19 @@ namespace
+             if ((btns & PAD_DOWN) == 0u) data[7] = 0xFF;
+         }
+ 
++        // The VR controllers' sticks, proportional (over the D-pad's full tilt above).
++        if (vr.leftStick)
++        {
++            data[6] = vr.lx;
++            data[7] = vr.ly;
++        }
++        if (vr.rightStick)
++        {
++            data[4] = vr.rx;
++            data[5] = vr.ry;
++        }
++        std::memcpy(g_hostShoulder.data(), vr.shoulder, g_hostShoulder.size());
++
+         data[2] = static_cast<uint8_t>(btns & 0xFF);
+         data[3] = static_cast<uint8_t>(btns >> 8);
+     }
+@@ -249,12 +266,21 @@ void ps2PadSampleHostInput()
+     {
+         pad[2] = pad[3] = 0xFF;
+         pad[4] = pad[5] = pad[6] = pad[7] = 0x80;
++        g_hostShoulder.fill(0);
+     }
+     std::lock_guard<std::mutex> lock(g_hostPadMutex);
+     g_hostPad = pad;
++    g_hostShoulderShared = g_hostShoulder;
+     g_hostPadSampled = true;
+ }
+ 
++bool ps2PadHostShoulderPressure(uint8_t out[4])
++{
++    std::lock_guard<std::mutex> lock(g_hostPadMutex);
++    std::memcpy(out, g_hostShoulderShared.data(), 4);
++    return g_hostShoulderShared != std::array<uint8_t, 4>{};
++}
++
+ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+diff --git a/ps2xRuntime/src/lib/ps2_pad_input.h b/ps2xRuntime/src/lib/ps2_pad_input.h
+index a1ebe2b..f5b3749 100644
+--- a/ps2xRuntime/src/lib/ps2_pad_input.h
++++ b/ps2xRuntime/src/lib/ps2_pad_input.h
+@@ -3,3 +3,8 @@
+ // Main thread only, right after EndDrawing() polled host input: publish the
+ // pad state that PSPadBackend::readState hands to the game thread.
+ void ps2PadSampleHostInput();
++
++// The analog pressure (0..255) of L1, R1, L2, R2 that the VR controllers
++// give the pad, as of the last sample; false when all are 0 (the pad then
++// derives the pressure of a pressed button as full).
++bool ps2PadHostShoulderPressure(unsigned char out[4]);
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 8969fc6..9e22f1b 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -28,6 +28,7 @@ add_library(ps2_test_lib STATIC
+     src/r5900_decoder_tests.cpp
+     src/elf_analyzer_tests.cpp
+     src/pad_input_tests.cpp
++    src/ga2_vr_input_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+diff --git a/ps2xTest/src/ga2_vr_input_tests.cpp b/ps2xTest/src/ga2_vr_input_tests.cpp
+new file mode 100644
+index 0000000..4b225c1
+--- /dev/null
++++ b/ps2xTest/src/ga2_vr_input_tests.cpp
+@@ -0,0 +1,599 @@
++#include "MiniTest.h"
++
++#include "ga2_vr_bindings.h"
++#include "ga2_vr_input.h"
++
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace
++{
++    using namespace ga2_vr_input;
++    using ga2_vr_bindings::Act;
++
++    bool has(const Output &o, uint16_t mask) { return (o.buttons & mask) == mask; }
++    bool none(const Output &o, uint16_t mask) { return (o.buttons & mask) == 0; }
++
++    // ---- spec path lists of the interaction profiles (OpenXR 1.1 / extensions) --------------
++    // 'b' boolean, 'f' float, 'v' vector2f, 'p' pose.
++    using Paths = std::map<std::string, char>;
++
++    void add(Paths &p, const std::string &hand, const char *input, char type)
++    {
++        p["/user/hand/" + hand + "/input/" + input] = type;
++    }
++    void stick(Paths &p, const std::string &hand, const char *name, bool click)
++    {
++        const std::string n = name;
++        add(p, hand, name, 'v');
++        add(p, hand, (n + "/x").c_str(), 'f');
++        add(p, hand, (n + "/y").c_str(), 'f');
++        if (click)
++            add(p, hand, (n + "/click").c_str(), 'b');
++        add(p, hand, (n + "/touch").c_str(), 'b');
++    }
++    void poses(Paths &p)
++    {
++        for (const char *hand : {"left", "right"})
++        {
++            add(p, hand, "grip/pose", 'p');
++            add(p, hand, "aim/pose", 'p');
++        }
++    }
++
++    Paths touchPaths()
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "squeeze/value", 'f');
++            add(p, h, "trigger/value", 'f');
++            add(p, h, "trigger/touch", 'b');
++            stick(p, h, "thumbstick", true);
++            add(p, h, "thumbrest/touch", 'b');
++        }
++        for (const char *i : {"x/click", "x/touch", "y/click", "y/touch", "menu/click"})
++            add(p, "left", i, 'b');
++        for (const char *i : {"a/click", "a/touch", "b/click", "b/touch", "system/click"})
++            add(p, "right", i, 'b');
++        return p;
++    }
++
++    Paths picoPaths()
++    {
++        Paths p = touchPaths();
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "squeeze/click", 'b');
++            add(p, h, "trigger/click", 'b');
++        }
++        return p;
++    }
++
++    Paths hpPaths()
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "menu/click", 'b');
++            add(p, h, "squeeze/value", 'f');
++            add(p, h, "trigger/value", 'f');
++            stick(p, h, "thumbstick", true);
++        }
++        for (const char *i : {"x/click", "y/click"})
++            add(p, "left", i, 'b');
++        for (const char *i : {"a/click", "b/click"})
++            add(p, "right", i, 'b');
++        return p;
++    }
++
++    Paths indexPaths()
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "system/click", 'b');
++            add(p, h, "system/touch", 'b');
++            for (const char *i : {"a/click", "a/touch", "b/click", "b/touch", "trigger/click", "trigger/touch", "trackpad/touch"})
++                add(p, h, i, 'b');
++            for (const char *i : {"squeeze/value", "squeeze/force", "trigger/value", "trackpad/force"})
++                add(p, h, i, 'f');
++            stick(p, h, "thumbstick", true);
++            add(p, h, "trackpad", 'v');
++            add(p, h, "trackpad/x", 'f');
++            add(p, h, "trackpad/y", 'f');
++        }
++        return p;
++    }
++
++    Paths viveLikePaths(bool wmr)
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "menu/click", 'b');
++            add(p, h, "trackpad", 'v');
++            add(p, h, "trackpad/x", 'f');
++            add(p, h, "trackpad/y", 'f');
++            add(p, h, "trackpad/click", 'b');
++            add(p, h, "trackpad/touch", 'b');
++            add(p, h, "squeeze/click", 'b');
++            if (wmr)
++            {
++                add(p, h, "trigger/value", 'f');
++                stick(p, h, "thumbstick", true);
++            }
++            else
++            {
++                add(p, h, "system/click", 'b');
++                add(p, h, "trigger/click", 'b');
++                add(p, h, "trigger/value", 'f');
++            }
++        }
++        return p;
++    }
++
++    Paths simplePaths()
++    {
++        Paths p;
++        poses(p);
++        for (const char *h : {"left", "right"})
++        {
++            add(p, h, "select/click", 'b');
++            add(p, h, "menu/click", 'b');
++        }
++        return p;
++    }
++
++    Paths specFor(const std::string &profile)
++    {
++        if (profile.find("oculus/touch") != std::string::npos || profile.find("touch_controller_pro") != std::string::npos ||
++            profile.find("touch_controller_plus") != std::string::npos)
++            return touchPaths();
++        if (profile.find("pico") != std::string::npos)
++            return picoPaths();
++        if (profile.find("hp/") != std::string::npos)
++            return hpPaths();
++        if (profile.find("valve/index") != std::string::npos)
++            return indexPaths();
++        if (profile.find("microsoft/") != std::string::npos || profile.find("samsung/") != std::string::npos)
++            return viveLikePaths(true);
++        if (profile.find("htc/vive") != std::string::npos)
++            return viveLikePaths(false);
++        if (profile.find("khr/simple") != std::string::npos)
++            return simplePaths();
++        return {};
++    }
++
++    char actionType(Act a)
++    {
++        switch (a)
++        {
++        case Act::Aim: return 'p';
++        case Act::Trigger:
++        case Act::L1:
++        case Act::R1:
++        case Act::L2:
++        case Act::R2: return 'f';
++        case Act::DPad:
++        case Act::LeftStick:
++        case Act::RightStick:
++        case Act::FacePad: return 'v';
++        default: return 'b';
++        }
++    }
++
++    bool compatible(char action, char path)
++    {
++        if (action == 'b' || action == 'f')
++            return path == 'b' || path == 'f';
++        return action == path;
++    }
++
++    const ga2_vr_bindings::Profile *profileNamed(const char *suffix)
++    {
++        for (const auto &p : ga2_vr_bindings::profiles())
++            if (p.name.find(suffix) != std::string::npos)
++                return &p;
++        return nullptr;
++    }
++
++    std::set<Act> bound(const ga2_vr_bindings::Profile &p)
++    {
++        std::set<Act> out;
++        for (const auto &b : p.bindings)
++            out.insert(b.action);
++        return out;
++    }
++
++    Inputs sceneInputs(Scene scene)
++    {
++        Inputs in;
++        in.scene = scene;
++        return in;
++    }
++}
++
++void register_ga2_vr_input_tests()
++{
++    MiniTest::Case("VrInput", [](TestCase &tc) {
++        tc.Run("face buttons, stick clicks and Start / Select map to their pad bits", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.circle = in.cross = in.square = in.triangle = in.l3 = in.r3 = in.start = in.select = true;
++            const Output o = m.step(in, 0.0);
++            t.Equals(o.buttons, uint16_t(kCircle | kCross | kSquare | kTriangle | kL3 | kR3 | kStart | kSelect),
++                     "every pressed action presses its pad button");
++            t.IsTrue(!o.leftActive && !o.rightActive, "no stick active");
++            t.Equals(int(o.lx), 0x80, "stick centred");
++            const Output idle = m.step(Inputs{}, 0.1);
++            t.Equals(idle.buttons, uint16_t(0), "released: nothing pressed");
++        });
++
++        tc.Run("both stick clicks press L3 and R3 together (the cheat menu chord)", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.l3 = true;
++            t.Equals(m.step(in, 0.0).buttons, uint16_t(kL3), "left click alone is L3");
++            in.r3 = true;
++            t.Equals(m.step(in, 0.1).buttons, uint16_t(kL3 | kR3), "both clicks are L3 + R3");
++        });
++
++        tc.Run("menu: a tap is Start, holding it is Select", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.menu = true;
++            t.IsTrue(none(m.step(in, 0.0), kStart | kSelect), "pressing does nothing yet");
++            t.IsTrue(none(m.step(in, 0.3), kStart | kSelect), "still nothing before the hold time");
++            in.menu = false;
++            Output o = m.step(in, 0.35); // released after 0.35 s: a tap
++            t.IsTrue(has(o, kStart), "a tap presses Start on release");
++            t.IsTrue(none(o, kSelect), "a tap is not Select");
++            t.IsTrue(has(m.step(in, 0.35 + kTapPulse * 0.5), kStart), "Start lasts for several frames");
++            t.IsTrue(none(m.step(in, 0.35 + kTapPulse + 0.01), kStart), "and ends");
++
++            in.menu = true;
++            m.step(in, 1.0);
++            o = m.step(in, 1.0 + kMenuHold + 0.01);
++            t.IsTrue(has(o, kSelect), "held for 0.6 s: Select");
++            t.IsTrue(none(o, kStart), "held: not Start");
++            in.menu = false;
++            o = m.step(in, 2.0);
++            t.IsTrue(none(o, kSelect | kStart), "releasing a hold presses neither");
++            t.IsTrue(none(m.step(in, 2.05), kStart), "no Start tap after a hold");
++        });
++
++        tc.Run("direct Start and Select actions stay available next to the menu action", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.select = true;
++            t.Equals(m.step(in, 0.0).buttons, uint16_t(kSelect), "Select action");
++            in.select = false;
++            in.start = true;
++            t.Equals(m.step(in, 0.1).buttons, uint16_t(kStart), "Start action");
++        });
++
++        tc.Run("grips are L1 / R1 with hysteresis and analog pressure", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.l1 = 0.3f;
++            Output o = m.step(in, 0.0);
++            t.IsTrue(none(o, kL1), "light squeeze: no digital L1");
++            t.IsTrue(o.pressure[0] > 60 && o.pressure[0] < 90, "light squeeze: analog pressure");
++            in.l1 = 0.7f;
++            t.IsTrue(has(m.step(in, 0.1), kL1), "firm squeeze presses L1");
++            in.l1 = 0.5f; // between on and off: stays pressed
++            t.IsTrue(has(m.step(in, 0.2), kL1), "hysteresis keeps L1 down");
++            in.l1 = 0.3f;
++            t.IsTrue(none(m.step(in, 0.3), kL1), "released below the off level");
++            in.r1 = 1.0f;
++            o = m.step(in, 0.4);
++            t.IsTrue(has(o, kR1) && none(o, kL1), "right grip is R1");
++            t.Equals(int(o.pressure[1]), 255, "R1 pressure is full");
++            t.Equals(int(o.pressure[0]), 77, "L1 pressure still follows the left grip");
++        });
++
++        tc.Run("both grips held for a second recentre once and press neither L1 nor R1", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.l1 = in.r1 = 1.0f;
++            Output o = m.step(in, 0.0);
++            t.IsTrue(none(o, kL1 | kR1), "both grips: no L1 / R1");
++            t.IsFalse(o.recenter, "not yet");
++            t.IsFalse(m.step(in, 0.9).recenter, "0.9 s: not yet");
++            o = m.step(in, 1.05);
++            t.IsTrue(o.recenter, "after a second: recentre");
++            t.IsTrue(none(o, kL1 | kR1), "still no L1 / R1");
++            t.IsFalse(m.step(in, 1.2).recenter, "only once while held");
++            t.Equals(int(o.pressure[0]) + int(o.pressure[1]), 0, "no shoulder pressure either");
++            in.r1 = 0.0f;
++            o = m.step(in, 1.3);
++            t.IsTrue(has(o, kL1), "letting go of one grip leaves the other as L1");
++            in.r1 = 1.0f;
++            m.step(in, 1.4);
++            t.IsFalse(m.step(in, 1.5).recenter, "a new hold starts counting again");
++            t.IsTrue(m.step(in, 2.6).recenter, "and recentres again");
++        });
++
++        tc.Run("left stick: analog bytes with a dead zone, D-pad with hysteresis", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.leftStick = {0.05f, 0.05f};
++            t.IsFalse(m.step(in, 0.0).leftActive, "inside the dead zone");
++            in.leftStick = {1.0f, 0.0f};
++            Output o = m.step(in, 0.1);
++            t.IsTrue(o.leftActive, "pushed right");
++            t.Equals(int(o.lx), 255, "full right = 0xFF");
++            t.Equals(int(o.ly), 128, "centred vertically");
++            in.leftStick = {0.0f, 1.0f}; // OpenXR y up = PS2 0 (up)
++            o = m.step(in, 0.2);
++            t.Equals(int(o.ly), 1, "full up = 1 (up is the low end of the pad's y axis)");
++            in.leftStick = {-1.0f, -1.0f};
++            o = m.step(in, 0.3);
++            t.IsTrue(o.lx < 60 && o.ly > 195, "left and down (the corner is clamped to the circle)");
++            in.leftStick = {0.5f, 0.0f};
++            o = m.step(in, 0.4);
++            t.IsTrue(o.lx > 128 + 40 && o.lx < 255 - 40, "half push is about half");
++            t.IsFalse(o.rightActive, "right stick untouched");
++
++            in = Inputs{};
++            in.dpad = {0.5f, 0.0f};
++            t.IsTrue(none(m.step(in, 0.5), kRight), "0.5: below the press level");
++            in.dpad = {0.6f, 0.0f};
++            t.IsTrue(has(m.step(in, 0.6), kRight), "0.6: right");
++            in.dpad = {0.4f, 0.0f};
++            t.IsTrue(has(m.step(in, 0.7), kRight), "0.4: held by hysteresis");
++            in.dpad = {0.3f, 0.0f};
++            t.IsTrue(none(m.step(in, 0.8), kRight), "0.3: released");
++            in.dpad = {-0.8f, 0.8f};
++            const Output d = m.step(in, 0.9);
++            t.IsTrue(has(d, kLeft | kUp) && none(d, kRight | kDown), "diagonals press two directions");
++            in.dpad = {0.0f, -0.9f};
++            t.IsTrue(has(m.step(in, 1.0), kDown), "down");
++        });
++
++        tc.Run("right stick: analog bytes, and sideways it is L2 / R2 with pressure", [](TestCase &t) {
++            Mapper m;
++            Inputs in = sceneInputs(Scene::Stereo);
++            in.rightStick = {1.0f, 0.0f};
++            Output o = m.step(in, 0.0);
++            t.IsTrue(o.rightActive && !o.leftActive, "right stick active");
++            t.Equals(int(o.rx), 255, "full right");
++            t.IsTrue(has(o, kR2) && none(o, kL2), "pushed right: R2");
++            t.Equals(int(o.pressure[3]), 255, "R2 pressure follows the push");
++            in.rightStick = {-1.0f, 0.0f};
++            o = m.step(in, 0.1);
++            t.IsTrue(has(o, kL2) && none(o, kR2), "pushed left: L2");
++            t.Equals(int(o.pressure[2]), 255, "L2 pressure");
++            in.rightStick = {0.2f, 1.0f};
++            o = m.step(in, 0.2);
++            t.IsTrue(none(o, kL2 | kR2), "mostly vertical: no shoulder button");
++            t.IsTrue(o.ry < 20, "but the analog bytes carry it (up)");
++            in.rightStick = {0.5f, 0.0f};
++            o = m.step(in, 0.3);
++            t.IsTrue(none(o, kR2) && o.pressure[3] > 40 && o.pressure[3] < 100,
++                     "half push: analog pressure without the digital button");
++        });
++
++        tc.Run("unit camera view: the right stick only turns the camera, the triggers are L2 / R2", [](TestCase &t) {
++            Mapper m;
++            Inputs in = sceneInputs(Scene::UnitCamera);
++            in.rightStick = {1.0f, 0.0f};
++            Output o = m.step(in, 0.0);
++            t.IsTrue(o.rightActive && o.rx == 255, "the stick is analog");
++            t.IsTrue(none(o, kL2 | kR2) && o.pressure[3] == 0, "and does not zoom");
++            in.rightStick = {};
++            in.trigger[1] = 1.0f;
++            o = m.step(in, 0.1);
++            t.IsTrue(has(o, kR2) && o.pressure[3] == 255, "right trigger = R2");
++            t.IsTrue(none(o, kCircle | kCross), "and no confirm / fire");
++            in.trigger[0] = 0.5f;
++            in.trigger[1] = 0.0f;
++            o = m.step(in, 0.2);
++            t.IsTrue(none(o, kR2) && o.pressure[2] > 100 && o.pressure[2] < 150, "left trigger half pulled = L2 pressure");
++        });
++
++        tc.Run("triggers by scene", [](TestCase &t) {
++            // Flat: the trigger is the mouse click only.
++            Mapper flat;
++            Inputs in = sceneInputs(Scene::Flat);
++            in.trigger[1] = 1.0f;
++            t.Equals(flat.step(in, 0.0).buttons, uint16_t(0), "flat screen: no pad button");
++
++            // 3D scenes without a screen, and the tactical map: the pointing hand confirms.
++            for (Scene scene : {Scene::Stereo, Scene::TacticalMap})
++            {
++                Mapper m;
++                Inputs s = sceneInputs(scene);
++                s.activeHand = 1;
++                s.trigger[1] = 1.0f;
++                t.Equals(m.step(s, 0.0).buttons, uint16_t(kCircle), "active hand's trigger is Circle");
++                s.trigger[1] = 0.5f;
++                t.IsTrue(has(m.step(s, 0.1), kCircle), "held by hysteresis");
++                s.trigger[1] = 0.0f;
++                s.trigger[0] = 1.0f; // the other hand, which is not pointing
++                t.Equals(m.step(s, 0.2).buttons, uint16_t(0), "the other hand's trigger does nothing");
++                s.activeHand = 0;
++                t.Equals(m.step(s, 0.3).buttons, uint16_t(kCircle), "unless it became the pointing hand");
++            }
++
++            // Cockpit: either trigger fires (Cross).
++            Mapper m;
++            Inputs c = sceneInputs(Scene::Cockpit);
++            c.trigger[0] = 1.0f;
++            t.Equals(m.step(c, 0.0).buttons, uint16_t(kCross), "left trigger fires");
++            c.trigger[0] = 0.0f;
++            c.trigger[1] = 1.0f;
++            t.Equals(m.step(c, 0.1).buttons, uint16_t(kCross), "right trigger fires");
++            c.trigger[1] = 0.0f;
++            t.Equals(m.step(c, 0.2).buttons, uint16_t(0), "released");
++        });
++
++        tc.Run("a face pad's click is Circle / Cross / Square / Triangle by direction", [](TestCase &t) {
++            Mapper m;
++            Inputs in;
++            in.facePad = {0.9f, 0.1f};
++            t.Equals(m.step(in, 0.0).buttons, uint16_t(0), "touching without a click does nothing");
++            in.facePadClick = true;
++            t.Equals(m.step(in, 0.1).buttons, uint16_t(kCircle), "right = Circle");
++            in.facePad = {-0.9f, 0.2f};
++            t.Equals(m.step(in, 0.2).buttons, uint16_t(kSquare), "left = Square");
++            in.facePad = {0.1f, 0.9f};
++            t.Equals(m.step(in, 0.3).buttons, uint16_t(kTriangle), "up = Triangle");
++            in.facePad = {-0.1f, -0.9f};
++            t.Equals(m.step(in, 0.4).buttons, uint16_t(kCross), "down = Cross");
++            in.facePad = {0.1f, 0.1f};
++            t.Equals(m.step(in, 0.5).buttons, uint16_t(0), "the centre of the pad is nothing");
++        });
++
++        tc.Run("a Touch-like controller: every PS2 input has a source at once", [](TestCase &t) {
++            // All inputs together: nothing masks anything else (the sticks are separate
++            // from the face buttons, the trigger is Circle in a 3D scene).
++            Mapper m;
++            Inputs in = sceneInputs(Scene::Stereo);
++            in.circle = in.cross = in.square = in.triangle = true;
++            in.l1 = in.r1 = 0.0f;
++            in.l3 = in.r3 = true;
++            in.dpad = in.leftStick = {1.0f, 0.0f};
++            in.rightStick = {0.0f, 1.0f};
++            in.menu = true;
++            const Output o = m.step(in, 0.0);
++            t.IsTrue(has(o, kCircle | kCross | kSquare | kTriangle | kL3 | kR3 | kRight), "buttons, clicks and D-pad together");
++            t.IsTrue(o.leftActive && o.rightActive, "both sticks at once");
++        });
++    });
++
++    MiniTest::Case("VrBindings", [](TestCase &tc) {
++        tc.Run("every suggested path is valid for its profile, has a matching type and is not duplicated", [](TestCase &t) {
++            for (const auto &profile : ga2_vr_bindings::profiles())
++            {
++                const Paths spec = specFor(profile.name);
++                t.IsFalse(spec.empty(), "profile has a path list: " + profile.name);
++                std::set<std::pair<int, std::string>> seen;
++                for (const auto &b : profile.bindings)
++                {
++                    const auto it = spec.find(b.path);
++                    t.IsTrue(it != spec.end(), profile.name + " has no input " + b.path);
++                    if (it != spec.end())
++                        t.IsTrue(compatible(actionType(b.action), it->second),
++                                 profile.name + ": action type does not fit " + b.path);
++                    t.IsTrue(seen.insert({int(b.action), b.path}).second, profile.name + ": duplicate binding " + b.path);
++                }
++            }
++        });
++
++        tc.Run("profiles that need an extension name it, the others are core", [](TestCase &t) {
++            const std::map<std::string, std::string> expected = {
++                {"/interaction_profiles/khr/simple_controller", ""},
++                {"/interaction_profiles/oculus/touch_controller", ""},
++                {"/interaction_profiles/valve/index_controller", ""},
++                {"/interaction_profiles/htc/vive_controller", ""},
++                {"/interaction_profiles/microsoft/motion_controller", ""},
++                {"/interaction_profiles/facebook/touch_controller_pro", "XR_FB_touch_controller_pro"},
++                {"/interaction_profiles/meta/touch_controller_plus", "XR_META_touch_controller_plus"},
++                {"/interaction_profiles/hp/mixed_reality_controller", "XR_EXT_hp_mixed_reality_controller"},
++                {"/interaction_profiles/samsung/odyssey_controller", "XR_EXT_samsung_odyssey_controller"},
++                {"/interaction_profiles/bytedance/pico4_controller", "XR_BD_controller_interaction"},
++                {"/interaction_profiles/bytedance/pico_neo3_controller", "XR_BD_controller_interaction"},
++            };
++            std::set<std::string> seen;
++            for (const auto &profile : ga2_vr_bindings::profiles())
++            {
++                const auto it = expected.find(profile.name);
++                t.IsTrue(it != expected.end(), "unexpected profile " + profile.name);
++                if (it != expected.end())
++                    t.Equals(profile.extension, it->second, "extension of " + profile.name);
++                t.IsTrue(seen.insert(profile.name).second, "profile listed twice: " + profile.name);
++            }
++            t.Equals(seen.size(), expected.size(), "all profiles present");
++        });
++
++        tc.Run("every profile reaches confirm, cancel, Start, Select and the pointer", [](TestCase &t) {
++            for (const auto &profile : ga2_vr_bindings::profiles())
++            {
++                const std::set<Act> a = bound(profile);
++                const auto have = [&](Act x) { return a.count(x) != 0; };
++                t.IsTrue(have(Act::Aim) && have(Act::Trigger), profile.name + ": aim and trigger (pointer, confirm, fire)");
++                t.IsTrue(have(Act::Circle) || have(Act::FacePadClick) || have(Act::Trigger), profile.name + ": confirm");
++                t.IsTrue(have(Act::Cross) || have(Act::FacePadClick), profile.name + ": cancel");
++                t.IsTrue(have(Act::Menu) || (have(Act::Start) && have(Act::Select)), profile.name + ": Start and Select");
++            }
++        });
++
++        tc.Run("thumbstick controllers reach every PS2 input", [](TestCase &t) {
++            for (const char *name : {"oculus/touch", "touch_controller_pro", "touch_controller_plus", "pico4", "pico_neo3",
++                                     "hp/mixed", "valve/index", "microsoft/motion", "samsung/odyssey"})
++            {
++                const auto *profile = profileNamed(name);
++                t.IsNotNull(profile, std::string("profile ") + name);
++                if (!profile)
++                    continue;
++                const std::set<Act> a = bound(*profile);
++                for (Act x : {Act::DPad, Act::LeftStick, Act::RightStick, Act::L1, Act::R1, Act::L3, Act::R3, Act::Trigger})
++                    t.IsTrue(a.count(x) != 0, std::string(name) + ": sticks, shoulders and clicks (action " + std::to_string(int(x)) + ")");
++                // Circle, Cross, Square, Triangle: buttons, or a face pad.
++                const bool faces = (a.count(Act::Circle) && a.count(Act::Cross) && a.count(Act::Square) && a.count(Act::Triangle)) ||
++                                   (a.count(Act::FacePad) && a.count(Act::FacePadClick));
++                t.IsTrue(faces, std::string(name) + ": all four face buttons");
++            }
++        });
++
++        tc.Run("Index: A / B of the right hand are Circle / Cross, of the left Square / Triangle, no menu button needed", [](TestCase &t) {
++            const auto *index = profileNamed("valve/index");
++            t.IsNotNull(index, "index profile");
++            if (!index)
++                return;
++            std::map<std::string, Act> byPath;
++            for (const auto &b : index->bindings)
++                byPath[b.path] = b.action;
++            t.IsTrue(byPath["/user/hand/right/input/a/click"] == Act::Circle, "right A = Circle");
++            t.IsTrue(byPath["/user/hand/right/input/b/click"] == Act::Cross, "right B = Cross");
++            t.IsTrue(byPath["/user/hand/left/input/a/click"] == Act::Square, "left A = Square");
++            t.IsTrue(byPath["/user/hand/left/input/b/click"] == Act::Triangle, "left B = Triangle");
++            t.IsTrue(byPath.count("/user/hand/left/input/menu/click") == 0, "Index has no menu button");
++            t.IsTrue(byPath["/user/hand/left/input/trackpad/force"] == Act::Menu, "left trackpad press = menu action");
++        });
++
++        tc.Run("Touch: A / B right = Circle / Cross, X / Y left = Square / Triangle, left menu = menu action", [](TestCase &t) {
++            const auto *touch = profileNamed("oculus/touch");
++            t.IsNotNull(touch, "touch profile");
++            if (!touch)
++                return;
++            std::map<std::string, Act> byPath;
++            for (const auto &b : touch->bindings)
++                byPath[b.path] = b.action;
++            t.IsTrue(byPath["/user/hand/right/input/a/click"] == Act::Circle, "A = Circle");
++            t.IsTrue(byPath["/user/hand/right/input/b/click"] == Act::Cross, "B = Cross");
++            t.IsTrue(byPath["/user/hand/left/input/x/click"] == Act::Square, "X = Square");
++            t.IsTrue(byPath["/user/hand/left/input/y/click"] == Act::Triangle, "Y = Triangle");
++            t.IsTrue(byPath["/user/hand/left/input/menu/click"] == Act::Menu, "menu = Start / Select");
++            t.IsTrue(byPath["/user/hand/left/input/thumbstick/click"] == Act::L3 &&
++                         byPath["/user/hand/right/input/thumbstick/click"] == Act::R3,
++                     "stick clicks = L3 / R3");
++            t.IsTrue(byPath["/user/hand/left/input/squeeze/value"] == Act::L1 &&
++                         byPath["/user/hand/right/input/squeeze/value"] == Act::R1,
++                     "grips = L1 / R1");
++        });
++
++        tc.Run("Vive wands and simple controllers: confirm, cancel, Start, Select; Vive has the D-pad too", [](TestCase &t) {
++            const auto *vive = profileNamed("htc/vive");
++            const auto *simple = profileNamed("khr/simple");
++            t.IsNotNull(vive, "vive profile");
++            t.IsNotNull(simple, "simple profile");
++            if (!vive || !simple)
++                return;
++            const std::set<Act> v = bound(*vive), s = bound(*simple);
++            t.IsTrue(v.count(Act::DPad) && v.count(Act::LeftStick), "Vive: left trackpad is D-pad and stick");
++            t.IsTrue(v.count(Act::FacePad) && v.count(Act::FacePadClick), "Vive: right trackpad is the face buttons");
++            t.IsTrue(v.count(Act::L1) && v.count(Act::R1) && v.count(Act::L3) && v.count(Act::R3), "Vive: grips and clicks");
++            t.IsTrue(s.count(Act::Cross) && s.count(Act::Menu) && s.count(Act::Trigger), "simple: cancel, menu, trigger");
++            t.IsFalse(s.count(Act::DPad) != 0, "simple controllers have no stick for the D-pad");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index e6213c5..434f3a8 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -6,6 +6,7 @@ void register_code_generator_tests();
+ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
++void register_ga2_vr_input_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+@@ -39,6 +40,7 @@ int main()
+     register_r5900_decoder_tests();
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
++    register_ga2_vr_input_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
+index 88dbbb9..eeee18f 100644
+--- a/ps2xTest/src/pad_input_tests.cpp
++++ b/ps2xTest/src/pad_input_tests.cpp
+@@ -570,8 +570,8 @@ void register_pad_input_tests()
+             t.Equals(data[14], static_cast<uint8_t>(0xFF), "cross pressure should be populated when pressed");
+             t.Equals(data[15], static_cast<uint8_t>(0x00), "square pressure should be clear when not pressed");
+             t.Equals(data[16], static_cast<uint8_t>(0xFF), "L1 pressure should be populated when pressed");
+-            t.Equals(data[17], static_cast<uint8_t>(0x00), "L2 pressure should be clear when not pressed");
+-            t.Equals(data[18], static_cast<uint8_t>(0x00), "R1 pressure should be clear when not pressed");
++            t.Equals(data[17], static_cast<uint8_t>(0x00), "R1 pressure should be clear when not pressed");
++            t.Equals(data[18], static_cast<uint8_t>(0x00), "L2 pressure should be clear when not pressed");
+             t.Equals(data[19], static_cast<uint8_t>(0xFF), "R2 pressure should be populated when pressed");
+ 
+             setRegU32(ctx, 4, 0u);
+@@ -589,6 +589,23 @@ void register_pad_input_tests()
+             t.Equals(data[16], static_cast<uint8_t>(0xFF), "enabled L1 pressure should remain populated");
+             t.Equals(data[19], static_cast<uint8_t>(0xFF), "enabled R2 pressure should remain populated");
+ 
++            // libpad order l1, r1, l2, r2: R1 is byte 17 and L2 byte 18 (the games read 17 / 19 to
++            // raise and lower the battle map camera).
++            setRegU32(ctx, 4, 0u);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 0xFFFFu);
++            ps2_stubs::scePadSetButtonInfo(rdram.data(), &ctx, nullptr);
++            ps2_stubs::setPadOverrideState(static_cast<uint16_t>(0xFFFFu & ~kPadBtnR1), 0x80, 0x80, 0x80, 0x80);
++            runPadRead(ctx, rdram);
++            t.Equals(data[16], static_cast<uint8_t>(0x00), "L1 pressure clear with only R1 pressed");
++            t.Equals(data[17], static_cast<uint8_t>(0xFF), "R1 pressure is byte 17");
++            t.Equals(data[18], static_cast<uint8_t>(0x00), "L2 pressure clear with only R1 pressed");
++            t.Equals(data[19], static_cast<uint8_t>(0x00), "R2 pressure clear with only R1 pressed");
++            ps2_stubs::setPadOverrideState(static_cast<uint16_t>(0xFFFFu & ~kPadBtnL2), 0x80, 0x80, 0x80, 0x80);
++            runPadRead(ctx, rdram);
++            t.Equals(data[17], static_cast<uint8_t>(0x00), "R1 pressure clear with only L2 pressed");
++            t.Equals(data[18], static_cast<uint8_t>(0xFF), "L2 pressure is byte 18");
++
+             ps2_stubs::clearPadOverrideState();
+             closePadPort(ctx, rdram);
+         });
+-- 
+2.55.0
+

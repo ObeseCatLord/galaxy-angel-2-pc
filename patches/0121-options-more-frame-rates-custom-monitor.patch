@@ -1,0 +1,1309 @@
+From 612e433682685344a0442aa086521c90e1555f96 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:03:56 -0500
+Subject: [PATCH] options: more frame rates, Monitor refresh rate and Custom
+ (61-240); hover/keyboard-only menu selection
+
+The option table gets an editable-number choice (stored as fps=173; fps=monitor
+follows the monitor the window is on, polled twice a second). The F2 menu steps
+the custom number with Left/Right (Shift: 10), the wheel, or typed digits +
+Enter. Menus highlight only a hovered item or one chosen with the keys/pad.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_framepace.h   |   3 +-
+ ps2xRuntime/include/runtime/ga2_menu_select.h |  72 +++++
+ ps2xRuntime/include/runtime/ga2_options.h     | 142 ++++++++-
+ ps2xRuntime/include/runtime/ga2_settings.h    |  24 +-
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp        |  54 ++--
+ ps2xRuntime/src/lib/ga2_framepace.cpp         |   5 +-
+ ps2xRuntime/src/lib/ga2_settings.cpp          | 101 +++++--
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp     | 276 ++++++++++++++----
+ ps2xRuntime/src/lib/ga2_settings_menu.h       |  19 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |   2 +
+ ps2xTest/src/ga2_settings_tests.cpp           | 125 +++++++-
+ 11 files changed, 712 insertions(+), 111 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_menu_select.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index 69f2fb5..982351f 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -25,7 +25,8 @@ namespace ga2_framepace
+     // The highest rate this run can reach: 240 whenever the hooks can run (the settings menu raises the cap live),
+     // 0 = native only (VR, software GS; GA2_FPS_LIVE=0 limits it to GA2_FPS as before). Read once.
+     int fps();
+-    // GA2_FPS: the cap the run starts with, 61..fps(); 60 = the native cadence (unset, 60, invalid).
++    // GA2_FPS: the cap the run starts with, 61..fps(); 60 = the native cadence (unset, 60, invalid, or "monitor":
++    // the cap then follows the window's monitor, set by the main loop once the window exists).
+     int startCap();
+     inline bool enabled() { return fps() > 0; }
+     // The rate the game runs at now: fps() is the maximum, the game side's governor lowers it (down to 60, the
+diff --git a/ps2xRuntime/include/runtime/ga2_menu_select.h b/ps2xRuntime/include/runtime/ga2_menu_select.h
+new file mode 100644
+index 0000000..0f6e404
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_menu_select.h
+@@ -0,0 +1,72 @@
++// Which item of a menu is shown as selected, shared by the launcher and the in-game menus (F1 cheats, F2 settings).
++// Nothing is highlighted unless
++//   - the mouse pointer is over an item (that item, while hovered), or
++//   - the keyboard / controller chose an item (that one, until the mouse moves or clicks again).
++// Up/Down with nothing chosen picks the item last hovered or chosen, or the first. Keys that act on the item (confirm,
++// Left/Right) use keySelection() only, which is -1 while the mouse is in charge; clicks act on the hovered item.
++#pragma once
++
++namespace ga2_menu
++{
++    class Selector
++    {
++    public:
++        // Once per frame, before the keys are read. `hovered`: the item under the pointer (-1: none); `pointerMoved`
++        // and `clicked` hand the control back to the mouse.
++        void begin(int hovered, bool pointerMoved, bool clicked)
++        {
++            m_hover = hovered;
++            if (pointerMoved || clicked)
++                m_keyboard = false;
++            if (!m_keyboard && m_hover >= 0)
++                m_last = m_hover;
++        }
++
++        // Up / Down (delta -1 / +1) over `count` items. Taking the control from the mouse does not move further when
++        // nothing was hovered: the first press only shows where the selection is.
++        void move(int delta, int count)
++        {
++            if (count <= 0)
++                return;
++            if (!m_keyboard)
++            {
++                m_keyboard = true;
++                if (m_hover >= 0 && m_hover < count)
++                    m_sel = m_hover;
++                else
++                {
++                    m_sel = m_last >= 0 && m_last < count ? m_last : 0;
++                    m_last = m_sel;
++                    return;
++                }
++            }
++            m_sel = (m_sel + delta % count + count) % count;
++            m_last = m_sel;
++        }
++
++        // Home / End, or any key that picks `item` (digits typed on a hovered row).
++        void adopt(int item)
++        {
++            m_keyboard = true;
++            m_sel = item;
++            m_last = item;
++        }
++
++        // The item to highlight (-1: none).
++        int shown() const { return m_keyboard ? m_sel : m_hover; }
++        // The item keys act on (-1: the mouse is in charge).
++        int keySelection() const { return m_keyboard ? m_sel : -1; }
++        int hovered() const { return m_hover; }
++        bool keyboard() const { return m_keyboard; }
++        // The menu was opened or closed: nothing chosen by keys; the last item is remembered for Up / Down.
++        void release()
++        {
++            m_keyboard = false;
++            m_hover = -1;
++        }
++
++    private:
++        int m_sel = 0, m_last = -1, m_hover = -1;
++        bool m_keyboard = false;
++    };
++}
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index 69d72b1..5b98ac2 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -5,8 +5,14 @@
+ //
+ // Values live in <data>/settings.ini (key=value); the launcher hands them to
+ // the engines as the environment variables named here.
++//
++// An option may have one "editable number" choice (Option::customChoice): the player types a whole number in a range
++// and the choice stands for that number. The state of such an option is a pair (choice, number); the number is only
++// used while the custom choice is chosen. It is stored as the plain number ("fps=173"), the other choices by their
++// value ("fps=120", "fps=monitor"); a number equal to another choice's value reads as that choice.
+ #pragma once
+ 
++#include <cmath>
+ #include <cstddef>
+ #include <cstdlib>
+ #include <string>
+@@ -57,6 +63,9 @@ namespace ga2_options
+         const char *env;   // the variable the engines read
+         Apply apply;
+         std::vector<Choice> choices; // the first is the default
++        // The editable number (-1: none): choices[customChoice] is "a number the player types", customMin..customMax.
++        int customChoice = -1;
++        int customMin = 0, customMax = 0, customDefault = 0;
+     };
+ 
+     inline const std::vector<Option> &options()
+@@ -82,8 +91,13 @@ namespace ga2_options
+              {{"bilinear", "Bilinear"}, {"smooth", "Smooth (removes dither grain)"}, {"anime4k", "Anime4K"},
+               {"anime4k-hq", "Anime4K HQ (fast GPU)"}, {"sharp", "Sharp pixels"}, {"nearest", "Nearest (raw pixels)"}}},
+             {"fps", "Frame rate",
+-             "Frames drawn per second; the game keeps its own speed. The rate drops by itself when the PC can't keep up. In VR the headset's refresh rate is used.",
+-             "GA2_FPS", Apply::Live, {{"60", "60 (PS2)"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}}},
++             "Frames drawn per second; the game keeps its own speed, and the rate drops by itself if the PC can't keep up. "
++             "Monitor follows the refresh rate of the screen the window is on. In VR the headset's rate is used.",
++             "GA2_FPS", Apply::Live,
++             {{"60", "60 (PS2)"}, {"75", "75"}, {"90", "90"}, {"100", "100"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
++              {"170", "170"}, {"175", "175"}, {"180", "180"}, {"200", "200"}, {"240", "240"},
++              {"monitor", "Monitor refresh rate"}, {"custom", "Custom"}},
++             13, 61, 240, 120},
+             {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+              Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
+             {"buttons", "Button prompts", "Which button icons the games show: follows the controller or keyboard you use.",
+@@ -99,11 +113,106 @@ namespace ga2_options
+         return table;
+     }
+ 
++    // ---- the editable number ----
++
++    inline bool hasCustom(const Option &o) { return o.customChoice >= 0; }
++
++    // The index of the choice with this stored value; -1 when there is none.
++    inline int choiceIndex(size_t option, const char *value)
++    {
++        const Option &o = options()[option];
++        for (size_t c = 0; c < o.choices.size(); ++c)
++            if (std::string(o.choices[c].value) == value)
++                return int(c);
++        return -1;
++    }
++
++    // Plain decimal digits only (no sign, no spaces), at most five of them.
++    inline bool parseWhole(const std::string &text, int &out)
++    {
++        if (text.empty() || text.size() > 5)
++            return false;
++        int n = 0;
++        for (char ch : text)
++        {
++            if (ch < '0' || ch > '9')
++                return false;
++            n = n * 10 + (ch - '0');
++        }
++        out = n;
++        return true;
++    }
++
++    inline int clampCustom(const Option &o, int number)
++    {
++        return number < o.customMin ? o.customMin : number > o.customMax ? o.customMax : number;
++    }
++
++    // The number a choice's value stands for when it is one (the frame rate presets); `fallback` otherwise.
++    inline int choiceNumber(const Option &o, int choice, int fallback)
++    {
++        int n = 0;
++        if (choice >= 0 && choice < int(o.choices.size()) && choice != o.customChoice && parseWhole(o.choices[size_t(choice)].value, n) &&
++            n >= o.customMin && n <= o.customMax)
++            return n;
++        return fallback;
++    }
++
++    // The number to start from when `to` is the custom choice and `from` the one before: a preset's own number
++    // (stepping from 144 to Custom shows 144), else what the custom number was.
++    inline int carryNumber(const Option &o, int from, int to, int number)
++    {
++        if (to == o.customChoice && from != o.customChoice)
++            return choiceNumber(o, from, number);
++        return number;
++    }
++
++    // What settings.ini stores for a state: the custom choice stores its number, the others their value.
++    inline std::string storedValue(size_t option, int choice, int number)
++    {
++        const Option &o = options()[option];
++        if (choice == o.customChoice)
++            return std::to_string(clampCustom(o, number));
++        return o.choices[size_t(choice)].value;
++    }
++
++    // The state a stored value stands for. A value that is one choice's value is that choice; otherwise a whole number
++    // in the custom range is the custom choice with that number. False for anything else (the state is left alone).
++    inline bool parseStored(size_t option, const std::string &text, int &choice, int &number)
++    {
++        const Option &o = options()[option];
++        for (size_t c = 0; c < o.choices.size(); ++c)
++            if (int(c) != o.customChoice && text == o.choices[c].value)
++            {
++                choice = int(c);
++                return true;
++            }
++        int n = 0;
++        if (hasCustom(o) && parseWhole(text, n) && n >= o.customMin && n <= o.customMax)
++        {
++            choice = o.customChoice;
++            number = n;
++            return true;
++        }
++        return false;
++    }
++
++    // The text a menu shows for a state ("Custom: 173" for the custom choice).
++    inline std::string choiceLabel(size_t option, int choice, int number)
++    {
++        const Option &o = options()[option];
++        if (choice == o.customChoice)
++            return std::string(o.choices[size_t(choice)].label) + ": " + std::to_string(clampCustom(o, number));
++        return o.choices[size_t(choice)].label;
++    }
++
+     // The environment text for a choice. `dumpDir` is where the texture dump
+     // goes when it is on.
+-    inline std::string envValue(size_t option, int choice, const std::string &dumpDir)
++    inline std::string envValue(size_t option, int choice, const std::string &dumpDir, int number = 0)
+     {
+         const Option &o = options()[option];
++        if (choice == o.customChoice)
++            return std::to_string(clampCustom(o, number)); // GA2_FPS=173
+         const std::string value = o.choices[size_t(choice)].value;
+         switch (Key(option))
+         {
+@@ -116,8 +225,9 @@ namespace ga2_options
+         }
+     }
+ 
+-    // The choice an environment text stands for; -1 when it is none of them.
+-    inline int choiceFromEnv(size_t option, const std::string &text)
++    // The choice an environment text stands for; -1 when it is none of them. `number` (when given) gets the custom
++    // number when the choice is the custom one.
++    inline int choiceFromEnv(size_t option, const std::string &text, int *number = nullptr)
+     {
+         const Option &o = options()[option];
+         switch (Key(option))
+@@ -130,15 +240,21 @@ namespace ga2_options
+             break;
+         case Fps:
+         {
+-            // GA2_FPS accepts any rate: the highest choice that is not above it.
+-            const int rate = std::atoi(text.c_str());
+-            if (rate < 1)
++            // GA2_FPS: "monitor", or a rate (the engine rounds it): 60 or less is the PS2 rate, 61..240 a choice or the
++            // custom number, anything else is not a rate (the engine falls back to the PS2 rate).
++            if (text == "monitor")
++                break;
++            const int rate = int(std::lround(std::atof(text.c_str())));
++            if (rate < 1 || rate > o.customMax)
++                return -1;
++            if (rate <= 60)
++                return 0;
++            int choice = -1, n = o.customDefault;
++            if (!parseStored(option, std::to_string(rate), choice, n))
+                 return -1;
+-            int best = 0;
+-            for (size_t c = 0; c < o.choices.size(); ++c)
+-                if (std::atoi(o.choices[c].value) <= rate)
+-                    best = int(c);
+-            return best;
++            if (number && choice == o.customChoice)
++                *number = n;
++            return choice;
+         }
+         default:
+             break;
+diff --git a/ps2xRuntime/include/runtime/ga2_settings.h b/ps2xRuntime/include/runtime/ga2_settings.h
+index 60458d1..b9617e4 100644
+--- a/ps2xRuntime/include/runtime/ga2_settings.h
++++ b/ps2xRuntime/include/runtime/ga2_settings.h
+@@ -25,14 +25,24 @@ namespace ga2_settings
+     // environment (the engines at their start) sees the file's values. Safe to call again.
+     void init();
+ 
+-    // The current choice (index into ga2_options::options()[key].choices) and its value text.
++    // The current choice (index into ga2_options::options()[key].choices) and its value text. For an option with an
++    // editable number (the frame rate's Custom) value() is the choice's own value ("custom"); text() is what
++    // settings.ini stores ("173") and number() the custom number.
+     int get(Key key);
+     const char *value(Key key);
+-    // The choice the game started with (what the engines read at their start).
++    int number(Key key);
++    std::string text(Key key);
++    // What the menus show for the current state ("Custom: 173").
++    std::string label(Key key);
++    // The choice (and custom number) the game started with (what the engines read at their start).
+     int started(Key key);
++    int startedNumber(Key key);
+ 
+     // Main thread: takes a new choice. Does not save (see save()); consumers pick it up by value() / generation().
++    // Choosing the custom choice from a preset starts from that preset's number.
+     void set(Key key, int choice);
++    // Main thread: the custom choice with this number (clamped to the option's range).
++    void setCustom(Key key, int number);
+     // Counts every set(): consumers cache what they derived and rebuild when it changes.
+     uint32_t generation();
+     // The player changed it in this run (what save() writes).
+@@ -41,9 +51,19 @@ namespace ga2_settings
+     // The running game cannot take `choice` of `key` now (a restart option, or a frame rate above what this run
+     // started with); the menu then says "after restart". `why` gets a short reason.
+     bool takesEffectNow(Key key, int choice, const char **why = nullptr);
++    bool takesEffectNow(Key key, int choice, int number, const char **why);
+     // The saved setting differs from what this run uses and needs a restart.
+     bool restartPending(Key key);
+ 
++    // The frame rate cap the Frame rate option asks for now: 60 (the PS2 rate) or 61..240. The preset or custom
++    // number, or for "Monitor refresh rate" the refresh rate of the monitor the window is on (setMonitorRate; a
++    // monitor at 60 Hz or below, or one not read yet, is the PS2 rate).
++    int fpsCap();
++    int fpsCapFor(int choice, int number);
++    // The monitor's refresh rate in Hz (0: unknown), read by the window code (ga2_settings_menu::followMonitor).
++    void setMonitorRate(int hz);
++    int monitorRate();
++
+     // <data>/settings.ini. Written by save(): the keys the player changed in this run replace their lines, other
+     // lines (the launcher's window_scale, options this run did not touch) stay as they are.
+     std::filesystem::path dataDir();
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index baeeabb..b35947b 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -2,6 +2,7 @@
+ #include "ga2_settings_menu.h"
+ #include "ga2_vr.h"
+ #include "runtime/ga2_cheats.h"
++#include "runtime/ga2_menu_select.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -27,7 +28,8 @@ namespace ga2_cheat_menu
+         // with it until released (Enter would otherwise reach the game as
+         // Start on the closing frame).
+         bool g_swallow = false;
+-        int g_selected = 0;
++        // The cheats page: the hovered row, or the row the keys / pad chose (nothing until one of them is used).
++        ga2_menu::Selector g_sel;
+         std::string g_notice;
+         double g_noticeUntil = 0.0;
+ 
+@@ -108,6 +110,7 @@ namespace ga2_cheat_menu
+         {
+             g_open = true;
+             g_page = page;
++            g_sel.release();
+             if (page == Page::Settings)
+                 ga2_settings_menu::opened();
+         }
+@@ -148,6 +151,11 @@ namespace ga2_cheat_menu
+     void update(const uint8_t *rdram)
+     {
+         g_rdram = rdram;
++        // Typed characters are read every frame, so what was typed in the game never waits in the queue for the menu.
++        std::string typed;
++        for (int ch = GetCharPressed(); ch != 0; ch = GetCharPressed())
++            if (ch < 128)
++                typed += char(ch);
+         if (g_swallow && !menuInputHeld())
+             g_swallow = false;
+         const bool cheats = ga2_cheats::state().available.load();
+@@ -183,7 +191,9 @@ namespace ga2_cheat_menu
+         }
+         if (!g_open)
+             return;
+-        const bool back = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) ||
++        // Esc and Backspace belong to the number being typed on the settings page (drop it / delete a digit).
++        const bool typing = g_page == Page::Settings && ga2_settings_menu::editing();
++        const bool back = (!typing && (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE))) ||
+                           IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || vrPressed(kVrCross);
+         if (back)
+         {
+@@ -203,6 +213,12 @@ namespace ga2_cheat_menu
+             in.left = keyStep(KEY_LEFT) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) || vrPressed(kVrLeft);
+             in.right = keyStep(KEY_RIGHT) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) || vrPressed(kVrRight);
+             in.confirm = confirm;
++            in.prev = IsKeyPressed(KEY_PAGE_UP);
++            in.next = IsKeyPressed(KEY_PAGE_DOWN);
++            in.shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
++            in.backspace = typing && keyStep(KEY_BACKSPACE);
++            in.escape = typing && IsKeyPressed(KEY_ESCAPE);
++            in.typed = typed;
+             in.home = IsKeyPressed(KEY_HOME);
+             in.end = IsKeyPressed(KEY_END);
+             in.pointerMoved = GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f;
+@@ -216,24 +232,24 @@ namespace ga2_cheat_menu
+         if (!cheats)
+             return;
+         const int count = int(items().size());
+-        if (up)
+-            g_selected = (g_selected + count - 1) % count;
+-        if (down)
+-            g_selected = (g_selected + 1) % count;
++        int hovered = -1;
+         for (int i = 0; i < count; ++i)
+             if (CheckCollisionPointRec(mouse, row(windowCanvas(), i)))
+-            {
+-                if (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f)
+-                    g_selected = i;
+-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+-                {
+-                    g_selected = i;
+-                    activate(i, rdram);
+-                    return;
+-                }
+-            }
+-        if (confirm || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))
+-            activate(g_selected, rdram);
++                hovered = i;
++        const bool clicked = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
++        g_sel.begin(hovered, GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f, clicked);
++        if (up)
++            g_sel.move(-1, count);
++        if (down)
++            g_sel.move(1, count);
++        // A click acts on the row under the pointer; Enter, Space and Left / Right on the row the keys chose.
++        if (clicked && hovered >= 0)
++        {
++            activate(hovered, rdram);
++            return;
++        }
++        if ((confirm || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT)) && g_sel.keySelection() >= 0)
++            activate(g_sel.keySelection(), rdram);
+     }
+ 
+     namespace
+@@ -271,7 +287,7 @@ namespace ga2_cheat_menu
+             for (int i = 0; i < int(list.size()); ++i)
+             {
+                 const Rectangle r = row(c, i);
+-                if (i == g_selected)
++                if (i == g_sel.shown())
+                     DrawRectangleRec(r, Color{30, 44, 90, 255});
+                 const bool enabled = list[size_t(i)].toggle || list[size_t(i)].settings || battle;
+                 DrawText(list[size_t(i)].settings && !c.vr ? "Settings (F2)" : list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index d83d0e0..30ad141 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -23,10 +23,13 @@ namespace ga2_framepace
+     namespace
+     {
+         // GA2_FPS: the frame rate cap the run starts with (61..240), 60 = the native cadence (also unset/invalid).
++        // "monitor" (the player's "Monitor refresh rate"): the window's monitor sets the cap, which is known only
++        // once the window exists, so the run starts native and the main loop raises the cap
++        // (ga2_settings_menu::followMonitor).
+         int parseAsked()
+         {
+             const char *v = std::getenv("GA2_FPS");
+-            if (!v || !*v)
++            if (!v || !*v || std::strcmp(v, "monitor") == 0)
+                 return 60;
+             const int n = int(std::lround(std::atof(v)));
+             if (n == 60 || n == 0)
+diff --git a/ps2xRuntime/src/lib/ga2_settings.cpp b/ps2xRuntime/src/lib/ga2_settings.cpp
+index d2cc269..d47c905 100644
+--- a/ps2xRuntime/src/lib/ga2_settings.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings.cpp
+@@ -19,6 +19,9 @@ namespace ga2_settings
+         std::once_flag g_once;
+         std::array<std::atomic<int>, ga2_options::KeyCount> g_current{};
+         std::array<int, ga2_options::KeyCount> g_started{};
++        std::array<std::atomic<int>, ga2_options::KeyCount> g_number{};
++        std::array<int, ga2_options::KeyCount> g_startedNumber{};
++        std::atomic<int> g_monitorHz{0};
+         std::array<bool, ga2_options::KeyCount> g_changed{};
+         std::atomic<uint32_t> g_generation{1};
+ 
+@@ -60,21 +63,13 @@ namespace ga2_settings
+ #endif
+         }
+ 
+-        int choiceForValue(size_t option, const std::string &text)
+-        {
+-            const auto &o = ga2_options::options()[option];
+-            for (size_t c = 0; c < o.choices.size(); ++c)
+-                if (text == o.choices[c].value)
+-                    return int(c);
+-            return -1;
+-        }
+-
+         void doInit()
+         {
+             const auto &table = ga2_options::options();
+             // settings.ini, only for a run that names the data folder.
+-            std::array<int, ga2_options::KeyCount> fromFile;
++            std::array<int, ga2_options::KeyCount> fromFile, fileNumber;
+             fromFile.fill(-1);
++            fileNumber.fill(0);
+             if (envSet("GA2_DATA_DIR"))
+             {
+                 std::ifstream in(settingsFile());
+@@ -88,26 +83,34 @@ namespace ga2_settings
+                     const std::string key = line.substr(0, equals), text = line.substr(equals + 1);
+                     for (size_t i = 0; i < table.size(); ++i)
+                         if (key == table[i].key)
+-                            fromFile[i] = choiceForValue(i, text);
++                        {
++                            int choice = -1, number = table[i].customDefault;
++                            // A value that is no choice (and no number in range) leaves the default.
++                            fromFile[i] = ga2_options::parseStored(i, text, choice, number) ? choice : -1;
++                            fileNumber[i] = number;
++                        }
+                 }
+             }
+             int fromEnvironment = 0, fromSettingsFile = 0;
+             for (size_t i = 0; i < table.size(); ++i)
+             {
+-                int choice = 0;
++                int choice = 0, number = table[i].customDefault;
+                 if (envSet(table[i].env))
+                 {
+-                    choice = std::max(0, ga2_options::choiceFromEnv(i, env(table[i].env)));
++                    choice = std::max(0, ga2_options::choiceFromEnv(i, env(table[i].env), &number));
+                     ++fromEnvironment;
+                 }
+                 else if (fromFile[i] >= 0)
+                 {
+                     choice = fromFile[i];
+-                    putEnv(table[i].env, ga2_options::envValue(i, choice, dumpDirectory()));
++                    number = fileNumber[i];
++                    putEnv(table[i].env, ga2_options::envValue(i, choice, dumpDirectory(), number));
+                     ++fromSettingsFile;
+                 }
+                 g_started[i] = choice;
++                g_startedNumber[i] = number;
+                 g_current[i].store(choice);
++                g_number[i].store(number);
+             }
+             std::fprintf(stderr, "[settings] %d options from the environment, %d from %s; changes are saved to %s\n", fromEnvironment,
+                          fromSettingsFile, envSet("GA2_DATA_DIR") ? "settings.ini" : "(no data folder given)",
+@@ -125,24 +128,58 @@ namespace ga2_settings
+ 
+     const char *value(Key key) { return ga2_options::options()[key].choices[size_t(get(key))].value; }
+ 
++    int number(Key key)
++    {
++        init();
++        return g_number[key].load(std::memory_order_relaxed);
++    }
++
++    std::string text(Key key) { return ga2_options::storedValue(key, get(key), number(key)); }
++
++    std::string label(Key key) { return ga2_options::choiceLabel(key, get(key), number(key)); }
++
+     int started(Key key)
+     {
+         init();
+         return g_started[key];
+     }
+ 
++    int startedNumber(Key key)
++    {
++        init();
++        return g_startedNumber[key];
++    }
++
+     void set(Key key, int choice)
+     {
+         init();
+         const int count = int(ga2_options::options()[key].choices.size());
+         choice = std::max(0, std::min(choice, count - 1));
+-        if (choice == g_current[key].load())
++        const int before = g_current[key].load();
++        if (choice == before)
+             return;
++        const auto &o = ga2_options::options()[key];
++        g_number[key].store(ga2_options::carryNumber(o, before, choice, g_number[key].load()));
+         g_current[key].store(choice);
+         g_changed[key] = true;
+         g_generation.fetch_add(1);
+     }
+ 
++    void setCustom(Key key, int number)
++    {
++        init();
++        const auto &o = ga2_options::options()[key];
++        if (!ga2_options::hasCustom(o))
++            return;
++        number = ga2_options::clampCustom(o, number);
++        if (g_current[key].load() == o.customChoice && g_number[key].load() == number)
++            return;
++        g_number[key].store(number);
++        g_current[key].store(o.customChoice);
++        g_changed[key] = true;
++        g_generation.fetch_add(1);
++    }
++
+     uint32_t generation()
+     {
+         init();
+@@ -155,7 +192,28 @@ namespace ga2_settings
+         return g_changed[key];
+     }
+ 
+-    bool takesEffectNow(Key key, int choice, const char **why)
++    int fpsCapFor(int choice, int number)
++    {
++        const auto &o = ga2_options::options()[ga2_options::Fps];
++        int rate = 60;
++        if (choice == o.customChoice)
++            rate = number;
++        else if (choice == ga2_options::choiceIndex(ga2_options::Fps, "monitor"))
++            rate = g_monitorHz.load(std::memory_order_relaxed);
++        else
++            rate = std::atoi(o.choices[size_t(choice)].value);
++        return rate > 60 ? std::min(rate, o.customMax) : 60;
++    }
++
++    int fpsCap() { return fpsCapFor(get(ga2_options::Fps), number(ga2_options::Fps)); }
++
++    void setMonitorRate(int hz) { g_monitorHz.store(hz, std::memory_order_relaxed); }
++
++    int monitorRate() { return g_monitorHz.load(std::memory_order_relaxed); }
++
++    bool takesEffectNow(Key key, int choice, const char **why) { return takesEffectNow(key, choice, number(key), why); }
++
++    bool takesEffectNow(Key key, int choice, int customNumber, const char **why)
+     {
+         init();
+         const auto &o = ga2_options::options()[key];
+@@ -170,7 +228,7 @@ namespace ga2_settings
+             // The frame rate hooks run in every run that can use them (ga2_framepace::fps(): up to 240), so the cap
+             // moves live; VR and the software GS keep the PS2 rate (fps() == 0) and GA2_FPS_LIVE=0 limits it to the
+             // rate the run started with.
+-            const int wanted = std::atoi(o.choices[size_t(choice)].value);
++            const int wanted = fpsCapFor(choice, customNumber);
+             const int top = ga2_framepace::fps();
+             if (wanted > 60 && wanted > top)
+             {
+@@ -186,9 +244,12 @@ namespace ga2_settings
+     {
+         init();
+         const int now = g_current[key].load();
++        // A custom number that differs counts as a different state (only while the custom choice is chosen).
++        const bool differs = now != g_started[key] ||
++                             (now == ga2_options::options()[key].customChoice && g_number[key].load() != g_startedNumber[key]);
+         if (ga2_options::options()[key].apply == ga2_options::Apply::Restart)
+-            return now != g_started[key];
+-        return !takesEffectNow(key, now) && now != g_started[key];
++            return differs;
++        return !takesEffectNow(key, now) && differs;
+     }
+ 
+     std::filesystem::path dataDir()
+@@ -225,7 +286,7 @@ namespace ga2_settings
+         {
+             if (!g_changed[i])
+                 continue;
+-            const std::string line = std::string(table[i].key) + "=" + table[i].choices[size_t(g_current[i].load())].value;
++            const std::string line = std::string(table[i].key) + "=" + ga2_options::storedValue(i, g_current[i].load(), g_number[i].load());
+             bool found = false;
+             for (std::string &existing : lines)
+                 if (existing.compare(0, std::strlen(table[i].key) + 1, std::string(table[i].key) + "=") == 0)
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index 222e996..319ce72 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -3,6 +3,7 @@
+ #include "ga2_present.h"
+ #include "runtime/ga2_activity.h"
+ #include "runtime/ga2_framepace.h"
++#include "runtime/ga2_menu_select.h"
+ #include "runtime/ga2_settings.h"
+ #include "ga2_vr.h"
+ 
+@@ -21,7 +22,10 @@ namespace ga2_settings_menu
+     {
+         using ga2_options::Key;
+ 
+-        int g_selected = 0;
++        ga2_menu::Selector g_sel; // what is highlighted: hovered row, or the row the keys chose
++        // Digits typed into an editable number (on row g_editKey) before Enter.
++        std::string g_edit;
++        int g_editKey = -1;
+         std::string g_notice;
+         double g_noticeUntil = 0.0;
+         // The fullscreen row shows the window as it is (F11 and Alt+Enter change it too).
+@@ -69,14 +73,41 @@ namespace ga2_settings_menu
+         constexpr float kValueFrom = 0.43f, kValueTo = 0.80f;
+ 
+         // ---- changing a value ----
+-        const char *choiceLabel(Key key, int choice) { return ga2_options::options()[key].choices[size_t(choice)].label; }
+-
+         void say(const std::string &text)
+         {
+             g_notice = text;
+             g_noticeUntil = GetTime() + 4.0;
+         }
+ 
++        bool customChosen(Key key)
++        {
++            const auto &o = ga2_options::options()[key];
++            return ga2_options::hasCustom(o) && ga2_settings::get(key) == o.customChoice;
++        }
++
++        // The text of a row's value: typed digits while editing, else the current choice ("Custom: 173").
++        std::string valueLabel(Key key)
++        {
++            const auto &o = ga2_options::options()[key];
++            if (!g_edit.empty() && g_editKey == int(key))
++                return std::string(o.choices[size_t(o.customChoice)].label) + ": " + g_edit + "_";
++            return ga2_options::choiceLabel(key, shownChoice(key), ga2_settings::number(key));
++        }
++
++        // After a change: the cap, the file, and what the notice says.
++        void applied(Key key, bool now, const char *why)
++        {
++            if (key == ga2_options::Fps && now)
++                ga2_framepace::setUserCap(ga2_settings::fpsCap());
++            const bool saved = ga2_settings::save();
++            std::string text = std::string(ga2_options::options()[key].label) + ": " + ga2_settings::label(key);
++            if (!now)
++                text += std::string(" (") + (why ? why : "applies after restart") + ")";
++            if (!saved)
++                text += " - could not save settings.ini";
++            say(text);
++        }
++
+         void change(Key key, int delta)
+         {
+             const auto &option = ga2_options::options()[key];
+@@ -86,19 +117,50 @@ namespace ga2_settings_menu
+             if (choice == before)
+                 return;
+             const char *why = nullptr;
+-            const bool now = ga2_settings::takesEffectNow(key, choice, &why);
++            const bool now = ga2_settings::takesEffectNow(key, choice, ga2_options::carryNumber(option, before, choice, ga2_settings::number(key)), &why);
+             ga2_settings::set(key, choice);
+             if (key == ga2_options::Fullscreen && fullscreenNow() != (choice == 1))
+                 ToggleBorderlessWindowed();
+-            if (key == ga2_options::Fps && now)
+-                ga2_framepace::setUserCap(std::atoi(option.choices[size_t(choice)].value));
+-            const bool saved = ga2_settings::save();
+-            std::string text = std::string(option.label) + ": " + choiceLabel(key, choice);
+-            if (!now)
+-                text += std::string(" (") + (why ? why : "applies after restart") + ")";
+-            if (!saved)
+-                text += " - could not save settings.ini";
+-            say(text);
++            applied(key, now, why);
++        }
++
++        // The editable number takes `number` (and becomes the chosen value).
++        void setNumber(Key key, int number)
++        {
++            const char *why = nullptr;
++            const bool now = ga2_settings::takesEffectNow(key, ga2_options::options()[key].customChoice, number, &why);
++            ga2_settings::setCustom(key, number);
++            applied(key, now, why);
++        }
++
++        void stepNumber(Key key, int delta)
++        {
++            const auto &o = ga2_options::options()[key];
++            const int before = ga2_settings::number(key);
++            const int number = ga2_options::clampCustom(o, before + delta);
++            if (number == before && customChosen(key))
++            {
++                say(std::string(o.label) + ": " + std::to_string(number) + (delta < 0 ? " is the lowest" : " is the highest") + " custom value");
++                return;
++            }
++            setNumber(key, number);
++        }
++
++        // Enter after typing: the typed number, brought into range.
++        void commitEdit(Key key)
++        {
++            const auto &o = ga2_options::options()[key];
++            int typed = 0;
++            const bool ok = ga2_options::parseWhole(g_edit, typed);
++            g_edit.clear();
++            g_editKey = -1;
++            if (!ok)
++                return;
++            const int number = ga2_options::clampCustom(o, typed);
++            setNumber(key, number);
++            if (number != typed)
++                say(std::string(o.label) + ": " + std::to_string(typed) + " is outside " + std::to_string(o.customMin) + "-" +
++                    std::to_string(o.customMax) + "; using " + std::to_string(number));
+         }
+ 
+         // One line about the selected row beyond its help text: what applies when, and what the setting needs.
+@@ -114,12 +176,21 @@ namespace ga2_settings_menu
+                     return "In VR the headset sets the rate.";
+                 if (top <= 0)
+                     return "This run keeps the PS2's 60 (software GS): higher rates apply after restart.";
++                if (customChosen(key))
++                    return "Left/Right: 1 (Shift: 10), or type 61-240 and press Enter. Enter / PageDown: next choice.";
++                std::string prefix;
++                if (ga2_settings::get(key) == ga2_options::choiceIndex(ga2_options::Fps, "monitor"))
++                {
++                    const int hz = ga2_settings::monitorRate();
++                    prefix = hz > 0 ? "This monitor: " + std::to_string(hz) + " Hz" + (hz <= 60 ? " (the PS2 rate). " : ". ")
++                                    : "Monitor rate not known yet. ";
++                }
+                 if (ga2_framepace::nativeNow())
+                     std::snprintf(text, sizeof(text), "Now the PS2's 60 (the PC's speed lowers the rate below the cap when needed).");
+                 else
+                     std::snprintf(text, sizeof(text), "Now %d fps (the PC's speed lowers the rate below the cap when needed).",
+                                   ga2_framepace::rate());
+-                return text;
++                return prefix + text;
+             }
+             case ga2_options::Sides:
+                 if (ga2_settings::get(key) == 2 && ga2_present::skyboxMissing())
+@@ -176,50 +247,153 @@ namespace ga2_settings_menu
+ 
+     void opened()
+     {
+-        // The row stays where it was; what was said last does not.
++        // What was said last and what was half typed do not stay; the keys have chosen nothing yet.
+         g_notice.clear();
+         g_noticeUntil = 0.0;
++        g_edit.clear();
++        g_editKey = -1;
++        g_sel.release();
+     }
+ 
++    bool editing() { return !g_edit.empty(); }
++
+     void update(const Input &in, const Canvas &window)
+     {
+         const int count = int(ga2_options::KeyCount);
++        const Layout l = layout(window);
++        int hovered = -1;
++        Rectangle hoveredRect{};
++        for (int i = 0; i < count; ++i)
++        {
++            const Rectangle r = rowRect(l, i);
++            if (in.x >= r.x && in.x < r.x + r.width && in.y >= r.y && in.y < r.y + r.height)
++            {
++                hovered = i;
++                hoveredRect = r;
++            }
++        }
++        g_sel.begin(hovered, in.pointerMoved, in.click);
+         if (in.home)
+-            g_selected = 0;
++            g_sel.adopt(0);
+         if (in.end)
+-            g_selected = count - 1;
++            g_sel.adopt(count - 1);
+         if (in.up)
+-            g_selected = (g_selected + count - 1) % count;
++            g_sel.move(-1, count);
+         if (in.down)
+-            g_selected = (g_selected + 1) % count;
+-        if (in.left)
+-            change(Key(g_selected), -1);
+-        if (in.right || in.confirm)
+-            change(Key(g_selected), 1);
+-        const Layout l = layout(window);
+-        for (int i = 0; i < count; ++i)
++            g_sel.move(1, count);
++        // Digits typed over a row with an editable number choose it.
++        if (!in.typed.empty() && g_sel.keySelection() < 0 && hovered >= 0 && ga2_options::hasCustom(ga2_options::options()[size_t(hovered)]))
++            g_sel.adopt(hovered);
++        const int row = g_sel.keySelection();
++        if (row != g_editKey)
+         {
+-            const Rectangle r = rowRect(l, i);
+-            if (in.x < r.x || in.x >= r.x + r.width || in.y < r.y || in.y >= r.y + r.height)
+-                continue;
+-            if (in.pointerMoved)
+-                g_selected = i;
+-            const float inRow = (in.x - r.x) / r.width;
+-            if (in.click)
++            g_edit.clear();
++            g_editKey = -1;
++        }
++        if (row >= 0)
++        {
++            const Key key = Key(row);
++            const auto &option = ga2_options::options()[key];
++            if (ga2_options::hasCustom(option))
++                for (char ch : in.typed)
++                    if (ch >= '0' && ch <= '9' && g_edit.size() < 3)
++                    {
++                        g_edit += ch;
++                        g_editKey = row;
++                    }
++            if (in.backspace && !g_edit.empty())
++                g_edit.pop_back();
++            if (in.escape)
++                g_edit.clear();
++            if (in.confirm)
+             {
+-                g_selected = i;
+-                // Left of the value's middle: back, right of it: forward; the label only selects.
+-                if (inRow >= kValueFrom && inRow < kValueTo)
+-                    change(Key(i), inRow < (kValueFrom + kValueTo) * 0.5f ? -1 : 1);
++                if (!g_edit.empty())
++                    commitEdit(key);
++                else
++                    change(key, 1);
++            }
++            if (in.next)
++                change(key, 1);
++            if (in.prev)
++                change(key, -1);
++            if (in.left || in.right)
++            {
++                const int direction = in.right ? 1 : -1;
++                g_edit.clear();
++                if (customChosen(key))
++                    stepNumber(key, direction * (in.shift ? 10 : 1));
++                else
++                    change(key, direction);
+             }
++        }
++        // The pointer acts on the row under it.
++        if (hovered >= 0)
++        {
++            const Rectangle r = hoveredRect;
++            const float inRow = (in.x - r.x) / r.width;
++            if (in.click && inRow >= kValueFrom && inRow < kValueTo)
++                change(Key(hovered), inRow < (kValueFrom + kValueTo) * 0.5f ? -1 : 1);
+             if (in.wheel != 0.0f)
+             {
+-                g_selected = i;
+-                change(Key(i), in.wheel > 0.0f ? -1 : 1);
++                if (customChosen(Key(hovered)))
++                    stepNumber(Key(hovered), (in.wheel > 0.0f ? 1 : -1) * (in.shift ? 10 : 1));
++                else
++                    change(Key(hovered), in.wheel > 0.0f ? -1 : 1);
+             }
+         }
+     }
+ 
++    void followMonitor()
++    {
++        // The monitor the window is on, twice a second (cheap, and it catches both a moved window and a changed rate).
++        static double next = 0.0;
++        static int lastCap = -1;
++        const double now = GetTime();
++        if (now < next || !IsWindowReady())
++            return;
++        next = now + 0.5;
++        int hz = GetMonitorRefreshRate(GetCurrentMonitor());
++        // Developer aid for displays that report no rate (Xvfb): GA2_MONITOR_HZ=<hz>, or the path of a file holding
++        // the rate, which is read at every poll (change the file to simulate moving to another monitor).
++        if (const char *fake = std::getenv("GA2_MONITOR_HZ"); fake && *fake)
++        {
++            int value = std::atoi(fake);
++            if (fake[0] == '/' || fake[0] == '.')
++                if (std::FILE *f = std::fopen(fake, "r"))
++                {
++                    if (std::fscanf(f, "%d", &value) != 1)
++                        value = 0;
++                    std::fclose(f);
++                }
++            hz = value;
++        }
++        if (hz != ga2_settings::monitorRate())
++        {
++            ga2_settings::setMonitorRate(hz);
++            std::fprintf(stderr, "[ga2 fps] monitor %d refresh rate %d Hz\n", GetCurrentMonitor(), hz);
++        }
++        // In VR the headset sets the cap (ga2_vr), without the frame rate hooks there is nothing to move.
++        if (ga2_vr::headsetRunning() || ga2_framepace::fps() <= 0)
++            return;
++        if (ga2_settings::get(ga2_options::Fps) != ga2_options::choiceIndex(ga2_options::Fps, "monitor"))
++        {
++            lastCap = -1;
++            return;
++        }
++        const int cap = ga2_settings::fpsCap();
++        // The choice is Monitor, so the cap is the monitor's rate; set it whenever it differs (the monitor changed, or
++        // the choice was just made).
++        if (cap != lastCap || ga2_framepace::userCap() != cap)
++        {
++            const char *why = nullptr;
++            if (ga2_settings::takesEffectNow(ga2_options::Fps, ga2_settings::get(ga2_options::Fps), &why))
++                ga2_framepace::setUserCap(cap);
++            if (cap != lastCap)
++                std::fprintf(stderr, "[ga2 fps] frame rate cap follows the monitor: %d fps (monitor %d Hz)\n", cap, hz);
++            lastCap = cap;
++        }
++    }
++
+     void draw(const Canvas &c)
+     {
+         const Layout l = layout(c);
+@@ -244,18 +418,18 @@ namespace ga2_settings_menu
+             const Key key = Key(i);
+             const Rectangle r = rowRect(l, i);
+             const int ty = int(r.y + (r.height - float(fontSize)) * 0.5f);
+-            if (i == g_selected)
++            const bool highlighted = i == g_sel.shown();
++            if (highlighted)
+                 DrawRectangleRec(r, Color{30, 44, 90, 255});
+             DrawText(table[key].label, int(r.x + 8 * u), ty, fontSize, Color{230, 236, 250, 255});
+ 
+-            const int choice = shownChoice(key);
+             const bool pending = ga2_settings::restartPending(key);
+-            const char *label = choiceLabel(key, choice);
++            const std::string label = valueLabel(key);
+             const float vx0 = r.x + r.width * kValueFrom, vx1 = r.x + r.width * kValueTo;
+             const Color valueColor = pending ? Color{255, 190, 90, 255} : Color{150, 200, 255, 255};
+-            const int w = MeasureText(label, fontSize);
+-            DrawText(label, int((vx0 + vx1) * 0.5f) - w / 2, ty, fontSize, valueColor);
+-            if (i == g_selected)
++            const int w = MeasureText(label.c_str(), fontSize);
++            DrawText(label.c_str(), int((vx0 + vx1) * 0.5f) - w / 2, ty, fontSize, valueColor);
++            if (highlighted)
+             {
+                 DrawText("<", int(vx0), ty, fontSize, Color{230, 236, 250, 255});
+                 DrawText(">", int(vx1) - MeasureText(">", fontSize), ty, fontSize, Color{230, 236, 250, 255});
+@@ -272,14 +446,18 @@ namespace ga2_settings_menu
+         // Help for the selected row, then what applies now.
+         const float helpTop = l.y + (kTitleHeight + kRowHeight * float(ga2_options::KeyCount) + 6.0f) * u;
+         const int helpSize = std::max(8, int(15 * u));
+-        const Key key = Key(g_selected);
++        const int shownRow = g_sel.shown();
++        const Key key = Key(shownRow >= 0 ? shownRow : 0);
+         float y = helpTop;
+-        for (const std::string &line : wrap(table[key].help, helpSize, l.w - 36.0f * u))
++        if (shownRow >= 0)
+         {
+-            DrawText(line.c_str(), int(l.x + 18 * u), int(y), helpSize, Color{190, 198, 220, 255});
+-            y += float(helpSize) * 1.25f;
++            for (const std::string &line : wrap(table[key].help, helpSize, l.w - 36.0f * u))
++            {
++                DrawText(line.c_str(), int(l.x + 18 * u), int(y), helpSize, Color{190, 198, 220, 255});
++                y += float(helpSize) * 1.25f;
++            }
+         }
+-        const std::string status = g_noticeUntil > GetTime() ? g_notice : context(key);
++        const std::string status = g_noticeUntil > GetTime() ? g_notice : (shownRow >= 0 ? context(key) : std::string());
+         std::string saved = std::string("Saved to ") + ga2_settings::settingsFile().string();
+         const float bottom = l.y + l.h - (kFooterHeight + 4.0f) * u;
+         if (!status.empty())
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.h b/ps2xRuntime/src/lib/ga2_settings_menu.h
+index 5ad6eee..fad901e 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.h
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.h
+@@ -1,11 +1,14 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <string>
+ 
+ // The settings page of the in-game menu (ga2_cheat_menu.cpp owns the window, the input and the headset texture and
+ // opens this page with F2). One row per player option (runtime/ga2_options.h, the same table as the launcher's
+ // Options screen): left / right change the value, which takes effect at once (the live options) or is saved for the
+-// next start and marked "restart". Changes go through ga2_settings, which the consumers read, and are written to
++// next start and marked "restart". An option with an editable number (the frame rate's Custom) steps by 1 with
++// Left/Right (Shift: 10) and takes typed digits + Enter. Nothing is highlighted unless the pointer is over a row or the
++// keys / pad chose one (runtime/ga2_menu_select.h). Changes go through ga2_settings, which the consumers read, and are written to
+ // settings.ini right away.
+ namespace ga2_settings_menu
+ {
+@@ -20,7 +23,12 @@ namespace ga2_settings_menu
+     struct Input
+     {
+         bool up = false, down = false, left = false, right = false;
+-        bool confirm = false;       // the same as right: next value
++        bool confirm = false;       // Enter: commits typed digits, else the next value
++        bool prev = false, next = false; // PageUp / PageDown: previous / next value, also on an editable number
++        bool shift = false;         // Shift held: editable numbers step by 10
++        bool backspace = false;     // deletes a typed digit (only passed while editing())
++        bool escape = false;        // drops the typed digits (only passed while editing())
++        std::string typed;          // characters typed this frame (digits are used)
+         bool home = false, end = false; // first / last row
+         bool pointerMoved = false;  // the mouse moved this frame
+         bool click = false;         // left button pressed
+@@ -28,8 +36,13 @@ namespace ga2_settings_menu
+         float wheel = 0.0f;
+     };
+ 
+-    // The menu was opened: the selected row stays, pending notices are cleared.
++    // The menu was opened: pending notices and typed digits are cleared, nothing is chosen by keys.
+     void opened();
++    // Digits are being typed into an editable number: Backspace and Esc belong to the field, not to the menu.
++    bool editing();
++    // Main thread, every frame: the cap of the "Monitor refresh rate" frame rate follows the refresh rate of the
++    // monitor the window is on (read at the start and again when the window moves or the rate changes).
++    void followMonitor();
+     // Main thread, while the page is open.
+     void update(const Input &input, const Canvas &window);
+     void draw(const Canvas &canvas);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 625362a..d9e3ecd 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -9,6 +9,7 @@
+ #include "runtime/ga2_settings.h"
+ #include "ga2_vr.h"
+ #include "ga2_cheat_menu.h"
++#include "ga2_settings_menu.h"
+ #include "runtime/ga2_activity.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -3074,6 +3075,7 @@ void PS2Runtime::run()
+         ps2_mouse::beginFrame(ps2_mouse::Rect{dstRect.x, dstRect.y, dstRect.width, dstRect.height},
+                               static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+         ga2_cheat_menu::update(m_memory.getRDRAM());
++        ga2_settings_menu::followMonitor(); // the "Monitor refresh rate" frame rate cap
+         ga2_pgs::applySettings(); // button prompts, dithering, texture dump (changed in the settings menu)
+         ps2PadSampleHostInput();
+         // Developer aid: GA2_GS_CAPTURE + F10 records the GIF stream (gs_pgs.cpp).
+diff --git a/ps2xTest/src/ga2_settings_tests.cpp b/ps2xTest/src/ga2_settings_tests.cpp
+index 5e2d8df..926f12a 100644
+--- a/ps2xTest/src/ga2_settings_tests.cpp
++++ b/ps2xTest/src/ga2_settings_tests.cpp
+@@ -1,5 +1,6 @@
+ #include "MiniTest.h"
+ 
++#include "runtime/ga2_menu_select.h"
+ #include "runtime/ga2_options.h"
+ #include "runtime/ga2_settings.h"
+ 
+@@ -51,18 +52,98 @@ void register_ga2_settings_tests()
+                 t.IsTrue(envs.insert(o.env).second, std::string("unique variable ") + o.env);
+                 t.IsTrue(o.choices.size() >= 2, std::string("choices for ") + o.key);
+                 for (size_t c = 0; c < o.choices.size(); ++c)
+-                    t.Equals(choiceFromEnv(i, envValue(i, int(c), "/data/dumps/textures")), int(c),
++                {
++                    int number = 0;
++                    t.Equals(choiceFromEnv(i, envValue(i, int(c), "/data/dumps/textures", 150), &number), int(c),
+                              std::string(o.key) + "=" + o.choices[c].value + " round trip");
++                    if (int(c) == o.customChoice)
++                        t.Equals(number, 150, "the custom number survives the environment");
++                }
+             }
+             t.Equals(std::string(envValue(Resolution, 2, "")), std::string("16"), "4x is 16 samples");
+             t.Equals(std::string(envValue(DumpTextures, 0, "/d")), std::string(), "dump off is an empty path");
+             t.Equals(std::string(envValue(DumpTextures, 1, "/d")), std::string("/d"), "dump on is the folder");
+             t.Equals(choiceFromEnv(Vr, "preview"), 1, "preview counts as VR on");
+-            t.Equals(choiceFromEnv(Fps, "130"), 1, "any rate maps to the nearest choice below it");
+-            t.Equals(choiceFromEnv(Fps, "300"), 4, "above the table: the top choice");
++            int number = 0;
++            t.Equals(choiceFromEnv(Fps, "130", &number), options()[Fps].customChoice, "a rate that is no preset is the custom number");
++            t.Equals(number, 130, "with its number");
++            t.Equals(choiceFromEnv(Fps, "120"), choiceIndex(Fps, "120"), "a preset's rate is the preset");
++            t.Equals(choiceFromEnv(Fps, "monitor"), choiceIndex(Fps, "monitor"), "monitor");
++            t.Equals(choiceFromEnv(Fps, "30"), 0, "60 or below is the PS2 rate");
++            t.Equals(choiceFromEnv(Fps, "300"), -1, "above 240 is no rate (the engine falls back to the PS2 rate)");
++            t.Equals(choiceFromEnv(Fps, "abc"), -1, "text is no rate");
+             t.Equals(choiceFromEnv(Aspect, "bogus"), -1, "unknown text");
+         });
+ 
++        tc.Run("the frame rate options: presets, monitor, custom number, old files and out-of-range values", [](TestCase &t) {
++            const Option &fps = options()[Fps];
++            t.IsTrue(hasCustom(fps), "the frame rate has an editable number");
++            t.Equals(fps.customMin, 61, "lowest custom rate");
++            t.Equals(fps.customMax, 240, "highest custom rate");
++            for (const char *preset : {"60", "75", "90", "100", "120", "144", "165", "170", "175", "180", "200", "240", "monitor"})
++                t.IsTrue(choiceIndex(Fps, preset) >= 0, std::string("choice ") + preset);
++            // Stored values.
++            int choice = -1, number = 0;
++            t.IsTrue(parseStored(Fps, "120", choice, number) && choice == choiceIndex(Fps, "120"), "an old fps=120 is the preset");
++            t.IsTrue(parseStored(Fps, "144", choice, number) && choice == choiceIndex(Fps, "144"), "an old fps=144 is the preset");
++            t.IsTrue(parseStored(Fps, "60", choice, number) && choice == 0, "60");
++            t.IsTrue(parseStored(Fps, "monitor", choice, number) && choice == choiceIndex(Fps, "monitor"), "monitor");
++            t.IsTrue(parseStored(Fps, "173", choice, number) && choice == fps.customChoice && number == 173, "a plain number is custom");
++            t.IsTrue(parseStored(Fps, "61", choice, number) && number == 61, "lowest");
++            t.IsTrue(parseStored(Fps, "240", choice, number) && choice == choiceIndex(Fps, "240"), "240 is its preset");
++            choice = 7;
++            for (const char *bad : {"", "custom", "60.5", "-90", "50", "0", "241", "9999", "12345678", "fast", "1e2", " 90"})
++                t.IsFalse(parseStored(Fps, bad, choice, number), std::string("not a frame rate: '") + bad + "'");
++            t.Equals(choice, 7, "a refused value leaves the state alone");
++            t.Equals(storedValue(Fps, fps.customChoice, 173), std::string("173"), "custom stores its number");
++            t.Equals(storedValue(Fps, fps.customChoice, 500), std::string("240"), "clamped");
++            t.Equals(storedValue(Fps, fps.customChoice, 3), std::string("61"), "clamped up");
++            t.Equals(storedValue(Fps, choiceIndex(Fps, "monitor"), 173), std::string("monitor"), "monitor stores its word");
++            t.Equals(storedValue(Fps, choiceIndex(Fps, "144"), 173), std::string("144"), "a preset stores its value");
++            t.Equals(envValue(Fps, fps.customChoice, "", 173), std::string("173"), "GA2_FPS=173");
++            t.Equals(envValue(Fps, choiceIndex(Fps, "monitor"), ""), std::string("monitor"), "GA2_FPS=monitor");
++            t.Equals(choiceLabel(Fps, fps.customChoice, 173), std::string("Custom: 173"), "label");
++            // Stepping into Custom from a preset starts at that preset's rate.
++            t.Equals(carryNumber(fps, choiceIndex(Fps, "144"), fps.customChoice, 120), 144, "144 -> Custom shows 144");
++            t.Equals(carryNumber(fps, choiceIndex(Fps, "monitor"), fps.customChoice, 133), 133, "monitor -> Custom keeps the number");
++            t.Equals(carryNumber(fps, fps.customChoice, 0, 133), 133, "other targets leave it");
++        });
++
++        tc.Run("menu selection: only a hovered item or a key-chosen item is highlighted", [](TestCase &t) {
++            ga2_menu::Selector s;
++            s.begin(-1, false, false);
++            t.Equals(s.shown(), -1, "nothing highlighted at the start");
++            t.Equals(s.keySelection(), -1, "keys act on nothing");
++            s.begin(2, true, false);
++            t.Equals(s.shown(), 2, "hovered item");
++            t.Equals(s.keySelection(), -1, "hover is not a key selection");
++            s.begin(-1, true, false);
++            t.Equals(s.shown(), -1, "pointer off the items: no highlight");
++            s.move(1, 5);
++            t.Equals(s.shown(), 2, "Down with nothing chosen: the last hovered item");
++            t.Equals(s.keySelection(), 2, "keys now act on it");
++            s.move(1, 5);
++            t.Equals(s.shown(), 3, "Down moves on");
++            s.begin(3, false, false);
++            t.Equals(s.shown(), 3, "the mouse resting over an item does not take over");
++            s.begin(4, false, false);
++            t.Equals(s.shown(), 3, "still the key selection while the mouse is still");
++            s.begin(4, true, false);
++            t.Equals(s.shown(), 4, "mouse moved: hover wins");
++            t.Equals(s.keySelection(), -1, "keys act on nothing again");
++            s.move(-1, 5);
++            t.Equals(s.shown(), 3, "Up from the hovered item moves from it");
++            ga2_menu::Selector fresh;
++            fresh.begin(-1, false, false);
++            fresh.move(-1, 5);
++            t.Equals(fresh.shown(), 0, "Up with nothing ever chosen: the first item");
++            fresh.begin(1, false, true);
++            t.Equals(fresh.shown(), 1, "a click hands control to the mouse");
++            fresh.release();
++            fresh.begin(-1, false, false);
++            t.Equals(fresh.shown(), -1, "reopened menu: nothing");
++        });
++
+         tc.Run("the registry reads settings.ini under GA2_DATA_DIR, lets the environment win and saves only what changed", [](TestCase &t) {
+             namespace fs = std::filesystem;
+             const fs::path dir = fs::temp_directory_path() / ("ga2-settings-test-" + std::to_string(std::rand()));
+@@ -113,6 +194,44 @@ void register_ga2_settings_tests()
+             t.IsTrue(ini.count("vr") == 1 && ini.at("vr") == "0", "VR set and set back writes the final value");
+             t.IsFalse(fs::exists(dir / "settings.ini.tmp"), "no temporary file left");
+             t.Equals(ga2_settings::dumpDirectory(), (dir / "dumps" / "textures").string(), "dump folder under the data folder");
++
++            // The frame rate: custom numbers, monitor, what is saved.
++            t.Equals(std::string(std::getenv("GA2_FPS") ? std::getenv("GA2_FPS") : ""), std::string("144"), "handed on as GA2_FPS=144");
++            ga2_settings::setCustom(Fps, 1000);
++            t.Equals(ga2_settings::number(Fps), 240, "custom clamped to the top");
++            ga2_settings::setCustom(Fps, 2);
++            t.Equals(ga2_settings::number(Fps), 61, "custom clamped to the bottom");
++            ga2_settings::setCustom(Fps, 173);
++            t.Equals(ga2_settings::get(Fps), options()[Fps].customChoice, "setCustom chooses Custom");
++            t.Equals(ga2_settings::label(Fps), std::string("Custom: 173"), "label");
++            t.Equals(ga2_settings::text(Fps), std::string("173"), "text");
++            t.Equals(ga2_settings::fpsCap(), 173, "the cap is the custom number");
++            const int monitor = choiceIndex(Fps, "monitor");
++            ga2_settings::set(Fps, monitor);
++            ga2_settings::setMonitorRate(0);
++            t.Equals(ga2_settings::fpsCap(), 60, "monitor not read yet: the PS2 rate");
++            ga2_settings::setMonitorRate(59);
++            t.Equals(ga2_settings::fpsCap(), 60, "a 59 Hz monitor: the PS2 rate");
++            ga2_settings::setMonitorRate(60);
++            t.Equals(ga2_settings::fpsCap(), 60, "a 60 Hz monitor");
++            ga2_settings::setMonitorRate(144);
++            t.Equals(ga2_settings::fpsCap(), 144, "a 144 Hz monitor");
++            ga2_settings::setMonitorRate(360);
++            t.Equals(ga2_settings::fpsCap(), 240, "a 360 Hz monitor is clamped to 240");
++            ga2_settings::set(Fps, options()[Fps].customChoice);
++            t.Equals(ga2_settings::number(Fps), 173, "Custom after monitor keeps the number");
++            ga2_settings::set(Fps, choiceIndex(Fps, "165"));
++            ga2_settings::set(Fps, options()[Fps].customChoice);
++            t.Equals(ga2_settings::number(Fps), 165, "Custom from the 165 preset starts at 165");
++            ga2_settings::setCustom(Fps, 99);
++            t.IsTrue(ga2_settings::save(), "saved");
++            t.Equals(readIni(dir / "settings.ini").at("fps"), std::string("99"), "custom saved as a plain number");
++            ga2_settings::set(Fps, monitor);
++            t.IsTrue(ga2_settings::save(), "saved");
++            t.Equals(readIni(dir / "settings.ini").at("fps"), std::string("monitor"), "monitor saved as a word");
++            ga2_settings::set(Fps, choiceIndex(Fps, "120"));
++            t.IsTrue(ga2_settings::save(), "saved");
++            t.Equals(readIni(dir / "settings.ini").at("fps"), std::string("120"), "a preset saved by its value");
+             fs::remove_all(dir);
+         });
+     });
+-- 
+2.56.0
+

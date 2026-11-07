@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 13,
+  "source": {
+    "descriptor": "002d4338",
+    "slots": {
+      "0x8": {
+        "adjustment": 0,
+        "target": "0x13a290"
+      },
+      "0x20": {
+        "adjustment": 0,
+        "target": "0x13a4b8"
+      },
+      "0x28": {
+        "adjustment": 0,
+        "target": "0x13a4c0"
+      },
+      "0x30": {
+        "adjustment": 0,
+        "target": "0x13a4c8"
+      },
+      "0x38": {
+        "adjustment": 0,
+        "target": "0x13a4d0"
+      }
+    },
+    "switch_table": "002dd270",
+    "switch_targets": [
+      "0x13a2c8",
+      "0x13a308",
+      "0x13a328",
+      "0x13a348",
+      "0x13a2e8",
+      "0x13a368",
+      "0x13a388",
+      "0x13a3a8",
+      "0x13a3c8",
+      "0x13a3e8",
+      "0x13a408"
+    ],
+    "caller": "001033c8",
+    "observed_jalr": "00103410",
+    "prior_missing_target_capture": [
+      "20261009-041005",
+      "20261009-041203"
+    ],
+    "shared_epilogue": "0013a420",
+    "emitted_words_verified": 103,
+    "omitted_zero_delay_words_verified": [
+      "0x13a2c0",
+      "0x13a4bc",
+      "0x13a4c4",
+      "0x13a4cc",
+      "0x13a4d4"
+    ],
+    "descriptor_installer": "unverified"
+  },
+  "generation": {
+    "method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+    "entry_hints_total": 22,
+    "config_sha256": "e76e063454214d9e3b101a09c1bd5664b330743d3d172af5cbdfec9cdc6fb79e",
+    "changed_files": [
+      {
+        "file": "entry_13a290_0x13a420.cpp",
+        "old_sha256": null,
+        "new_sha256": "e06a08739d8ffcc2476d79519057426525ad16567842f01c5d00c6ddc8a8a27f"
+      },
+      {
+        "file": "entry_13a4b8_0x13a4c0.cpp",
+        "old_sha256": null,
+        "new_sha256": "8ce07a409d16cac6f796417a364ec25dd7fc27233415db85178d1fa5e2e63e28"
+      },
+      {
+        "file": "entry_13a4c0_0x13a4c8.cpp",
+        "old_sha256": null,
+        "new_sha256": "066e053097cc91320794b8303db8067019532657bcc956921f95f003430fd4d3"
+      },
+      {
+        "file": "entry_13a4c8_0x13a4d0.cpp",
+        "old_sha256": null,
+        "new_sha256": "ba2031d0234dc95fa7218aa59c5909acef7c96b14e10266e7d8d48f8b10a4a67"
+      },
+      {
+        "file": "entry_13a4d0_0x13a4d8.cpp",
+        "old_sha256": null,
+        "new_sha256": "10b61f79ab5278be8b2f8227e578c7825a66316ef478769efe0d6f3332a5537a"
+      },
+      {
+        "file": "ps2_recompiled_functions.h",
+        "old_sha256": "6dd38f8867886541f18c65051d8838fbbf647c8aa7aac86709b50f8c6303a854",
+        "new_sha256": "5f4687daee52a8690e4cada9ab6265e0409a9a7cd6a7712b3e53c6e1dd34ea0d"
+      },
+      {
+        "file": "register_functions.cpp",
+        "old_sha256": "216f66a00c1797c48205c30f6eb7f187195fbd875898de7758c7fd7b4c568d8e",
+        "new_sha256": "0e7ee2c186f89b956155fceddbcd3c1df5825baa27ce38dbe2aa08ae7810f442"
+      }
+    ],
+    "obsolete_files": [],
+    "config_artifact": "private analysis/zettai/recomp.toml",
+    "entry_profile_artifact": "configs/recomp-entry-points.json",
+    "entry_profile_sha256": "4c87e44b6b4edc0cf87a54dadff89222723dacf4dc327dccbf47af40c242d670"
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "Astra Ultra accepted final source/observer/native selector-one proof; independently compared raw128bit saved-register snapshots and seven generated-file hashes; other cases/helpers unobserved",
+    "document": "docs/reviews/object-factory-entries.md"
+  },
+  "tests": {
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "runtime": "production unchanged from475 runtime cases/9 IOP suites"
+  },
+  "native": {
+    "build": "target rebuild completed successfully",
+    "factory_entry_observed": true,
+    "guest_logical_return_observed": true,
+    "scene_verified": false,
+    "audio_verified": false,
+    "binary_sha256": "4ead9b5156378acefdf776d24942897e20dd7050e33fbd6d924730596329d151",
+    "binary_size": 364377272,
+    "focused_capture": "20261009-043559",
+    "ordinary_capture": "20261009-043207",
+    "resolved_hooks": 7,
+    "probe_errors": 0,
+    "selector": 1,
+    "case1_constructor_observed": true,
+    "constructor": "0013c4c8",
+    "allocated_object": "008f9af0",
+    "return_pc": "00103418",
+    "result": "008f9af0",
+    "pointer_matches_constructor": true,
+    "full128_preserved": [
+      "S0",
+      "GP",
+      "SP",
+      "RA"
+    ],
+    "original_sp": "01ffff00",
+    "original_ra": "00103418",
+    "original_gp": "004ee3f0",
+    "pending_factory_samples": 0,
+    "nop_entry_samples": {},
+    "unobserved_selectors": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "invalid_selector_native": "unverified",
+    "unobserved_nop_callbacks": [
+      "0013a4b8",
+      "0013a4c0",
+      "0013a4c8",
+      "0013a4d0"
+    ],
+    "constructor_result_prefix": "word+4=002d4398,+8=1,+c/+10/+14/+18=0; observed final values, not individual store proof",
+    "next_missing_target": "0023f0f8",
+    "next_missing_source": "00231054",
+    "ordinary_last_frame": "25.2s magenta viewport with black borders; visually inspected",
+    "debugger_exit_code": 0,
+    "natural_exit_code": null,
+    "bounded_stop": true,
+    "initial_focused_capture": "20261009-043206",
+    "preservation_evidence": "before/after raw128bit S0/GP/SP/RA independently compared; matches"
+  }
+}

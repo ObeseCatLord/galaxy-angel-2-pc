@@ -1,0 +1,170 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..84395fe 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -540,21 +540,41 @@ namespace ps2_syscalls
+         const uint32_t heapBaseRaw = getRegU32(ctx, 4); // $a0
+         const uint32_t heapSize = getRegU32(ctx, 5);    // $a1 (optional size)
+ 
+-        const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
++        const uint64_t alignedBase = (static_cast<uint64_t>(heapBaseRaw) + 0xFu) & ~0xFull;
++        if (alignedBase >= PS2_RAM_SIZE)
++        {
++            setReturnU32(ctx, 0u);
++            return;
++        }
++        const uint32_t heapBase = static_cast<uint32_t>(alignedBase);
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
++        uint32_t maximum = PS2_RAM_SIZE;
++        if (runtime)
++        {
++            // The main thread's stable stack base bounds its default heap.
++            // Live SP moves during calls, and a child stack is not this boundary.
++            const auto *main = runtime->eeScheduler().thread(EeScheduler::kMainThreadId);
++            if (main && main->stack != 0u && main->stackSize != 0u &&
++                static_cast<uint64_t>(main->stack) + main->stackSize <= PS2_RAM_SIZE)
++            {
++                maximum = main->stack;
++                heapLimit = maximum;
++            }
++        }
+ 
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+         {
+             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
+-            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
++            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, maximum));
+         }
+ 
+         if (heapLimit <= heapBase)
+         {
+-            heapLimit = kDefaultGuestHeapEnd;
++            setReturnU32(ctx, 0u);
++            return;
+         }
+ 
+         if (runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..f4c25d1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1618,22 +1618,20 @@ uint32_t PS2Runtime::normalizeGuestHeapAlignment(uint32_t alignment)
+ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
+ {
+     uint32_t normalized = guestBase;
+-    if (normalized >= PS2_RAM_SIZE)
++    if (normalized > PS2_RAM_SIZE)
+     {
+         normalized &= PS2_RAM_MASK;
+     }
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    return std::min(normalized, hardLimit);
++    return std::min(normalized, PS2_RAM_SIZE);
+ }
+ 
+ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ {
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    if (guestLimit == 0u || guestLimit > hardLimit)
++    if (guestLimit == 0u)
+     {
+-        return hardLimit;
++        return std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+     }
+-    return guestLimit;
++    return std::min(guestLimit, PS2_RAM_SIZE);
+ }
+ 
+ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1646,12 +1644,6 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+         base = alignGuestHeapValue(clampGuestHeapBase(fallbackBase), kGuestHeapDefaultAlignment);
+     }
+ 
+-    if (limit <= base)
+-    {
+-        base = alignGuestHeapValue(clampGuestHeapBase(m_guestHeapSuggestedBase), kGuestHeapDefaultAlignment);
+-        limit = clampGuestHeapLimit(0u);
+-    }
+-
+     if (limit <= base)
+     {
+         base = 0u;
+@@ -1972,7 +1964,7 @@ uint32_t PS2Runtime::guestHeapEnd() const
+ uint32_t PS2Runtime::guestHeapLimit() const
+ {
+     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
++    return m_guestHeapLimit;
+ }
+ 
+ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..4139362 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -889,6 +889,53 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(ee.semaphore(gSchedulerSemaphoreId)->count, 0, "direct handoff must not increment count");
+         });
+ 
++        tc.Run("root stack permits large startup heap without crossing stack boundary", [](TestCase &t)
++        {
++            TestEnv env;
++            constexpr uint32_t stackBase = 0x01FE0000u;
++            setRegU32(env.ctx, 5, stackBase);
++            setRegU32(env.ctx, 6, 0x00020000u);
++            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime), "SetupThread dispatches");
++            setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x100u);
++            setRegU32(env.ctx, 4, 0x0083991Cu);
++            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
++            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap dispatches");
++            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap dispatches");
++            t.Equals(::getRegU32(&env.ctx, 2), stackBase, "heap ends at stable stack base, independently of live SP");
++            const uint32_t allocation = env.runtime.guestMalloc(0x0179E020u);
++            t.IsTrue(allocation >= 0x00839920u, "large startup allocation succeeds above static data");
++            t.IsTrue(static_cast<uint64_t>(allocation) + 0x0179E020u <= stackBase,
++                     "startup allocation does not enter the root stack");
++            t.Equals(env.runtime.guestMalloc(0x10000u), 0u, "allocation exceeding remaining heap fails");
++
++            setRegU32(env.ctx, 4, 0x0083991Cu);
++            setRegU32(env.ctx, 5, 0xFFFFFFFEu);
++            callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(env.runtime.guestHeapLimit(), stackBase, "finite overflowing request is bounded by root stack");
++            for (const uint32_t invalidBase : {stackBase, PS2_RAM_SIZE, 0xFFFFFFFFu})
++            {
++                setRegU32(env.ctx, 4, invalidBase);
++                setRegU32(env.ctx, 5, 0xFFFFFFFFu);
++                callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime);
++                t.Equals(::getRegU32(&env.ctx, 2), 0u, "invalid range fails without wraparound");
++                t.Equals(env.runtime.guestHeapLimit(), stackBase, "invalid range never widens configured heap");
++            }
++        });
++
++        tc.Run("heap defaults and invalid configuration do not silently widen", [](TestCase &t)
++        {
++            TestEnv env;
++            t.Equals(env.runtime.guestHeapLimit(), 0x01F00000u, "unconfigured heap reports its default ceiling");
++            setRegU32(env.ctx, 4, 0x0083991Cu);
++            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
++            callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(env.runtime.guestHeapLimit(), 0x01F00000u, "missing stack metadata preserves default ceiling");
++            env.runtime.configureGuestHeap(0x01FE0000u, 0x01FE0000u);
++            t.Equals(env.runtime.guestMalloc(16u), 0u, "empty configured range cannot fall back to wider heap");
++            env.runtime.configureGuestHeap(PS2_RAM_SIZE, PS2_RAM_SIZE);
++            t.Equals(env.runtime.guestMalloc(16u), 0u, "RAM endpoint cannot wrap to a valid heap base");
++        });
++
+         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
+         {
+             TestEnv env;
+@@ -1064,7 +1111,7 @@ void register_ps2_runtime_kernel_tests()
+             setRegU32(env.ctx, 4, 0xFFFFFFFFu);
+             t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+             const uint32_t clampedBase = static_cast<uint32_t>(getRegS32(env.ctx, 2));
+-            t.IsTrue(clampedBase < PS2_RAM_SIZE, "SetupHeap should normalize out-of-range base into guest RAM");
++            t.Equals(clampedBase, 0u, "SetupHeap should reject out-of-range base without wraparound");
+ 
+             t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+             const uint32_t heapEnd = static_cast<uint32_t>(getRegS32(env.ctx, 2));

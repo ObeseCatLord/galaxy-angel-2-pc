@@ -1,0 +1,55 @@
+{
+  "bounded_native_narration_observation_accepted": true,
+  "consumed_advance_input_accepted": false,
+  "voiced_dialogue_accepted": false,
+  "normal_runtime_speed_accepted": false,
+  "native_stock_scene_timing_parity_accepted": false,
+  "raw_typed_native_clock_samples_accepted": true,
+  "raw_stock_register_extraction_accepted": true,
+  "stock_timed_oracle_accepted": false,
+  "offline_stock_parser_tests": 16,
+  "private_pcm_observer_semantics_accepted": true,
+  "completed_producer_capture_accepted": false,
+  "shipping_change_applied": false,
+  "public_source_baseline": 23,
+  "allfive_public_native_baseline": 22,
+  "full_goal_complete": false,
+  "reviewers": [
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "typed native clock/partial profile"
+    },
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "fresh stock register ABI and raw states"
+    },
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "PCM observer semantics and member hashes"
+    },
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "narration observations and offline parser"
+    }
+  ],
+  "private_artifacts": [
+    "research/native-clock36",
+    "research/native-pcm37"
+  ],
+  "accepted_native_dialogue_binary_sha256": "0d0e61b6c0942e56f8461522a30db171127381b45f54637c18a8ca92c1c906c1",
+  "private_producer_binary_sha256": "705d4ef20fadfe6319ab3e1b236bc038e39f54112989d9c9c6da0bc900a62493",
+  "evidence_sha256": {
+    "native_dialogue_observation": "8167a79bde8ecb82448ae37002d66dcd184a7f1752aa2a97a5634b1cb4ffb27d",
+    "native_clock_disposition": "5d7ada2431cee012574116eae899c0114505d3ea17e4c77659f0fc741507ff4a",
+    "parser_verification": "4c5696f0ff39adf76cc50fee47ff725f340ac9db8d11d6dccc7de7ae90307c0d",
+    "checkpoint_review": "16d59735fee1792aece6349220ff9a0e470d6df2ed51d273bf0a8cfe145f3970"
+  }
+}

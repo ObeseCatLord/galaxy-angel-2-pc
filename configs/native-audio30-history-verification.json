@@ -1,0 +1,21 @@
+{
+  "status": "accepted-bounded-original-requests-and-positive-stock-bank-identity",
+  "review_model": "gpt-6-astra",
+  "review_effort": "ultra",
+  "capture": "20261010-085414",
+  "gates": ["native27-observation-gate", "native29-observation-gate", "native30-history-gate"],
+  "requested_store_count": 2229,
+  "requested_sh_count": 2223,
+  "requested_sw_count": 6,
+  "observer_frozen_input_count": 47,
+  "stock_bank_bytes": 96704,
+  "stock_bank_unique_byte_address": 151952,
+  "stock_bank_sha256": "016bd49e3001059d11990dd344cfdfc07bc08fe0d77f6404caf42533aedf530d",
+  "stock_scene_provenance_reconciled": false,
+  "missed_breakpoint_completeness_proved": false,
+  "native_sample_ram_proved": false,
+  "native_audio_proved": false,
+  "private31_integration_accepted": false,
+  "gameplay_or_feature_gate_passed": false,
+  "public_baseline": "source23/allfive-native22"
+}

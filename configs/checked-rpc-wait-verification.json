@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "kind": "checked-native-rpc-wait-source-verification",
+  "patch_prefix": 17,
+  "patch_file": "0017-checked-native-rpc-wait.patch",
+  "patch_sha256": "e458c7ec1496802649fe5598a4991fd594aaa093c180001cb4ca10e329825e5a",
+  "review": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "ultra",
+    "effective_settings_independently_verified": true,
+    "scope": "13-file final source approval; original-game wait and PCM acceptance open"
+  },
+  "checks": {
+    "runtime_tests_passed": 485,
+    "runtime_tests_failed": 0,
+    "iop_suites_passed": 9,
+    "iop_suites_failed": 0,
+    "tooling_tests_passed": 27,
+    "tooling_tests_failed": 0,
+    "final_ioman_boundaries_asan_ubsan": "passed; leak detection enabled, no sanitizer findings",
+    "fresh_patch_source_files_equal": 72,
+    "fresh_and_live_idempotence_prefix": 17
+  },
+  "boundaries": [
+    "two registered DMA IRQs; original MIPS semaphore signal and same GP/SP/RA continuation",
+    "same-pump signals preserve immediate token handoff; competing poll cannot steal",
+    "pending vs acquired reservation; second token owned-worker wait allowed",
+    "ordinary owned waits, existing/new competing waits, checked scheduler faults and real device-read exception cleanup",
+    "normal JAL ExitThread/ExitDeleteThread and actual deletion",
+    "server erasure/replacement while blocked: current default reply retained, next RPC uses replacement",
+    "one absolute instruction/cycle budget across waits and recursive imports; exact-deadline tail completion",
+    "pending semaphore deletion fails; acquired deletion preserves completed wait",
+    "native bridge and host failure: negative result, no receive mutation/fallback/callback/completion; stale binding/serial cleanup boundary"
+  ],
+  "native_builds": {
+    "all_five": "final patch17 native builds complete; no native gameplay acceptance",
+    "source_commit": "cea34d2"
+  },
+  "pre_final_diagnostic": {
+    "capture": "captures/native-zettai/20261009-141543",
+    "event_sha256": "87a973705361577b5cf2554f2d1df0fa60f779a87c27c91c95fa44b9895e5e0a",
+    "revision": "revised candidate before final pending/acquired guard and return-sentinel corrections; not final patch17 execution",
+    "units_O0": 5,
+    "actual_seconds": 326.549,
+    "rpc_entries": 12,
+    "rpc_completed": 11,
+    "rpc_failed": 1,
+    "failed_function_address": 702772,
+    "gp": 773360,
+    "instruction_delta": 2000000,
+    "cycle_delta": 2000000,
+    "status": "ResetRequired",
+    "failure_result": -5,
+    "busy_word_after": 0,
+    "transfer_semaphore_after": 4294967295,
+    "explicit_semaphore_after": 9,
+    "observer_errors": [],
+    "caps": {},
+    "pending_finishes": 0,
+    "excluded_event_kinds": [
+      "checked-incomplete-guest-call"
+    ],
+    "exclusion_reason": "Debugger source-line conditions emitted mislabeled completed frames; excluded from guest fault-PC/cause proof. Separate checked-RPC Finish status/counters retained.",
+    "owned_audio": "zero recorded signal; no voice/PCM acceptance",
+    "astra_independent_verification": "Astra Ultra independently verified all12RPC Finish records/counter differences/negative result/latch and record/provenance hashes; no fault-PC/cause/final-revision/PCM acceptance."
+  },
+  "remaining": "Identify earlier incomplete native RPC actual caller/module/instruction/wait and worker effects, then original bank signal/reservation/same-frame/subsequent-chunk proof, real SPU PCM/voices, scenes/battles/saves/trilogy/transitions/unified import application/enhancements/language/mods; later VR."
+}

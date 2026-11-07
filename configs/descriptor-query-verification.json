@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 13,
+  "source": {
+    "descriptor": "002cf7c0",
+    "active_pointer": "007fb780",
+    "getter": "0022f8d8",
+    "getter_return": "0023104c",
+    "callback_slot": "20",
+    "missing_entry": "0023f0f8",
+    "jalr": "00231054",
+    "provenance_capture": "20261009-044424",
+    "registration_native": "unobserved; getter return and callback slot verified",
+    "switch_table": "002ec9c0",
+    "switch_targets": [
+      "0x23f128",
+      "0x23f130",
+      "0x23f140",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f138",
+      "0x23f148",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f158",
+      "0x23f138",
+      "0x23f150"
+    ],
+    "emitted_words_verified": 25,
+    "omitted_zero_delay_words_verified": [
+      "0023f120"
+    ],
+    "existing_case_body_hashes": {
+      "caseD_1_0x23f128.cpp": "5c04a4ba4eb2500f328ae9b63e17a2f166a1bf6f203866acd3a468d7b5bb15e7",
+      "caseD_2_0x23f130.cpp": "327f8f0ff198852b8afbe94255ed6e521e1569c86351a3fe3143c820b0af5596",
+      "caseD_12_0x23f138.cpp": "adc3d01235c74e0583cae8aacd322d9494271c0f70cc1e8bc0a253ced5462271",
+      "caseD_3_0x23f140.cpp": "1f0dce28c8154777b86a5c626f74215376b6994e903561baa7d0480d99496120",
+      "caseD_13_0x23f148.cpp": "6f390461aa4e5f7e1be9051554d8bfe0a784b2e99916f79bbc7e81098666ca0d",
+      "caseD_23_0x23f150.cpp": "5cd5c88c0a131af37aa5c62bc133835d8f27a925f870b98e5ad11dce34ffab7a",
+      "caseD_4_0x23f158.cpp": "c83872329b1ec90d06e056a396387ac7cabee7e744645829dc3e7956751fd877"
+    }
+  },
+  "generation": {
+    "method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+    "entry_hints_total": 23,
+    "config_sha256": "ec46ef95559f97a9b2527d7b1d3ce25e2344c3b04fd0c3fb44cad9511e4ba03e",
+    "config_artifact": "private analysis/zettai/recomp.toml",
+    "entry_profile_artifact": "configs/recomp-entry-points.json",
+    "entry_profile_sha256": "3f9484b8548f4a9361e6e2315032484025312005d29abfcb9db63da6737fcc8b",
+    "changed_files": [
+      {
+        "file": "entry_23f0f8_0x23f128.cpp",
+        "old_sha256": null,
+        "new_sha256": "93fd772378455d7dcd5159c2970f8a77aeffe6ee7b0e5cde2a8f1fb894b5f784"
+      },
+      {
+        "file": "ps2_recompiled_functions.h",
+        "old_sha256": "5f4687daee52a8690e4cada9ab6265e0409a9a7cd6a7712b3e53c6e1dd34ea0d",
+        "new_sha256": "4c6379bf1cfa6846a4317148776eeae15b3a0b25896eed806b90fbeb24623064"
+      },
+      {
+        "file": "register_functions.cpp",
+        "old_sha256": "0e7ee2c186f89b956155fceddbcd3c1df5825baa27ce38dbe2aa08ae7810f442",
+        "new_sha256": "21cabed2ad965b74f730910c5ff7e5066abb59dd06c55bf652f921d51b46ee9f"
+      }
+    ],
+    "obsolete_files": [],
+    "header_registered_instruction_addresses": 12
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "Astra Ultra accepted final source/observer/native selector19 completion; independently verified all35live tablewords againstoriginalELF, raw128savedregisters and3publicationhashes; registration/otherselectors unobserved",
+    "document": "docs/reviews/descriptor-query-entry.md"
+  },
+  "tests": {
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "runtime": "production unchanged from475 runtime tests/9 IOP suites"
+  },
+  "native": {
+    "build": "native target rebuild completed successfully",
+    "query_return_verified": true,
+    "scene_verified": false,
+    "audio_verified": false,
+    "binary_sha256": "e3a88a8b27277a98c56d427134b878441aec1ae57bc380f11f9cc7a748f11f11",
+    "binary_size": 364380952,
+    "focused_capture": "20261009-045919",
+    "ordinary_capture": "20261009-045920",
+    "resolved_hooks": 8,
+    "probe_errors": 0,
+    "entry_samples": 1,
+    "case_samples": 1,
+    "return_samples": 1,
+    "selector": 19,
+    "selected_case": "0023f148",
+    "result": 4,
+    "output_word_before": 0,
+    "output_word_after": "00006db0",
+    "two_neighbor_words_unchanged": true,
+    "full128_gp_sp_ra_unchanged": true,
+    "raw128_comparison": "independently compared entry/return snapshots",
+    "all35_live_table_entries_match_original": true,
+    "active_descriptor": "002cf7c0",
+    "active_slot20": "0023f0f8",
+    "return_pc": "0023105c",
+    "pending_samples": 0,
+    "native_unobserved": "other selectors and invalid selector path; original registration execution",
+    "ordinary_last_frame": "25.2s magenta viewport with black borders; visually inspected",
+    "next_missing_target": "0023ed20",
+    "next_missing_source": "00237ae8",
+    "debugger_exit_code": 0,
+    "natural_exit_code": null,
+    "bounded_stop": true
+  }
+}

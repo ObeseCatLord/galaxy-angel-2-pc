@@ -1,0 +1,340 @@
+From 08e513c0b2889188dce9819bf56c7739300b273d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:33:22 -0500
+Subject: [PATCH] ga2: code review 55 fixes, round 3
+
+- EE invocation stacks: when the arena is full, a slot whose invocation
+  retired is re-keyed instead of ending the session; exhaustion with every
+  slot live logs the slot owners (code-review51 F4 / review 55 C2).
+- Memory-card RPC results come from the command that just ran
+  (takeMemoryCardCommandResult) instead of a global read afterwards; a
+  command that posts nothing is logged and fails (C5).
+- ELF segments overlapping the native SDK pools in kernel RAM are refused
+  at load; pool bounds live in runtime/ee_kernel_ram.h (C1).
+- Generic IOP->EE reverse RPC uses the SDK metadata pointer rule (aligned
+  main-RAM aliases) for server, buffer and reply, and logs rejections (C4).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_kernel_ram.h   | 14 ++++++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    | 33 +++++++++++++++++--
+ .../src/lib/Kernel/Stubs/MemoryCard.cpp       |  9 +++++
+ ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.h |  4 +++
+ .../src/lib/Kernel/Syscalls/Helpers/State.h   |  9 +++--
+ ps2xRuntime/src/lib/ps2_iop_host.cpp          | 33 +++++++++++++++----
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  9 +++++
+ ps2xTest/src/ee_owner_tests21.cpp             | 16 +++++++++
+ ps2xTest/src/ps2_idle_irq_stack_tests.cpp     | 25 ++++++++++++++
+ 9 files changed, 138 insertions(+), 14 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ee_kernel_ram.h
+
+diff --git a/ps2xRuntime/include/runtime/ee_kernel_ram.h b/ps2xRuntime/include/runtime/ee_kernel_ram.h
+new file mode 100644
+index 0000000..48529dd
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ee_kernel_ram.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstdint>
++
++// Native SDK pools (RPC packets/servers, TLS, boot mode) live in EE kernel RAM
++// below 0x80000, which games never touch; at the top of user RAM they
++// overlapped game heaps (Eigou's file buffers at 0x01F0xxxx were corrupted by
++// server records). The ELF loader and the invocation-stack arena refuse
++// anything that overlaps them.
++namespace ps2_kernel_ram
++{
++    inline constexpr uint32_t kNativeSdkPoolBase = 0x00020000u;
++    inline constexpr uint32_t kNativeSdkPoolEnd = 0x00051000u;
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c4586c2..171311a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+ #include "runtime/ee_guest_range.h"
++#include "runtime/ee_kernel_ram.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -1453,7 +1454,7 @@ void EeScheduler::configureInvocationStackArena(uint32_t begin, uint32_t end)
+     if (overlaps(m_runtime.guestHeapBase(), m_runtime.guestHeapLimit()))
+         throw std::runtime_error("EE callback arena overlaps guest heap entitlement");
+     // Existing native SDK packet/server/TLS/boot-mode pools are fixed claims.
+-    if (overlaps(0x00020000u, 0x00051000u)) // kNativeSdkPoolBase..kNativeSdkPoolEnd
++    if (overlaps(ps2_kernel_ram::kNativeSdkPoolBase, ps2_kernel_ram::kNativeSdkPoolEnd))
+         throw std::runtime_error("EE callback arena overlaps native SDK storage");
+     for (const auto &[id, owner] : m_threads)
+     {
+@@ -1628,10 +1629,36 @@ EeScheduler::InvocationStackChoice EeScheduler::selectInvocationStack()
+         return {existing->second, existing->second + 0x10u - kInvocationStackSize,
+                 existing->second + 0x10u};
+     }
+-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
++    uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+     if (top == 0u)
+     {
+-        throw std::runtime_error("EE invocation stack space exhausted");
++        // The arena is full. Slots stay keyed by (owner, depth) after their
++        // invocation retires, so re-key one that no live or queued invocation holds.
++        const auto held = [this](uint32_t slotTop)
++        {
++            const auto holds = [slotTop](const GuestInvocation &invocation)
++            { return invocation.stackReservationEnd == slotTop + 0x10u; };
++            if (std::any_of(m_pendingInvocations.begin(), m_pendingInvocations.end(), holds)) return true;
++            for (const auto &[id, thread] : m_threads)
++                if (std::any_of(thread.invocations.begin(), thread.invocations.end(), holds)) return true;
++            return false;
++        };
++        for (auto it = m_invocationStackTops.begin(); it != m_invocationStackTops.end(); ++it)
++        {
++            if (held(it->second)) continue;
++            top = it->second;
++            m_invocationStackTops.erase(it);
++            break;
++        }
++        if (top == 0u)
++        {
++            std::fprintf(stderr, "[ee] invocation stack arena exhausted; slots:");
++            for (const auto &[slotKey, slotTop] : m_invocationStackTops)
++                std::fprintf(stderr, " owner=%d/depth=%u@0x%x", static_cast<int32_t>(slotKey >> 32u),
++                             static_cast<uint32_t>(slotKey), slotTop);
++            std::fprintf(stderr, " request owner=%d/depth=%zu\n", static_cast<int32_t>(keyOwner), depth);
++            throw std::runtime_error("EE invocation stack space exhausted");
++        }
+     }
+     validateIsolatedInvocationStack(top);
+     m_invocationStackTops.emplace(key, top);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 3b1ee44..26fd612 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -487,6 +487,15 @@ namespace ps2_stubs
+         }
+     }
+ 
++    std::optional<int32_t> takeMemoryCardCommandResult()
++    {
++        std::lock_guard<std::mutex> lock(g_mcStateMutex);
++        if (!g_mcCommandPending)
++            return std::nullopt;
++        g_mcCommandPending = false;
++        return g_mcLastResult;
++    }
++
+     MemoryCardDebugSnapshot getMemoryCardDebugSnapshot()
+     {
+         MemoryCardDebugSnapshot snapshot{};
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.h b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.h
+index 2a71bb2..6db4406 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.h
+@@ -3,6 +3,7 @@
+ #include "ps2_stubs.h"
+ 
+ #include <array>
++#include <optional>
+ #include <cstdint>
+ #include <filesystem>
+ #include <string>
+@@ -37,6 +38,9 @@ namespace ps2_stubs
+     };
+ 
+     MemoryCardDebugSnapshot getMemoryCardDebugSnapshot();
++    // Result posted by the sceMc* call that just ran, consumed once; empty when
++    // that call posted none (sceMcInit, or a stub that returned early).
++    std::optional<int32_t> takeMemoryCardCommandResult();
+     void sceMcChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceMcChdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index fcc388b..f0d009d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "runtime/ee_kernel_ram.h"
+ #include <cstddef>
+ #include <cstdint>
+ 
+@@ -257,11 +258,9 @@ inline std::filesystem::path g_host_cwd;
+ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
+-// Native SDK pools live in kernel RAM (below 0x80000), which games never
+-// touch; at the top of user RAM they overlapped game heaps (Eigou's file
+-// buffers at 0x01F0xxxx were corrupted by server records).
+-static constexpr uint32_t kNativeSdkPoolBase = 0x00020000;
+-static constexpr uint32_t kNativeSdkPoolEnd = 0x00051000;
++// Native SDK pools live in kernel RAM; see runtime/ee_kernel_ram.h.
++static constexpr uint32_t kNativeSdkPoolBase = ps2_kernel_ram::kNativeSdkPoolBase;
++static constexpr uint32_t kNativeSdkPoolEnd = ps2_kernel_ram::kNativeSdkPoolEnd;
+ static constexpr uint32_t kRpcPacketSize = 64;
+ static constexpr uint32_t kRpcPacketPoolBase = kNativeSdkPoolBase;
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 83ec575..3e5e013 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -191,11 +191,23 @@ bool PS2IopHostAdapter::submitGenericReverseRpc(const ps2x::iop::ReverseRpcReque
+     constexpr uint32_t kReplyBytes = 64u;
+     uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+     const auto physical = [](uint32_t address) { return address & 0x1FFFFFFFu; };
+-    const auto inRam = [&](uint32_t address, uint32_t size)
+-    { return physical(address) < PS2_RAM_SIZE && size <= PS2_RAM_SIZE - physical(address); };
+-    if (!rdram || !endpoint.isCurrent || !endpoint.complete || !endpoint.isCurrent() ||
+-        !inRam(request.serverAddress, 68u) || !inRam(request.bufferAddress, request.send.size()))
++    // Same pointer rule as the SDK metadata walk: aligned main-RAM aliases only,
++    // so a corrupted record cannot reach scratchpad or mirrored addresses.
++    const auto inRam = [](uint32_t address, uint32_t size) { return nativeRpcRamRange(address, size); };
++    const auto rejected = [](const char *what, uint32_t address)
++    {
++        static bool logged = false;
++        if (!logged)
++            std::cerr << "[reverse rpc] rejected " << what << " 0x" << std::hex << address << std::dec << '\n';
++        logged = true;
+         return false;
++    };
++    if (!rdram || !endpoint.isCurrent || !endpoint.complete || !endpoint.isCurrent())
++        return false;
++    if (!inRam(request.serverAddress, 68u))
++        return rejected("server", request.serverAddress);
++    if (!inRam(request.bufferAddress, request.send.size()))
++        return rejected("buffer", request.bufferAddress);
+     const auto word = [&](uint32_t address)
+     {
+         uint32_t value = 0;
+@@ -216,7 +228,7 @@ bool PS2IopHostAdapter::submitGenericReverseRpc(const ps2x::iop::ReverseRpcReque
+                   << (word(sd + 8u) != request.bufferAddress || !m_runtime.hasFunction(func) ? " REJECTED" : "") << '\n';
+     }
+     if (word(sd + 8u) != request.bufferAddress || !m_runtime.hasFunction(func))
+-        return false;
++        return rejected("server record", sd);
+ 
+     std::memcpy(rdram + physical(request.bufferAddress), request.send.data(), request.send.size());
+     putWord(sd + 12u, static_cast<uint32_t>(request.send.size())); // size
+@@ -249,6 +261,7 @@ bool PS2IopHostAdapter::submitGenericReverseRpc(const ps2x::iop::ReverseRpcReque
+         std::array<uint8_t, kReplyBytes> bytes{};
+         if (!ram || !inRam(reply, kReplyBytes))
+         {
++            std::cerr << "[reverse rpc] reply pointer 0x" << std::hex << reply << std::dec << " rejected\n";
+             shared->complete(-1, {});
+             return;
+         }
+@@ -818,10 +831,18 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
+     setRegU32(&context, 8, request.arguments[4]);
+     setRegU32(&context, 9, request.arguments[5]);
+ 
++    (void)ps2_stubs::takeMemoryCardCommandResult(); // drop anything stale
+     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
+             &context,
+             &m_runtime);
+-    const int32_t result = ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
++    int32_t result = 0;
++    if (const auto posted = ps2_stubs::takeMemoryCardCommandResult())
++        result = *posted;
++    else if (request.operation != ps2x::iop::MemoryCardOperation::Init)
++    {
++        std::cerr << "[mc] op=" << static_cast<int>(request.operation) << " posted no result\n";
++        result = -1;
++    }
+     static const bool trace = std::getenv("GA2_MC_TRACE") != nullptr;
+     if (trace)
+         std::cerr << "[mc] op=" << static_cast<int>(request.operation) << std::hex << " args=0x" << request.arguments[0]
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d39c42e..a78e61a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ee_kernel_ram.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+@@ -1066,6 +1067,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+             return false;
+         }
+ 
++        if (!scratch && physAddr < ps2_kernel_ram::kNativeSdkPoolEnd &&
++            ps2_kernel_ram::kNativeSdkPoolBase < segmentMemEnd)
++        {
++            std::cerr << "ELF segment " << i << " overlaps the runtime's kernel-RAM pools (vaddr=0x"
++                      << std::hex << ph.vaddr << " memsz=0x" << ph.memsz << std::dec << ")." << std::endl;
++            return false;
++        }
++
+         uint8_t *destBase = scratch ? m_memory.getScratchpad() : m_memory.getRDRAM();
+         if (!destBase)
+         {
+diff --git a/ps2xTest/src/ee_owner_tests21.cpp b/ps2xTest/src/ee_owner_tests21.cpp
+index 1926b89..0c0d53f 100644
+--- a/ps2xTest/src/ee_owner_tests21.cpp
++++ b/ps2xTest/src/ee_owner_tests21.cpp
+@@ -869,6 +869,22 @@ void register_ee_owner_tests21()
+                      "reset after partial load must consume its intended context with another fresh lifetime");
+         });
+ 
++        tc.Run("ELF segments overlapping the native SDK pools in kernel RAM are refused", [](TestCase &t)
++        {
++            Env env;
++            t.IsTrue(env.runtime.memory().initialize(), "loader requires actual RDRAM backing");
++            R5900Context main{};
++            resetAndBind(env, main, kReturnEntry);
++            TempElf overlapping(0x00100000u, 0x00050FFCu, 8u);
++            t.IsFalse(env.runtime.loadELF(overlapping.path.string()),
++                      "a segment reaching into the pools must fail the load");
++            t.Equals(read32(env.runtime.memory().getRDRAM(), 0x00050FFCu), 0u,
++                     "refused segment must not write kernel RAM");
++            TempElf adjacent(0x00100000u, 0x00051000u, 4u);
++            t.IsTrue(env.runtime.loadELF(adjacent.path.string()),
++                     "a segment starting at the pool end must load");
++        });
++
+         tc.Run("throwing queued cancellation retries through actual cold-discard cleanup", [](TestCase &t)
+         {
+             Env env;
+diff --git a/ps2xTest/src/ps2_idle_irq_stack_tests.cpp b/ps2xTest/src/ps2_idle_irq_stack_tests.cpp
+index e74c7c3..7825eb8 100644
+--- a/ps2xTest/src/ps2_idle_irq_stack_tests.cpp
++++ b/ps2xTest/src/ps2_idle_irq_stack_tests.cpp
+@@ -485,6 +485,31 @@ void register_ps2_idle_irq_stack_tests()
+             t.IsTrue(exhausted, "a fifth live callback reservation must exhaust the four-frame arena");
+         });
+ 
++        tc.Run("configured arena re-keys slots whose invocations retired", [](TestCase &t)
++        {
++            TestEnv env;
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            R5900Context main{};
++            setReg(main, 29, 0x00180000u);
++            scheduler.reset(env.ram.data(), main);
++            scheduler.bindMainContextForSyscall(main, env.ram.data());
++            // Each external invocation deepens the owner without holding a slot, so
++            // every depth asks for a new key; slots no invocation holds are re-keyed.
++            std::vector<uint32_t> tops;
++            for (int depth = 0; depth < 6; ++depth)
++            {
++                tops.push_back(scheduler.invocationStackTop());
++                GuestInvocation external{};
++                setReg(external.context, 29, 0x00018000u);
++                try { scheduler.invokeCurrent(std::move(external)); }
++                catch (const EeDispatcherTransfer &) {}
++            }
++            for (uint32_t top : tops)
++                t.IsTrue(top >= kInvocationArenaBegin && top < kInvocationArenaEnd, "re-keyed slot must stay in the arena");
++            t.IsTrue(tops[4] != 0u && tops[5] != 0u, "fifth and sixth keys must reuse retired slots");
++        });
++
+         tc.Run("arena rejects mirror registration and removal before map or memory mutation", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.55.0
+

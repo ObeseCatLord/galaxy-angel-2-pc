@@ -1,0 +1,1926 @@
+From 3336180ecb205a8651cdf2c298c63fe076819ae5 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 14:02:22 -0500
+Subject: [PATCH] In-game settings menu (F2) and a live settings registry
+
+The launcher's options (ga2_options.h, one table shared with the launcher) become runtime-adjustable
+values (ga2_settings): the engines take them from the environment as before (or settings.ini under
+GA2_DATA_DIR for what is unset), and the in-game menu changes them and saves settings.ini at once,
+so launcher and game stay in sync. F2 opens the settings page of the cheat menu (the cheats page has
+a Settings row for gamepad and VR controllers).
+
+Live: display, screen shape (window follows), sides, 2D scene size, 2D filter (shaders built on demand),
+dithering (applied at vsync), button prompts, on-screen pad, texture dump (textures loaded from then
+on), frame rate between 60 and the run's top rate (governor ladder follows setUserCap). Hor+ is live
+through the game side (SC native/compat). Language, resolution, VR and frame rates above the run's top
+are marked restart and applied by the next start.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                  |   2 +
+ ps2xRuntime/include/runtime/ga2_framepace.h |   4 +
+ ps2xRuntime/include/runtime/ga2_options.h   | 151 ++++++++++
+ ps2xRuntime/include/runtime/ga2_settings.h  |  54 ++++
+ ps2xRuntime/include/runtime/gs/gs_pgs.h     |   3 +
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp      | 133 ++++++---
+ ps2xRuntime/src/lib/ga2_cheat_menu.h        |   9 +-
+ ps2xRuntime/src/lib/ga2_framepace.cpp       |   8 +
+ ps2xRuntime/src/lib/ga2_present.cpp         | 195 +++++++++----
+ ps2xRuntime/src/lib/ga2_present.h           |   5 +-
+ ps2xRuntime/src/lib/ga2_settings.cpp        | 258 +++++++++++++++++
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp   | 298 ++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_settings_menu.h     |  36 +++
+ ps2xRuntime/src/lib/ga2_vr.cpp              |   3 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp           |  33 +++
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp      |  48 +++-
+ ps2xRuntime/src/lib/gs/gs_texpacks.h        |   4 +
+ ps2xRuntime/src/lib/ps2_mouse.cpp           |   9 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp         |   4 +
+ ps2xTest/CMakeLists.txt                     |   1 +
+ ps2xTest/src/ga2_settings_tests.cpp         | 119 ++++++++
+ ps2xTest/src/main.cpp                       |   2 +
+ 22 files changed, 1265 insertions(+), 114 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_options.h
+ create mode 100644 ps2xRuntime/include/runtime/ga2_settings.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_settings.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_settings_menu.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_settings_menu.h
+ create mode 100644 ps2xTest/src/ga2_settings_tests.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index adf3ea9..c5db575 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -403,6 +403,8 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
+     src/lib/ga2_cheat_menu.cpp
++    src/lib/ga2_settings.cpp
++    src/lib/ga2_settings_menu.cpp
+     src/lib/ga2_stereo.cpp
+     src/lib/ga2_framepace.cpp
+     src/lib/ps2_rom_device.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index f824eec..cd83b5d 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -28,6 +28,10 @@ namespace ga2_framepace
+     // The rate the game runs at now: fps() is the maximum, the game side's governor lowers it (down to 60, the
+     // native cadence) when the host cannot keep up and raises it again. 0 when not enabled.
+     int rate();
++    // Main thread (the settings menu): the highest rate the player wants now, at most fps(); 60 means the native
++    // cadence, 0 the rate the run started with. The game side's governor follows it at an iteration boundary.
++    void setUserCap(int cap);
++    int userCap();
+     // Game thread, at an iteration boundary: run at `rate` frames per second from now (clamped to 60..fps()); retunes
+     // the frame clock. Returns the previous rate.
+     int setRate(PS2Runtime &runtime, int rate);
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+new file mode 100644
+index 0000000..aeffb58
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -0,0 +1,151 @@
++// The player options, one table shared by the launcher's Options screen
++// (native/launcher/settings.cpp), the in-game settings menu
++// (src/lib/ga2_settings_menu.cpp) and the runtime's settings registry
++// (ga2_settings.h). Header only, so the launcher needs no runtime library.
++//
++// Values live in <data>/settings.ini (key=value); the launcher hands them to
++// the engines as the environment variables named here.
++#pragma once
++
++#include <cstddef>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++namespace ga2_options
++{
++    // Index into options(); the launcher's and the registry's arrays use it.
++    enum Key : size_t
++    {
++        Language,
++        Resolution,
++        Fullscreen,
++        Aspect,
++        Widescreen3d,
++        Sides,
++        Scale2d,
++        Filter,
++        Fps,
++        Dither,
++        Buttons,
++        Vr,
++        OnscreenPad,
++        DumpTextures,
++        KeyCount
++    };
++
++    // Whether the running game can take the change at once. Restart options
++    // are saved and applied by the next start (the launcher, or the engine
++    // with GA2_DATA_DIR set, reads settings.ini).
++    enum class Apply
++    {
++        Live,
++        Restart
++    };
++
++    struct Choice
++    {
++        const char *value; // stored in settings.ini
++        const char *label; // shown in the menus
++    };
++
++    struct Option
++    {
++        const char *key;   // settings.ini key
++        const char *label;
++        const char *help;  // one line under the list
++        const char *env;   // the variable the engines read
++        Apply apply;
++        std::vector<Choice> choices; // the first is the default
++    };
++
++    inline const std::vector<Option> &options()
++    {
++        static const std::vector<Option> table = {
++            {"language", "Language", "Game names in the window title (language packs follow the same setting).", "GA2_LANG",
++             Apply::Restart, {{"ja", "Japanese"}, {"en", "English"}}},
++            {"resolution", "Internal resolution", "3D detail (the 2D art is drawn at its native 640x448 size; 4x needs a fast GPU).",
++             "GA2_PGS_SSAA", Apply::Restart, {{"0", "Native (640x448)"}, {"1", "2x (1280x896)"}, {"2", "4x (2560x1792)"}}},
++            {"fullscreen", "Display", "F11 or Alt+Enter also switches while playing.", "GA2_FULLSCREEN", Apply::Live,
++             {{"0", "Window"}, {"1", "Fullscreen"}}},
++            {"aspect", "Screen shape", "Shape of the play area. 4:3 scenes are centred in wider shapes.", "GA2_ASPECT", Apply::Live,
++             {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9 ultrawide"}, {"4:3", "4:3 (PS2)"}, {"fit", "Fill the window"}}},
++            {"widescreen3d", "3D widescreen (hor+)",
++             "3D scenes show more to the sides on wide screens (same height as the PS2's view; menus and text keep their shape).",
++             "GA2_WIDESCREEN_3D", Apply::Live, {{"1", "On"}, {"0", "Off (4:3 with sides)"}}},
++            {"sides", "Sides of 4:3 scenes", "What fills the area beside a 4:3 picture.", "GA2_SIDES", Apply::Live,
++             {{"black", "Black"}, {"blur", "Blurred picture"}, {"skybox", "Space skybox"}}},
++            {"scale2d", "2D scene size", "Visual-novel scenes: fill the play area, or whole multiples (2x, 3x) for crisp pixels.",
++             "GA2_SCALE_2D", Apply::Live, {{"fill", "Fill"}, {"integer", "Integer (crisp)"}}},
++            {"filter", "2D picture filter", "Applies to 2D scenes only; 3D scenes always use plain bilinear.", "GA2_FILTER",
++             Apply::Live,
++             {{"bilinear", "Bilinear"}, {"smooth", "Smooth (removes dither grain)"}, {"anime4k", "Anime4K"},
++              {"anime4k-hq", "Anime4K HQ (fast GPU)"}, {"sharp", "Sharp pixels"}, {"nearest", "Nearest (raw pixels)"}}},
++            {"fps", "Frame rate",
++             "Frames drawn per second; the game keeps its own speed. Needs a fast PC (a PC that can't keep up runs the game slower); VR keeps the PS2 rate.",
++             "GA2_FPS", Apply::Live, {{"60", "60 (PS2)"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}}},
++            {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
++             Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
++            {"buttons", "Button prompts", "Which button icons the games show: follows the controller or keyboard you use.",
++             "GA2_BUTTONS", Apply::Live, {{"auto", "Automatic"}, {"playstation", "PlayStation"}, {"xbox", "Xbox"}, {"keyboard", "Keyboard"}}},
++            {"vr", "VR mode", "Plays in a headset through SteamVR or Monado (OpenXR). Hold both grips to recentre the screen.",
++             "GA2_VR", Apply::Restart, {{"0", "Off"}, {"1", "On (headset)"}}},
++            {"onscreen_pad", "On-screen pad", "Clickable pad buttons beside the picture, for mouse-only play.", "GA2_ONSCREEN_PAD",
++             Apply::Live, {{"0", "Off"}, {"1", "On"}}},
++            {"dump_textures", "Dump textures (modding)",
++             "Saves every texture the game shows to <data>/dumps/textures as <hash>_<w>x<h>.png.", "GA2_TEX_DUMP", Apply::Live,
++             {{"0", "Off"}, {"1", "On"}}},
++        };
++        return table;
++    }
++
++    // The environment text for a choice. `dumpDir` is where the texture dump
++    // goes when it is on.
++    inline std::string envValue(size_t option, int choice, const std::string &dumpDir)
++    {
++        const Option &o = options()[option];
++        const std::string value = o.choices[size_t(choice)].value;
++        switch (Key(option))
++        {
++        case Resolution:
++            return value == "2" ? "16" : value == "1" ? "4" : "1";
++        case DumpTextures:
++            return value == "1" ? dumpDir : std::string();
++        default:
++            return value;
++        }
++    }
++
++    // The choice an environment text stands for; -1 when it is none of them.
++    inline int choiceFromEnv(size_t option, const std::string &text)
++    {
++        const Option &o = options()[option];
++        switch (Key(option))
++        {
++        case DumpTextures: // any path means on
++            return text.empty() ? 0 : 1;
++        case Vr: // "preview" (a developer mode) counts as on
++            if (text == "preview")
++                return 1;
++            break;
++        case Fps:
++        {
++            // GA2_FPS accepts any rate: the highest choice that is not above it.
++            const int rate = std::atoi(text.c_str());
++            if (rate < 1)
++                return -1;
++            int best = 0;
++            for (size_t c = 0; c < o.choices.size(); ++c)
++                if (std::atoi(o.choices[c].value) <= rate)
++                    best = int(c);
++            return best;
++        }
++        default:
++            break;
++        }
++        for (size_t c = 0; c < o.choices.size(); ++c)
++            if (text == envValue(option, int(c), "1"))
++                return int(c);
++        return -1;
++    }
++}
+diff --git a/ps2xRuntime/include/runtime/ga2_settings.h b/ps2xRuntime/include/runtime/ga2_settings.h
+new file mode 100644
+index 0000000..60458d1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_settings.h
+@@ -0,0 +1,54 @@
++// The player options while the game runs: the launcher's settings (ga2_options.h) as live values. The in-game
++// settings menu (src/lib/ga2_settings_menu.cpp) writes them; the consumers (presentation, hor+, frame rate, GS, ...)
++// read them each frame instead of the environment, so a change shows at once where the setting allows it.
++//
++// Start: init() takes every option from its environment variable (the launcher sets them all); a variable that is
++// not set falls back to <data>/settings.ini when GA2_DATA_DIR names the data folder (the launcher sets that too), so
++// an engine started by hand with GA2_DATA_DIR sees the same options and a handoff to another disc's engine keeps what
++// was changed in game. The launcher's settings.ini is also where changes are saved: the data folder is GA2_DATA_DIR,
++// or where the launcher keeps it (XDG_DATA_HOME/ga2, ~/.local/share/ga2, %APPDATA%\ga2).
++#pragma once
++
++#include "runtime/ga2_options.h"
++
++#include <atomic>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++
++namespace ga2_settings
++{
++    using ga2_options::Key;
++
++    // Reads the environment (and settings.ini for what is unset) once. Call before anything reads GA2_* variables:
++    // for the options that are not set it also sets them in the environment, so code that still reads the
++    // environment (the engines at their start) sees the file's values. Safe to call again.
++    void init();
++
++    // The current choice (index into ga2_options::options()[key].choices) and its value text.
++    int get(Key key);
++    const char *value(Key key);
++    // The choice the game started with (what the engines read at their start).
++    int started(Key key);
++
++    // Main thread: takes a new choice. Does not save (see save()); consumers pick it up by value() / generation().
++    void set(Key key, int choice);
++    // Counts every set(): consumers cache what they derived and rebuild when it changes.
++    uint32_t generation();
++    // The player changed it in this run (what save() writes).
++    bool changed(Key key);
++
++    // The running game cannot take `choice` of `key` now (a restart option, or a frame rate above what this run
++    // started with); the menu then says "after restart". `why` gets a short reason.
++    bool takesEffectNow(Key key, int choice, const char **why = nullptr);
++    // The saved setting differs from what this run uses and needs a restart.
++    bool restartPending(Key key);
++
++    // <data>/settings.ini. Written by save(): the keys the player changed in this run replace their lines, other
++    // lines (the launcher's window_scale, options this run did not touch) stay as they are.
++    std::filesystem::path dataDir();
++    std::filesystem::path settingsFile();
++    bool save();
++    // The folder for texture dumps (<data>/dumps/textures).
++    std::string dumpDirectory();
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 3430764..6a9e06b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -38,6 +38,9 @@ namespace ga2_pgs
+     void setTexturePacks(const std::vector<std::string> &dirs);
+     // Button prompt style for the detected input device (gs_texpacks.h).
+     void setButtonStyle(const std::string &style);
++    // Main thread, each frame: takes the settings the player changed in the menu (button prompt style, PS2
++    // dithering, texture dump) from ga2_settings.
++    void applySettings();
+     // Developer aid (GA2_GS_CAPTURE, gs_pgs.cpp): record the GIF stream from now.
+     void captureNow();
+     // Game thread, at vblank: flush, scan out with the live CRTC registers and
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index e39d227..baeeabb 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_cheat_menu.h"
++#include "ga2_settings_menu.h"
+ #include "ga2_vr.h"
+ #include "runtime/ga2_cheats.h"
+ 
+@@ -30,41 +31,49 @@ namespace ga2_cheat_menu
+         std::string g_notice;
+         double g_noticeUntil = 0.0;
+ 
++        // The menu has two pages: the cheats (F1) and the settings (F2, ga2_settings_menu.cpp). The cheats page ends
++        // with a row that leads to the settings, so the pad and the VR controllers reach them too.
++        enum class Page { Cheats, Settings };
++        Page g_page = Page::Cheats;
++
+         struct Item
+         {
+             const char *label;
+-            std::atomic<bool> *toggle; // nullptr: the skip action
++            std::atomic<bool> *toggle; // nullptr: an action (skip, or the settings page)
++            bool settings;
+         };
+ 
+         std::vector<Item> items()
+         {
+             ga2_cheats::State &s = ga2_cheats::state();
+-            return {{"Skip this battle (win, best result)", nullptr},
+-                    {"Invincible units", &s.invincible},
+-                    {"Infinite energy and spirit", &s.infiniteEnergy},
+-                    {"One-hit kills", &s.oneHitKill},
+-                    {"Stop the time limit", &s.stopTimer}};
++            return {{"Skip this battle (win, best result)", nullptr, false},
++                    {"Invincible units", &s.invincible, false},
++                    {"Infinite energy and spirit", &s.infiniteEnergy, false},
++                    {"One-hit kills", &s.oneHitKill, false},
++                    {"Stop the time limit", &s.stopTimer, false},
++                    {"Settings", nullptr, true}};
+         }
+ 
+         // The runtime's pad bits (ga2_vr::padState().buttons).
+-        constexpr uint16_t kVrL3 = 0x0002, kVrR3 = 0x0004, kVrUp = 0x0010, kVrDown = 0x0040, kVrCircle = 0x2000,
+-                           kVrCross = 0x4000;
++        constexpr uint16_t kVrL3 = 0x0002, kVrR3 = 0x0004, kVrUp = 0x0010, kVrRight = 0x0020, kVrDown = 0x0040,
++                           kVrLeft = 0x0080, kVrCircle = 0x2000, kVrCross = 0x4000;
+         uint16_t g_vrPrevious = 0;
+ 
+         bool menuInputHeld()
+         {
+-            for (int key : {KEY_F1, KEY_ESCAPE, KEY_BACKSPACE, KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_UP, KEY_DOWN,
++            for (int key : {KEY_F1, KEY_F2, KEY_HOME, KEY_END, KEY_ESCAPE, KEY_BACKSPACE, KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_UP, KEY_DOWN,
+                             KEY_LEFT, KEY_RIGHT})
+                 if (IsKeyDown(key))
+                     return true;
+             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+                 return true;
+             // VR controllers: stick clicks, Circle, Cross, D-pad up / down.
+-            if (ga2_vr::padState().buttons & (kVrL3 | kVrR3 | kVrCircle | kVrCross | kVrUp | kVrDown))
++            if (ga2_vr::padState().buttons & (kVrL3 | kVrR3 | kVrCircle | kVrCross | kVrUp | kVrDown | kVrLeft | kVrRight))
+                 return true;
+             if (IsGamepadAvailable(0))
+                 for (int button : {GAMEPAD_BUTTON_LEFT_THUMB, GAMEPAD_BUTTON_RIGHT_THUMB, GAMEPAD_BUTTON_RIGHT_FACE_DOWN,
+-                                   GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, GAMEPAD_BUTTON_LEFT_FACE_UP, GAMEPAD_BUTTON_LEFT_FACE_DOWN})
++                                   GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, GAMEPAD_BUTTON_LEFT_FACE_UP, GAMEPAD_BUTTON_LEFT_FACE_DOWN,
++                                   GAMEPAD_BUTTON_LEFT_FACE_LEFT, GAMEPAD_BUTTON_LEFT_FACE_RIGHT})
+                     if (IsGamepadButtonDown(0, button))
+                         return true;
+             return false;
+@@ -76,18 +85,13 @@ namespace ga2_cheat_menu
+             g_swallow = true;
+         }
+ 
+-        // Where and how big the menu is drawn: the window (scale 1) or the headset's texture (scale 2).
+-        struct Canvas
+-        {
+-            float width, height, scale;
+-            bool vr;
+-        };
++        using Canvas = ga2_settings_menu::Canvas;
+ 
+         Canvas windowCanvas() { return Canvas{float(GetScreenWidth()), float(GetScreenHeight()), 1.0f, false}; }
+ 
+         Rectangle panel(const Canvas &c)
+         {
+-            const float w = 560.0f * c.scale, h = 330.0f * c.scale;
++            const float w = 560.0f * c.scale, h = 376.0f * c.scale;
+             return Rectangle{(c.width - w) * 0.5f, (c.height - h) * 0.5f, w, h};
+         }
+ 
+@@ -100,9 +104,22 @@ namespace ga2_cheat_menu
+ 
+         const uint8_t *g_rdram = nullptr;
+ 
++        void openPage(Page page)
++        {
++            g_open = true;
++            g_page = page;
++            if (page == Page::Settings)
++                ga2_settings_menu::opened();
++        }
++
+         void activate(int index, const uint8_t *rdram)
+         {
+             const auto list = items();
++            if (list[size_t(index)].settings)
++            {
++                openPage(Page::Settings);
++                return;
++            }
+             if (list[size_t(index)].toggle)
+             {
+                 list[size_t(index)].toggle->store(!list[size_t(index)].toggle->load());
+@@ -119,6 +136,9 @@ namespace ga2_cheat_menu
+             g_noticeUntil = GetTime() + 2.0;
+             close();
+         }
++
++        // Keys that move on a menu page; held keys repeat.
++        bool keyStep(int key) { return IsKeyPressed(key) || IsKeyPressedRepeat(key); }
+     }
+ 
+     bool open() { return g_open || g_swallow; }
+@@ -130,8 +150,7 @@ namespace ga2_cheat_menu
+         g_rdram = rdram;
+         if (g_swallow && !menuInputHeld())
+             g_swallow = false;
+-        if (!ga2_cheats::state().available.load())
+-            return;
++        const bool cheats = ga2_cheats::state().available.load();
+         const bool padToggle = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB) &&
+                                IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_THUMB);
+         // VR controllers act as a gamepad: both stick clicks open and close it, D-pad up /
+@@ -141,28 +160,66 @@ namespace ga2_cheat_menu
+         g_vrPrevious = vr;
+         const auto vrPressed = [&](uint16_t mask) { return (vr & mask) == mask && (vrBefore & mask) != mask; };
+         const bool vrToggle = vrPressed(kVrL3 | kVrR3);
+-        if (IsKeyPressed(KEY_F1) || padToggle || vrToggle)
++        // F2 opens and closes the settings, F1 the cheats; both stick clicks (gamepad, VR) the menu: the cheats page
++        // (which has the row for the settings), or the settings themselves on a disc without cheats.
++        if (IsKeyPressed(KEY_F2))
+         {
+-            if (g_open)
++            if (g_open && g_page == Page::Settings)
+                 close();
+             else
+-                g_open = true;
++                openPage(Page::Settings);
++            return;
++        }
++        const bool f1 = IsKeyPressed(KEY_F1) && cheats;
++        if (f1 || padToggle || vrToggle)
++        {
++            if (g_open && f1 && g_page == Page::Settings)
++                g_page = Page::Cheats;
++            else if (g_open)
++                close();
++            else
++                openPage(cheats ? Page::Cheats : Page::Settings);
+             return;
+         }
+         if (!g_open)
+             return;
+-        const int count = int(items().size());
+-        if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) ||
+-            vrPressed(kVrCross))
++        const bool back = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) ||
++                          IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) || vrPressed(kVrCross);
++        if (back)
+         {
+             close();
+             return;
+         }
+-        if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP) || vrPressed(kVrUp))
++        const bool up = keyStep(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP) || vrPressed(kVrUp);
++        const bool down = keyStep(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN) || vrPressed(kVrDown);
++        const bool confirm = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_SPACE) ||
++                             IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) || vrPressed(kVrCircle);
++        const Vector2 mouse = GetMousePosition();
++        if (g_page == Page::Settings)
++        {
++            ga2_settings_menu::Input in;
++            in.up = up;
++            in.down = down;
++            in.left = keyStep(KEY_LEFT) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) || vrPressed(kVrLeft);
++            in.right = keyStep(KEY_RIGHT) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) || vrPressed(kVrRight);
++            in.confirm = confirm;
++            in.home = IsKeyPressed(KEY_HOME);
++            in.end = IsKeyPressed(KEY_END);
++            in.pointerMoved = GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f;
++            in.click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
++            in.x = mouse.x;
++            in.y = mouse.y;
++            in.wheel = GetMouseWheelMove();
++            ga2_settings_menu::update(in, windowCanvas());
++            return;
++        }
++        if (!cheats)
++            return;
++        const int count = int(items().size());
++        if (up)
+             g_selected = (g_selected + count - 1) % count;
+-        if (IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN) || vrPressed(kVrDown))
++        if (down)
+             g_selected = (g_selected + 1) % count;
+-        const Vector2 mouse = GetMousePosition();
+         for (int i = 0; i < count; ++i)
+             if (CheckCollisionPointRec(mouse, row(windowCanvas(), i)))
+             {
+@@ -175,8 +232,7 @@ namespace ga2_cheat_menu
+                     return;
+                 }
+             }
+-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
+-            IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) || vrPressed(kVrCircle))
++        if (confirm || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))
+             activate(g_selected, rdram);
+     }
+ 
+@@ -197,14 +253,19 @@ namespace ga2_cheat_menu
+                 }
+                 return;
+             }
++            if (g_page == Page::Settings)
++            {
++                ga2_settings_menu::draw(c);
++                return;
++            }
+             const Rectangle p = panel(c);
+             if (!c.vr)
+                 DrawRectangle(0, 0, int(c.width), int(c.height), Color{0, 0, 0, 120});
+             DrawRectangleRounded(p, 0.06f, 8, Color{12, 18, 44, 235});
+             DrawRectangleRoundedLinesEx(p, 0.06f, 8, 2.0f * k, Color{90, 160, 255, 255});
+             DrawText("CHEATS", int(p.x + 20 * k), int(p.y + 18 * k), int(30 * k), Color{230, 236, 250, 255});
+-            const char *hint = c.vr ? "Cross / L3+R3: close" : "F1 / L3+R3: close";
+-            DrawText(hint, int(p.x + p.width - (c.vr ? 210 : 190) * k), int(p.y + 26 * k), int(16 * k), Color{130, 140, 170, 255});
++            const char *hint = c.vr ? "Cross / L3+R3: close" : "F1 / L3+R3: close, F2: settings";
++            DrawText(hint, int(p.x + p.width - (c.vr ? 210 : 270) * k), int(p.y + 26 * k), int(16 * k), Color{130, 140, 170, 255});
+             const auto list = items();
+             const bool battle = ga2_cheats::battleActive(rdram);
+             for (int i = 0; i < int(list.size()); ++i)
+@@ -212,11 +273,11 @@ namespace ga2_cheat_menu
+                 const Rectangle r = row(c, i);
+                 if (i == g_selected)
+                     DrawRectangleRec(r, Color{30, 44, 90, 255});
+-                const bool enabled = list[size_t(i)].toggle || battle;
+-                DrawText(list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
++                const bool enabled = list[size_t(i)].toggle || list[size_t(i)].settings || battle;
++                DrawText(list[size_t(i)].settings && !c.vr ? "Settings (F2)" : list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
+                          enabled ? Color{230, 236, 250, 255} : Color{110, 118, 140, 255});
+                 const char *value = list[size_t(i)].toggle ? (list[size_t(i)].toggle->load() ? "ON" : "OFF")
+-                                                           : (battle ? (c.vr ? "Circle" : "Enter") : "no battle");
++                                   : (battle || list[size_t(i)].settings ? (c.vr ? "Circle" : "Enter") : "no battle");
+                 const int w = MeasureText(value, int(20 * k));
+                 DrawText(value, int(r.x + r.width) - w - int(14 * k), int(r.y + 10 * k), int(20 * k),
+                          list[size_t(i)].toggle && list[size_t(i)].toggle->load() ? Color{120, 220, 150, 255}
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.h b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+index ad2bd18..2df8958 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.h
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+@@ -2,10 +2,11 @@
+ 
+ #include <cstdint>
+ 
+-// In-game cheat menu (main thread): F1 or both stick clicks (gamepad or VR
+-// controllers) open it while a disc with battle cheats runs
+-// (runtime/ga2_cheats.h). The game gets no input while it is open. In a
+-// headset it is drawn in the player's view (renderForHeadset).
++// In-game menu (main thread). Two pages: the battle cheats (F1, or both stick
++// clicks on a gamepad or the VR controllers, while a disc with battle cheats
++// runs; runtime/ga2_cheats.h) and the settings (F2, or the Settings row of the
++// cheats page; ga2_settings_menu.h). The game gets no input while it is open.
++// In a headset it is drawn in the player's view (renderForHeadset).
+ namespace ga2_cheat_menu
+ {
+     // The menu has the input: open, or closed with its keys still held.
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index ea31dd7..01c7aa3 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -108,6 +108,14 @@ namespace ga2_framepace
+         std::atomic<int> g_rate{0};
+     }
+ 
++    namespace
++    {
++        std::atomic<int> g_userCap{0};
++    }
++
++    void setUserCap(int cap) { g_userCap.store(cap > 60 ? cap : (cap == 60 ? 60 : 0), std::memory_order_relaxed); }
++    int userCap() { return g_userCap.load(std::memory_order_relaxed); }
++
+     int rate()
+     {
+         const int r = g_rate.load(std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 05ad982..cf77350 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_present.h"
++#include "runtime/ga2_settings.h"
+ #include "runtime/ga2_display.h"
+ #include "ga2_mpv_shader.h"
+ #include "runtime/ga2_activity.h"
+@@ -8,6 +9,7 @@
+ #include "external/glad.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -30,6 +32,8 @@ namespace ga2_present
+             return v && *v ? std::string(v) : std::string(fallback);
+         }
+ 
++        // What the player can change while playing is read from ga2_settings each frame (aspect, sides, filter,
++        // 2D scene size); the rest is fixed for the run.
+         struct Settings
+         {
+             float aspect = 16.0f / 9.0f; // 0: the window's own shape
+@@ -40,23 +44,27 @@ namespace ga2_present
+             bool integer2d = false; // 2D scenes at whole multiples of 640x448
+         };
+ 
++        Filter filterFor(const std::string &filter)
++        {
++            return filter == "nearest" ? Filter::Nearest
++                   : filter == "sharp" ? Filter::Sharp
++                   : filter == "smooth" ? Filter::Smooth
++                   : filter == "anime4k" ? Filter::Anime4K
++                   : filter == "anime4k-hq" ? Filter::Anime4KHQ
++                                            : Filter::Bilinear;
++        }
++
+         Settings load()
+         {
++            ga2_settings::init();
+             Settings s;
+-            const std::string aspect = env("GA2_ASPECT", "16:9");
+-            s.aspect = ga2_display::parseAspect(aspect.c_str());
+-            const std::string sides = env("GA2_SIDES", "black");
++            s.aspect = ga2_display::parseAspect(ga2_settings::value(ga2_options::Aspect));
++            const std::string sides = ga2_settings::value(ga2_options::Sides);
+             s.sides = sides == "blur" ? Sides::Blur : sides == "skybox" ? Sides::Skybox : Sides::Black;
+             s.skybox = env("GA2_SKYBOX", "");
+-            const std::string filter = env("GA2_FILTER", "bilinear");
+-            s.filter = filter == "nearest" ? Filter::Nearest
+-                       : filter == "sharp" ? Filter::Sharp
+-                       : filter == "smooth" ? Filter::Smooth
+-                       : filter == "anime4k" ? Filter::Anime4K
+-                       : filter == "anime4k-hq" ? Filter::Anime4KHQ
+-                                                : Filter::Bilinear;
+-            s.english = env("GA2_LANG", "ja") == "en";
+-            s.integer2d = env("GA2_SCALE_2D", "fill") == "integer";
++            s.filter = filterFor(ga2_settings::value(ga2_options::Filter));
++            s.english = std::string(ga2_settings::value(ga2_options::Language)) == "en";
++            s.integer2d = std::string(ga2_settings::value(ga2_options::Scale2d)) == "integer";
+             return s;
+         }
+ 
+@@ -66,8 +74,29 @@ namespace ga2_present
+             return s;
+         }
+ 
+-        bool g_wide = false;
+         bool g_ready = false;
++
++        // The live settings, refreshed when the menu changes one (on the main thread, in draw()).
++        uint32_t g_seenGeneration = 0;
++        void refresh(Settings &s)
++        {
++            const uint32_t generation = ga2_settings::generation();
++            if (generation == g_seenGeneration)
++                return;
++            g_seenGeneration = generation;
++            const std::string skybox = s.skybox;
++            const bool english = s.english;
++            const float aspectBefore = s.aspect;
++            s = load();
++            s.skybox = skybox;   // resolved against the program in init()
++            s.english = english; // the title language is a restart option
++            // A window takes the new shape of the play area at its height; fullscreen and "fill the window" keep it.
++            if (g_ready && s.aspect > 0.0f && s.aspect != aspectBefore && !IsWindowFullscreen() &&
++                !IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) && !IsWindowMaximized())
++                SetWindowSize(int(std::lround(float(GetScreenHeight()) * s.aspect)), GetScreenHeight());
++        }
++
++        bool g_wide = false;
+         std::unique_ptr<ga2_mpv::Chain> g_chain; // smooth / Anime4K
+         Shader g_sharp{};
+         bool g_sharpLoaded = false;
+@@ -233,13 +262,22 @@ namespace ga2_display
+ 
+     float wideAspect()
+     {
+-        static float fitted = 0.0f;
+-        const float aspect = ga2_present::settings().aspect;
++        // "fit" is the window's shape when it was asked first (or when the shape setting last changed) and then
++        // kept, so the 3D view the game was set up for and the presentation agree through resizes.
++        static std::atomic<float> fitted{0.0f};
++        static std::atomic<int> fittedFor{-1};
++        const int choice = ga2_settings::get(ga2_options::Aspect);
++        const float aspect = parseAspect(ga2_options::options()[ga2_options::Aspect].choices[size_t(choice)].value);
+         if (aspect > 0.0f)
+             return aspect;
+-        if (fitted <= 0.0f && IsWindowReady() && GetScreenHeight() > 0)
+-            fitted = float(GetScreenWidth()) / float(GetScreenHeight());
+-        return fitted > 0.0f ? fitted : 16.0f / 9.0f;
++        if (fittedFor.load() != choice)
++        {
++            fitted.store(0.0f);
++            fittedFor.store(choice);
++        }
++        if (fitted.load() <= 0.0f && IsWindowReady() && GetScreenHeight() > 0)
++            fitted.store(float(GetScreenWidth()) / float(GetScreenHeight()));
++        return fitted.load() > 0.0f ? fitted.load() : 16.0f / 9.0f;
+     }
+ }
+ 
+@@ -263,46 +301,65 @@ namespace ga2_present
+         return settings().skybox;
+     }
+ 
+-    void init(const std::string &program)
++    namespace
+     {
+-        SetWindowTitle(title(program).c_str());
+-        Settings &s = settings();
+-        // A folder holds one panorama per program (<dir>/SLPM_662.43.png).
+-        if (!s.skybox.empty() && std::filesystem::is_directory(s.skybox))
+-            s.skybox = (std::filesystem::path(s.skybox) / (program + ".png")).string();
+-        switch (s.filter)
++        // The filter the shaders below were built for (the player can change it while playing: the menu).
++        Filter g_loadedFilter = Filter::Bilinear;
++        bool g_skyboxTried = false;
++
++        const char *filterName()
+         {
+-        case Filter::Smooth:
++            return g_chain ? "shader chain" : g_sharpLoaded ? "sharp bilinear" : g_loadedFilter == Filter::Nearest ? "nearest" : "bilinear";
++        }
++
++        // Builds what `filter` needs and drops what the old one used (main thread, GL context current).
++        void loadFilter(Filter filter)
+         {
+-            g_chain = std::make_unique<ga2_mpv::Chain>();
+-            std::string error;
+-            if (!g_chain->add(kSmooth, "smooth", error))
++            g_chain.reset();
++            if (g_sharpLoaded)
+             {
+-                std::fprintf(stderr, "[filter] smooth: %s\n", error.c_str());
+-                g_chain.reset();
++                UnloadShader(g_sharp);
++                g_sharp = Shader{};
++                g_sharpLoaded = false;
+             }
+-            break;
+-        }
+-        case Filter::Anime4K:
+-            // Anime4K "mode A (fast)": restore, then a CNN 2x upscale.
+-            loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_M.glsl",
+-                       "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
+-            break;
+-        case Filter::Anime4KHQ:
+-            // Anime4K "mode A (HQ)": larger networks and a second 2x step.
+-            loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_VL.glsl",
+-                       "anime4k/Anime4K_Upscale_CNN_x2_VL.glsl", "anime4k/Anime4K_AutoDownscalePre_x2.glsl",
+-                       "anime4k/Anime4K_AutoDownscalePre_x4.glsl", "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
+-            break;
+-        case Filter::Sharp:
+-            g_sharp = LoadShaderFromMemory(nullptr, kSharp);
+-            g_sharpLoaded = IsShaderValid(g_sharp);
+-            break;
+-        default:
+-            break;
++            g_loadedFilter = filter;
++            switch (filter)
++            {
++            case Filter::Smooth:
++            {
++                g_chain = std::make_unique<ga2_mpv::Chain>();
++                std::string error;
++                if (!g_chain->add(kSmooth, "smooth", error))
++                {
++                    std::fprintf(stderr, "[filter] smooth: %s\n", error.c_str());
++                    g_chain.reset();
++                }
++                break;
++            }
++            case Filter::Anime4K:
++                // Anime4K "mode A (fast)": restore, then a CNN 2x upscale.
++                loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_M.glsl",
++                           "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
++                break;
++            case Filter::Anime4KHQ:
++                // Anime4K "mode A (HQ)": larger networks and a second 2x step.
++                loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_VL.glsl",
++                           "anime4k/Anime4K_Upscale_CNN_x2_VL.glsl", "anime4k/Anime4K_AutoDownscalePre_x2.glsl",
++                           "anime4k/Anime4K_AutoDownscalePre_x4.glsl", "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
++                break;
++            case Filter::Sharp:
++                g_sharp = LoadShaderFromMemory(nullptr, kSharp);
++                g_sharpLoaded = IsShaderValid(g_sharp);
++                break;
++            default:
++                break;
++            }
++            std::fprintf(stderr, "[present] 2D filter: %s\n", filterName());
+         }
+-        if (s.sides == Sides::Skybox)
++
++        void loadSkybox(Settings &s)
+         {
++            g_skyboxTried = true;
+             if (!s.skybox.empty() && std::filesystem::exists(s.skybox))
+             {
+                 g_skybox = LoadTexture(s.skybox.c_str());
+@@ -310,20 +367,38 @@ namespace ga2_present
+                 SetTextureWrap(g_skybox, TEXTURE_WRAP_REPEAT);
+             }
+             if (g_skybox.id == 0)
+-            {
+                 std::fprintf(stderr, "[present] no skybox image (GA2_SKYBOX); sides stay black\n");
+-                s.sides = Sides::Black;
+-            }
+         }
+-        std::fprintf(stderr, "[present] aspect %.3f, filter %s\n", s.aspect,
+-                     g_chain ? "shader chain" : g_sharpLoaded ? "sharp bilinear"
+-                                              : s.filter == Filter::Nearest ? "nearest" : "bilinear");
++    }
++
++    bool skyboxMissing()
++    {
++        return g_ready && g_skyboxTried && g_skybox.id == 0;
++    }
++
++    void init(const std::string &program)
++    {
++        SetWindowTitle(title(program).c_str());
++        Settings &s = settings();
++        // A folder holds one panorama per program (<dir>/SLPM_662.43.png).
++        if (!s.skybox.empty() && std::filesystem::is_directory(s.skybox))
++            s.skybox = (std::filesystem::path(s.skybox) / (program + ".png")).string();
++        // The filter and the skybox are built when the picture first needs them (draw()), and again when the player
++        // changes them.
++        g_loadedFilter = Filter::Bilinear;
++        std::fprintf(stderr, "[present] aspect %.3f, filter %s, title language %s\n", s.aspect, ga2_settings::value(ga2_options::Filter),
++                     s.english ? "English" : "Japanese");
+         g_ready = true;
+     }
+ 
+     Rect draw(const Texture &frame, float srcWidth, float srcHeight)
+     {
+-        const Settings &s = settings();
++        Settings &s = settings();
++        refresh(s);
++        if (g_ready && s.filter != g_loadedFilter)
++            loadFilter(s.filter);
++        if (g_ready && s.sides == Sides::Skybox && !g_skyboxTried)
++            loadSkybox(s);
+         // Upscalers, smoothing and integer scaling are made for 2D art: 3D
+         // scenes always fill the play area with plain bilinear. Hor+ 3D
+         // frames are anamorphic and fill the whole area.
+@@ -335,7 +410,9 @@ namespace ga2_present
+         // A PS2 picture is 4:3 on a TV, whatever its pixel count.
+         // Hor+ frames have the shape the game's cameras were set up for;
+         // anything else would stretch them (bars instead, e.g. after a resize).
+-        Rect picture = g_wide ? fitAspect(area, ga2_display::wideAspect()) : fitAspect(area, 4.0f / 3.0f);
++        // (4:3 times the factor the cameras were set up with: the frame on screen, not the setting just chosen.)
++        Rect picture = g_wide ? fitAspect(area, 4.0f / 3.0f * ga2_activity::horPlus.load(std::memory_order_relaxed))
++                              : fitAspect(area, 4.0f / 3.0f);
+         if (s.integer2d && !scene3d && !g_wide)
+         {
+             // Whole multiples of 640x448 (square pixels): crisp 2x, 3x...
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+index 329759d..3f6dcfa 100644
+--- a/ps2xRuntime/src/lib/ga2_present.h
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -6,7 +6,8 @@ struct Texture;
+ 
+ // How the game picture reaches the window (main thread only).
+ //
+-// Settings come from the environment (the launcher's options):
++// Settings come from the environment at the start (the launcher's options) and then from ga2_settings, which the
++// in-game settings menu changes: aspect, sides, filter and 2D scene size take effect on the next frame.
+ //   GA2_ASPECT  4:3 | 16:9 | 21:9 | fit   shape of the play area / window
+ //   GA2_SIDES   black | blur | skybox     what fills the sides of a 4:3 picture
+ //   GA2_SKYBOX  <png> | <dir>             equirectangular panorama for "skybox"
+@@ -34,6 +35,8 @@ namespace ga2_present
+     std::string title(const std::string &program);
+     // The panorama for this game (after init), or empty.
+     std::string skyboxFile();
++    // "Space skybox" is chosen but no picture was extracted yet (the sides stay black).
++    bool skyboxMissing();
+ 
+     // Inside BeginDrawing: draws the frame (srcWidth x srcHeight of it is the
+     // picture) and returns where the picture went, in window pixels.
+diff --git a/ps2xRuntime/src/lib/ga2_settings.cpp b/ps2xRuntime/src/lib/ga2_settings.cpp
+new file mode 100644
+index 0000000..756be08
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_settings.cpp
+@@ -0,0 +1,258 @@
++#include "runtime/ga2_settings.h"
++
++#include "runtime/ga2_framepace.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <vector>
++
++namespace ga2_settings
++{
++    namespace
++    {
++        std::once_flag g_once;
++        std::array<std::atomic<int>, ga2_options::KeyCount> g_current{};
++        std::array<int, ga2_options::KeyCount> g_started{};
++        std::array<bool, ga2_options::KeyCount> g_changed{};
++        std::atomic<uint32_t> g_generation{1};
++
++        std::string env(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return v ? std::string(v) : std::string();
++        }
++
++        bool envSet(const char *name) { return std::getenv(name) != nullptr; }
++
++        void putEnv(const char *name, const std::string &value)
++        {
++#ifdef _WIN32
++            _putenv_s(name, value.c_str());
++#else
++            setenv(name, value.c_str(), 1);
++#endif
++        }
++
++        std::filesystem::path pathFromUtf8(const std::string &text)
++        {
++            return std::filesystem::path(std::u8string(text.begin(), text.end()));
++        }
++
++        // The launcher's folder (Library::defaultDataDir).
++        std::filesystem::path defaultDataDir()
++        {
++#ifdef _WIN32
++            if (const std::string appdata = env("APPDATA"); !appdata.empty())
++                return pathFromUtf8(appdata) / "ga2";
++            return std::filesystem::current_path() / "ga2-data";
++#else
++            if (const std::string xdg = env("XDG_DATA_HOME"); !xdg.empty())
++                return pathFromUtf8(xdg) / "ga2";
++            if (const std::string home = env("HOME"); !home.empty())
++                return pathFromUtf8(home) / ".local" / "share" / "ga2";
++            return std::filesystem::current_path() / "ga2-data";
++#endif
++        }
++
++        int choiceForValue(size_t option, const std::string &text)
++        {
++            const auto &o = ga2_options::options()[option];
++            for (size_t c = 0; c < o.choices.size(); ++c)
++                if (text == o.choices[c].value)
++                    return int(c);
++            return -1;
++        }
++
++        void doInit()
++        {
++            const auto &table = ga2_options::options();
++            // settings.ini, only for a run that names the data folder.
++            std::array<int, ga2_options::KeyCount> fromFile;
++            fromFile.fill(-1);
++            if (envSet("GA2_DATA_DIR"))
++            {
++                std::ifstream in(settingsFile());
++                for (std::string line; std::getline(in, line);)
++                {
++                    if (!line.empty() && line.back() == '\r')
++                        line.pop_back();
++                    const auto equals = line.find('=');
++                    if (equals == std::string::npos)
++                        continue;
++                    const std::string key = line.substr(0, equals), text = line.substr(equals + 1);
++                    for (size_t i = 0; i < table.size(); ++i)
++                        if (key == table[i].key)
++                            fromFile[i] = choiceForValue(i, text);
++                }
++            }
++            int fromEnvironment = 0, fromSettingsFile = 0;
++            for (size_t i = 0; i < table.size(); ++i)
++            {
++                int choice = 0;
++                if (envSet(table[i].env))
++                {
++                    choice = std::max(0, ga2_options::choiceFromEnv(i, env(table[i].env)));
++                    ++fromEnvironment;
++                }
++                else if (fromFile[i] >= 0)
++                {
++                    choice = fromFile[i];
++                    putEnv(table[i].env, ga2_options::envValue(i, choice, dumpDirectory()));
++                    ++fromSettingsFile;
++                }
++                g_started[i] = choice;
++                g_current[i].store(choice);
++            }
++            std::fprintf(stderr, "[settings] %d options from the environment, %d from %s; changes are saved to %s\n", fromEnvironment,
++                         fromSettingsFile, envSet("GA2_DATA_DIR") ? "settings.ini" : "(no data folder given)",
++                         settingsFile().string().c_str());
++        }
++    }
++
++    void init() { std::call_once(g_once, doInit); }
++
++    int get(Key key)
++    {
++        init();
++        return g_current[key].load(std::memory_order_relaxed);
++    }
++
++    const char *value(Key key) { return ga2_options::options()[key].choices[size_t(get(key))].value; }
++
++    int started(Key key)
++    {
++        init();
++        return g_started[key];
++    }
++
++    void set(Key key, int choice)
++    {
++        init();
++        const int count = int(ga2_options::options()[key].choices.size());
++        choice = std::max(0, std::min(choice, count - 1));
++        if (choice == g_current[key].load())
++            return;
++        g_current[key].store(choice);
++        g_changed[key] = true;
++        g_generation.fetch_add(1);
++    }
++
++    uint32_t generation()
++    {
++        init();
++        return g_generation.load(std::memory_order_relaxed);
++    }
++
++    bool changed(Key key)
++    {
++        init();
++        return g_changed[key];
++    }
++
++    bool takesEffectNow(Key key, int choice, const char **why)
++    {
++        init();
++        const auto &o = ga2_options::options()[key];
++        if (o.apply == ga2_options::Apply::Restart)
++        {
++            if (why)
++                *why = "applies after restart";
++            return false;
++        }
++        if (key == ga2_options::Fps)
++        {
++            // The high frame rate machinery (hooks, display pacing) is set up at the start for the rate the run
++            // started with; the rate can move between 60 and that. VR keeps the PS2 rate.
++            const int wanted = std::atoi(o.choices[size_t(choice)].value);
++            const int top = ga2_framepace::fps();
++            if (wanted > 60 && wanted > top)
++            {
++                if (why)
++                    *why = top > 0 ? "above this run's top rate: applies after restart" : "applies after restart";
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool restartPending(Key key)
++    {
++        init();
++        const int now = g_current[key].load();
++        if (ga2_options::options()[key].apply == ga2_options::Apply::Restart)
++            return now != g_started[key];
++        return !takesEffectNow(key, now) && now != g_started[key];
++    }
++
++    std::filesystem::path dataDir()
++    {
++        const std::string dir = env("GA2_DATA_DIR");
++        return dir.empty() ? defaultDataDir() : pathFromUtf8(dir);
++    }
++
++    std::filesystem::path settingsFile() { return dataDir() / "settings.ini"; }
++
++    std::string dumpDirectory()
++    {
++        const auto path = dataDir() / "dumps" / "textures";
++        const auto text = path.u8string();
++        return std::string(text.begin(), text.end());
++    }
++
++    bool save()
++    {
++        init();
++        const auto &table = ga2_options::options();
++        const std::filesystem::path file = settingsFile();
++        std::vector<std::string> lines;
++        {
++            std::ifstream in(file);
++            for (std::string line; std::getline(in, line);)
++            {
++                if (!line.empty() && line.back() == '\r')
++                    line.pop_back();
++                lines.push_back(line);
++            }
++        }
++        for (size_t i = 0; i < table.size(); ++i)
++        {
++            if (!g_changed[i])
++                continue;
++            const std::string line = std::string(table[i].key) + "=" + table[i].choices[size_t(g_current[i].load())].value;
++            bool found = false;
++            for (std::string &existing : lines)
++                if (existing.compare(0, std::strlen(table[i].key) + 1, std::string(table[i].key) + "=") == 0)
++                {
++                    existing = line;
++                    found = true;
++                }
++            if (!found)
++                lines.push_back(line);
++        }
++        std::error_code error;
++        std::filesystem::create_directories(file.parent_path(), error);
++        // A temporary file renamed over the old one: a crash cannot leave half a settings file.
++        std::filesystem::path temporary = file;
++        temporary += ".tmp";
++        {
++            std::ofstream out(temporary, std::ios::trunc);
++            for (const std::string &line : lines)
++                out << line << '\n';
++            if (!out)
++                return false;
++        }
++        std::filesystem::rename(temporary, file, error);
++        if (error)
++        {
++            std::fprintf(stderr, "[settings] cannot write %s: %s\n", file.string().c_str(), error.message().c_str());
++            return false;
++        }
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+new file mode 100644
+index 0000000..c4d29c0
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -0,0 +1,298 @@
++#include "ga2_settings_menu.h"
++
++#include "ga2_present.h"
++#include "runtime/ga2_activity.h"
++#include "runtime/ga2_framepace.h"
++#include "runtime/ga2_settings.h"
++#include "ga2_vr.h"
++
++#include "raylib.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++namespace ga2_settings_menu
++{
++    namespace
++    {
++        using ga2_options::Key;
++
++        int g_selected = 0;
++        std::string g_notice;
++        double g_noticeUntil = 0.0;
++        // The fullscreen row shows the window as it is (F11 and Alt+Enter change it too).
++        bool fullscreenNow() { return IsWindowFullscreen() || IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE); }
++
++        int shownChoice(Key key)
++        {
++            if (key == ga2_options::Fullscreen)
++                return fullscreenNow() ? 1 : 0;
++            return ga2_settings::get(key);
++        }
++
++        // ---- layout: logical units, scaled by the canvas ----
++        constexpr float kPanelWidth = 620.0f, kTitleHeight = 52.0f, kRowHeight = 26.0f, kHelpHeight = 92.0f,
++                        kFooterHeight = 24.0f, kPad = 14.0f;
++
++        struct Layout
++        {
++            float u;          // logical unit in pixels
++            float x, y, w, h; // the panel
++        };
++
++        Layout layout(const Canvas &c)
++        {
++            const float rows = float(ga2_options::KeyCount);
++            const float height = kTitleHeight + rows * kRowHeight + kHelpHeight + kFooterHeight;
++            float u = std::min((c.width - 20.0f * c.scale) / kPanelWidth, (c.height - 20.0f * c.scale) / height);
++            u = std::clamp(u, 0.4f, c.vr ? 2.0f : 1.4f);
++            Layout l;
++            l.u = u;
++            l.w = kPanelWidth * u;
++            l.h = height * u;
++            l.x = (c.width - l.w) * 0.5f;
++            l.y = (c.height - l.h) * 0.5f;
++            return l;
++        }
++
++        Rectangle rowRect(const Layout &l, int i)
++        {
++            return Rectangle{l.x + 8.0f * l.u, l.y + (kTitleHeight + kRowHeight * float(i)) * l.u, l.w - 16.0f * l.u,
++                             kRowHeight * l.u};
++        }
++
++        // The value column: [<] value [>] between these fractions of the row.
++        constexpr float kValueFrom = 0.43f, kValueTo = 0.80f;
++
++        // ---- changing a value ----
++        const char *choiceLabel(Key key, int choice) { return ga2_options::options()[key].choices[size_t(choice)].label; }
++
++        void say(const std::string &text)
++        {
++            g_notice = text;
++            g_noticeUntil = GetTime() + 4.0;
++        }
++
++        void change(Key key, int delta)
++        {
++            const auto &option = ga2_options::options()[key];
++            const int count = int(option.choices.size());
++            const int before = shownChoice(key);
++            const int choice = (before + delta % count + count) % count;
++            if (choice == before)
++                return;
++            const char *why = nullptr;
++            const bool now = ga2_settings::takesEffectNow(key, choice, &why);
++            ga2_settings::set(key, choice);
++            if (key == ga2_options::Fullscreen && fullscreenNow() != (choice == 1))
++                ToggleBorderlessWindowed();
++            if (key == ga2_options::Fps && now)
++                ga2_framepace::setUserCap(std::atoi(option.choices[size_t(choice)].value));
++            const bool saved = ga2_settings::save();
++            std::string text = std::string(option.label) + ": " + choiceLabel(key, choice);
++            if (!now)
++                text += std::string(" (") + (why ? why : "applies after restart") + ")";
++            if (!saved)
++                text += " - could not save settings.ini";
++            say(text);
++        }
++
++        // One line about the selected row beyond its help text: what applies when, and what the setting needs.
++        std::string context(Key key)
++        {
++            char text[200];
++            switch (key)
++            {
++            case ga2_options::Fps:
++            {
++                const int top = ga2_framepace::fps();
++                if (ga2_vr::headsetRunning())
++                    return "In VR the headset sets the rate.";
++                if (top <= 0)
++                    return "This run started at the PS2's 60: higher rates apply after restart.";
++                std::snprintf(text, sizeof(text), "Now %d fps (up to %d in this run; higher applies after restart).",
++                              std::max(60, ga2_framepace::rate()), top);
++                return text;
++            }
++            case ga2_options::Sides:
++                if (ga2_settings::get(key) == 2 && ga2_present::skyboxMissing())
++                    return "No skybox picture yet (the launcher extracts it from your discs): sides stay black.";
++                return "";
++            case ga2_options::Widescreen3d:
++                if (ga2_vr::headsetRunning())
++                    return "Not used in VR (the headset's view replaces it).";
++                if (ga2_settings::get(ga2_options::Aspect) == 3)
++                    return "Needs a wider screen shape than 4:3.";
++                return "";
++            case ga2_options::Filter:
++                return ga2_activity::scene3d() ? "This is a 3D scene: the filter shows in 2D scenes." : "";
++            case ga2_options::DumpTextures:
++                return "Textures the game loads from now on go to the dump folder.";
++            case ga2_options::Vr:
++                return "Takes effect when the game is started again.";
++            default:
++                return ga2_options::options()[key].apply == ga2_options::Apply::Restart ? "Takes effect when the game is started again." : "";
++            }
++        }
++
++        std::vector<std::string> wrap(const std::string &text, int fontSize, float width)
++        {
++            std::vector<std::string> lines;
++            std::string line, word;
++            auto flush = [&] {
++                if (!word.empty())
++                {
++                    const std::string trial = line.empty() ? word : line + " " + word;
++                    if (!line.empty() && float(MeasureText(trial.c_str(), fontSize)) > width)
++                    {
++                        lines.push_back(line);
++                        line = word;
++                    }
++                    else
++                        line = trial;
++                    word.clear();
++                }
++            };
++            for (char ch : text)
++            {
++                if (ch == ' ')
++                    flush();
++                else
++                    word += ch;
++            }
++            flush();
++            if (!line.empty())
++                lines.push_back(line);
++            return lines;
++        }
++    }
++
++    void opened()
++    {
++        // The row stays where it was; what was said last does not.
++        g_notice.clear();
++        g_noticeUntil = 0.0;
++    }
++
++    void update(const Input &in, const Canvas &window)
++    {
++        const int count = int(ga2_options::KeyCount);
++        if (in.home)
++            g_selected = 0;
++        if (in.end)
++            g_selected = count - 1;
++        if (in.up)
++            g_selected = (g_selected + count - 1) % count;
++        if (in.down)
++            g_selected = (g_selected + 1) % count;
++        if (in.left)
++            change(Key(g_selected), -1);
++        if (in.right || in.confirm)
++            change(Key(g_selected), 1);
++        const Layout l = layout(window);
++        for (int i = 0; i < count; ++i)
++        {
++            const Rectangle r = rowRect(l, i);
++            if (in.x < r.x || in.x >= r.x + r.width || in.y < r.y || in.y >= r.y + r.height)
++                continue;
++            if (in.pointerMoved)
++                g_selected = i;
++            const float inRow = (in.x - r.x) / r.width;
++            if (in.click)
++            {
++                g_selected = i;
++                // Left of the value's middle: back, right of it: forward; the label only selects.
++                if (inRow >= kValueFrom && inRow < kValueTo)
++                    change(Key(i), inRow < (kValueFrom + kValueTo) * 0.5f ? -1 : 1);
++            }
++            if (in.wheel != 0.0f)
++            {
++                g_selected = i;
++                change(Key(i), in.wheel > 0.0f ? -1 : 1);
++            }
++        }
++    }
++
++    void draw(const Canvas &c)
++    {
++        const Layout l = layout(c);
++        const float u = l.u;
++        const Rectangle panel{l.x, l.y, l.w, l.h};
++        if (!c.vr)
++            DrawRectangle(0, 0, int(c.width), int(c.height), Color{0, 0, 0, 120});
++        DrawRectangleRounded(panel, 0.03f, 8, Color{12, 18, 44, 240});
++        DrawRectangleRoundedLinesEx(panel, 0.03f, 8, std::max(1.0f, 2.0f * u), Color{90, 160, 255, 255});
++        DrawText("SETTINGS", int(l.x + 20 * u), int(l.y + 14 * u), int(28 * u), Color{230, 236, 250, 255});
++        const char *hint = c.vr ? "Stick: choose and change   B: close" : "Up/Down: choose  Left/Right: change  F2/Esc: close";
++        {
++            const int fs = int(14 * u);
++            const int w = MeasureText(hint, fs);
++            DrawText(hint, int(l.x + l.w - w - 18 * u), int(l.y + 24 * u), fs, Color{130, 140, 170, 255});
++        }
++
++        const int fontSize = std::max(8, int(18 * u));
++        const auto &table = ga2_options::options();
++        for (int i = 0; i < int(ga2_options::KeyCount); ++i)
++        {
++            const Key key = Key(i);
++            const Rectangle r = rowRect(l, i);
++            const int ty = int(r.y + (r.height - float(fontSize)) * 0.5f);
++            if (i == g_selected)
++                DrawRectangleRec(r, Color{30, 44, 90, 255});
++            DrawText(table[key].label, int(r.x + 8 * u), ty, fontSize, Color{230, 236, 250, 255});
++
++            const int choice = shownChoice(key);
++            const bool pending = ga2_settings::restartPending(key);
++            const char *label = choiceLabel(key, choice);
++            const float vx0 = r.x + r.width * kValueFrom, vx1 = r.x + r.width * kValueTo;
++            const Color valueColor = pending ? Color{255, 190, 90, 255} : Color{150, 200, 255, 255};
++            const int w = MeasureText(label, fontSize);
++            DrawText(label, int((vx0 + vx1) * 0.5f) - w / 2, ty, fontSize, valueColor);
++            if (i == g_selected)
++            {
++                DrawText("<", int(vx0), ty, fontSize, Color{230, 236, 250, 255});
++                DrawText(">", int(vx1) - MeasureText(">", fontSize), ty, fontSize, Color{230, 236, 250, 255});
++            }
++            const char *tag = pending ? "after restart" : table[key].apply == ga2_options::Apply::Restart ? "restart" : "";
++            if (*tag)
++            {
++                const int tf = std::max(8, int(13 * u));
++                DrawText(tag, int(r.x + r.width - 8 * u) - MeasureText(tag, tf), int(r.y + (r.height - float(tf)) * 0.5f), tf,
++                         pending ? Color{255, 190, 90, 255} : Color{110, 118, 140, 255});
++            }
++        }
++
++        // Help for the selected row, then what applies now.
++        const float helpTop = l.y + (kTitleHeight + kRowHeight * float(ga2_options::KeyCount) + 6.0f) * u;
++        const int helpSize = std::max(8, int(15 * u));
++        const Key key = Key(g_selected);
++        float y = helpTop;
++        for (const std::string &line : wrap(table[key].help, helpSize, l.w - 36.0f * u))
++        {
++            DrawText(line.c_str(), int(l.x + 18 * u), int(y), helpSize, Color{190, 198, 220, 255});
++            y += float(helpSize) * 1.25f;
++        }
++        const std::string status = g_noticeUntil > GetTime() ? g_notice : context(key);
++        std::string saved = std::string("Saved to ") + ga2_settings::settingsFile().string();
++        const float bottom = l.y + l.h - (kFooterHeight + 4.0f) * u;
++        if (!status.empty())
++        {
++            const auto lines = wrap(status, helpSize, l.w - 36.0f * u);
++            float sy = bottom - float(lines.size()) * float(helpSize) * 1.25f + 2.0f * u;
++            for (const std::string &line : lines)
++            {
++                DrawText(line.c_str(), int(l.x + 18 * u), int(sy), helpSize, Color{255, 205, 120, 255});
++                sy += float(helpSize) * 1.25f;
++            }
++        }
++        const int footer = std::max(8, int(12 * u));
++        // A long folder name loses its beginning.
++        while (saved.size() > 12 && float(MeasureText(saved.c_str(), footer)) > l.w - 36.0f * u)
++            saved = "..." + saved.substr(saved.size() > 60 ? saved.size() - 60 : 4);
++        DrawText(saved.c_str(), int(l.x + 18 * u), int(l.y + l.h - (kFooterHeight - 6.0f) * u), footer, Color{110, 118, 140, 255});
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.h b/ps2xRuntime/src/lib/ga2_settings_menu.h
+new file mode 100644
+index 0000000..5ad6eee
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cstdint>
++
++// The settings page of the in-game menu (ga2_cheat_menu.cpp owns the window, the input and the headset texture and
++// opens this page with F2). One row per player option (runtime/ga2_options.h, the same table as the launcher's
++// Options screen): left / right change the value, which takes effect at once (the live options) or is saved for the
++// next start and marked "restart". Changes go through ga2_settings, which the consumers read, and are written to
++// settings.ini right away.
++namespace ga2_settings_menu
++{
++    // Where and how big the menu is drawn: the window (scale 1) or the headset's texture (scale 2).
++    struct Canvas
++    {
++        float width, height, scale;
++        bool vr;
++    };
++
++    // One frame of what the player asked for, from keyboard, pad, VR controllers and mouse.
++    struct Input
++    {
++        bool up = false, down = false, left = false, right = false;
++        bool confirm = false;       // the same as right: next value
++        bool home = false, end = false; // first / last row
++        bool pointerMoved = false;  // the mouse moved this frame
++        bool click = false;         // left button pressed
++        float x = 0.0f, y = 0.0f;   // mouse position in the window canvas
++        float wheel = 0.0f;
++    };
++
++    // The menu was opened: the selected row stays, pending notices are cleared.
++    void opened();
++    // Main thread, while the page is open.
++    void update(const Input &input, const Canvas &window);
++    void draw(const Canvas &canvas);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 2e6bf67..8b8edf5 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -3,6 +3,7 @@
+ #include "ga2_vr_bindings.h"
+ #include "ga2_vr_input.h"
+ #include "runtime/ga2_display.h"
++#include "runtime/ga2_settings.h"
+ #include "ps2_mouse.h"
+ #include "runtime/ga2_vrpointer.h"
+ #include "ga2_present.h"
+@@ -484,7 +485,7 @@ void main() {
+         {
+             ScreenGeometry s;
+             s.halfHeight = kScreenHeight * 0.5f;
+-            const float wideAspect = std::max(ga2_display::parseAspect(std::getenv("GA2_ASPECT")), 4.0f / 3.0f);
++            const float wideAspect = std::max(ga2_display::parseAspect(ga2_settings::value(ga2_options::Aspect)), 4.0f / 3.0f);
+             s.halfWidth = s.halfHeight * (wide ? (wideAspect > 4.0f / 3.0f ? wideAspect : 16.0f / 9.0f) : 4.0f / 3.0f);
+             s.center = V3{0.0f, 0.0f, -kScreenDistance};
+             return s;
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 8e09d0d..5bb57d5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "runtime/ga2_stereo.h"
+ #include "runtime/ga2_framepace.h"
++#include "runtime/ga2_settings.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_texpacks.h"
+ 
+@@ -192,6 +193,8 @@ namespace
+     };
+ 
+     std::atomic<bool> g_rendering{false};
++    // The player's dither choice while playing (-1: as the environment said at the start); applied at vsync.
++    std::atomic<int> g_ditherWanted{-1};
+ 
+     // Persistent Vulkan pipeline cache. paraLLEl-GS pre-compiles ~2000 compute
+     // pipelines at start; without a cache every launch recompiles them.
+@@ -748,6 +751,23 @@ namespace ga2_pgs
+ 
+     void setButtonStyle(const std::string &style) { ga2_texpacks::setButtonStyle(style); }
+ 
++    void applySettings()
++    {
++        static uint32_t seen = 0;
++        const uint32_t generation = ga2_settings::generation();
++        if (generation == seen)
++            return;
++        seen = generation;
++        // Only what the player changed: the rest stays as the environment said at the start.
++        if (ga2_settings::changed(ga2_options::Buttons))
++            ga2_texpacks::setFixedButtonStyle(ga2_settings::value(ga2_options::Buttons));
++        if (ga2_settings::changed(ga2_options::Dither))
++            g_ditherWanted.store(ga2_settings::get(ga2_options::Dither) == 1 ? 1 : 0);
++        if (ga2_settings::changed(ga2_options::DumpTextures))
++            ga2_texpacks::setDumpDirectory(ga2_settings::get(ga2_options::DumpTextures) == 1 ? ga2_settings::dumpDirectory()
++                                                                                              : std::string());
++    }
++
+     void readLocalToHost(uint8_t *dst, uint32_t qwords)
+     {
+         State &s = state();
+@@ -792,6 +812,18 @@ namespace ga2_pgs
+             put(p.bgcolor, r.bgcolor);
+         }
+ 
++        // PS2 dithering changed in the settings menu: every instance takes it before the next frame's draws.
++        if (const int wanted = g_ditherWanted.load(std::memory_order_relaxed); wanted >= 0)
++            for (uint32_t e = 0; e < s.instanceCount(); ++e)
++            {
++                Eye &inst = s.instance(e);
++                if (inst.hacks.disable_dither != (wanted == 0))
++                {
++                    inst.hacks.disable_dither = wanted == 0;
++                    inst.gs.set_hacks(inst.hacks);
++                }
++            }
++
+         VSyncInfo info = {};
+         info.phase = s.field ^= 1u;
+         info.dst_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
+@@ -984,6 +1016,7 @@ namespace ga2_pgs
+     void setVramMirror(const uint8_t *) {}
+     void setTexturePacks(const std::vector<std::string> &) {}
+     void setButtonStyle(const std::string &) {}
++    void applySettings() {}
+     void imageUpload(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, size_t) {}
+     void readLocalToHost(uint8_t *, uint32_t) {}
+     void vsync(const GSRegisters &) {}
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 3b939e2..3c9e55b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -60,7 +60,9 @@ namespace ga2_texpacks
+             std::string button;
+             int x = 0, y = 0, w = 0, h = 0;
+         };
+-        std::string g_style = "playstation";
++        std::string g_style = "playstation"; // in use: g_fixed when the player chose one, else the detected device's
++        std::string g_detected = "playstation";
++        std::string g_fixed;                 // empty: follow the input device
+         std::string g_buttonDir;
+         bool g_buttonMapLoaded = false;
+         std::unordered_map<uint64_t, std::vector<IconSpot>> g_buttonMap;
+@@ -544,7 +546,7 @@ namespace ga2_texpacks
+             else
+                 g_buttonDir = (std::filesystem::path(GetApplicationDirectory()) / "buttons").string();
+             if (const char *style = std::getenv("GA2_BUTTONS"); style && *style && std::string(style) != "auto")
+-                g_style = style;
++                g_style = g_fixed = style;
+             if (const char *dump = std::getenv("GA2_TEX_DUMP"); dump && *dump)
+             {
+                 g_dumpDir = dump;
+@@ -567,16 +569,46 @@ namespace ga2_texpacks
+ 
+     bool takeChanged() { return g_changed.exchange(false); }
+ 
++    namespace
++    {
++        // g_mutex held.
++        void applyStyle()
++        {
++            const std::string want = g_fixed.empty() ? g_detected : g_fixed;
++            if (want == g_style)
++                return;
++            g_style = want;
++            g_changed.store(true);
++            std::fprintf(stderr, "[texpacks] button prompts: %s\n", want.c_str());
++        }
++    }
++
+     void setButtonStyle(const std::string &style)
+     {
+         std::lock_guard<std::mutex> lock(g_mutex);
+-        if (const char *fixed = std::getenv("GA2_BUTTONS"); fixed && *fixed && std::string(fixed) != "auto")
+-            return; // the player chose a style
+-        if (style == g_style)
++        g_detected = style;
++        applyStyle();
++    }
++
++    void setFixedButtonStyle(const std::string &style)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_fixed = style == "auto" ? std::string() : style;
++        applyStyle();
++    }
++
++    void setDumpDirectory(const std::string &dir)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (dir == g_dumpDir)
+             return;
+-        g_style = style;
+-        g_changed.store(true);
+-        std::fprintf(stderr, "[texpacks] button prompts: %s\n", style.c_str());
++        g_dumpDir = dir;
++        if (!dir.empty())
++        {
++            std::error_code ec;
++            std::filesystem::create_directories(dir, ec);
++        }
++        std::fprintf(stderr, "[texpacks] texture dump: %s\n", dir.empty() ? "off" : dir.c_str());
+     }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index 90de1e6..a66f7d0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -37,5 +37,9 @@ namespace ga2_texpacks
+     // GA2_BUTTON_DIR is where the icons and map.json are (default
+     // <app>/buttons).
+     void setButtonStyle(const std::string &style);
++    // The player's choice ("auto" or empty: follow the device). Takes the place of GA2_BUTTONS while playing.
++    void setFixedButtonStyle(const std::string &style);
++    // Where textures are dumped; empty turns the dump off.
++    void setDumpDirectory(const std::string &dir);
+ }
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 3c91e05..b4375fb 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -1,6 +1,7 @@
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
+ #include "ga2_cheat_menu.h"
++#include "runtime/ga2_settings.h"
+ #include "ps2_host_backend.h"
+ #include "runtime/ga2_activity.h"
+ 
+@@ -99,17 +100,15 @@ namespace ps2_mouse
+         }
+ 
+         // GA2_ONSCREEN_PAD=1 (launcher option, off by default) enables the pad.
+-        const bool g_padEnabled = [] {
+-            const char *v = std::getenv("GA2_ONSCREEN_PAD");
+-            return v && *v == '1';
+-        }();
++        // (The in-game settings menu switches it while playing.)
++        bool padEnabled() { return ga2_settings::get(ga2_options::OnscreenPad) == 1; }
+ 
+         // In the side bars the pad shows whenever the mouse moved recently;
+         // over the image (no bars) only while the pointer is near its edges,
+         // so it does not cover menus being pointed at.
+         bool padVisible()
+         {
+-            if (!g_padEnabled)
++            if (!padEnabled())
+                 return false;
+             if (g_overPad)
+                 return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c35aa12..ddf7b09 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
+ #include "runtime/ga2_framepace.h"
++#include "runtime/ga2_settings.h"
+ #include "ga2_vr.h"
+ #include "ga2_cheat_menu.h"
+ #include "runtime/ga2_activity.h"
+@@ -946,6 +947,8 @@ bool PS2Runtime::syncCoreSubsystems()
+ 
+ bool PS2Runtime::initialize(const char *title)
+ {
++    // The player's options (launcher environment, settings.ini): before anything reads a GA2_* variable.
++    ga2_settings::init();
+     try
+     {
+         if (!m_memory.initialize())
+@@ -3068,6 +3071,7 @@ void PS2Runtime::run()
+         ps2_mouse::beginFrame(ps2_mouse::Rect{dstRect.x, dstRect.y, dstRect.width, dstRect.height},
+                               static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+         ga2_cheat_menu::update(m_memory.getRDRAM());
++        ga2_pgs::applySettings(); // button prompts, dithering, texture dump (changed in the settings menu)
+         ps2PadSampleHostInput();
+         // Developer aid: GA2_GS_CAPTURE + F10 records the GIF stream (gs_pgs.cpp).
+         if (IsKeyPressed(KEY_F10) && std::getenv("GA2_GS_CAPTURE"))
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index b3cdec9..017aba4 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -29,6 +29,7 @@ add_library(ps2_test_lib STATIC
+     src/elf_analyzer_tests.cpp
+     src/pad_input_tests.cpp
+     src/ga2_vr_input_tests.cpp
++    src/ga2_settings_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+diff --git a/ps2xTest/src/ga2_settings_tests.cpp b/ps2xTest/src/ga2_settings_tests.cpp
+new file mode 100644
+index 0000000..5e2d8df
+--- /dev/null
++++ b/ps2xTest/src/ga2_settings_tests.cpp
+@@ -0,0 +1,119 @@
++#include "MiniTest.h"
++
++#include "runtime/ga2_options.h"
++#include "runtime/ga2_settings.h"
++
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <set>
++#include <sstream>
++#include <string>
++
++namespace
++{
++    using namespace ga2_options;
++
++    void setEnv(const char *name, const char *value)
++    {
++#ifdef _WIN32
++        _putenv_s(name, value ? value : "");
++#else
++        if (value)
++            setenv(name, value, 1);
++        else
++            unsetenv(name);
++#endif
++    }
++
++    std::map<std::string, std::string> readIni(const std::filesystem::path &file)
++    {
++        std::map<std::string, std::string> out;
++        std::ifstream in(file);
++        for (std::string line; std::getline(in, line);)
++            if (const auto equals = line.find('='); equals != std::string::npos)
++                out[line.substr(0, equals)] = line.substr(equals + 1);
++        return out;
++    }
++}
++
++void register_ga2_settings_tests()
++{
++    MiniTest::Case("Ga2Settings", [](TestCase &tc) {
++        tc.Run("the option table has unique keys and variables, and every choice survives the environment round trip", [](TestCase &t) {
++            std::set<std::string> keys, envs;
++            t.Equals(options().size(), size_t(KeyCount), "one option per key");
++            for (size_t i = 0; i < options().size(); ++i)
++            {
++                const Option &o = options()[i];
++                t.IsTrue(keys.insert(o.key).second, std::string("unique key ") + o.key);
++                t.IsTrue(envs.insert(o.env).second, std::string("unique variable ") + o.env);
++                t.IsTrue(o.choices.size() >= 2, std::string("choices for ") + o.key);
++                for (size_t c = 0; c < o.choices.size(); ++c)
++                    t.Equals(choiceFromEnv(i, envValue(i, int(c), "/data/dumps/textures")), int(c),
++                             std::string(o.key) + "=" + o.choices[c].value + " round trip");
++            }
++            t.Equals(std::string(envValue(Resolution, 2, "")), std::string("16"), "4x is 16 samples");
++            t.Equals(std::string(envValue(DumpTextures, 0, "/d")), std::string(), "dump off is an empty path");
++            t.Equals(std::string(envValue(DumpTextures, 1, "/d")), std::string("/d"), "dump on is the folder");
++            t.Equals(choiceFromEnv(Vr, "preview"), 1, "preview counts as VR on");
++            t.Equals(choiceFromEnv(Fps, "130"), 1, "any rate maps to the nearest choice below it");
++            t.Equals(choiceFromEnv(Fps, "300"), 4, "above the table: the top choice");
++            t.Equals(choiceFromEnv(Aspect, "bogus"), -1, "unknown text");
++        });
++
++        tc.Run("the registry reads settings.ini under GA2_DATA_DIR, lets the environment win and saves only what changed", [](TestCase &t) {
++            namespace fs = std::filesystem;
++            const fs::path dir = fs::temp_directory_path() / ("ga2-settings-test-" + std::to_string(std::rand()));
++            fs::create_directories(dir);
++            {
++                std::ofstream ini(dir / "settings.ini");
++                ini << "filter=anime4k\nfps=144\nvr=0\nwindow_scale=3\nfuture_key=x\nbuttons=xbox\n";
++            }
++            for (const Option &o : options())
++                setEnv(o.env, nullptr);
++            setEnv("GA2_DATA_DIR", dir.string().c_str());
++            setEnv("GA2_BUTTONS", "keyboard"); // the environment wins over the file
++            ga2_settings::init();
++            t.Equals(std::string(ga2_settings::value(Filter)), std::string("anime4k"), "filter from the file");
++            t.Equals(std::string(ga2_settings::value(Fps)), std::string("144"), "frame rate from the file");
++            t.Equals(std::string(ga2_settings::value(Buttons)), std::string("keyboard"), "environment wins");
++            t.Equals(std::string(ga2_settings::value(Sides)), std::string("black"), "default where nothing says otherwise");
++            t.Equals(std::string(std::getenv("GA2_FILTER") ? std::getenv("GA2_FILTER") : ""), std::string("anime4k"),
++                     "the file's value is handed to code that reads the environment");
++            t.Equals(ga2_settings::get(Filter), ga2_settings::started(Filter), "nothing changed yet");
++            t.IsFalse(ga2_settings::changed(Filter), "not changed");
++
++            const uint32_t before = ga2_settings::generation();
++            ga2_settings::set(Dither, 1);
++            ga2_settings::set(Filter, 0);
++            ga2_settings::set(Vr, 1);
++            t.IsTrue(ga2_settings::generation() > before, "a change bumps the generation");
++            t.IsTrue(ga2_settings::changed(Dither) && ga2_settings::changed(Filter), "changed keys are marked");
++            t.IsFalse(ga2_settings::changed(Fps), "untouched keys are not");
++            t.IsTrue(ga2_settings::restartPending(Vr), "VR waits for a restart");
++            t.IsFalse(ga2_settings::restartPending(Filter), "the filter is live");
++            const char *why = nullptr;
++            t.IsFalse(ga2_settings::takesEffectNow(Vr, 1, &why), "VR is a restart option");
++            t.IsTrue(why != nullptr, "with a reason");
++            t.IsTrue(ga2_settings::takesEffectNow(Filter, 2), "filter is live");
++            t.IsTrue(ga2_settings::takesEffectNow(Fps, 0), "the PS2 rate is always possible");
++            ga2_settings::set(Vr, 0);
++            t.IsFalse(ga2_settings::restartPending(Vr), "back to what the run started with");
++
++            t.IsTrue(ga2_settings::save(), "saved");
++            const auto ini = readIni(dir / "settings.ini");
++            t.Equals(ini.at("filter"), std::string("bilinear"), "changed value replaces its line");
++            t.Equals(ini.at("dither"), std::string("1"), "new key appended");
++            t.Equals(ini.at("fps"), std::string("144"), "untouched keys stay as they were");
++            t.Equals(ini.at("buttons"), std::string("xbox"), "a key an environment override hid is not rewritten");
++            t.Equals(ini.at("window_scale"), std::string("3"), "the launcher's own lines stay");
++            t.Equals(ini.at("future_key"), std::string("x"), "unknown lines stay");
++            t.IsTrue(ini.count("vr") == 1 && ini.at("vr") == "0", "VR set and set back writes the final value");
++            t.IsFalse(fs::exists(dir / "settings.ini.tmp"), "no temporary file left");
++            t.Equals(ga2_settings::dumpDirectory(), (dir / "dumps" / "textures").string(), "dump folder under the data folder");
++            fs::remove_all(dir);
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 2a889aa..5e5284c 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -7,6 +7,7 @@ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
+ void register_ga2_vr_input_tests();
++void register_ga2_settings_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+@@ -42,6 +43,7 @@ int main()
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
+     register_ga2_vr_input_tests();
++    register_ga2_settings_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+-- 
+2.55.0
+

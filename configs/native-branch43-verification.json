@@ -1,0 +1,30 @@
+{
+  "patch": "0024-use-64-bit-signed-ee-branch-predicates.patch",
+  "patch_sha256": "010893c28435fecafb5b383e466608f90b477abec70bcce819d0aa3688722612",
+  "shared_source_prefix": 24,
+  "upstream_pin": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "code_correctness_review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_verified": true
+  },
+  "integration_review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_verified": true
+  },
+  "authored_nonlink_branch_cases": 192,
+  "unchanged_baseline_failures": 96,
+  "candidate_failures": 0,
+  "integrated_ctest_cases": 192,
+  "integrated_ctest_failures": 0,
+  "existing_codegen_decoder_cases": 76,
+  "existing_codegen_decoder_failures": 0,
+  "reproduced_files": 85,
+  "idempotent_prefix": 24,
+  "generator_sha256": "28b4af28394df85f9e9fca5faeea50d66aab43ce707f23e6d3ad5393de276f0a",
+  "game_code_regenerated": false,
+  "native_binaries_promoted": false,
+  "movie_playback_accepted": false,
+  "separate_open_issue": "BLTZALL/BGEZALL untaken link semantics; no correction in this patch"
+}

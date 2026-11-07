@@ -1,0 +1,49 @@
+From 10e3ca849e87dc83e34964763aecd6b073a12d83 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:31:01 -0500
+Subject: [PATCH] ga2: IPU decoder waiting for input lets the pump settle
+
+BDEC's end-of-macroblock start-code check aligned the bit position and
+called advance(0) before finding the input FIFO empty; both counted as
+activity, so with the toIPU DMA stopped every pump iteration looked like
+progress and the pump threw "IPU pump did not settle" (Zettai's opening
+movie after 0071 changed the IOP/IPU interleaving). advance/align now count
+only a moved bit position.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_ipu.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_ipu.cpp b/ps2xRuntime/src/lib/ps2_ipu.cpp
+index 441d0c0..5beb603 100644
+--- a/ps2xRuntime/src/lib/ps2_ipu.cpp
++++ b/ps2xRuntime/src/lib/ps2_ipu.cpp
+@@ -417,12 +417,18 @@ void IpuDevice::advance(uint32_t bits)
+             m_fp = inputRead(&m_internal[0]) ? 1u : 0u;
+         }
+     }
+-    ++m_activity;
++    // Only a moved bit position is progress (input reads count themselves):
++    // a command waiting for input must let the pump settle.
++    if (bits)
++        ++m_activity;
+ }
+ 
+ void IpuDevice::align()
+ {
++    const uint32_t before = m_bp;
+     m_bp = (m_bp + 7u) & ~7u;
++    if (m_bp != before)
++        ++m_activity;
+     advance(0);
+ }
+ 
+@@ -1886,3 +1892,4 @@ void IpuDevice::vectorQuantize()
+         for (int j = 0; j < 8; ++j)
+             d.indx4[i * 8 + j] = static_cast<uint8_t>(closest(i, 2 * j + 1) << 4 | closest(i, 2 * j));
+ }
++
+-- 
+2.55.0
+

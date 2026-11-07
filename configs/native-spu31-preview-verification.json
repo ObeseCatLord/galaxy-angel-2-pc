@@ -1,0 +1,21 @@
+{
+  "status": "accepted-bounded-owned-nonsilent-native-preview",
+  "review_model": "gpt-6-astra",
+  "review_effort": "ultra",
+  "capture": "20261010-094939",
+  "bounded_seconds": 300.948,
+  "sample_rate": 48000,
+  "channels": 2,
+  "frames": 14398677,
+  "nonzero_channel_samples": 1070740,
+  "owned_periodic_checks": 275,
+  "max_check_interval_seconds": 3.125581,
+  "wav_sha256": "8e79ab8a6148ccbee36a462034a3ce6a1faf9f1b162bc1a707560b7fb52f0f4f",
+  "observed_scene_samples": ["card-prompts", "title", "starfield", "prologue-text"],
+  "original_device_bank_or_key_trace_in_this_capture": false,
+  "exclusive_voice_attribution_accepted": false,
+  "reference_parity_accepted": false,
+  "speech_or_gameplay_accepted": false,
+  "production_approved": false,
+  "public_baseline": "source23/allfive-native22"
+}

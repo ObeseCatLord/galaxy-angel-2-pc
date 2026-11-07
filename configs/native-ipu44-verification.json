@@ -1,0 +1,44 @@
+{
+  "date": "2026-10-10",
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_verified": true,
+    "independently_reproduced_reference_archives": 4
+  },
+  "reference": {
+    "producer": "PCSX2 v2.8.2",
+    "run": "native-ipu44/reference-run2",
+    "bounded_seconds": 154.37780151399784,
+    "first_post_load_s1": "0x8000000000000000",
+    "later_commands": [
+      "0x40000020",
+      "0x40000020"
+    ],
+    "later_post_load_s1": [
+      "0x2801e012",
+      "0x0dac2381"
+    ],
+    "bit_positions": [
+      32,
+      64
+    ],
+    "input_iso_offset": 3864449075,
+    "input_bytes_matched": 1024,
+    "input_sha256": "014f8a13830163729f8edc3fa09a8812152dfcb5cf9c896ce203841e239a4902",
+    "screenshots_register_values_accepted": false,
+    "movie_playback_accepted": false
+  },
+  "next_architecture": "bounded original-SDK-preserving IPU device/input proof; reopen before full codec/output implementation",
+  "full_decoder_route_approved": false,
+  "generation_main_verified": {
+    "source_prefix": 24,
+    "changed_files": 3285,
+    "changed_lines": 4875,
+    "only_signed_branch_width": true,
+    "original_tree_preserved": true,
+    "new_native_link": false,
+    "identical_new_files_removed": 30171,
+    "allocated_bytes_reclaimed": 194139648
+  }
+}

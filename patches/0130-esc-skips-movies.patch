@@ -1,0 +1,76 @@
+From 37aaa19001e9d26df00b8ea13392adc90ec59ff8 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:24:47 -0500
+Subject: [PATCH] keyboard: Esc skips movies
+
+The pad side records an Esc press; the game side (native/compat/ga2_skip.cpp)
+answers the movie players' own skip query (pad action 0xA, Start) with yes
+within 0.2 s of it, so the movie ends as with Start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_framepace.h |  6 ++++++
+ ps2xRuntime/src/lib/ga2_framepace.cpp       | 15 +++++++++++++++
+ ps2xRuntime/src/lib/ps2_pad.cpp             |  3 +++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index b489c71..206a636 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -110,6 +110,12 @@ namespace ga2_framepace
+     void skipSeenBlock();
+     void skipAdvance();
+     bool skipNow();
++
++    // Esc skips a movie: the main thread (ps2_pad.cpp) records the key press; the game side
++    // (native/compat/ga2_skip.cpp, the pad action query) takes it within 0.2 s and answers the movie player's
++    // own "skip" pad query with yes, so the game ends the movie the way its skip button does.
++    void requestCutsceneSkip();
++    bool takeCutsceneSkip();
+ }
+ 
+ // The oracle: one line per game loop iteration plus events, stamped with the
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index 7aa3d37..b68c1d8 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -227,6 +227,21 @@ namespace ga2_framepace
+         g_skipNow.store(now, std::memory_order_relaxed);
+     }
+     bool skipNow() { return g_skipNow.load(std::memory_order_relaxed); }
++
++    namespace
++    {
++        std::atomic<int64_t> g_cutsceneSkipAt{0}; // steady-clock nanoseconds of the last Esc press, 0 = none
++        int64_t steadyNow()
++        {
++            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        }
++    }
++    void requestCutsceneSkip() { g_cutsceneSkipAt.store(steadyNow(), std::memory_order_relaxed); }
++    bool takeCutsceneSkip()
++    {
++        const int64_t at = g_cutsceneSkipAt.exchange(0, std::memory_order_relaxed);
++        return at != 0 && steadyNow() - at < 200'000'000;
++    }
+     uint16_t scriptedPad() { return g_scriptedPad.load(std::memory_order_relaxed); }
+ 
+     namespace
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 5ccb302..86897dd 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -248,6 +248,9 @@ void ps2PadSampleHostInput()
+     static const bool scriptOnly = std::getenv("GA2_PAD_SCRIPT") != nullptr;
+     const bool skip = !scriptOnly && !ga2_cheat_menu::open() && ps2_pad_keys::skipHeld([](int key) { return IsKeyDown(key); });
+     ga2_framepace::setSkipHeld(skip);
++    // Esc also skips movies (the game side decides whether one is playing).
++    if (!scriptOnly && !ga2_cheat_menu::open() && IsKeyPressed(KEY_ESCAPE))
++        ga2_framepace::requestCutsceneSkip();
+     if (skip)
+     {
+         // Any button but Circle and the D-pad (the system menu on Select, the backlog on Square, Auto, Cross, Start,
+-- 
+2.56.0
+

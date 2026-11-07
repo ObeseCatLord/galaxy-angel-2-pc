@@ -1,0 +1,448 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..4cf7a36 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <utility>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -44,6 +45,11 @@ namespace ps2x::iop::detail
+         return address & 0x1FFFFFFFu;
+     }
+ 
++    void IopMemory::setCdvdDiscTypeReader(std::function<uint8_t()> reader)
++    {
++        m_cdvdDiscTypeReader = std::move(reader);
++    }
++
+     uint8_t IopMemory::read8(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+@@ -213,6 +219,9 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        // CDVD TYPE is the high byte at 1f40200f (also bf40200f).
++        if (address == 0x1F40200Cu)
++            return m_cdvdDiscTypeReader ? uint32_t(m_cdvdDiscTypeReader()) << 24u : 0u;
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..af59727 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -70,6 +71,9 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+ 
++        // The controller owns media state; reset RAM without duplicating it here.
++        void setCdvdDiscTypeReader(std::function<uint8_t()> reader);
++
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+     private:
+@@ -87,5 +91,6 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++        std::function<uint8_t()> m_cdvdDiscTypeReader;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index dc6a8c0..78765ea 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -282,7 +282,7 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 12: // sceCdGetDiskType
+-                cpu.gpr[2] = kCdvdTypePs2Dvd;
++                cpu.gpr[2] = discType();
+                 return true;
+ 
+             case 13: // sceCdDiskReady
+@@ -311,11 +311,46 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = fsvReadBuffer;
+                 return true;
+ 
++            case 63: // sceCdRV: raw DVD sectors, with chunk-completion callback.
++            {
++                const uint32_t mode = cpu.gpr[7];
++                const uint32_t stack = cpu.gpr[29];
++                if (!memory.ownsRamRange(mode, 4u) ||
++                    uint64_t(IopMemory::physicalAddress(stack)) + 24u > IopMemory::RamSize ||
++                    !memory.ownsRamRange(stack + 16u, 8u) ||
++                    memory.read8(mode + 2u) != 0u)
++                {
++                    lastError = kCdvdErrorRead;
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
++                const uint32_t chunk = memory.read32(stack + 16u);
++                const uint32_t function = memory.read32(stack + 20u);
++                // A multi-chunk request reuses the destination after each
++                // callback; never fill beyond it or claim partial success.
++                if ((chunk != 0u && a1 > chunk) ||
++                    (function != 0u && !memory.ownsRamRange(function, 4u)) ||
++                    !readDvdSectors(a0, a1, a2))
++                {
++                    lastError = kCdvdErrorRead;
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
++                signalCommandComplete();
++                if (function != 0u)
++                    completionCallback = CompletionCallback{function, cpu.gpr[28], 0u};
++                cpu.gpr[2] = 1u;
++                return true;
++            }
++
+             case 50: // sceCdSC
+             {
+                 const int32_t code = static_cast<int32_t>(a0);
+                 switch (code)
+                 {
++                case -22: // DVD layer information available; single-layer media.
++                    cpu.gpr[2] = discType() == kCdvdTypePs2Dvd ? 1u : 0u;
++                    return true;
+                 case -23: // Translate a logical sector for a dual-layer disc.
+                     // The host image exposes one continuous LSN space, so no layer offset is required.
+                     cpu.gpr[2] = a1 != 0u ? memory.read32(a1) : 0u;
+@@ -374,7 +409,32 @@ namespace ps2x::iop::detail
+             return result;
+         }
+ 
++        uint8_t discType()
++        {
++            const auto path = host.hostPath(HostPathKind::CdImage);
++            if (!path.empty())
++                return openImage(path) ? kCdvdTypePs2Dvd : 0u;
++            (void)openImage(path); // Retire a prior mounted-image handle.
++            return buildVirtualIso() ? kCdvdTypePs2Dvd : 0u;
++        }
++
+     private:
++        bool openImage(const std::string &path)
++        {
++            if (imageHandle != 0u && imageHandlePath != path)
++            {
++                host.closeHostFile(imageHandle);
++                imageHandle = 0u;
++            }
++            imageHandlePath = path;
++            if (path.empty())
++                return false;
++            if (imageHandle == 0u)
++                imageHandle = host.openHostFile(path);
++            uint64_t size = 0u;
++            return imageHandle != 0u && host.hostFileSize(imageHandle, size) &&
++                   size != 0u && size % kSectorSize == 0u;
++        }
+         int ensureInterruptEventFlag()
+         {
+             if (interruptEventFlagId == 0)
+@@ -396,6 +456,7 @@ namespace ps2x::iop::detail
+             if (imageHandle != 0u)
+                 host.closeHostFile(imageHandle);
+             imageHandle = 0u;
++            imageHandlePath.clear();
+             for (IsoNode &node : nodes)
+             {
+                 if (node.handle != 0u)
+@@ -684,15 +745,59 @@ namespace ps2x::iop::detail
+                 return false;
+             }
+             const size_t byteCount = static_cast<size_t>(byteCount64);
+-            std::vector<uint8_t> bytes(byteCount, 0u);
++            std::vector<uint8_t> bytes;
++            if (!readSectorBytes(lsn, sectors, bytes) ||
++                !memory.writeRam(destination, bytes.data(), byteCount))
++            {
++                lastError = kCdvdErrorRead;
++                return false;
++            }
++            lastError = kCdvdErrorNone;
++            return true;
++        }
++
++        bool readDvdSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        {
++            constexpr uint32_t rawBytes = 2064u;
++            const uint64_t size = uint64_t(sectors) * rawBytes;
++            if (size > IopMemory::RamSize || !memory.ownsRamRange(destination, size) ||
++                uint64_t(lsn) + sectors + 0x30000u > 0x1000000u)
++                return false;
++            std::vector<uint8_t> data;
++            if (!readSectorBytes(lsn, sectors, data))
++                return false;
++            std::vector<uint8_t> raw(size, 0u);
++            for (uint32_t sector = 0u; sector < sectors; ++sector)
++            {
++                auto *out = raw.data() + size_t(sector) * rawBytes;
++                const uint32_t id = lsn + sector + 0x30000u;
++                // Single-layer DVD layout, as supplied by the stock controller:
++                // ID, IED/CPR_MAI, 2048 payload bytes, then EDC padding.
++                out[0] = 0x20u;
++                out[1] = static_cast<uint8_t>(id >> 16u);
++                out[2] = static_cast<uint8_t>(id >> 8u);
++                out[3] = static_cast<uint8_t>(id);
++                std::memcpy(out + 12u, data.data() + size_t(sector) * kSectorSize, kSectorSize);
++            }
++            if (!memory.writeRam(destination, raw.data(), raw.size()))
++                return false;
++            lastError = kCdvdErrorNone;
++            return true;
++        }
++
++        bool readSectorBytes(uint32_t lsn, uint32_t sectors, std::vector<uint8_t> &bytes)
++        {
++            const uint64_t byteCount = uint64_t(sectors) * kSectorSize;
++            if (byteCount > IopMemory::RamSize || uint64_t(lsn) + sectors > 0x100000000ull)
++                return false;
++            bytes.assign(static_cast<size_t>(byteCount), 0u);
+ 
+             bool read = false;
+             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            const bool imageOpen = openImage(imagePath);
+             if (!imagePath.empty())
+             {
+-                if (imageHandle == 0u)
+-                    imageHandle = host.openHostFile(imagePath);
+-                if (imageHandle != 0u)
++                if (imageOpen)
+                 {
+                     size_t bytesRead = 0u;
+                     read = host.readHostFile(imageHandle,
+@@ -704,7 +809,7 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
+-            if (!read && buildVirtualIso())
++            if (imagePath.empty() && !read && buildVirtualIso())
+             {
+                 read = true;
+                 for (uint32_t sector = 0u; sector < sectors; ++sector)
+@@ -717,13 +822,7 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
+-            if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
+-            {
+-                lastError = kCdvdErrorRead;
+-                return false;
+-            }
+-            lastError = kCdvdErrorNone;
+-            return true;
++            return read;
+         }
+ 
+         IopHost &host;
+@@ -739,6 +838,7 @@ namespace ps2x::iop::detail
+         uint32_t lastReadTimeout = 0u;
+         int interruptEventFlagId = 0;
+         uint64_t imageHandle = 0u;
++        std::string imageHandlePath;
+         uint32_t fsvReadBuffer = 0u;
+         bool virtualIsoBuilt = false;
+         bool virtualIsoValid = false;
+@@ -764,6 +864,11 @@ namespace ps2x::iop::detail
+         return m_impl->dispatchImport(ordinal, cpu);
+     }
+ 
++    uint8_t IopCdvd::discType()
++    {
++        return m_impl->discType();
++    }
++
+     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
+     {
+         return m_impl->takeCompletionCallback();
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 2ca6048..11fbd38 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -34,6 +34,7 @@ namespace ps2x::iop::detail
+         void reset() noexcept;
+ 
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] uint8_t discType();
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+ 
+     private:
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index af25d88..6efa77d 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -110,6 +110,7 @@ namespace ps2x::iop::detail
+               imports(memory),
+               loadcore(memory, imports)
+         {
++            memory.setCdvdDiscTypeReader([this] { return cdvd.discType(); });
+             reset();
+         }
+ 
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 93e320a..1a0c1bd 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -16,6 +16,8 @@
+ #include <filesystem>
+ #include <string>
+ #include <string_view>
++#include <map>
++#include <vector>
+ 
+ namespace
+ {
+@@ -66,6 +68,48 @@ namespace
+         std::filesystem::path root;
+     };
+ 
++    class ImageHost final : public NullHost
++    {
++    public:
++        std::string mounted = "A";
++        std::filesystem::path looseRoot;
++        std::map<std::string, std::vector<uint8_t>> images;
++        std::map<uint64_t, std::string> handles;
++        uint64_t nextHandle = 0;
++        unsigned closes = 0;
++        std::string hostPath(HostPathKind kind) const override
++        {
++            if (kind == HostPathKind::CdImage) return mounted;
++            if (kind == HostPathKind::CdRoot) return looseRoot.string();
++            return {};
++        }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            if (!images.contains(std::string(path))) return 0;
++            handles[++nextHandle] = path;
++            return nextHandle;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            const auto found = handles.find(handle);
++            if (found == handles.end()) return false;
++            size = images.at(found->second).size();
++            return true;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *out, size_t size,
++                          size_t &read) override
++        {
++            read = 0;
++            uint64_t length;
++            if (!hostFileSize(handle, length) || offset > length || size > length - offset)
++                return false;
++            std::memcpy(out, images.at(handles.at(handle)).data() + offset, size);
++            read = size;
++            return true;
++        }
++        void closeHostFile(uint64_t handle) override { handles.erase(handle); ++closes; }
++    };
++
+     class RecordingExecutor final : public IopGuestExecutor
+     {
+     public:
+@@ -321,6 +365,80 @@ namespace
+                       "allocation failure produced a fake transfer-buffer pointer");
+     }
+ 
++    bool testDvdSectorTransfer()
++    {
++        ImageHost host;
++        host.images["A"] = std::vector<uint8_t>(20u * 2048u, 0x31u);
++        host.images["B"] = std::vector<uint8_t>(20u * 2048u, 0x72u);
++        host.images["short"] = std::vector<uint8_t>(13u, 0xEEu);
++        const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
++        host.looseRoot = std::filesystem::temp_directory_path() / ("ga2-cdvd-failure-" + suffix);
++        std::filesystem::create_directory(host.looseRoot);
++        struct RemoveFixture
++        {
++            std::filesystem::path path;
++            ~RemoveFixture() { std::error_code e; std::filesystem::remove_all(path, e); }
++        } remove{host.looseRoot};
++        IopMemory memory;
++        IopKernel kernel(memory);
++        kernel.reset();
++        IopCdvd cdvd(host, memory, kernel);
++        memory.setCdvdDiscTypeReader([&] { return cdvd.discType(); });
++        constexpr uint32_t mode = 0x2000u, stack = 0x3000u, function = 0x4000u;
++        memory.write32(mode, 0x10u);
++        memory.write32(function, 0x03E00008u);
++        memory.write32(stack + 16u, 2u);
++        memory.write32(stack + 20u, function);
++        const uint32_t allocation = memory.allocate(2u * 2064u + 32u);
++        const uint32_t destination = allocation + 16u;
++        std::vector<uint8_t> poison(2u * 2064u + 32u, 0xCCu);
++        (void)memory.writeRam(allocation, poison.data(), poison.size());
++        IopCpuState cpu{};
++        cpu.gpr[4] = 3u; cpu.gpr[5] = 2u; cpu.gpr[6] = destination;
++        cpu.gpr[7] = mode; cpu.gpr[29] = stack; cpu.gpr[28] = 0x5678u;
++        for (const auto &path : {"A", "B", "A"})
++        {
++            host.mounted = path;
++            if (!expect(memory.read8(0xBF40200Fu) == 0x14u, "MMIO did not report mounted DVD") ||
++                !expect(cdvd.dispatchImport(63u, cpu) && cpu.gpr[2] == 1u, "DVD transfer failed"))
++                return false;
++            const auto callback = cdvd.takeCompletionCallback();
++            if (!expect(callback && callback->address == function && callback->gp == 0x5678u &&
++                            callback->reason == 0u, "explicit completion callback lost its ABI"))
++                return false;
++            std::vector<uint8_t> bytes(poison.size());
++            (void)memory.readRam(allocation, bytes.data(), bytes.size());
++            if (!expect(bytes.front() == 0xCCu && bytes.back() == 0xCCu,
++                        "DVD read overwrote allocation guards")) return false;
++            for (unsigned s = 0; s < 2; ++s)
++            {
++                const auto *raw = bytes.data() + 16u + s * 2064u;
++                if (!expect(raw[0] == 0x20u && raw[1] == 3u && raw[2] == 0u && raw[3] == 3u + s,
++                            "DVD sector ID does not match requested LSN") ||
++                    !expect(std::memcmp(raw + 12u, host.images.at(path).data() + (3u + s) * 2048u,
++                                        2048u) == 0, "DVD payload came from stale media")) return false;
++            }
++        }
++        if (!expect(host.closes == 2u, "mount changes did not retire prior image handles")) return false;
++        for (const auto &path : {"missing", "short"})
++        {
++            host.mounted = path;
++            (void)memory.writeRam(allocation, poison.data(), poison.size());
++            cpu.gpr[4] = 16u; cpu.gpr[5] = 1u;
++            if (!expect(memory.read8(0x1F40200Fu) == 0u, "failed image reported a DVD") ||
++                !expect(cdvd.dispatchImport(63u, cpu) && cpu.gpr[2] == 0u,
++                        "failed configured image fell back to virtual PVD") ||
++                !expect(!cdvd.takeCompletionCallback(), "failed transfer scheduled completion")) return false;
++            std::vector<uint8_t> bytes(poison.size());
++            (void)memory.readRam(allocation, bytes.data(), bytes.size());
++            if (!expect(bytes == poison, "failed transfer changed destination bytes")) return false;
++        }
++        host.mounted = "A";
++        cpu.gpr[4] = 3u; cpu.gpr[5] = 3u;
++        return expect(cdvd.dispatchImport(63u, cpu) && cpu.gpr[2] == 0u,
++                      "unsupported multi-chunk transfer claimed full completion");
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopTimrman timrman;
+@@ -378,7 +496,7 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testCdvdReadBufferOwnership() || !testTimrmanPeriodicCallback())
++        !testCdvdReadBufferOwnership() || !testDvdSectorTransfer() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;

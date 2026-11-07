@@ -1,0 +1,55 @@
+From 13cadb59422027ddb42ce73953be047e0c113428 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:16:22 -0500
+Subject: [PATCH] settings menu: shorter frame rate help and status lines so
+ they fit the panel
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_options.h | 4 ++--
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp | 6 +++---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index 5b98ac2..b011994 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -91,8 +91,8 @@ namespace ga2_options
+              {{"bilinear", "Bilinear"}, {"smooth", "Smooth (removes dither grain)"}, {"anime4k", "Anime4K"},
+               {"anime4k-hq", "Anime4K HQ (fast GPU)"}, {"sharp", "Sharp pixels"}, {"nearest", "Nearest (raw pixels)"}}},
+             {"fps", "Frame rate",
+-             "Frames drawn per second; the game keeps its own speed, and the rate drops by itself if the PC can't keep up. "
+-             "Monitor follows the refresh rate of the screen the window is on. In VR the headset's rate is used.",
++             "Frames per second; the game keeps its own speed, and the rate drops if the PC can't keep up. "
++             "Monitor follows the screen the window is on; VR uses the headset's rate.",
+              "GA2_FPS", Apply::Live,
+              {{"60", "60 (PS2)"}, {"75", "75"}, {"90", "90"}, {"100", "100"}, {"120", "120"}, {"144", "144"}, {"165", "165"},
+               {"170", "170"}, {"175", "175"}, {"180", "180"}, {"200", "200"}, {"240", "240"},
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index 319ce72..98211c4 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -177,7 +177,7 @@ namespace ga2_settings_menu
+                 if (top <= 0)
+                     return "This run keeps the PS2's 60 (software GS): higher rates apply after restart.";
+                 if (customChosen(key))
+-                    return "Left/Right: 1 (Shift: 10), or type 61-240 and press Enter. Enter / PageDown: next choice.";
++                    return "Left/Right: 1 (Shift 10), or type a rate + Enter. PageDown: next choice.";
+                 std::string prefix;
+                 if (ga2_settings::get(key) == ga2_options::choiceIndex(ga2_options::Fps, "monitor"))
+                 {
+@@ -186,9 +186,9 @@ namespace ga2_settings_menu
+                                     : "Monitor rate not known yet. ";
+                 }
+                 if (ga2_framepace::nativeNow())
+-                    std::snprintf(text, sizeof(text), "Now the PS2's 60 (the PC's speed lowers the rate below the cap when needed).");
++                    std::snprintf(text, sizeof(text), "Now the PS2's 60.");
+                 else
+-                    std::snprintf(text, sizeof(text), "Now %d fps (the PC's speed lowers the rate below the cap when needed).",
++                    std::snprintf(text, sizeof(text), "Now %d fps.",
+                                   ga2_framepace::rate());
+                 return prefix + text;
+             }
+-- 
+2.56.0
+

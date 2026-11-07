@@ -1,0 +1,213 @@
+From b8ba0b41816027351f96cf009091728cc76504df Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:24:53 -0500
+Subject: [PATCH 45/45] ga2: fixes from code review 55
+
+- IOP DeleteThread only deletes a dormant, non-running thread
+  (KE_NOT_DORMANT otherwise; freeing the running thread was a
+  use-after-free); TerminateThread refuses the calling thread
+  (KE_ILLEGAL_THID). Tests now terminate before deleting, as games do.
+- IOP: exceptions during unchecked scheduling are logged, not swallowed.
+- IOP RPC: request payloads to KSEG0/KSEG1 server buffers were dropped.
+- IPU getBits32 lost the low bits at unaligned positions (FDEC, TOP, CMD
+  peek); ubits/sbits assert their 25-bit limit.
+- Escape (a pad button) no longer closes the window (raylib exit key).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_kernel.cpp  | 19 +++++++++++++++++++
+ ps2xIOP/src/emulator/iop_emulator.cpp     | 11 ++++++++++-
+ ps2xIOP/src/emulator/services/iop_rpc.cpp |  6 ++++--
+ ps2xIOP/tests/iop_reverse_rpc_tests.cpp   |  4 ++++
+ ps2xIOP/tests/iop_rpc_wait_tests.cpp      |  1 +
+ ps2xRuntime/src/lib/ps2_ipu.cpp           | 15 ++++++++++-----
+ ps2xRuntime/src/lib/ps2_runtime.cpp       |  2 ++
+ 7 files changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index be0c265..e475671 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -7,6 +7,12 @@
+ 
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        constexpr int32_t kKeIllegalThid = -406;
++        constexpr int32_t kKeNotDormant = -414;
++    }
++
+     namespace
+     {
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+@@ -115,6 +121,14 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            // Like the kernel: only a dormant thread that is not running can
++            // be deleted (freeing the running thread's state would leave the
++            // scheduler stepping a dead CPU).
++            if (it->second.state != IopThreadState::Dormant || &it->second == m_currentThread)
++            {
++                setV0(static_cast<uint32_t>(kKeNotDormant));
++                return true;
++            }
+             if (it->second.stackBase != 0u)
+                 (void)m_memory.freeAllocation(it->second.stackBase);
+             m_threads.erase(it);
+@@ -167,6 +181,11 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (&it->second == m_currentThread)
++            {
++                setV0(static_cast<uint32_t>(kKeIllegalThid)); // a thread cannot terminate itself
++                return true;
++            }
+             invalidateRpcWait(it->second);
+             it->second.state = IopThreadState::Dormant;
+             setV0(0);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index a85f181..8d3fa32 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -23,6 +23,8 @@
+ #include <map>
+ #include <optional>
+ #include <span>
++#include <stdexcept>
++#include <string>
+ #include <sstream>
+ #include <utility>
+ #include <ga2/spu_device.h>
+@@ -1102,9 +1104,16 @@ namespace ps2x::iop::detail
+                         advanceIopTime(1u);
+                 }
+             }
++            catch (const std::exception &error)
++            {
++                // Runtime scheduling must never throw through EeScheduler::accountCycles(),
++                // but the failure must not vanish either.
++                try { log(LogLevel::Error, std::string("[IOP] exception during scheduling: ") + error.what()); } catch (...) {}
++                if (checked || (spu && spu->faulted())) markResetRequired(__LINE__);
++            }
+             catch (...)
+             {
+-                // Runtime scheduling must never throw through EeScheduler::accountCycles().
++                try { log(LogLevel::Error, "[IOP] unknown exception during scheduling"); } catch (...) {}
+                 if (checked || (spu && spu->faulted())) markResetRequired(__LINE__);
+             }
+             return !resetRequired;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 19817bb..01a0d3b 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -737,12 +737,14 @@ namespace ps2x::iop::detail
+         const RpcServer server = serverIt->second;
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+-            const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
++            // Server buffers may be KSEG0/KSEG1 aliases; size against the physical address.
++            const uint32_t buffer = IopMemory::physicalAddress(server.buffer);
++            const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(buffer, IopMemory::RamSize));
+             if (copySize != 0u)
+             {
+                 std::vector<uint8_t> payload(copySize);
+                 if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
+-                    (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
++                    (void)m_memory.writeRam(buffer, payload.data(), payload.size());
+             }
+         }
+ 
+diff --git a/ps2xIOP/tests/iop_reverse_rpc_tests.cpp b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+index db0ec60..95e1944 100644
+--- a/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
++++ b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+@@ -1108,7 +1108,11 @@ namespace
+         deleted.endSlice(deleteThread);
+         deleted.control = {};
+         deleted.control.gpr[4] = static_cast<uint32_t>(deleteId);
++        require(deleted.kernel.dispatchThreadImport(10u, deleted.control, 0u), "TerminateThread failed");
++        deleted.control = {};
++        deleted.control.gpr[4] = static_cast<uint32_t>(deleteId);
+         require(deleted.kernel.dispatchThreadImport(5u, deleted.control, 0u), "DeleteThread failed");
++        require(deleted.control.gpr[2] == 0u, "DeleteThread of a terminated worker failed");
+         deleted.host.complete(0, patternedReply());
+         require(deleted.reply() == deleteBefore, "deleted worker accepted late completion");
+ 
+diff --git a/ps2xIOP/tests/iop_rpc_wait_tests.cpp b/ps2xIOP/tests/iop_rpc_wait_tests.cpp
+index e58ebc4..80863ae 100644
+--- a/ps2xIOP/tests/iop_rpc_wait_tests.cpp
++++ b/ps2xIOP/tests/iop_rpc_wait_tests.cpp
+@@ -352,6 +352,7 @@ namespace
+         IopThread &deletable = fixture.runThread();
+         const auto beforeDelete = fixture.beginWait(deletable, 6u);
+         fixture.endSlice(deletable);
++        fixture.importForThread(10u, id); // terminate, then delete (kernel order)
+         fixture.importForThread(5u, id); // DeleteThread
+         require(!fixture.kernel.completeRpcWait(beforeDelete, 3), "DeleteThread retained RPC ownership");
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_ipu.cpp b/ps2xRuntime/src/lib/ps2_ipu.cpp
+index e95dee9..441d0c0 100644
+--- a/ps2xRuntime/src/lib/ps2_ipu.cpp
++++ b/ps2xRuntime/src/lib/ps2_ipu.cpp
+@@ -16,6 +16,7 @@
+ #include "ps2_ipu_vlc.h"
+ 
+ #include <algorithm>
++#include <cassert>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -427,6 +428,8 @@ void IpuDevice::align()
+ 
+ uint32_t IpuDevice::ubits(uint32_t bits) const
+ {
++    // A 32-bit load shifted by up to 7 bits: exact for at most 25 bits.
++    assert(bits <= 25u);
+     uint32_t result = loadBe32(&m_internal[m_bp / 8u]);
+     result <<= (m_bp & 7u);
+     return result >> (32u - bits);
+@@ -434,6 +437,7 @@ uint32_t IpuDevice::ubits(uint32_t bits) const
+ 
+ int32_t IpuDevice::sbits(uint32_t bits) const
+ {
++    assert(bits <= 25u);
+     int32_t result = static_cast<int32_t>(loadBe32(&m_internal[m_bp / 8u]));
+     result = static_cast<int32_t>(static_cast<uint32_t>(result) << (m_bp & 7u));
+     return result >> (32u - bits);
+@@ -461,11 +465,12 @@ bool IpuDevice::getBits32(uint8_t *out, bool adv)
+ {
+     if (!fillBuffer(32))
+         return false;
+-    const uint32_t v = ubits(32);
+-    out[0] = static_cast<uint8_t>(v >> 24);
+-    out[1] = static_cast<uint8_t>(v >> 16);
+-    out[2] = static_cast<uint8_t>(v >> 8);
+-    out[3] = static_cast<uint8_t>(v);
++    // ubits() only covers 25 bits at an unaligned position; like PCSX2, the
++    // low bits of each byte come from the next byte.
++    const uint32_t shift = m_bp & 7u;
++    const uint8_t *p = &m_internal[m_bp / 8u];
++    for (int i = 0; i < 4; ++i)
++        out[i] = shift == 0u ? p[i] : static_cast<uint8_t>((p[i] << shift) | (p[i + 1] >> (8u - shift)));
+     if (adv)
+         advance(32);
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1a8a783..50f4797 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -899,6 +899,8 @@ bool PS2Runtime::initialize(const char *title)
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetTargetFPS(60);
++        // Escape is a pad button (Circle); only the window's close button quits.
++        SetExitKey(KEY_NULL);
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+-- 
+2.55.0
+

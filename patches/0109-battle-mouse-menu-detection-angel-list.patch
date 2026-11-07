@@ -1,0 +1,103 @@
+From 723eb1c7ae0aed418143838d9cf487bd99d541ba Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:45:43 -0500
+Subject: [PATCH] mouse: battle views leave menu detection alone; edge scroll
+ diagnostics; angel list on held middle button
+
+ps2_mouse_menus no longer claims the pointer while a battle view runs without a menu over it
+(the map HUD matched the system-menu picture test and swallowed clicks); the list pulses queue
+is thread safe (the game side steps the angel list cursor with the wheel).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_mouse.cpp       | 26 +++++++++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_mouse.h         |  4 ++++
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp |  8 ++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 8c9553c..3c91e05 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -392,11 +392,31 @@ namespace ps2_mouse
+                 }
+             }
+ 
++            if (debug && st.view == BattleView::Map && st.edgeScroll && !IsWindowFocused())
++            {
++                static double shown = 0.0;
++                if (now - shown > 5.0)
++                {
++                    shown = now;
++                    std::fprintf(stderr, "[battle mouse] edge scroll off: the window is not focused\n");
++                }
++            }
+             // The picture's edge pans the map with the game's own D-pad scroll.
+             if (st.view == BattleView::Map && st.edgeScroll && g_edgeScrollEnabled && inWindow && !padHit && overGame &&
+                 IsWindowFocused() && GetTime() - g_lastMove < 6.0 && !g_track[1].down)
+             {
+                 const float band = std::clamp(g_game.width * 0.008f, 3.0f, 10.0f);
++                if (debug && (mouse.x < g_game.x + band || mouse.x >= g_game.x + g_game.width - band || mouse.y < g_game.y + band ||
++                              mouse.y >= g_game.y + g_game.height - band))
++                {
++                    static double shown = 0.0;
++                    if (now - shown > 1.0)
++                    {
++                        shown = now;
++                        std::fprintf(stderr, "[battle mouse] edge scroll: pointer (%.0f, %.0f) in the edge band, pad bits l %04x r %04x u %04x d %04x\n",
++                                     mouse.x, mouse.y, b.left, b.right, b.up, b.down);
++                    }
++                }
+                 if (mouse.x < g_game.x + band && b.left)
+                     held |= b.left;
+                 else if (mouse.x >= g_game.x + g_game.width - band && b.right)
+@@ -623,6 +643,12 @@ namespace ps2_mouse
+ 
+     void battlePulse(uint16_t bits) { pulse(bits); }
+ 
++    bool battleViewOwnsPointer()
++    {
++        std::lock_guard<std::mutex> lock(g_battleLock);
++        return g_battle.view != BattleView::None && !g_battle.modal && steadyNanos() - g_battleStamp <= kBattleLapseNanos;
++    }
++
+     int battlePulsesPending()
+     {
+         std::lock_guard<std::mutex> lock(g_pulseLock);
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.h b/ps2xRuntime/src/lib/ps2_mouse.h
+index 1b7820e..bee179e 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.h
++++ b/ps2xRuntime/src/lib/ps2_mouse.h
+@@ -95,6 +95,10 @@ namespace ps2_mouse
+         bool doubleClick = false;  // a quick second left click on the unit the first one was on (its Circle was not sent)
+         bool listHeld = false;     // the middle button is held on empty map: L2 is down (the angel list is open)
+     };
++    // A battle view is running without a menu, pause or balloon over it: the
++    // pointer belongs to the view (ps2_mouse_menus must not claim it from what
++    // it thinks it sees in the picture).
++    bool battleViewOwnsPointer();
+     // Called by the game side once per frame; clears the counters.
+     BattleEvents takeBattleEvents();
+     // A press (3 frames and more, then a gap) of the given pad bits, queued.
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index f32d7f0..2e0ec1c 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -285,6 +285,14 @@ namespace ps2_mouse_menus
+         g_owns = false;
+         if (!g_ram)
+             return 0;
++        // A battle view without a menu over it (the tactical map's HUD can look like a menu).
++        if (ps2_mouse::battleViewOwnsPointer())
++        {
++            g_target = -1;
++            g_confirm = false;
++            g_phase = 0;
++            return 0;
++        }
+         // Pulses are 3 frames on, 3 off, whichever source started them.
+         if (g_phase > 0 && g_target < 0)
+         {
+-- 
+2.55.0
+

@@ -1,0 +1,492 @@
+From 0ede7f2cec5c8e128784d6b2b3d80f1083bd2576 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:19:13 -0500
+Subject: [PATCH] vr: cheat menu in the headset, scene note and dump list
+
+The cheat menu is drawn into a 1280x960 render texture (ga2_cheat_menu
+renderForHeadset) that ga2_vr puts on the theater screen or, in stereo scenes,
+on a head-locked panel 0.9 m in front of the player. While it is open the
+trigger is Circle and pointer clicks go nowhere; D-pad/stick, Circle, Cross and
+both stick clicks drive it. Fixes the VR edge detection (previous state was
+overwritten before the lambda ran, so only the open/close chord worked).
+
+ga2_vrpointer::scene() lets the newer of the map's and a view's note win, so
+the trigger is Cross in the cockpit from the first frame after the map.
+GA2_VR_INPUT_SCRIPT times are seconds since the window opened;
+GA2_VR_DUMP_AT takes a comma list.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp | 131 ++++++++++++++++++-------
+ ps2xRuntime/src/lib/ga2_cheat_menu.h   |  13 ++-
+ ps2xRuntime/src/lib/ga2_vr.cpp         | 129 ++++++++++++++++++++----
+ 3 files changed, 212 insertions(+), 61 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index a51d177..e39d227 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/ga2_cheats.h"
+ 
+ #include "raylib.h"
++#include "rlgl.h"
+ 
+ #include <string>
+ #include <vector>
+@@ -75,18 +76,30 @@ namespace ga2_cheat_menu
+             g_swallow = true;
+         }
+ 
+-        Rectangle panel()
++        // Where and how big the menu is drawn: the window (scale 1) or the headset's texture (scale 2).
++        struct Canvas
+         {
+-            const float w = 560.0f, h = 330.0f;
+-            return Rectangle{(GetScreenWidth() - w) * 0.5f, (GetScreenHeight() - h) * 0.5f, w, h};
++            float width, height, scale;
++            bool vr;
++        };
++
++        Canvas windowCanvas() { return Canvas{float(GetScreenWidth()), float(GetScreenHeight()), 1.0f, false}; }
++
++        Rectangle panel(const Canvas &c)
++        {
++            const float w = 560.0f * c.scale, h = 330.0f * c.scale;
++            return Rectangle{(c.width - w) * 0.5f, (c.height - h) * 0.5f, w, h};
+         }
+ 
+-        Rectangle row(int i)
++        Rectangle row(const Canvas &c, int i)
+         {
+-            const Rectangle p = panel();
+-            return Rectangle{p.x + 16.0f, p.y + 70.0f + 46.0f * float(i), p.width - 32.0f, 40.0f};
++            const Rectangle p = panel(c);
++            return Rectangle{p.x + 16.0f * c.scale, p.y + (70.0f + 46.0f * float(i)) * c.scale, p.width - 32.0f * c.scale,
++                             40.0f * c.scale};
+         }
+ 
++        const uint8_t *g_rdram = nullptr;
++
+         void activate(int index, const uint8_t *rdram)
+         {
+             const auto list = items();
+@@ -110,8 +123,11 @@ namespace ga2_cheat_menu
+ 
+     bool open() { return g_open || g_swallow; }
+ 
++    bool visible() { return g_open; }
++
+     void update(const uint8_t *rdram)
+     {
++        g_rdram = rdram;
+         if (g_swallow && !menuInputHeld())
+             g_swallow = false;
+         if (!ga2_cheats::state().available.load())
+@@ -121,9 +137,10 @@ namespace ga2_cheat_menu
+         // VR controllers act as a gamepad: both stick clicks open and close it, D-pad up /
+         // down move, Circle chooses, Cross closes.
+         const uint16_t vr = ga2_vr::padState().buttons;
+-        const auto vrPressed = [&](uint16_t mask) { return (vr & mask) == mask && (g_vrPrevious & mask) != mask; };
+-        const bool vrToggle = vrPressed(kVrL3 | kVrR3);
++        const uint16_t vrBefore = g_vrPrevious;
+         g_vrPrevious = vr;
++        const auto vrPressed = [&](uint16_t mask) { return (vr & mask) == mask && (vrBefore & mask) != mask; };
++        const bool vrToggle = vrPressed(kVrL3 | kVrR3);
+         if (IsKeyPressed(KEY_F1) || padToggle || vrToggle)
+         {
+             if (g_open)
+@@ -147,7 +164,7 @@ namespace ga2_cheat_menu
+             g_selected = (g_selected + 1) % count;
+         const Vector2 mouse = GetMousePosition();
+         for (int i = 0; i < count; ++i)
+-            if (CheckCollisionPointRec(mouse, row(i)))
++            if (CheckCollisionPointRec(mouse, row(windowCanvas(), i)))
+             {
+                 if (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f)
+                     g_selected = i;
+@@ -163,40 +180,80 @@ namespace ga2_cheat_menu
+             activate(g_selected, rdram);
+     }
+ 
+-    void draw(const uint8_t *rdram)
++    namespace
+     {
+-        if (!g_open)
++        // The notice (what an action did) and the menu itself, drawn at the canvas's size and scale.
++        void drawMenu(const uint8_t *rdram, const Canvas &c)
+         {
+-            if (GetTime() < g_noticeUntil)
++            const float k = c.scale;
++            if (!g_open)
+             {
+-                const int w = MeasureText(g_notice.c_str(), 22);
+-                DrawRectangle(20, 20, w + 24, 36, Color{10, 16, 40, 210});
+-                DrawText(g_notice.c_str(), 32, 27, 22, Color{150, 205, 255, 255});
++                if (GetTime() < g_noticeUntil)
++                {
++                    const int fs = int(22 * k);
++                    const int w = MeasureText(g_notice.c_str(), fs);
++                    DrawRectangle(int(20 * k), int(20 * k), w + int(24 * k), int(36 * k), Color{10, 16, 40, 210});
++                    DrawText(g_notice.c_str(), int(32 * k), int(27 * k), fs, Color{150, 205, 255, 255});
++                }
++                return;
++            }
++            const Rectangle p = panel(c);
++            if (!c.vr)
++                DrawRectangle(0, 0, int(c.width), int(c.height), Color{0, 0, 0, 120});
++            DrawRectangleRounded(p, 0.06f, 8, Color{12, 18, 44, 235});
++            DrawRectangleRoundedLinesEx(p, 0.06f, 8, 2.0f * k, Color{90, 160, 255, 255});
++            DrawText("CHEATS", int(p.x + 20 * k), int(p.y + 18 * k), int(30 * k), Color{230, 236, 250, 255});
++            const char *hint = c.vr ? "Cross / L3+R3: close" : "F1 / L3+R3: close";
++            DrawText(hint, int(p.x + p.width - (c.vr ? 210 : 190) * k), int(p.y + 26 * k), int(16 * k), Color{130, 140, 170, 255});
++            const auto list = items();
++            const bool battle = ga2_cheats::battleActive(rdram);
++            for (int i = 0; i < int(list.size()); ++i)
++            {
++                const Rectangle r = row(c, i);
++                if (i == g_selected)
++                    DrawRectangleRec(r, Color{30, 44, 90, 255});
++                const bool enabled = list[size_t(i)].toggle || battle;
++                DrawText(list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
++                         enabled ? Color{230, 236, 250, 255} : Color{110, 118, 140, 255});
++                const char *value = list[size_t(i)].toggle ? (list[size_t(i)].toggle->load() ? "ON" : "OFF")
++                                                           : (battle ? (c.vr ? "Circle" : "Enter") : "no battle");
++                const int w = MeasureText(value, int(20 * k));
++                DrawText(value, int(r.x + r.width) - w - int(14 * k), int(r.y + 10 * k), int(20 * k),
++                         list[size_t(i)].toggle && list[size_t(i)].toggle->load() ? Color{120, 220, 150, 255}
++                                                                                 : Color{150, 160, 190, 255});
+             }
+-            return;
+         }
+-        const Rectangle p = panel();
+-        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{0, 0, 0, 120});
+-        DrawRectangleRounded(p, 0.06f, 8, Color{12, 18, 44, 235});
+-        DrawRectangleRoundedLinesEx(p, 0.06f, 8, 2.0f, Color{90, 160, 255, 255});
+-        DrawText("CHEATS", int(p.x) + 20, int(p.y) + 18, 30, Color{230, 236, 250, 255});
+-        DrawText("F1 / L3+R3: close", int(p.x + p.width) - 190, int(p.y) + 26, 16, Color{130, 140, 170, 255});
+-        const auto list = items();
+-        const bool battle = ga2_cheats::battleActive(rdram);
+-        for (int i = 0; i < int(list.size()); ++i)
++    }
++
++    void draw(const uint8_t *rdram) { drawMenu(rdram, windowCanvas()); }
++
++    uint32_t renderForHeadset(int &width, int &height)
++    {
++        if (!g_open && GetTime() >= g_noticeUntil)
++            return 0;
++        // Twice the window's size per unit, so the text stays sharp on the headset's panel.
++        constexpr int kWidth = 1280, kHeight = 960;
++        static RenderTexture2D target{};
++        if (!target.id)
+         {
+-            const Rectangle r = row(i);
+-            if (i == g_selected)
+-                DrawRectangleRec(r, Color{30, 44, 90, 255});
+-            const bool enabled = list[size_t(i)].toggle || battle;
+-            DrawText(list[size_t(i)].label, int(r.x) + 14, int(r.y) + 10, 20,
+-                     enabled ? Color{230, 236, 250, 255} : Color{110, 118, 140, 255});
+-            const char *value = list[size_t(i)].toggle ? (list[size_t(i)].toggle->load() ? "ON" : "OFF")
+-                                                       : (battle ? "Enter" : "no battle");
+-            const int w = MeasureText(value, 20);
+-            DrawText(value, int(r.x + r.width) - w - 14, int(r.y) + 10, 20,
+-                     list[size_t(i)].toggle && list[size_t(i)].toggle->load() ? Color{120, 220, 150, 255}
+-                                                                             : Color{150, 160, 190, 255});
++            target = LoadRenderTexture(kWidth, kHeight);
++            SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
+         }
++        if (!target.id || !g_rdram)
++            return 0;
++        rlDrawRenderBatchActive();
++        BeginTextureMode(target);
++        rlEnableColorBlend(); // the headset code leaves GL blending off
++        ClearBackground(BLANK);
++        // Straight alpha out: the panel's translucency must not square in the alpha channel.
++        rlSetBlendFactorsSeparate(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA, RL_ONE, RL_ONE_MINUS_SRC_ALPHA, RL_FUNC_ADD, RL_FUNC_ADD);
++        BeginBlendMode(BLEND_CUSTOM_SEPARATE);
++        drawMenu(g_rdram, Canvas{float(kWidth), float(kHeight), 2.0f, true});
++        EndBlendMode();
++        EndTextureMode();
++        rlDrawRenderBatchActive();
++        width = kWidth;
++        height = kHeight;
++        return target.texture.id;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.h b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+index d75b9ea..ad2bd18 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.h
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+@@ -2,9 +2,10 @@
+ 
+ #include <cstdint>
+ 
+-// In-game cheat menu (main thread): F1 or both stick clicks open it while a
+-// disc with battle cheats runs (runtime/ga2_cheats.h). The game gets no
+-// input while it is open.
++// In-game cheat menu (main thread): F1 or both stick clicks (gamepad or VR
++// controllers) open it while a disc with battle cheats runs
++// (runtime/ga2_cheats.h). The game gets no input while it is open. In a
++// headset it is drawn in the player's view (renderForHeadset).
+ namespace ga2_cheat_menu
+ {
+     // The menu has the input: open, or closed with its keys still held.
+@@ -13,4 +14,10 @@ namespace ga2_cheat_menu
+     void update(const uint8_t *rdram);
+     // Inside BeginDrawing, over the game.
+     void draw(const uint8_t *rdram);
++    // The menu itself is on screen (not just a notice).
++    bool visible();
++    // Headset: the menu (or a notice) drawn to a 1280x960 RGBA texture with straight alpha (GL id; image
++    // upright when v runs bottom-up), or 0 when there is nothing to show. Main thread, outside BeginDrawing;
++    // ga2_vr puts it on the theater screen or on a panel in front of the player.
++    uint32_t renderForHeadset(int &width, int &height);
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 3bae338..caa38b0 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,4 +1,5 @@
+ #include "ga2_vr.h"
++#include "ga2_cheat_menu.h"
+ #include "ga2_vr_bindings.h"
+ #include "ga2_vr_input.h"
+ #include "runtime/ga2_display.h"
+@@ -173,7 +174,7 @@ namespace ga2_vr
+ 
+         struct Renderer
+         {
+-            GLuint quad = 0, hud = 0, frame = 0, sky = 0, beam = 0, dot = 0, cursor = 0;
++            GLuint quad = 0, hud = 0, menu = 0, frame = 0, sky = 0, beam = 0, dot = 0, cursor = 0;
+             GLuint vao = 0, vbo = 0, skyVao = 0, skyVbo = 0;
+             GLuint skyTexture = 0;
+             bool ready = false;
+@@ -240,6 +241,17 @@ void main()
+     o = vec4(min(t.rgb * gain, vec3(1.0)), a);
+ })";
+ 
++        // The cheat menu's image (straight alpha, from a raylib render texture): premultiplied for the blend.
++        const char *kMenuFs = R"(#version 330
++in vec2 v_uv;
++uniform sampler2D tex;
++out vec4 o;
++void main()
++{
++    vec4 t = texture(tex, v_uv);
++    o = vec4(t.rgb * t.a, t.a);
++})";
++
+         // A soft cyan glow around the screen (uv 0..1 over a slightly larger quad).
+         const char *kFrameFs = R"(#version 330
+ in vec2 v_uv;
+@@ -363,6 +375,7 @@ void main() {
+                 return;
+             g_gl.quad = compile(kMeshVs, kQuadFs, "screen");
+             g_gl.hud = compile(kMeshVs, kHudFs, "hud");
++            g_gl.menu = compile(kMeshVs, kMenuFs, "menu");
+             g_gl.frame = compile(kMeshVs, kFrameFs, "frame");
+             g_gl.sky = compile(kSkyVs, kSkyFs, "sky");
+             g_gl.beam = compile(kMeshVs, kBeamFs, "laser");
+@@ -420,6 +433,47 @@ void main() {
+             glUniformMatrix4fv(glGetUniformLocation(program, name), 1, GL_FALSE, m.m);
+         }
+ 
++        // ---- cheat menu in the headset -----------------------------------------------
++        // ga2_cheat_menu draws itself to a texture each frame it is shown; it goes on the theater screen (in
++        // front of it) or, in stereo scenes, on a panel in front of the head.
++        struct MenuImage
++        {
++            GLuint texture = 0;
++        };
++        MenuImage g_menu;
++
++        // A quad with the menu image: centre c and half height in the model's frame, 4:3.
++        void drawMenuQuad(const M4 &viewProj, const M4 &model, V3 c, float halfHeight)
++        {
++            glDisable(GL_CULL_FACE);
++            glDisable(GL_DEPTH_TEST);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_BLEND);
++            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
++            glUseProgram(g_gl.menu);
++            setMatrix(g_gl.menu, "mvp", mul(viewProj, model));
++            glActiveTexture(GL_TEXTURE0);
++            glBindTexture(GL_TEXTURE_2D, g_menu.texture);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            glUniform1i(glGetUniformLocation(g_gl.menu, "tex"), 0);
++            rect(c, V3{halfHeight * (4.0f / 3.0f), 0, 0}, V3{0, halfHeight, 0}, true); // render textures are bottom-up
++            glDisable(GL_BLEND);
++            glDepthMask(GL_TRUE);
++            glUseProgram(0);
++            glBindVertexArray(0);
++        }
++
++        // Over a stereo frame: in front of the head the frame was rendered with, 0.9 m away, 0.8 m tall.
++        void drawMenuPanel(const M4 &viewProj, const ga2_stereo::Setup &st)
++        {
++            M4 model;
++            std::memcpy(model.m, st.headAnchor, sizeof(model.m));
++            drawMenuQuad(viewProj, model, V3{0.0f, -0.02f, -0.9f}, 0.4f);
++        }
++
+         struct ScreenGeometry
+         {
+             V3 center;
+@@ -525,6 +579,11 @@ void main() {
+             glUniform1i(glGetUniformLocation(g_gl.quad, "tex"), 0);
+             glUniform2f(glGetUniformLocation(g_gl.quad, "extent"), extentX, extentY);
+             rect(s.center, V3{s.halfWidth, 0, 0}, V3{0, s.halfHeight, 0}, false);
++            if (g_menu.texture) // the cheat menu in front of the screen
++            {
++                drawMenuQuad(viewProj, M4{}, s.center + V3{0, 0, 0.05f}, s.halfHeight);
++                glEnable(GL_DEPTH_TEST);
++            }
+ 
+             // Glow around the screen, lasers and hit points: additive.
+             glEnable(GL_BLEND);
+@@ -1117,7 +1176,7 @@ void main() {
+ 
+         // GA2_VR_INPUT_SCRIPT=<file>: scripted controller input for tests without a
+         // headset's hands. Each line "<seconds> name=value ..." sets every input from
+-        // that time (since the first headset frame) until the next line; unnamed
++        // that time (seconds since the window opened, about the process start) until the next line; unnamed
+         // inputs are 0. Names: circle cross square triangle start select menu l3 r3
+         // fpclick (0/1), l1 r1 l2 r2 trigl trigr (0..1), dpadx dpady lx ly rx ry fpx fpy.
+         struct ScriptStep
+@@ -1190,12 +1249,9 @@ void main() {
+         // The scripted inputs now, or nullptr.
+         const ga2_vr_input::Inputs *scriptedInputs(double seconds)
+         {
+-            static double start = -1.0;
+-            if (start < 0.0)
+-                start = seconds;
+             const ScriptStep *current = nullptr;
+             for (const ScriptStep &step : inputScript())
+-                if (seconds - start >= step.at)
++                if (seconds >= step.at)
+                     current = &step;
+             return current ? &current->in : nullptr;
+         }
+@@ -1448,6 +1504,18 @@ void main() {
+             if (padLog && ++frames == 200)
+                 logActiveActions();
+         }
++        // The cheat menu, when shown, is drawn into the player's view (theater screen or a panel); while it is
++        // open the controllers drive it (the pad is idle for the game): the trigger confirms, pointer clicks go nowhere.
++        {
++            int menuWidth = 0, menuHeight = 0;
++            g_menu.texture = ga2_cheat_menu::renderForHeadset(menuWidth, menuHeight);
++            if (g_menu.texture) // minified on a small panel: mip levels keep the text from shimmering
++            {
++                glBindTexture(GL_TEXTURE_2D, g_menu.texture);
++                glGenerateMipmap(GL_TEXTURE_2D);
++            }
++        }
++        const bool cheatMenuOpen = ga2_cheat_menu::visible();
+         const M4 world = worldFromLocal();
+         std::array<Laser, 2> lasers{};
+         float pointerX = 0, pointerY = 0;
+@@ -1511,7 +1579,7 @@ void main() {
+                     l.to = l.from + normalize(l.to - l.from) * 0.45f;
+                 }
+         }
+-        ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f, false, false, 0.0f);
++        ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f && !cheatMenuOpen, false, false, 0.0f);
+         {
+             ga2_vr_input::Inputs in = script ? *script : sampleActions();
+             in.trigger[0] = triggers[0];
+@@ -1525,6 +1593,8 @@ void main() {
+                 case ga2_vrpointer::Scene::UnitCamera: in.scene = ga2_vr_input::Scene::UnitCamera; break;
+                 default: in.scene = ga2_vr_input::Scene::Stereo; break;
+                 }
++            if (cheatMenuOpen)
++                in.scene = ga2_vr_input::Scene::Stereo; // the trigger is Circle in the menu
+             const ga2_vr_input::Output out = g_xr.mapper.step(in, GetTime());
+             if (out.recenter)
+                 recenter(frameState.predictedDisplayTime);
+@@ -1629,6 +1699,8 @@ void main() {
+                         const M4 handProj = projection(st.tanLeft, st.tanRight, st.tanUp, st.tanDown, 0.05f, 100.0f);
+                         if (hudPanelShowing(image))
+                             drawHudPanel(mul(handProj, inverseRigid(submitWorld)), st);
++                        if (g_menu.texture)
++                            drawMenuPanel(mul(handProj, inverseRigid(submitWorld)), st);
+                         glDisable(GL_DEPTH_TEST);
+                         glEnable(GL_BLEND);
+                         glBlendFunc(GL_ONE, GL_ONE);
+@@ -1647,16 +1719,24 @@ void main() {
+                                              std::tan(f.angleDown), 0.05f, 100.0f),
+                                   V3{eyeWorld.m[12], eyeWorld.m[13], eyeWorld.m[14]}, texture, srcWidth / float(texWidth),
+                                   srcHeight / float(texHeight), wide, lasers);
+-                    // GA2_VR_DUMP=<png>: both eyes once (eye 1 as <png>-eye1.png),
+-                    // GA2_VR_DUMP_AT seconds in (default 20; diagnostics).
+-                    static bool dumped[2] = {false, false};
+-                    static const double dumpAt = [] {
++                    // GA2_VR_DUMP=<png>: both eyes (eye 1 as <png>-eye1.png) at GA2_VR_DUMP_AT seconds
++                    // (default 20; diagnostics). A comma list ("480,490") dumps at each time, as
++                    // <png minus .png>-<n>.png and -<n>-eye1.png.
++                    static const std::vector<double> dumpTimes = [] {
++                        std::vector<double> times;
+                         const char *at = std::getenv("GA2_VR_DUMP_AT");
+-                        return at && *at ? std::atof(at) : 20.0;
++                        std::stringstream list(at && *at ? at : "20");
++                        for (std::string item; std::getline(list, item, ',');)
++                            times.push_back(std::atof(item.c_str()));
++                        return times;
+                     }();
+-                    if (v < 2 && !dumped[v] && GetTime() > dumpAt)
+-                        if (const char *dump = std::getenv("GA2_VR_DUMP"); dump && *dump)
++                    static std::vector<std::array<bool, 2>> dumped(dumpTimes.size(), {false, false});
++                    for (size_t n = 0; v < 2 && n < dumpTimes.size(); ++n)
++                        if (!dumped[n][v] && GetTime() > dumpTimes[n])
+                         {
++                            const char *dump = std::getenv("GA2_VR_DUMP");
++                            if (!dump || !*dump)
++                                break;
+                             std::vector<unsigned char> pixels(size_t(eye.width) * eye.height * 4);
+                             glReadPixels(0, 0, eye.width, eye.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+                             // GL rows run bottom-up (ImageFlipVertical would free our buffer).
+@@ -1665,12 +1745,16 @@ void main() {
+                                 std::swap_ranges(pixels.begin() + y * row, pixels.begin() + (y + 1) * row,
+                                                  pixels.begin() + (eye.height - 1 - y) * row);
+                             Image image{pixels.data(), eye.width, eye.height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                            std::string path = dump;
+-                            if (v == 1)
+-                                path = (path.size() > 4 ? path.substr(0, path.size() - 4) : path) + "-eye1.png";
++                            std::string base = dump;
++                            if (base.size() > 4 && base.substr(base.size() - 4) == ".png")
++                                base.resize(base.size() - 4);
++                            if (dumpTimes.size() > 1)
++                                base += "-" + std::to_string(n);
++                            const std::string path = base + (v == 1 ? "-eye1.png" : ".png");
+                             ExportImage(image, path.c_str());
+-                            std::fprintf(stderr, "[vr] eye %u dumped (%s)\n", v, stereo ? "stereo" : "theater");
+-                            dumped[v] = true;
++                            std::fprintf(stderr, "[vr] eye %u dumped (%s) %s\n", v, stereo ? "stereo" : "theater", path.c_str());
++                            dumped[n][v] = true;
++                            break;
+                         }
+                     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                     xr.xrReleaseSwapchainImage(eye.swapchain, &release);
+@@ -1794,10 +1878,13 @@ namespace ga2_vrpointer
+         g_sceneAt = nowNanos();
+     }
+ 
++    // The map's note and a view's note can overlap for half a second after a view change:
++    // the newer one counts.
+     Scene scene()
+     {
+-        if (triggerWanted())
++        const bool noted = nowNanos() - g_sceneAt.load() < 500'000'000;
++        if (triggerWanted() && !(noted && g_sceneAt.load() > g_wantedAt.load()))
+             return Scene::TacticalMap;
+-        return nowNanos() - g_sceneAt.load() < 500'000'000 ? Scene(g_scene.load()) : Scene::Other;
++        return noted ? Scene(g_scene.load()) : Scene::Other;
+     }
+ }
+-- 
+2.55.0
+

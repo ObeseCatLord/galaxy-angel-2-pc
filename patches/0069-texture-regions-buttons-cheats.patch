@@ -1,0 +1,873 @@
+From 5b687d75222b48cb1921811bcd9ce519efbcd441 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:32:41 -0500
+Subject: [PATCH] ga2: texture regions, button prompts, cheat menu, per-game
+ skybox
+
+- gs_texpacks: textures are identified, dumped and replaced per sampled
+  region (paraLLEl-GS replacements_cover_rect), since the games declare
+  textures larger than their art; dumps are named <hash>_<w>x<h>.png and
+  skip the 64-pixel frame-copy strips.
+- Button prompts: textures listed in buttons/map.json get the port's own
+  icons for the detected input device (Xbox-style pads, keyboard, VR;
+  PlayStation pads keep the games' icons) composited at 4x; GA2_BUTTONS
+  fixes a style.
+- Cheat menu (F1 or L3+R3): skip the running battle with the best result,
+  invincibility, infinite energy/spirit, one-hit kills, no time limit; the
+  game gets no input while it is open. Hooks live with the game glue.
+- GA2_SKYBOX may name a folder with one panorama per program.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt               |   1 +
+ ps2xRuntime/include/runtime/ga2_cheats.h |  41 ++++
+ ps2xRuntime/include/runtime/gs/gs_pgs.h  |   2 +
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp   | 155 ++++++++++++++++
+ ps2xRuntime/src/lib/ga2_cheat_menu.h     |  15 ++
+ ps2xRuntime/src/lib/ga2_present.cpp      |   8 +
+ ps2xRuntime/src/lib/ga2_present.h        |   5 +-
+ ps2xRuntime/src/lib/ga2_vr.cpp           |   4 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp        |   4 +
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp   | 226 +++++++++++++++++++----
+ ps2xRuntime/src/lib/gs/gs_texpacks.h     |   5 +
+ ps2xRuntime/src/lib/ps2_mouse.cpp        |   7 +
+ ps2xRuntime/src/lib/ps2_pad.cpp          |  58 ++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp      |   3 +
+ 14 files changed, 497 insertions(+), 37 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_cheats.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_cheat_menu.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index d4f7ace..1f71939 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -401,6 +401,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
++    src/lib/ga2_cheat_menu.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_cheats.h b/ps2xRuntime/include/runtime/ga2_cheats.h
+new file mode 100644
+index 0000000..427336d
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_cheats.h
+@@ -0,0 +1,41 @@
++// Cheat switches shared by the in-game cheat menu (main thread,
++// ga2_cheat_menu.cpp) and the per-disc game hooks that act on them (EE
++// thread, native/compat/ga2_cheats.cpp; docs/cheats/battle.md).
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++
++namespace ga2_cheats
++{
++    struct State
++    {
++        // Set by the hooks' binding: this disc has battle cheats, and where
++        // the battle manager pointer and its state field are.
++        std::atomic<bool> available{false};
++        std::atomic<uint32_t> managerGlobal{0}, stateOffset{0};
++
++        // One-shot: the running battle ends now as a win with the best result
++        // the battle gives (no damage taken, full time bonus).
++        std::atomic<bool> skipRequested{false};
++        // Toggles.
++        std::atomic<bool> invincible{false}, infiniteEnergy{false}, oneHitKill{false}, stopTimer{false};
++    };
++
++    State &state();
++
++    // A battle is being fought (the manager exists and is in its battle state).
++    inline bool battleActive(const uint8_t *rdram)
++    {
++        State &s = state();
++        if (!rdram || !s.available.load())
++            return false;
++        uint32_t manager = 0, phase = 0;
++        std::memcpy(&manager, rdram + (s.managerGlobal.load() & 0x1FFFFFFu), 4);
++        if (!manager || (manager & 0x1FFFFFFu) + s.stateOffset.load() + 4u > 0x2000000u)
++            return false;
++        std::memcpy(&phase, rdram + ((manager + s.stateOffset.load()) & 0x1FFFFFFu), 4);
++        return phase == 2u;
++    }
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index c6cdd38..3b077ce 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -32,6 +32,8 @@ namespace ga2_pgs
+     // textures from, and the pack folders to use (highest priority first).
+     void setVramMirror(const uint8_t *vram);
+     void setTexturePacks(const std::vector<std::string> &dirs);
++    // Button prompt style for the detected input device (gs_texpacks.h).
++    void setButtonStyle(const std::string &style);
+     // Game thread, at vblank: flush, scan out with the live CRTC registers and
+     // queue an asynchronous readback of the frame.
+     void vsync(const GSRegisters &regs);
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+new file mode 100644
+index 0000000..a203d58
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -0,0 +1,155 @@
++#include "ga2_cheat_menu.h"
++#include "runtime/ga2_cheats.h"
++
++#include "raylib.h"
++
++#include <string>
++#include <vector>
++
++namespace ga2_cheats
++{
++    State &state()
++    {
++        static State s;
++        return s;
++    }
++}
++
++namespace ga2_cheat_menu
++{
++    namespace
++    {
++        bool g_open = false;
++        int g_selected = 0;
++        std::string g_notice;
++        double g_noticeUntil = 0.0;
++
++        struct Item
++        {
++            const char *label;
++            std::atomic<bool> *toggle; // nullptr: the skip action
++        };
++
++        std::vector<Item> items()
++        {
++            ga2_cheats::State &s = ga2_cheats::state();
++            return {{"Skip this battle (win, best result)", nullptr},
++                    {"Invincible units", &s.invincible},
++                    {"Infinite energy and spirit", &s.infiniteEnergy},
++                    {"One-hit kills", &s.oneHitKill},
++                    {"Stop the time limit", &s.stopTimer}};
++        }
++
++        Rectangle panel()
++        {
++            const float w = 560.0f, h = 330.0f;
++            return Rectangle{(GetScreenWidth() - w) * 0.5f, (GetScreenHeight() - h) * 0.5f, w, h};
++        }
++
++        Rectangle row(int i)
++        {
++            const Rectangle p = panel();
++            return Rectangle{p.x + 16.0f, p.y + 70.0f + 46.0f * float(i), p.width - 32.0f, 40.0f};
++        }
++
++        void activate(int index, const uint8_t *rdram)
++        {
++            const auto list = items();
++            if (list[size_t(index)].toggle)
++            {
++                list[size_t(index)].toggle->store(!list[size_t(index)].toggle->load());
++                return;
++            }
++            if (!ga2_cheats::battleActive(rdram))
++            {
++                g_notice = "Only during a battle";
++                g_noticeUntil = GetTime() + 2.0;
++                return;
++            }
++            ga2_cheats::state().skipRequested = true;
++            g_notice = "Battle skipped";
++            g_noticeUntil = GetTime() + 2.0;
++            g_open = false;
++        }
++    }
++
++    bool open() { return g_open; }
++
++    void update(const uint8_t *rdram)
++    {
++        if (!ga2_cheats::state().available.load())
++            return;
++        const bool padToggle = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB) &&
++                               IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_THUMB);
++        if (IsKeyPressed(KEY_F1) || padToggle)
++        {
++            g_open = !g_open;
++            return;
++        }
++        if (!g_open)
++            return;
++        const int count = int(items().size());
++        if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
++        {
++            g_open = false;
++            return;
++        }
++        if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP))
++            g_selected = (g_selected + count - 1) % count;
++        if (IsKeyPressed(KEY_DOWN) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
++            g_selected = (g_selected + 1) % count;
++        const Vector2 mouse = GetMousePosition();
++        for (int i = 0; i < count; ++i)
++            if (CheckCollisionPointRec(mouse, row(i)))
++            {
++                if (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f)
++                    g_selected = i;
++                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++                {
++                    g_selected = i;
++                    activate(i, rdram);
++                    return;
++                }
++            }
++        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) ||
++            IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
++            activate(g_selected, rdram);
++    }
++
++    void draw(const uint8_t *rdram)
++    {
++        if (!g_open)
++        {
++            if (GetTime() < g_noticeUntil)
++            {
++                const int w = MeasureText(g_notice.c_str(), 22);
++                DrawRectangle(20, 20, w + 24, 36, Color{10, 16, 40, 210});
++                DrawText(g_notice.c_str(), 32, 27, 22, Color{150, 205, 255, 255});
++            }
++            return;
++        }
++        const Rectangle p = panel();
++        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{0, 0, 0, 120});
++        DrawRectangleRounded(p, 0.06f, 8, Color{12, 18, 44, 235});
++        DrawRectangleRoundedLinesEx(p, 0.06f, 8, 2.0f, Color{90, 160, 255, 255});
++        DrawText("CHEATS", int(p.x) + 20, int(p.y) + 18, 30, Color{230, 236, 250, 255});
++        DrawText("F1 / L3+R3: close", int(p.x + p.width) - 190, int(p.y) + 26, 16, Color{130, 140, 170, 255});
++        const auto list = items();
++        const bool battle = ga2_cheats::battleActive(rdram);
++        for (int i = 0; i < int(list.size()); ++i)
++        {
++            const Rectangle r = row(i);
++            if (i == g_selected)
++                DrawRectangleRec(r, Color{30, 44, 90, 255});
++            const bool enabled = list[size_t(i)].toggle || battle;
++            DrawText(list[size_t(i)].label, int(r.x) + 14, int(r.y) + 10, 20,
++                     enabled ? Color{230, 236, 250, 255} : Color{110, 118, 140, 255});
++            const char *value = list[size_t(i)].toggle ? (list[size_t(i)].toggle->load() ? "ON" : "OFF")
++                                                       : (battle ? "Enter" : "no battle");
++            const int w = MeasureText(value, 20);
++            DrawText(value, int(r.x + r.width) - w - 14, int(r.y) + 10, 20,
++                     list[size_t(i)].toggle && list[size_t(i)].toggle->load() ? Color{120, 220, 150, 255}
++                                                                             : Color{150, 160, 190, 255});
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.h b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+new file mode 100644
+index 0000000..8260e0e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <cstdint>
++
++// In-game cheat menu (main thread): F1 or both stick clicks open it while a
++// disc with battle cheats runs (runtime/ga2_cheats.h). The game gets no
++// input while it is open.
++namespace ga2_cheat_menu
++{
++    bool open();
++    // After input was polled.
++    void update(const uint8_t *rdram);
++    // Inside BeginDrawing, over the game.
++    void draw(const uint8_t *rdram);
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 1956435..e7c4572 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -225,10 +225,18 @@ void main() {
+         return en ? "Galaxy Angel II" : "ギャラクシーエンジェルⅡ";
+     }
+ 
++    std::string skyboxFile()
++    {
++        return settings().skybox;
++    }
++
+     void init(const std::string &program)
+     {
+         SetWindowTitle(title(program).c_str());
+         Settings &s = settings();
++        // A folder holds one panorama per program (<dir>/SLPM_662.43.png).
++        if (!s.skybox.empty() && std::filesystem::is_directory(s.skybox))
++            s.skybox = (std::filesystem::path(s.skybox) / (program + ".png")).string();
+         switch (s.filter)
+         {
+         case Filter::Smooth:
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+index 5f6cec1..329759d 100644
+--- a/ps2xRuntime/src/lib/ga2_present.h
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -9,7 +9,8 @@ struct Texture;
+ // Settings come from the environment (the launcher's options):
+ //   GA2_ASPECT  4:3 | 16:9 | 21:9 | fit   shape of the play area / window
+ //   GA2_SIDES   black | blur | skybox     what fills the sides of a 4:3 picture
+-//   GA2_SKYBOX  <png>                     equirectangular panorama for "skybox"
++//   GA2_SKYBOX  <png> | <dir>             equirectangular panorama for "skybox"
++//               (a folder holds <program>.png per game; also used by VR)
+ //   GA2_FILTER  nearest | bilinear | sharp | smooth | anime4k | anime4k-hq
+ //               (2D scenes only: 3D scenes, which run VU1, stay bilinear)
+ //   GA2_SCALE_2D fill | integer           2D scenes: fill, or whole multiples
+@@ -31,6 +32,8 @@ namespace ga2_present
+     void init(const std::string &program);
+     // The title for a program ("SLPM_662.43") in the chosen language.
+     std::string title(const std::string &program);
++    // The panorama for this game (after init), or empty.
++    std::string skyboxFile();
+ 
+     // Inside BeginDrawing: draws the frame (srcWidth x srcHeight of it is the
+     // picture) and returns where the picture went, in window pixels.
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index e3dad92..8c9ec1b 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,5 +1,6 @@
+ #include "ga2_vr.h"
+ #include "ps2_mouse.h"
++#include "ga2_present.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -320,7 +321,8 @@ void main() {
+             glEnableVertexAttribArray(1);
+             glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void *>(3 * sizeof(float)));
+             glBindVertexArray(0);
+-            if (const char *path = std::getenv("GA2_SKYBOX"); path && *path && FileExists(path))
++            const std::string sky = ga2_present::skyboxFile();
++            if (const char *path = sky.c_str(); *path && FileExists(path))
+             {
+                 Image image = LoadImage(path);
+                 ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 8c476ff..0513ea2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -213,6 +213,7 @@ namespace
+         // the PS2 checkerboard.
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
++        hacks.replacements_cover_rect = true; // gs_texpacks identifies and replaces cached regions
+         s.gs.set_hacks(hacks);
+         s.gs.set_texture_replacement_interface(ga2_texpacks::interface());
+         s.ok = true;
+@@ -348,6 +349,8 @@ namespace ga2_pgs
+ 
+     void setTexturePacks(const std::vector<std::string> &dirs) { ga2_texpacks::setPacks(dirs); }
+ 
++    void setButtonStyle(const std::string &style) { ga2_texpacks::setButtonStyle(style); }
++
+     void readLocalToHost(uint8_t *dst, uint32_t qwords)
+     {
+         State &s = state();
+@@ -463,6 +466,7 @@ namespace ga2_pgs
+     void gifTransfer(uint32_t, const uint8_t *, size_t) {}
+     void setVramMirror(const uint8_t *) {}
+     void setTexturePacks(const std::vector<std::string> &) {}
++    void setButtonStyle(const std::string &) {}
+     void imageUpload(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, size_t) {}
+     void readLocalToHost(uint8_t *, uint32_t) {}
+     void vsync(const GSRegisters &) {}
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 5166d1f..6a60d70 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -1,13 +1,16 @@
+-// Texture packs for paraLLEl-GS (see gs_texpacks.h): every texture the GS
+-// samples is identified by a hash of its decoded RGBA (texels through the
+-// palette, at its full 2^TW x 2^TH size), read from the CPU copy of GS memory
+-// that the runtime keeps alongside the GPU renderer. A PNG named after that
+-// hash in a pack folder replaces it, at any resolution.
++// Texture packs for paraLLEl-GS (see gs_texpacks.h): every texture region
++// the GS samples (the cached rectangle paraLLEl-GS derives from the draws'
++// texture coordinates; games often declare textures larger than their art,
++// so the region is what stays stable) is identified by a hash of its decoded
++// RGBA (texels through the palette), read from the CPU copy of GS memory the
++// runtime keeps alongside the GPU renderer. A PNG named after that hash in a
++// pack folder replaces the region, at any resolution.
+ #include "gs_texpacks.h"
+ 
+ #if defined(PS2X_HAVE_PGS)
+ 
+ #include "runtime/gs/ps2_gs_memory.h"
++#include <nlohmann/json.hpp>
+ #include "raylib.h"
+ 
+ #include "device.hpp"
+@@ -17,6 +20,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -40,6 +44,120 @@ namespace ga2_texpacks
+         // as it runs, so every image handed out stays alive here (this also
+         // keeps PNGs from being decoded twice).
+         std::unordered_map<std::string, ImageHandle> g_images;
++
++        // Button prompts (native/buttons): textures known to hold PS2 button
++        // icons get the port's own icons for the player's input device drawn
++        // over them, at 4x resolution.
++        struct IconSpot
++        {
++            std::string button;
++            int x = 0, y = 0, w = 0, h = 0;
++        };
++        std::string g_style = "playstation";
++        std::string g_buttonDir;
++        bool g_buttonMapLoaded = false;
++        std::unordered_map<uint64_t, std::vector<IconSpot>> g_buttonMap;
++        std::unordered_map<std::string, ::Image> g_icons; // style/button
++
++        void loadButtonMap()
++        {
++            g_buttonMapLoaded = true;
++            if (g_buttonDir.empty())
++                return;
++            std::ifstream in(std::filesystem::path(g_buttonDir) / "map.json");
++            if (!in)
++                return;
++            try
++            {
++                const nlohmann::json doc = nlohmann::json::parse(in);
++                for (const auto &[hash, spots] : doc.at("textures").items())
++                    for (const auto &spot : spots)
++                        g_buttonMap[std::stoull(hash, nullptr, 16)].push_back(
++                            {spot.at("button").get<std::string>(), spot.at("x").get<int>(), spot.at("y").get<int>(),
++                             spot.at("w").get<int>(), spot.at("h").get<int>()});
++                std::fprintf(stderr, "[texpacks] button map: %zu textures\n", g_buttonMap.size());
++            }
++            catch (const std::exception &e)
++            {
++                std::fprintf(stderr, "[texpacks] button map: %s\n", e.what());
++            }
++        }
++
++        const ::Image *icon(const std::string &button)
++        {
++            const std::string key = g_style + "/" + button;
++            auto it = g_icons.find(key);
++            if (it == g_icons.end())
++            {
++                ::Image image = LoadImage((std::filesystem::path(g_buttonDir) / g_style / (button + ".png")).string().c_str());
++                if (image.data)
++                    ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                it = g_icons.emplace(key, image).first;
++            }
++            return it->second.data ? &it->second : nullptr;
++        }
++
++        // The texture at 4x with the device's icons over the PS2 ones; RGBA
++        // with alpha 255 = opaque.
++        bool composeButtons(const std::vector<uint32_t> &px, uint32_t w, uint32_t h, const std::vector<IconSpot> &spots,
++                            ::Image &out)
++        {
++            constexpr int k = 4;
++            std::vector<uint32_t> base(px);
++            for (uint32_t &c : base)
++                c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
++            ::Image src{base.data(), int(w), int(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            out = ImageCopy(src);
++            ImageResize(&out, int(w) * k, int(h) * k);
++            bool drew = false;
++            for (const IconSpot &spot : spots)
++            {
++                const ::Image *art = icon(spot.button);
++                if (!art)
++                    continue;
++                // Cover the PS2 icon with the colour around it, then draw ours.
++                uint64_t sum[4] = {};
++                int n = 0;
++                for (int y = spot.y - 1; y <= spot.y + spot.h; ++y)
++                    for (int x = spot.x - 1; x <= spot.x + spot.w; ++x)
++                    {
++                        const bool border = y == spot.y - 1 || y == spot.y + spot.h || x == spot.x - 1 || x == spot.x + spot.w;
++                        if (!border || x < 0 || y < 0 || x >= int(w) || y >= int(h))
++                            continue;
++                        const uint32_t c = base[size_t(y) * w + size_t(x)];
++                        for (int i = 0; i < 4; ++i)
++                            sum[i] += (c >> (8 * i)) & 255u;
++                        ++n;
++                    }
++                const Color fill = n ? Color{uint8_t(sum[0] / n), uint8_t(sum[1] / n), uint8_t(sum[2] / n), uint8_t(sum[3] / n)}
++                                     : Color{0, 0, 0, 0};
++                ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, fill);
++                const int side = std::min(spot.w, spot.h) * k;
++                const Rectangle dst{float(spot.x * k + (spot.w * k - side) / 2), float(spot.y * k + (spot.h * k - side) / 2),
++                                    float(side), float(side)};
++                ImageDraw(&out, *art, Rectangle{0, 0, float(art->width), float(art->height)}, dst, WHITE);
++                drew = true;
++            }
++            return drew;
++        }
++
++        ImageHandle upload(Device &device, ::Image &image)
++        {
++            // Back to the GS's alpha range; paraLLEl-GS takes replacement
++            // images in the GENERAL layout.
++            auto *texels = static_cast<uint32_t *>(image.data);
++            for (int i = 0; i < image.width * image.height; ++i)
++            {
++                const uint32_t a = ((texels[i] >> 24) + 1u) >> 1;
++                texels[i] = (texels[i] & 0x00FFFFFFu) | (a << 24);
++            }
++            ImageCreateInfo info = ImageCreateInfo::immutable_2d_image(uint32_t(image.width), uint32_t(image.height),
++                                                                      VK_FORMAT_R8G8B8A8_UNORM);
++            info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;
++            info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++            ImageInitialData initial{image.data, 0, 0};
++            return device.create_image(info, &initial);
++        }
+         std::unordered_set<uint64_t> g_dumped;
+ 
+         uint32_t expand16(uint32_t c)
+@@ -69,15 +187,19 @@ namespace ga2_texpacks
+             return GSMem::ReadCT32(vram, cbp, 1, x, y);
+         }
+ 
+-        // The texture as RGBA (PS2 alpha, 0x80 = opaque); false for formats
+-        // not handled here.
+-        bool decode(uint64_t tex0, std::vector<uint32_t> &out, uint32_t &w, uint32_t &h)
++        // A region of the texture as RGBA (PS2 alpha, 0x80 = opaque); false
++        // for formats not handled here.
++        bool decode(uint64_t tex0, uint32_t rx, uint32_t ry, uint32_t &w, uint32_t &h, std::vector<uint32_t> &out)
+         {
+             uint8_t *vram = const_cast<uint8_t *>(g_vram);
+             const uint32_t tbp = uint32_t(tex0 & 0x3FFFu), tbw = uint32_t((tex0 >> 14) & 0x3Fu);
+             const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
+-            w = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 26) & 0xFu));
+-            h = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 30) & 0xFu));
++            const uint32_t tw = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 26) & 0xFu));
++            const uint32_t th = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 30) & 0xFu));
++            if (rx >= tw || ry >= th)
++                return false;
++            w = std::min(w, tw - rx);
++            h = std::min(h, th - ry);
+             const uint32_t cbp = uint32_t((tex0 >> 37) & 0x3FFFu), cpsm = uint32_t((tex0 >> 51) & 0xFu);
+             out.resize(size_t(w) * h);
+             uint32_t palette[256] = {};
+@@ -85,9 +207,10 @@ namespace ga2_texpacks
+             if (p8 || p4)
+                 for (uint32_t i = 0; i < (p8 ? 256u : 16u); ++i)
+                     palette[i] = clutEntry(vram, cbp, cpsm, p8, i);
+-            for (uint32_t y = 0; y < h; ++y)
+-                for (uint32_t x = 0; x < w; ++x)
++            for (uint32_t oy = 0; oy < h; ++oy)
++                for (uint32_t ox = 0; ox < w; ++ox)
+                 {
++                    const uint32_t x = rx + ox, y = ry + oy;
+                     uint32_t c = 0;
+                     switch (psm)
+                     {
+@@ -102,7 +225,7 @@ namespace ga2_texpacks
+                     case 0x2Cu: c = palette[GSMem::ReadP4HH(vram, tbp, tbw, x, y) & 15u]; break;
+                     default: return false;
+                     }
+-                    out[size_t(y) * w + x] = c;
++                    out[size_t(oy) * w + ox] = c;
+                 }
+             return true;
+         }
+@@ -131,7 +254,8 @@ namespace ga2_texpacks
+                     const auto &p = it->path();
+                     if (p.extension() != ".png")
+                         continue;
+-                    const std::string stem = p.stem().string();
++                    // <hash>.png or <hash>_<w>x<h>.png (the dump's names).
++                    const std::string stem = p.stem().string().substr(0, 16);
+                     if (stem.size() != 16 || stem.find_first_not_of("0123456789abcdef") != std::string::npos)
+                         continue;
+                     g_index.emplace(std::stoull(stem, nullptr, 16), p.string()); // first pack wins
+@@ -164,23 +288,32 @@ namespace ga2_texpacks
+         class Replacement final : public TextureReplacementInterface
+         {
+         public:
+-            ImageHandle replace(const TextureDescriptor &, uint64_t tex0, uint64_t, Device &device) override
++            ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, Device &device) override
+             {
+                 if (!g_vram)
+                     return {};
+                 std::lock_guard<std::mutex> lock(g_mutex);
+                 if (!g_indexed)
+                     buildIndex();
+-                if (g_index.empty() && g_dumpDir.empty())
++                if (!g_buttonMapLoaded)
++                    loadButtonMap();
++                const bool buttons = g_style != "playstation" && !g_buttonMap.empty();
++                if (g_index.empty() && g_dumpDir.empty() && !buttons)
+                     return {};
+                 std::vector<uint32_t> px;
+-                uint32_t w = 0, h = 0;
+-                if (!decode(tex0, px, w, h))
++                uint32_t w = desc.rect.width, h = desc.rect.height;
++                if (!w || !h || !decode(tex0, desc.rect.x, desc.rect.y, w, h, px))
++                    return {};
++                // A replacement must cover the whole cached region.
++                if (w != desc.rect.width || h != desc.rect.height)
+                     return {};
+                 const uint64_t hash = hashPixels(px, w, h);
+                 char name[32];
+                 std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
+-                if (!g_dumpDir.empty() && g_dumped.insert(hash).second)
++                // Full-height 64-pixel strips are the games' copies of the
++                // rendered frame, not art: not worth dumping.
++                const bool frameStrip = w == 64u && h >= 448u;
++                if (!g_dumpDir.empty() && !frameStrip && g_dumped.insert(hash).second)
+                 {
+                     // PNG alpha 255 = opaque (the GS's 0x80 doubled).
+                     std::vector<uint32_t> png(px);
+@@ -190,31 +323,36 @@ namespace ga2_texpacks
+                         c = (c & 0x00FFFFFFu) | (a << 24);
+                     }
+                     ::Image image{png.data(), int(w), int(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                    ExportImage(image, (std::filesystem::path(g_dumpDir) / (std::string(name) + ".png")).string().c_str());
++                    const std::string file = std::string(name) + "_" + std::to_string(w) + "x" + std::to_string(h) + ".png";
++                    ExportImage(image, (std::filesystem::path(g_dumpDir) / file).string().c_str());
+                 }
+                 const auto it = g_index.find(hash);
+                 if (it == g_index.end())
+-                    return {};
++                {
++                    const auto spots = buttons ? g_buttonMap.find(hash) : g_buttonMap.end();
++                    if (spots == g_buttonMap.end())
++                        return {};
++                    const std::string key = std::string(name) + "/" + g_style;
++                    if (const auto cached = g_images.find(key); cached != g_images.end())
++                        return cached->second;
++                    ::Image composed{};
++                    if (!composeButtons(px, w, h, spots->second, composed))
++                    {
++                        UnloadImage(composed);
++                        return {};
++                    }
++                    ImageHandle handle = upload(device, composed);
++                    UnloadImage(composed);
++                    g_images.emplace(key, handle);
++                    return handle;
++                }
+                 if (const auto cached = g_images.find(it->second); cached != g_images.end())
+                     return cached->second;
+                 ::Image image = LoadImage(it->second.c_str());
+                 if (!image.data)
+                     return {};
+                 ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+-                // Back to the GS's alpha range.
+-                auto *texels = static_cast<uint32_t *>(image.data);
+-                for (int i = 0; i < image.width * image.height; ++i)
+-                {
+-                    const uint32_t a = ((texels[i] >> 24) + 1u) >> 1;
+-                    texels[i] = (texels[i] & 0x00FFFFFFu) | (a << 24);
+-                }
+-                // paraLLEl-GS takes replacement images in the GENERAL layout.
+-                ImageCreateInfo info = ImageCreateInfo::immutable_2d_image(uint32_t(image.width), uint32_t(image.height),
+-                                                                          VK_FORMAT_R8G8B8A8_UNORM);
+-                info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;
+-                info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+-                ImageInitialData initial{image.data, 0, 0};
+-                ImageHandle handle = device.create_image(info, &initial);
++                ImageHandle handle = upload(device, image);
+                 UnloadImage(image);
+                 g_images.emplace(it->second, handle);
+                 return handle;
+@@ -234,6 +372,12 @@ namespace ga2_texpacks
+             configured = true;
+             std::lock_guard<std::mutex> lock(g_mutex);
+             g_packs = splitList(std::getenv("GA2_TEXTURE_PACKS"));
++            if (const char *dir = std::getenv("GA2_BUTTON_DIR"); dir && *dir)
++                g_buttonDir = dir;
++            else
++                g_buttonDir = (std::filesystem::path(GetApplicationDirectory()) / "buttons").string();
++            if (const char *style = std::getenv("GA2_BUTTONS"); style && *style && std::string(style) != "auto")
++                g_style = style;
+             if (const char *dump = std::getenv("GA2_TEX_DUMP"); dump && *dump)
+             {
+                 g_dumpDir = dump;
+@@ -255,6 +399,18 @@ namespace ga2_texpacks
+     }
+ 
+     bool takeChanged() { return g_changed.exchange(false); }
++
++    void setButtonStyle(const std::string &style)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (const char *fixed = std::getenv("GA2_BUTTONS"); fixed && *fixed && std::string(fixed) != "auto")
++            return; // the player chose a style
++        if (style == g_style)
++            return;
++        g_style = style;
++        g_changed.store(true);
++        std::fprintf(stderr, "[texpacks] button prompts: %s\n", style.c_str());
++    }
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index e1d6feb..5a7cc8f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -26,5 +26,10 @@ namespace ga2_texpacks
+     // The pack list changed since the last call (the bridge then drops its
+     // cached textures).
+     bool takeChanged();
++    // Button prompts for the player's input device: playstation (the
++    // games' own icons), xbox, keyboard or vr. GA2_BUTTONS fixes the style;
++    // GA2_BUTTON_DIR is where the icons and map.json are (default
++    // <app>/buttons).
++    void setButtonStyle(const std::string &style);
+ }
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 327c25e..1cd81f1 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
++#include "ga2_cheat_menu.h"
+ #include "ps2_host_backend.h"
+ #include "runtime/ga2_activity.h"
+ 
+@@ -165,6 +166,12 @@ namespace ps2_mouse
+         layout();
+ 
+         sampleInput();
++        if (ga2_cheat_menu::open())
++        {
++            g_held = 0;
++            g_clickedGame = false;
++            return;
++        }
+         const Vector2 mouse = g_in.pos;
+         const Vector2 delta = g_in.delta;
+         const bool inWindow = g_external.active ||
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index f42c0c7..4e1a4b1 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -2,7 +2,12 @@
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_input.h"
+ #include "ga2_vr.h"
++#include "ga2_cheat_menu.h"
+ #include "ps2_mouse.h"
++#include "runtime/gs/gs_pgs.h"
++#include <cctype>
++#include <cmath>
++#include <string>
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -154,10 +159,63 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Button prompts follow the input device used last (gs_texpacks.h):
++    // a VR headset, a gamepad (PlayStation-style pads keep the games' own
++    // icons, others get Xbox-style ones) or the keyboard.
++    std::string padStyle(const char *name)
++    {
++        std::string n = name ? name : "";
++        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return char(std::tolower(c)); });
++        for (const char *ps : {"dualshock", "dualsense", "playstation", "sony", "ps3", "ps4", "ps5", "wireless controller"})
++            if (n.find(ps) != std::string::npos)
++                return "playstation";
++        return "xbox";
++    }
++
++    void detectInputStyle()
++    {
++        static std::string current;
++        std::string style = current;
++        if (ga2_vr::headsetRunning())
++            style = "vr";
++        else
++        {
++            for (int key : {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_W, KEY_A, KEY_S, KEY_D, KEY_X, KEY_C, KEY_Z, KEY_V,
++                            KEY_Q, KEY_E, KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_ESCAPE, KEY_LEFT_SHIFT, KEY_RIGHT_SHIFT})
++                if (IsKeyPressed(key))
++                    style = "keyboard";
++            if (IsGamepadAvailable(0))
++            {
++                bool used = GetGamepadButtonPressed() != GAMEPAD_BUTTON_UNKNOWN;
++                for (int axis = 0; axis < 4; ++axis)
++                    used = used || std::fabs(GetGamepadAxisMovement(0, axis)) > 0.5f;
++                if (used || current.empty())
++                    style = padStyle(GetGamepadName(0));
++            }
++            if (style.empty())
++                style = "keyboard";
++        }
++        if (style != current)
++        {
++            current = style;
++            ga2_pgs::setButtonStyle(style);
++        }
++    }
++}
++
+ void ps2PadSampleHostInput()
+ {
++    detectInputStyle();
+     std::array<uint8_t, 32> pad{};
+     sampleHostPad(pad.data());
++    // The cheat menu takes the input while it is open: the game sees an idle pad.
++    if (ga2_cheat_menu::open())
++    {
++        pad[2] = pad[3] = 0xFF;
++        pad[4] = pad[5] = pad[6] = pad[7] = 0x80;
++    }
+     std::lock_guard<std::mutex> lock(g_hostPadMutex);
+     g_hostPad = pad;
+     g_hostPadSampled = true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0501c3d..ac4a077 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
+ #include "ga2_vr.h"
++#include "ga2_cheat_menu.h"
+ #include "runtime/ga2_activity.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -2992,10 +2993,12 @@ void PS2Runtime::run()
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
+         ps2_mouse::draw();
++        ga2_cheat_menu::draw(m_memory.getRDRAM());
+         EndDrawing();
+         // Input was polled in EndDrawing: mouse first (menus, on-screen pad), then the pad.
+         ps2_mouse::beginFrame(ps2_mouse::Rect{dstRect.x, dstRect.y, dstRect.width, dstRect.height},
+                               static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
++        ga2_cheat_menu::update(m_memory.getRDRAM());
+         ps2PadSampleHostInput();
+         // Developer aid: GA2_RAM_DUMP_DIR + F12 writes EE RAM to ram-<vsync>.bin.
+         if (IsKeyPressed(KEY_F12))
+-- 
+2.55.0
+

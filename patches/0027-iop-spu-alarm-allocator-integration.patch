@@ -1,0 +1,1771 @@
+From 4b29b2357838c133eab9da39c9a6eed909ac9b3d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:33:35 -0500
+Subject: [PATCH 27/31] ga2: private native31/38 IOP integration (SPU device,
+ allocator27, alarm25/38 cancel)
+
+---
+ ps2xIOP/include/ps2x/iop/iop_host.h          |   5 +
+ ps2xIOP/src/emulator/core/iop_memory.cpp     | 221 +++++++++++-
+ ps2xIOP/src/emulator/core/iop_memory.h       |  19 +
+ ps2xIOP/src/emulator/imports/iop_sysmem.cpp  |   8 +-
+ ps2xIOP/src/emulator/iop_emulator.cpp        | 328 +++++++++++++++---
+ ps2xIOP/src/emulator/iop_emulator.h          |   3 +
+ ps2xIOP/src/emulator/services/iop_rpc.cpp    |  12 +-
+ ps2xIOP/src/emulator/services/iop_rpc.h      |   4 +
+ ps2xIOP/tests/iop_alarm25_boundaries.inc     | 170 +++++++++
+ ps2xIOP/tests/iop_allocator27_boundaries.inc | 119 +++++++
+ ps2xIOP/tests/iop_compat_test_support.h      |  22 ++
+ ps2xIOP/tests/iop_spu31_boundaries.inc       | 347 +++++++++++++++++++
+ ps2xIOP/tests/iop_spu31_tests.cpp            |  23 ++
+ 13 files changed, 1222 insertions(+), 59 deletions(-)
+ create mode 100644 ps2xIOP/tests/iop_alarm25_boundaries.inc
+ create mode 100644 ps2xIOP/tests/iop_allocator27_boundaries.inc
+ create mode 100644 ps2xIOP/tests/iop_spu31_boundaries.inc
+ create mode 100644 ps2xIOP/tests/iop_spu31_tests.cpp
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index f3783f0..c890e63 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -210,5 +210,10 @@ namespace ps2x::iop
+         {
+             return false;
+         }
++        // Serialized guest owner; borrowed stereo48k signed16 PCM only.
++        // Appended methods preserve existing virtual ordering. Unsupported
++        // hosts return false rather than acknowledging discarded chip output.
++        virtual bool submitSpuPcm(std::span<const int16_t>, uint32_t) { return false; }
++        virtual bool resetSpuPcm() { return false; }
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index eaf5255..cb3a8ef 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -3,6 +3,8 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
++#include <stdexcept>
++#include <ga2/spu_device.h>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -18,6 +20,47 @@ namespace ps2x::iop::detail
+         {
+             return (value + alignment - 1u) & ~(alignment - 1u);
+         }
++
++        // Derived from the existing allocation vector; no second free-space state.
++        template <class Visitor>
++        bool visitFreeExtents(std::span<const IopMemory::Allocation> blocks, Visitor &&visitor)
++        {
++            uint32_t cursor = IopMemory::HeapBase;
++            while (cursor < IopMemory::HeapLimit)
++            {
++                uint32_t nextStart = IopMemory::HeapLimit;
++                uint32_t nextEnd = IopMemory::HeapLimit;
++                bool covered = false;
++                for (const auto &block : blocks)
++                {
++                    const uint64_t end = uint64_t(block.address) + block.size;
++                    if (block.size == 0u || block.address < IopMemory::HeapBase || end > IopMemory::HeapLimit)
++                        return false;
++                    if (block.address <= cursor && cursor < end)
++                    {
++                        cursor = uint32_t(end);
++                        covered = true;
++                        break;
++                    }
++                    if (block.address > cursor && block.address < nextStart)
++                    {
++                        nextStart = block.address;
++                        nextEnd = uint32_t(end);
++                    }
++                }
++                if (covered)
++                    continue;
++                if (cursor < nextStart && !visitor(cursor, nextStart))
++                    return true;
++                cursor = nextEnd;
++            }
++            return true;
++        }
++
++        uint64_t alignUpChecked(uint32_t value, uint32_t alignment)
++        {
++            return (uint64_t(value) + alignment - 1u) & ~(uint64_t(alignment) - 1u);
++        }
+     }
+ 
+     IopMemory::IopMemory()
+@@ -61,6 +104,8 @@ namespace ps2x::iop::detail
+     uint8_t IopMemory::read8(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++            return accessSpu([]() -> uint8_t { throw std::runtime_error("SPU byte read unsupported in private31"); });
+         if (phys < RamSize)
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+@@ -74,6 +119,13 @@ namespace ps2x::iop::detail
+     uint16_t IopMemory::read16(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++        {
++            return accessSpu([&]() -> uint16_t {
++            if (phys & 1u) throw std::runtime_error("unaligned SPU halfword read");
++            return m_spu->read16(phys);
++            });
++        }
+         if (phys + 1u < RamSize)
+         {
+             uint16_t value;
+@@ -88,6 +140,15 @@ namespace ps2x::iop::detail
+     uint32_t IopMemory::read32(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++        {
++            return accessSpu([&]() -> uint32_t {
++            if ((phys & 3u) || phys > Spu2End - 4u)
++                throw std::runtime_error("unaligned SPU word read");
++            const uint32_t low = m_spu->read16(phys);
++            return low | (uint32_t(m_spu->read16(phys + 2u)) << 16u);
++            });
++        }
+         if (phys >= 0x1F402014u && phys <= 0x1F40201Bu && m_cdvdSubcommandReader)
+         {
+             // Status must be sampled before consuming a following FIFO byte.
+@@ -120,6 +181,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++            return accessSpu([] { throw std::runtime_error("SPU byte write unsupported in private31"); });
+         if (phys >= 0x1F402016u && phys <= 0x1F402018u && m_cdvdSubcommandWriter)
+         {
+             m_cdvdSubcommandWriter(uint8_t(phys - 0x1F402000u), value);
+@@ -146,6 +209,19 @@ namespace ps2x::iop::detail
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++        {
++            accessSpu([&] {
++            if (phys & 1u) throw std::runtime_error("unaligned SPU halfword write");
++            m_spu->write16(phys, value);
++            // Diagnostic shadow only: never replay a merged command or read DATA.
++            const uint32_t aligned = phys & ~3u, shift = (phys & 2u) * 8u;
++            auto &shadow = m_hardware[aligned];
++            shadow = (shadow & ~(0xffffu << shift)) | (uint32_t(value) << shift);
++            return;
++            });
++            return;
++        }
+         if (phys + 1u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -159,6 +235,17 @@ namespace ps2x::iop::detail
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
++        {
++            accessSpu([&] {
++            if ((phys & 3u) || phys > Spu2End - 4u)
++                throw std::runtime_error("unaligned SPU word write");
++            write16(phys, uint16_t(value));
++            write16(phys + 2u, uint16_t(value >> 16u));
++            return;
++            });
++            return;
++        }
+         if (phys >= 0x1F402014u && phys <= 0x1F40201Bu && m_cdvdSubcommandWriter)
+         {
+             for (uint32_t n = 0u; n < 4u; ++n) write8(address + n, uint8_t(value >> (8u * n)));
+@@ -286,6 +373,41 @@ namespace ps2x::iop::detail
+         }
+ 
+         m_hardware[address] = value;
++        if ((address == kDmaSpu0Chcr || address == kDmaSpu1Chcr) && m_spuSynchronize)
++        {
++            accessSpu([&] {
++            const uint8_t core = address == kDmaSpu1Chcr ? 1u : 0u;
++            const int irq = core ? kDmaSpu1Irq : kDmaSpu0Irq;
++            if ((value & kDmaStart) == 0u)
++            {
++                if (m_spu->cancelOrdinaryDma(core))
++                    m_dmaStart = DmaStart{irq, 0u, core, true};
++                return;
++            }
++            // First slice accepts the observed ordinary request mode only.
++            if ((value & 0x00fffffeu) != 0x200u)
++                throw std::runtime_error("unsupported SPU DMA mode");
++            const uint32_t bcr = m_hardware[address - 4u];
++            const uint64_t words32 = uint64_t(bcr & 0xffffu) * (bcr >> 16u);
++            const uint32_t madr = physicalAddress(m_hardware[address - 8u]);
++            if (!words32 || words32 > RamSize / 4u || (madr & 3u) ||
++                !ownsRamRange(madr, size_t(words32 * 4u)))
++                throw std::runtime_error("SPU DMA range is not owned aligned IOP RAM");
++            std::vector<uint16_t> words(size_t(words32 * 2u));
++            const bool toSpu = (value & 1u) != 0u;
++            if (toSpu && !readRam(madr, words.data(), words.size() * 2u))
++                throw std::runtime_error("SPU DMA source read failed");
++            const auto result = m_spu->transfer({core, toSpu ? ga2::spu::DmaDirection::ToSpuRam :
++                ga2::spu::DmaDirection::FromSpuRam, madr, words, false});
++            if (result.status != ga2::spu::DmaStatus::Consumed || result.words_transferred != words.size())
++                throw std::runtime_error("SPU DMA rejected by device");
++            if (!toSpu && !writeRam(madr, words.data(), words.size() * 2u))
++                throw std::runtime_error("SPU DMA destination write failed");
++            m_dmaStart = DmaStart{irq, std::max<uint64_t>(words32 * 2u, 64u), core, false};
++            return;
++            });
++            return;
++        }
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+             return;
+ 
+@@ -321,32 +443,50 @@ namespace ps2x::iop::detail
+         return result;
+     }
+ 
++    void IopMemory::setSpuAccess(ga2::spu::Device *device, std::function<void()> synchronize,
++                                 std::function<void()> failed)
++    {
++        m_spu = device;
++        m_spuSynchronize = std::move(synchronize);
++        m_spuFailed = std::move(failed);
++    }
++
++    void IopMemory::finishSpuDma(uint8_t core)
++    {
++        m_hardware[core ? kDmaSpu1Chcr : kDmaSpu0Chcr] &= ~kDmaStart;
++    }
++
+     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
+     {
++        if (size > HeapLimit - HeapBase)
++            return 0u;
+         size = alignUp(std::max(size, 1u), 16u);
+         alignment = std::max<uint32_t>(alignment, 4u);
++        if ((alignment & (alignment - 1u)) != 0u)
++            return 0u;
+         if (fixed)
+         {
+             const uint32_t address = *fixed;
+-            if (address < HeapBase || address + size > HeapLimit)
++            if (address < HeapBase || address > HeapLimit || size > HeapLimit - address)
+                 return 0u;
+             for (const auto &block : m_allocations)
+-                if (address < block.address + block.size && block.address < address + size)
++                if (address < uint64_t(block.address) + block.size && block.address < uint64_t(address) + size)
+                     return 0u;
+             m_allocations.push_back({address, size});
+             markOwned(address, size);
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
++        uint64_t candidate = alignUpChecked(m_heapCursor, alignment);
+         for (;;)
+         {
+             bool overlap = false;
+             for (const auto &block : m_allocations)
+             {
+-                if (candidate < block.address + block.size && block.address < candidate + size)
++                const uint64_t end = uint64_t(block.address) + block.size;
++                if (candidate < end && block.address < candidate + size)
+                 {
+-                    candidate = alignUp(block.address + block.size, alignment);
++                    candidate = alignUpChecked(uint32_t(end), alignment);
+                     overlap = true;
+                     break;
+                 }
+@@ -355,11 +495,53 @@ namespace ps2x::iop::detail
+                 break;
+         }
+         if (candidate > HeapLimit || size > HeapLimit - candidate)
++        {
++            std::optional<uint32_t> reused;
++            const bool valid = visitFreeExtents(m_allocations, [&](uint32_t begin, uint32_t end)
++            {
++                const uint64_t aligned = alignUpChecked(begin, alignment);
++                if (aligned <= end && size <= uint64_t(end) - aligned)
++                {
++                    reused = uint32_t(aligned);
++                    return false;
++                }
++                return true;
++            });
++            if (!valid || !reused)
++                return 0u;
++            candidate = *reused;
++        }
++        m_allocations.push_back({uint32_t(candidate), size});
++        markOwned(uint32_t(candidate), size);
++        m_heapCursor = std::max(m_heapCursor, uint32_t(candidate) + size);
++        return uint32_t(candidate);
++    }
++
++    uint32_t IopMemory::allocateLast(uint32_t size, uint32_t alignment)
++    {
++        if (size > HeapLimit - HeapBase)
++            return 0u;
++        size = alignUp(std::max(size, 1u), 16u);
++        alignment = std::max<uint32_t>(alignment, 4u);
++        if ((alignment & (alignment - 1u)) != 0u)
++            return 0u;
++        std::optional<uint32_t> selected;
++        // Provisional private mode-1 interpretation: highest aligned placement.
++        // Exact original-kernel rounding/overhead still needs a reference trace.
++        const bool valid = visitFreeExtents(m_allocations, [&](uint32_t begin, uint32_t end)
++        {
++            if (size <= end - begin)
++            {
++                const uint32_t aligned = (end - size) & ~(alignment - 1u);
++                if (aligned >= begin && (!selected || aligned > *selected))
++                    selected = aligned;
++            }
++            return true;
++        });
++        if (!valid || !selected)
+             return 0u;
+-        m_allocations.push_back({candidate, size});
+-        markOwned(candidate, size);
+-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+-        return candidate;
++        // Reuse the exact placement commit, preserving the forward cursor.
++        return allocate(size, alignment, selected);
+     }
+ 
+     bool IopMemory::freeAllocation(uint32_t address)
+@@ -412,7 +594,26 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        uint32_t largest = 0u;
++        const bool valid = visitFreeExtents(m_allocations, [&](uint32_t begin, uint32_t end)
++        {
++            const uint64_t aligned = alignUpChecked(begin, 16u);
++            if (aligned <= end)
++                largest = std::max(largest, uint32_t(end - aligned) & ~15u);
++            return true;
++        });
++        return valid ? largest : 0u;
++    }
++
++    uint32_t IopMemory::totalFreeMemory() const
++    {
++        uint32_t total = 0u;
++        const bool valid = visitFreeExtents(m_allocations, [&](uint32_t begin, uint32_t end)
++        {
++            total += end - begin;
++            return true;
++        });
++        return valid ? total : 0u;
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index bf59bbe..b68b5db 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -9,6 +9,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++namespace ga2::spu { class Device; }
++
+ namespace ps2x::iop::detail
+ {
+     class IopMemory
+@@ -36,6 +38,8 @@ namespace ps2x::iop::detail
+         {
+             int irq = 0;
+             uint64_t delayCycles = 0;
++            uint8_t core = 0;
++            bool cancelled = false;
+         };
+ 
+         IopMemory();
+@@ -57,8 +61,10 @@ namespace ps2x::iop::detail
+         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
+ 
+         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
++        [[nodiscard]] uint32_t allocateLast(uint32_t size, uint32_t alignment = 16u);
+         [[nodiscard]] bool freeAllocation(uint32_t address);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
++        [[nodiscard]] uint32_t totalFreeMemory() const;
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+ 
+         // One serialized guest-executor owner may observe backing retirement.
+@@ -76,6 +82,11 @@ namespace ps2x::iop::detail
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++        // Serialized IOP owner supplies both lifetime and authoritative time.
++        void setSpuAccess(ga2::spu::Device *device, std::function<void()> synchronize,
++                          std::function<void()> failed);
++        void setSpuDevice(ga2::spu::Device *device) noexcept { m_spu = device; }
++        void finishSpuDma(uint8_t core);
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+ 
+         // The controller owns media state; reset RAM without duplicating it here.
+@@ -86,6 +97,11 @@ namespace ps2x::iop::detail
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+     private:
++        template<class Access> decltype(auto) accessSpu(Access &&access) const
++        {
++            try { m_spuSynchronize(); return access(); }
++            catch (...) { if (m_spuFailed) m_spuFailed(); throw; }
++        }
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+@@ -103,6 +119,9 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++        ga2::spu::Device *m_spu = nullptr;
++        std::function<void()> m_spuSynchronize;
++        std::function<void()> m_spuFailed;
+         std::function<uint8_t()> m_cdvdDiscTypeReader;
+         std::function<uint8_t(uint8_t)> m_cdvdSubcommandReader;
+         std::function<void(uint8_t, uint8_t)> m_cdvdSubcommandWriter;
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 2c8d8f7..4a83fe4 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -29,7 +29,9 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t address = a0 == 2u
+                                          ? m_memory.allocate(a1, 16u, a2)
+-                                         : m_memory.allocate(a1, 16u);
++                                         : a0 == 1u
++                                               ? m_memory.allocateLast(a1, 16u)
++                                               : m_memory.allocate(a1, 16u);
+             setV0(address);
+             return true;
+         }
+@@ -40,9 +42,11 @@ namespace ps2x::iop::detail
+             setV0(IopMemory::RamSize);
+             return true;
+         case 7: // QueryMaxFreeMemSize
+-        case 8: // QueryTotalFreeMemSize
+             setV0(m_memory.maxFreeMemory());
+             return true;
++        case 8: // QueryTotalFreeMemSize
++            setV0(m_memory.totalFreeMemory());
++            return true;
+         case 9: // QueryBlockTopAddress
+             if (const auto block = m_memory.allocationContaining(a0))
+                 setV0(block->address);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 5e259ab..a7ba1ae 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -24,6 +24,7 @@
+ #include <span>
+ #include <sstream>
+ #include <utility>
++#include <ga2/spu_device.h>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -89,9 +90,13 @@ namespace ps2x::iop::detail
+ 
+         struct ScheduledGuestCallback
+         {
++            // One authoritative queue. Alarm records remain here during delivery.
+             uint32_t function = 0u;
+             uint32_t gp = 0u;
+             uint32_t argument = 0u;
++            uint64_t identity = 0u;
++            bool alarm = false;
++            bool delivering = false;
+         };
+ 
+         explicit Impl(IopHost &hostRef)
+@@ -115,11 +120,45 @@ namespace ps2x::iop::detail
+             memory.setCdvdSubcommandAccess(
+                 [this](uint8_t offset) { return cdvd.readSubcommandRegister(offset); },
+                 [this](uint8_t offset, uint8_t value) { cdvd.writeSubcommandRegister(offset, value); });
++            rpc.setRamRetirementSupplement(this, [](void *context, uint32_t base, uint32_t size) noexcept { static_cast<Impl *>(context)->retireAlarms(base, size); });
++            bindSpuBus();
+             reset();
+         }
+ 
++        ~Impl()
++        {
++            rpc.setRamRetirementSupplement(nullptr, nullptr);
++            if (!spu) return;
++            if (syncingSpu || callDepth || activeCpu) std::terminate();
++            pendingDmaInterrupts.clear();
++            syncingSpu = true;
++            try {
++                if (!host.resetSpuPcm())
++                    log(LogLevel::Error, "[IOP SPU] owner teardown PCM drain failed");
++            } catch (...) {
++                try { log(LogLevel::Error, "[IOP SPU] owner teardown PCM drain threw"); } catch (...) {}
++            }
++            // A replacement owner checks a fresh drain before installing PCM.
++        }
++
+         void reset()
+         {
++            if (syncingSpu || (spu && (callDepth || activeCpu || servicingDmaInterrupts || servicingGuestCallbacks)))
++            { resetRequired = true; throw std::runtime_error("IOP SPU reset requires quiescent execution"); }
++            // Retire the sole completion owner before freeing its borrowed chip.
++            pendingDmaInterrupts.clear();
++            if (spu)
++            {
++                // Keep the owner on reset failure so retry cannot skip a failed
++                // host drain. Host callbacks cannot reset or reenter this chip.
++                syncingSpu = true;
++                struct Guard { bool &flag; ~Guard() { flag = false; } } guard{syncingSpu};
++                try {
++                    if (!host.resetSpuPcm()) throw std::runtime_error("SPU PCM reset failed");
++                } catch (...) { resetRequired = true; throw; }
++                spu.reset();
++                bindSpuBus();
++            }
+             // CDVD owns a dynamically allocated transfer workspace. Retire it
+             // while allocation ownership still refers to the previous epoch.
+             cdvd.reset();
+@@ -187,8 +226,74 @@ namespace ps2x::iop::detail
+ 
+         void schedulePendingDma()
+         {
+-            if (const auto dma = memory.takeDmaStart())
+-                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
++            try
++            {
++                if (const auto dma = memory.takeDmaStart())
++                {
++                    if (dma->cancelled) { pendingDmaInterrupts.erase(dma->irq); return; }
++                    if (dma->delayCycles > UINT64_MAX - totalCycles)
++                        throw std::runtime_error("IOP DMA deadline overflow");
++                    const uint64_t identity = reserveCallbackIdentity();
++                    pendingDmaInterrupts[dma->irq] = PendingDma{
++                        totalCycles + dma->delayCycles, identity, dma->core};
++                }
++            }
++            catch (...) { resetRequired = true; throw; }
++        }
++
++        void bindSpuBus()
++        {
++            memory.setSpuAccess(spu.get(), [this] { synchronizeSpu(true); },
++                [this] { resetRequired = true; });
++        }
++
++        void synchronizeSpu(bool access = false)
++        {
++            if (!access && !spu) return;
++            if (resetRequired || syncingSpu)
++            { resetRequired = true; throw std::runtime_error("SPU access outside quiescent IOP execution"); }
++            syncingSpu = true;
++            struct Guard { bool &flag; ~Guard() { flag = false; } } guard{syncingSpu};
++            try
++            {
++                if (!spu)
++                {
++                    spu = std::make_unique<ga2::spu::Device>();
++                    memory.setSpuDevice(spu.get());
++                    if (!host.resetSpuPcm()) throw std::runtime_error("SPU owner acquisition PCM drain failed");
++                    if (resetRequired) throw std::runtime_error("SPU owner acquisition callback faulted IOP");
++                    spu->setPcmSink([this](std::span<const ga2::spu::StereoFrame> frames) {
++                        std::vector<int16_t> interleaved;
++                        interleaved.reserve(frames.size() * 2u);
++                        for (const auto &frame : frames)
++                        { interleaved.push_back(frame.left); interleaved.push_back(frame.right); }
++                        if (!host.submitSpuPcm(interleaved, 48000u))
++                            throw std::runtime_error("SPU PCM submission rejected by host");
++                        if (resetRequired) throw std::runtime_error("SPU PCM callback faulted IOP");
++                    });
++                    // SPU address IRQ9 is distinct from DMA IRQ36/40. Raise only
++                    // existing hardware pending state; never execute guest in DSP.
++                    spu->setSpuAddressIrq([this](uint8_t) {
++                        memory.setInterruptStatus(memory.interruptStatus() | (1u << 9u));
++                    });
++                }
++                if (access || totalCycles - spu->lastIopCycle() >= ga2::spu::kIopCyclesPerSample)
++                    spu->advanceTo(totalCycles);
++            }
++            catch (...)
++            {
++                resetRequired = true;
++                try { log(LogLevel::Error, "[IOP SPU] device/PCM failure; reset required"); } catch (...) {}
++                throw;
++            }
++        }
++
++        void advanceIopTime(uint64_t cycles)
++        {
++            if (cycles > UINT64_MAX - totalCycles)
++            { resetRequired = true; throw std::runtime_error("IOP clock overflow"); }
++            totalCycles += cycles;
++            synchronizeSpu();
+         }
+ 
+         bool readRam(uint32_t address, void *destination, size_t size) const
+@@ -269,6 +374,7 @@ namespace ps2x::iop::detail
+                             callback->address,
+                             callback->gp,
+                             callback->reason,
++                            reserveCallbackIdentity(),
+                         });
+                 }
+                 return ImportDisposition::Handled;
+@@ -279,6 +385,8 @@ namespace ps2x::iop::detail
+ 
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+             {
++                if (call.ordinal >= 35u && call.ordinal <= 38u)
++                    return dispatchAlarmImport(call.ordinal, cpu);
+                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+@@ -481,6 +589,7 @@ namespace ps2x::iop::detail
+ 
+         bool step(CpuState &cpu)
+         {
++            if (syncingSpu) resetRequired = true;
+             if (resetRequired) { cpu.stopped = true; cpu.executionFault = true; return false; }
+             if (cpu.stopped)
+                 return false;
+@@ -505,10 +614,10 @@ namespace ps2x::iop::detail
+                 // A checked call charges the import before nested execution;
+                 // suspended import frames cannot add counters after deadline.
+                 const bool counted = rpcWaitCpu != nullptr;
+-                if (counted) { ++totalInstructions; ++totalCycles; }
++                if (counted) { ++totalInstructions; advanceIopTime(1u); }
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 if (disposition == ImportDisposition::Missing) cpu.missingImport = true;
+-                if (!counted) { ++totalInstructions; ++totalCycles; }
++                if (!counted) { ++totalInstructions; advanceIopTime(1u); }
+                 if (disposition == ImportDisposition::JumpToGuest)
+                     return true;
+                 cpu.pc = cpu.gpr[31];
+@@ -520,7 +629,7 @@ namespace ps2x::iop::detail
+             if (cpu.exception && (cpu.cop0[13] & 0x7Cu) != 0u) cpu.executionFault = true;
+             schedulePendingDma();
+             ++totalInstructions;
+-            ++totalCycles;
++            advanceIopTime(1u);
+             return running;
+         }
+ 
+@@ -725,23 +834,42 @@ namespace ps2x::iop::detail
+                 return;
+ 
+             servicingDmaInterrupts = true;
++            struct Guard { bool &flag; ~Guard() { flag = false; } } guard{servicingDmaInterrupts};
+ 
+-            std::vector<int> completed;
+-            for (auto it = pendingDmaInterrupts.begin(); it != pendingDmaInterrupts.end();)
++            // Keep live entries until settlement. A prior handler can cancel,
++            // reset or replace another due transfer; stale snapshots cannot win.
++            std::array<std::pair<int, uint64_t>, 2> completed{};
++            size_t count = 0u;
++            for (const auto &[irq, dma] : pendingDmaInterrupts)
+             {
+-                if (it->second > totalCycles)
++                if (dma.deadline <= totalCycles)
+                 {
+-                    ++it;
+-                    continue;
++                    if (count == completed.size())
++                    { resetRequired = true; throw std::runtime_error("SPU completion owner exceeds two channels"); }
++                    completed[count++] = {irq, dma.identity};
+                 }
+-                completed.push_back(it->first);
+-                it = pendingDmaInterrupts.erase(it);
+             }
+             try
+             {
+-                for (const int irq : completed)
++                for (const auto &[irq, identity] : std::span(completed).first(count))
+                 {
+                     if (resetRequired) break;
++                    const auto live = pendingDmaInterrupts.find(irq);
++                    if (live == pendingDmaInterrupts.end() || live->second.identity != identity) continue;
++                    const uint8_t core = live->second.core;
++                    bool settleDevice = true;
++#ifdef PS2X_IOP_TEST_BOUNDARIES
++                    // Existing RPC scheduler fixtures insert timer-only events
++                    // with identity0. Production transfers reserve nonzero IDs.
++                    settleDevice = identity != 0u;
++#endif
++                    if (settleDevice)
++                    {
++                        if (!spu || !spu->settleOrdinaryDma(core))
++                        { resetRequired = true; throw std::runtime_error("SPU DMA settlement lost its device owner"); }
++                        memory.finishSpuDma(core);
++                    }
++                    pendingDmaInterrupts.erase(live);
+                     (void)intrman.dispatchInterrupt(irq, *this);
+                 }
+             }
+@@ -753,53 +881,148 @@ namespace ps2x::iop::detail
+             servicingDmaInterrupts = false;
+         }
+ 
+-        void servicePendingGuestCallbacks()
++        uint64_t reserveCallbackIdentity()
+         {
+-            if (resetRequired || servicingGuestCallbacks || pendingGuestCallbacks.empty())
+-                return;
++            if (nextCallbackIdentity == UINT64_MAX) throw std::runtime_error("IOP callback identity exhausted");
++            return nextCallbackIdentity++;
++        }
+ 
+-            std::vector<ScheduledGuestCallback> callbacks;
++        void retireAlarms(uint32_t base, uint32_t size) noexcept
++        {
++            if (size == 0u) return;
++            const uint64_t end = uint64_t(base) + size;
++            const auto overlaps = [base, end](const ScheduledGuestCallback &callback) noexcept
++            {
++                const uint32_t function = IopMemory::physicalAddress(callback.function);
++                const uint32_t gp = IopMemory::physicalAddress(callback.gp);
++                return (function < end && uint64_t(function) + 4u > base) || (gp >= base && gp < end);
++            };
++            // Execution remains live after cancellation removes its registration.
++            // The stack witness outlives the checked call; never borrow a map node.
++            if (executingAlarm && overlaps(*executingAlarm)) resetRequired = true;
+             for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end();)
++                if (it->second.alarm && overlaps(it->second)) it = pendingGuestCallbacks.erase(it);
++                else ++it;
++        }
++
++        ImportDisposition alarmUnsupported(CpuState &cpu, const char *reason) noexcept
++        {
++            resetRequired = true;
++            cpu.gpr[2] = uint32_t(-5);
++            // Diagnostic scope only; never invent successful unsupported behavior.
++            try { log(LogLevel::Error, reason); } catch (...) {}
++            return ImportDisposition::Handled;
++        }
++
++        ImportDisposition dispatchAlarmImport(uint16_t ordinal, CpuState &cpu)
++        {
++            // This private candidate supports observed relative one-shot alarms.
++            // Generic duplicate/error/repeat semantics are not yet oracle-verified.
++            const uint32_t function = cpu.gpr[ordinal <= 36u ? 5 : 4];
++            const uint32_t argument = cpu.gpr[ordinal <= 36u ? 6 : 5];
++            auto matching = pendingGuestCallbacks.end();
++            size_t alarms = 0;
++            for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end(); ++it)
++                if (it->second.alarm)
++                {
++                    ++alarms;
++                    if (it->second.function == function && it->second.argument == argument) matching = it;
++                }
++            if (ordinal >= 37u)
+             {
+-                if (it->first > totalCycles)
+-                    break;
+-                callbacks.push_back(it->second);
+-                it = pendingGuestCallbacks.erase(it);
++                if (matching == pendingGuestCallbacks.end())
++                {
++                    // CancelAlarm's ordinary not-found result must not fault the IOP.
++                    // PS2SDK thbase.c / kerr.h: KE_NOTFOUND_HANDLER == -105.
++                    cpu.gpr[2] = uint32_t(-105);
++                    return ImportDisposition::Handled;
++                }
++                pendingGuestCallbacks.erase(matching);
++                cpu.gpr[2] = 0u;
++                return ImportDisposition::Handled;
+             }
+-            if (callbacks.empty())
+-                return;
++            const uint32_t clock = cpu.gpr[4];
++            const uint32_t canonicalFunction = IopMemory::physicalAddress(function);
++            const auto validAlias = [](uint32_t a) { return a < IopMemory::RamSize ||
++                (a >= 0x80000000u && a < 0x80200000u) || (a >= 0xA0000000u && a < 0xA0200000u); };
++            if (matching != pendingGuestCallbacks.end() || alarms >= 64u ||
++                !validAlias(clock) || !validAlias(function) || (clock & 3u) || !memory.ownsRamRange(clock, 8u) ||
++                (function & 3u) || !memory.ownsRamRange(canonicalFunction, 4u))
++                return alarmUnsupported(cpu, "[IOP alarm diagnostic] unsupported registration");
++            const uint64_t delay = uint64_t(memory.read32(clock)) | (uint64_t(memory.read32(clock + 4u)) << 32u);
++            if (!delay || delay > UINT64_MAX - totalCycles)
++                return alarmUnsupported(cpu, "[IOP alarm diagnostic] unsupported delay");
++            try
++            {
++                const uint64_t identity = reserveCallbackIdentity();
++                pendingGuestCallbacks.emplace(totalCycles + delay,
++                    ScheduledGuestCallback{function, cpu.gpr[28], argument, identity, true, false});
++            }
++            catch (...) { return alarmUnsupported(cpu, "[IOP alarm diagnostic] registration allocation failed"); }
++            cpu.gpr[2] = 0u;
++            return ImportDisposition::Handled;
++        }
+ 
++        void servicePendingGuestCallbacks()
++        {
++            if (resetRequired || servicingGuestCallbacks || pendingGuestCallbacks.empty()) return;
++            const uint64_t cutoff = totalCycles, watermark = nextCallbackIdentity - 1u;
+             servicingGuestCallbacks = true;
++            struct Guard { bool &flag; ~Guard() { flag = false; } } guard{servicingGuestCallbacks};
+             try
+             {
+-                for (const ScheduledGuestCallback &callback : callbacks)
++                while (!resetRequired)
+                 {
+-                    if (resetRequired) break;
+-                    if (callback.function != 0u)
++                    auto it = pendingGuestCallbacks.begin();
++                    while (it != pendingGuestCallbacks.end() && it->first <= cutoff &&
++                           (it->second.identity > watermark || it->second.delivering)) ++it;
++                    if (it == pendingGuestCallbacks.end() || it->first > cutoff) break;
++                    const ScheduledGuestCallback callback = it->second;
++                    if (callback.alarm) it->second.delivering = true;
++                    else pendingGuestCallbacks.erase(it);
++                    // Do not retain an iterator across guest execution.
++                    if (!callback.alarm)
+                     {
+-                        (void)callFunction(callback.function,
+-                                           callback.argument,
+-                                           0u,
+-                                           0u,
+-                                           0u,
+-                                           callback.gp,
+-                                           100000u);
++                        if (callback.function) (void)callFunction(callback.function, callback.argument,
++                            0u, 0u, 0u, callback.gp, 100000u);
++                        continue;
+                     }
++                    struct ExecutionGuard
++                    {
++                        const ScheduledGuestCallback *&slot;
++                        const ScheduledGuestCallback *previous;
++                        ~ExecutionGuard() { slot = previous; }
++                    } executionGuard{executingAlarm, executingAlarm};
++                    executingAlarm = &callback;
++                    uint32_t result = 0u;
++                    const auto status = executeGuestFunctionWithStackArgumentsChecked(callback.function,
++                        callback.argument, 0u, 0u, 0u, callback.gp, {}, 100000u, result);
++                    if (status != IopGuestCallStatus::Completed)
++                    { resetRequired = true; break; }
++                    auto live = pendingGuestCallbacks.end();
++                    for (auto scan = pendingGuestCallbacks.begin(); scan != pendingGuestCallbacks.end(); ++scan)
++                        if (scan->second.identity == callback.identity) { live = scan; break; }
++                    if (live == pendingGuestCallbacks.end()) continue; // Cancelled/replaced/retired.
++                    if (result != 0u)
++                    {
++                        resetRequired = true;
++                        log(LogLevel::Error, "[IOP alarm diagnostic] repeat semantics unsupported");
++                        break;
++                    }
++                    pendingGuestCallbacks.erase(live);
+                 }
+             }
+-            catch (...)
+-            {
+-                servicingGuestCallbacks = false;
+-                throw;
+-            }
+-            servicingGuestCallbacks = false;
++            catch (...) { resetRequired = true; }
+         }
+ 
+         bool runCyclesCore(uint64_t cycles, bool checked) noexcept
+         {
++            if (syncingSpu) { resetRequired = true; return false; }
+             if (resetRequired) return false;
+             try
+             {
++                if (cycles > UINT64_MAX - totalCycles)
++                { resetRequired = true; return false; }
+                 const uint64_t target = checked && rpcWaitCpu
+                     ? std::min(totalCycles + cycles, rpcCycleDeadline) : totalCycles + cycles;
+                 while (totalCycles < target && !resetRequired)
+@@ -815,12 +1038,12 @@ namespace ps2x::iop::detail
+                     if (!next)
+                     {
+                         uint64_t nextWake = kernel.nextWakeCycle(target);
+-                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+-                            nextWake = std::min(nextWake, completionCycle);
++                        for (const auto &[irq, dma] : pendingDmaInterrupts)
++                            nextWake = std::min(nextWake, dma.deadline);
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
+-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
++                        advanceIopTime(std::max(totalCycles + 1u, std::min(target, nextWake)) - totalCycles);
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
+@@ -839,13 +1062,13 @@ namespace ps2x::iop::detail
+                             resetRequired = true;
+                     }
+                     if (totalCycles == before)
+-                        ++totalCycles;
++                        advanceIopTime(1u);
+                 }
+             }
+             catch (...)
+             {
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
+-                if (checked) resetRequired = true;
++                if (checked || (spu && spu->faulted())) resetRequired = true;
+             }
+             return !resetRequired;
+         }
+@@ -991,6 +1214,7 @@ namespace ps2x::iop::detail
+             else
+             {
+                 kernel.terminateThreadsInRange(module.base, module.size);
++                retireAlarms(module.base, module.size);
+                 rpc.removeServersInRange(module.base, module.size);
+                 imports.eraseRange(module.base, module.size);
+                 log(LogLevel::Warning, "[IOP] released IRX backing retained until reset; complete resource retirement unverified");
+@@ -1027,6 +1251,7 @@ namespace ps2x::iop::detail
+                 return false;
+             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+             kernel.terminateThreadsInRange(it->second.base, it->second.size);
++            retireAlarms(it->second.base, it->second.size);
+             rpc.removeServersInRange(it->second.base, it->second.size);
+             imports.eraseRange(it->second.base, it->second.size);
+             modules.erase(it);
+@@ -1038,6 +1263,8 @@ namespace ps2x::iop::detail
+ 
+         IopHost &host;
+         IopMemory memory;
++        std::unique_ptr<ga2::spu::Device> spu;
++        bool syncingSpu = false;
+         IopSysmem sysmem;
+         IopKernel kernel;
+         IopCdvd cdvd;
+@@ -1053,8 +1280,11 @@ namespace ps2x::iop::detail
+         IopImportRegistry imports;
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+-        std::map<int, uint64_t> pendingDmaInterrupts;
++        struct PendingDma { uint64_t deadline; uint64_t identity; uint8_t core; };
++        std::map<int, PendingDma> pendingDmaInterrupts;
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
++        uint64_t nextCallbackIdentity = 1u;
++        const ScheduledGuestCallback *executingAlarm = nullptr;
+         uint32_t nextModuleId = 1;
+         uint32_t moduleCursor = kModuleLoadBase;
+         uint64_t totalCycles = 0;
+@@ -1215,3 +1445,11 @@ namespace ps2x::iop::detail
+ #include "../../tests/iop_device_callback_boundaries.inc"
+ #include "../../tests/iop_rpc_wait_boundaries.inc"
+ #endif
++#ifdef GA2_ALARM25_TEST
++#include "../../tests/iop_allocator27_boundaries.inc"
++#include "../../tests/iop_alarm25_boundaries.inc"
++#endif
++
++#ifdef GA2_SPU31_TEST
++#include "../../tests/iop_spu31_boundaries.inc"
++#endif
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 4f645ef..e93750f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -51,6 +51,9 @@ namespace ps2x::iop::detail
+         // Defined only in the boundary-test translation unit; no runtime API.
+         friend bool testIopDeviceCallbackBoundaries();
+         friend bool testIopRpcWaitBoundaries();
++#ifdef GA2_SPU31_TEST
++        friend void ga2_spu31_boundary_checks();
++#endif
+         class Impl;
+         std::unique_ptr<Impl> m_impl;
+     };
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index f79b413..367dd5b 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -57,9 +57,10 @@ namespace ps2x::iop::detail
+           m_reverseLease(std::make_shared<ReverseRpcLease>(ReverseRpcLease{&memory, &kernel}))
+     {
+         const std::weak_ptr<ReverseRpcLease> weakLease = m_reverseLease;
+-        std::function<void(uint32_t, uint32_t)> retirement = [weakLease](uint32_t base, uint32_t size) noexcept
++        std::function<void(uint32_t, uint32_t)> retirement = [weakLease, this](uint32_t base, uint32_t size) noexcept
+         {
+             IopRpcBridge::revokeRetiredEndpoints(weakLease, base, size);
++            if (m_retirementSupplement) m_retirementSupplement(m_retirementContext, base, size);
+         };
+         if (!m_memory.setRamRetirementObserver(this, std::move(retirement)))
+             throw std::runtime_error("IOP RAM retirement observer already has a live owner");
+@@ -197,13 +198,20 @@ namespace ps2x::iop::detail
+         (void)lease->kernel->completeRpcWait(endpoint->owner, 0);
+     }
+ 
++    void IopRpcBridge::setRamRetirementSupplement(void *context, void (*callback)(void *, uint32_t, uint32_t) noexcept) noexcept
++    {
++        m_retirementContext = context;
++        m_retirementSupplement = callback;
++    }
++
+     void IopRpcBridge::reset()
+     {
+         auto nextLease = std::make_shared<ReverseRpcLease>(ReverseRpcLease{&m_memory, &m_kernel});
+         const std::weak_ptr<ReverseRpcLease> weakNextLease = nextLease;
+-        std::function<void(uint32_t, uint32_t)> retirement = [weakNextLease](uint32_t base, uint32_t size) noexcept
++        std::function<void(uint32_t, uint32_t)> retirement = [weakNextLease, this](uint32_t base, uint32_t size) noexcept
+         {
+             IopRpcBridge::revokeRetiredEndpoints(weakNextLease, base, size);
++            if (m_retirementSupplement) m_retirementSupplement(m_retirementContext, base, size);
+         };
+         if (!m_memory.setRamRetirementObserver(this, std::move(retirement)))
+             return;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index 7900e19..6eb7bda 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -85,6 +85,8 @@ namespace ps2x::iop::detail
+         IopRpcBridge &operator=(IopRpcBridge &&) = delete;
+ 
+         void reset();
++        // Serialized supplement; reset preserves it. Clear before its owner dies.
++        void setRamRetirementSupplement(void *context, void (*callback)(void *, uint32_t, uint32_t) noexcept) noexcept;
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+@@ -125,6 +127,8 @@ namespace ps2x::iop::detail
+             uint32_t queue = 0;
+         };
+ 
++        void *m_retirementContext = nullptr;
++        void (*m_retirementSupplement)(void *, uint32_t, uint32_t) noexcept = nullptr;
+         IopHost &m_host;
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+diff --git a/ps2xIOP/tests/iop_alarm25_boundaries.inc b/ps2xIOP/tests/iop_alarm25_boundaries.inc
+new file mode 100644
+index 0000000..4ff7abe
+--- /dev/null
++++ b/ps2xIOP/tests/iop_alarm25_boundaries.inc
+@@ -0,0 +1,170 @@
++#include "iop_compat_test_support.h"
++#include <cstdlib>
++namespace ps2x::iop::detail {
++bool testIopRpcWaitBoundaries() {
++ using State=IopEmulator::Impl;
++ const auto require=[](bool b,const char *s){if(!b)throw std::runtime_error(s);};
++ constexpr uint32_t CLOCK=0x13000, MARK=0x13100, NEXT=0x13104;
++ const auto prepare=[&](State &s){
++  require(s.memory.zeroRam(0x10000,0x5000),"RAM seed");
++  const auto words=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
++  words(0x12000,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1200C,"thbase",7),"thbase");
++  for(uint32_t n=0;n<=41;n++)words(0x12014+n*8,{0x03E00008,0x24000000|n});
++  words(0x12200,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1220C,"thsemap",8),"thsemap");
++  for(uint32_t n=0;n<=10;n++)words(0x12214+n*8,{0x03E00008,0x24000000|n});
++  words(0x12400,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1240C,"sysmem",7),"sysmem");
++  for(uint32_t n=0;n<=15;n++)words(0x12414+n*8,{0x03E00008,0x24000000|n});
++  // Real callback increments the opaque common argument and returns0.
++  words(0x11000,{0x8C880000,0,0x25080001,0xAC880000,0x03E00008,0x00001021});
++  s.memory.write32(CLOCK,1000);s.memory.write32(CLOCK+4,0);
++ };
++ const auto driver=[&](State &s,uint32_t ordinal,uint32_t function=0x11000,uint32_t clock=CLOCK,uint32_t argument=MARK,uint32_t gp=0){
++  std::vector<uint32_t> w={0x27BDFFE8,0xAFBF0010};
++  const auto li=[&](unsigned r,uint32_t a){w.push_back(0x3C000000|(r<<16)|(a>>16));w.push_back(0x34000000|(r<<21)|(r<<16)|(a&65535));};
++  li(4,ordinal<=36?clock:function);li(5,ordinal<=36?function:argument);li(6,argument);
++  w.insert(w.end(),{0x0C000000|((0x12014+ordinal*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0});
++  uint32_t a=0x11200;for(auto v:w){s.memory.write32(a,v);a+=4;}
++  uint32_t result=0;auto status=s.executeGuestFunctionWithStackArgumentsChecked(0x11200,0,0,0,0,gp,{},100000,result);
++  return std::pair{status,result};
++ };
++ // Exercise actual MIPS imports and then a new callback, not only a host result.
++ for (uint32_t ordinal : {37u,38u}) {
++   iop_test::Host h;State s(h);prepare(s);
++   auto [st,v]=driver(s,ordinal);
++   require(st==IopGuestCallStatus::Completed&&v==uint32_t(-105)&&!s.resetRequired,"missing cancel faulted IOP");
++   driver(s,35);s.runCycles(1100);
++   require(!s.resetRequired&&s.memory.read32(MARK)==1,"not-found cancel stopped later callback");
++   auto [st2,v2]=driver(s,ordinal);
++   require(st2==IopGuestCallStatus::Completed&&v2==uint32_t(-105)&&!s.resetRequired,"expired cancel faulted IOP");
++   driver(s,35);s.runCycles(1100);
++   require(!s.resetRequired&&s.memory.read32(MARK)==2,"expired cancel prevented new alarm");
++   std::cout<<"PASS missing/expired MIPS cancellation and continued delivery ordinal="<<ordinal<<"\n";
++ }
++ for (uint32_t ordinal : {37u,38u}) {
++   iop_test::Host h;State s(h);prepare(s);driver(s,35);
++   auto [st,v]=driver(s,ordinal,0x11000,CLOCK,NEXT);
++   require(st==IopGuestCallStatus::Completed&&v==uint32_t(-105)&&!s.resetRequired&&s.pendingGuestCallbacks.size()==1,"wrong common cancelled live pair");
++   s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==1,"unrelated pair delivery lost");
++   std::cout<<"PASS missing common preserves other alarm ordinal="<<ordinal<<"\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);driver(s,35);
++   auto [st,v]=driver(s,37);auto [st2,v2]=driver(s,37);
++   require(st==IopGuestCallStatus::Completed&&v==0&&st2==IopGuestCallStatus::Completed&&v2==uint32_t(-105)&&!s.resetRequired,"repeated cancellation faulted IOP");
++   s.runCycles(2000);require(s.memory.read32(MARK)==0&&s.pendingGuestCallbacks.empty(),"already cancelled callback fired");
++   std::cout<<"PASS repeated MIPS cancellation returns not-found\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);
++   const uint32_t words[]={0x27BDFFE8,0xAFBF0010,0x3C040001,0x34841000,0x3C050001,0x34A53100,
++     0x0C000000|((0x12014+37*8)>>2),0,0x0C000000|((0x12014+37*8)>>2),0,
++     0x3C080001,0xAD023104,0x24090001,0xAD093100,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021};
++   uint32_t a=0x11000;for(auto w:words){s.memory.write32(a,w);a+=4;}
++   driver(s,35);s.runCycles(1100);
++   require(!s.resetRequired&&s.memory.read32(MARK)==1&&s.memory.read32(NEXT)==uint32_t(-105)&&s.pendingGuestCallbacks.empty(),"self double cancel did not finish guest callback");
++   std::cout<<"PASS MIPS callback continues after second self cancellation\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);auto [st,v]=driver(s,35);require(st==IopGuestCallStatus::Completed&&v==0,"MIPS SetAlarm rejected");
++   s.runCycles(50);require(s.memory.read32(MARK)==0,"alarm fired early");s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==1,"one-shot not delivered");s.runCycles(1100);require(s.memory.read32(MARK)==1,"one-shot repeated");std::cout<<"PASS real MIPS one-shot timing\n"; }
++ { iop_test::Host h;State s(h);prepare(s);driver(s,36);auto [st,v]=driver(s,38);require(st==IopGuestCallStatus::Completed&&v==0,"cancel failed");s.runCycles(2000);require(!s.resetRequired&&s.memory.read32(MARK)==0,"cancelled callback fired");std::cout<<"PASS MIPS interrupt aliases cancel\n"; }
++ { iop_test::Host h;State s(h);prepare(s);driver(s,35);s.retireAlarms(0x11000,4);s.runCycles(2000);require(!s.resetRequired&&s.memory.read32(MARK)==0,"retired callback fired");std::cout<<"PASS executable retirement boundary\n"; }
++ { iop_test::Host h;State s(h);prepare(s);
++   const uint32_t code=s.memory.allocate(0x100,16);require(code!=0,"code allocation");
++   std::array<uint8_t,24> body{};require(s.memory.readRam(0x11000,body.data(),body.size())&&s.memory.writeRam(code,body.data(),body.size()),"allocated callback copy");driver(s,35,code);
++   require(s.memory.freeAllocation(code),"real code free");s.runCycles(2000);
++   require(!s.resetRequired&&s.memory.read32(MARK)==0,"composed retirement did not revoke alarm");std::cout<<"PASS real backing free through composed observer\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);
++   const uint32_t clock=s.memory.allocate(0x100,16);require(clock!=0,"clock allocation");s.memory.write32(clock,1000);s.memory.write32(clock+4,0);driver(s,35,0x11000,clock);
++   require(s.memory.freeAllocation(clock),"clock free");s.runCycles(2000);
++   require(!s.resetRequired&&s.memory.read32(MARK)==1,"copied clock treated as live dependency");std::cout<<"PASS copied clock retirement\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);
++   // A cancels B after both are staged overdue. The batch must retain B's authority.
++   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
++   put(0x11100,{0x8C880000,0,0x25080001,0xAC880000,0x03E00008,0x00001021});
++   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x3C040001,0x34841100,0x3C050001,0x34A53100,
++       0x0C000000|((0x12014+37*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
++   driver(s,35,0x11000,CLOCK,NEXT);driver(s,35,0x11100,CLOCK,MARK);
++   s.totalCycles+=2000;s.servicePendingGuestCallbacks();
++   require(!s.resetRequired&&s.memory.read32(MARK)==0&&s.pendingGuestCallbacks.empty(),"cancelled due-batch callback executed");std::cout<<"PASS real MIPS cancellation within staged due batch\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);
++   // The callback cancels itself and registers the identical function/common again.
++   // Its old completion must not erase or resurrect the new registration.
++   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
++   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x8C880000,0,0x25080001,0xAC880000,
++     0x3C040001,0x34841000,0x3C050001,0x34A53100,0x0C000000|((0x12014+37*8)>>2),0,
++     0x3C040001,0x34843000,0x3C050001,0x34A51000,0x3C060001,0x34C63100,
++     0x0C000000|((0x12014+35*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
++   driver(s,35);s.totalCycles+=2000;s.servicePendingGuestCallbacks();
++   require(!s.resetRequired&&s.memory.read32(MARK)==1&&s.pendingGuestCallbacks.size()==1,"self replacement erased by old completion");
++   s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==2&&s.pendingGuestCallbacks.size()==1,"self replacement failed next delivery");
++   std::cout<<"PASS real MIPS self-cancel and same-pair replacement\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);
++   iop_test::Irx image(0x10000,0x5000);
++   require(s.memory.readRam(0x10000,image.bytes.data()+0x100,0x5000),"module image copy");
++   image.words(0,{0x03E00008,0x00001021});
++   const auto loaded=s.loadImage("authored-alarm.irx",image.bytes,nullptr,0);
++   require(loaded.moduleId>0&&loaded.startResult==0,"actual module startup");driver(s,35);
++   int32_t result=-1;require(s.stopModule(loaded.moduleId,&result)&&result==0,"actual module stop");s.runCycles(2000);
++   require(!s.resetRequired&&s.memory.read32(MARK)==0,"stopped module callback fired");std::cout<<"PASS actual authored module stop\n";
++ }
++ { iop_test::Host h;State s(h);prepare(s);driver(s,35);s.reset();s.runCycles(2000);require(!s.resetRequired&&s.pendingGuestCallbacks.empty(),"reset preserved work");std::cout<<"PASS cold reset\n"; }
++ { iop_test::Host h;State s(h);prepare(s);driver(s,35,0xC0011000);require(s.resetRequired&&s.pendingGuestCallbacks.empty(),"bad raw alias admitted");std::cout<<"PASS raw alias guard\n"; }
++ { iop_test::Host h;State s(h);prepare(s);s.memory.write32(0x11014,0x24020001);driver(s,35);s.runCycles(2000);require(s.resetRequired,"unverified repeat silently accepted");std::cout<<"PASS nonzero callback stop\n"; }
++ { iop_test::Host h;State s(h);prepare(s);s.memory.write32(0x11000,0x08004400);s.memory.write32(0x11004,0);driver(s,35);s.runCycles(2000);require(s.resetRequired,"nonreturning callback accepted");std::cout<<"PASS nonreturning callback stop\n"; }
++ { iop_test::Host h;State s(h);prepare(s);
++   // Allocate a real zero-count semaphore, then a MIPS callback signals it.
++   s.memory.write32(0x13300,0);s.memory.write32(0x13304,0);s.memory.write32(0x13308,0);s.memory.write32(0x1330C,1);
++   IopCpuState c{};c.gpr[4]=0x13300;require(s.kernel.dispatchSemaphoreImport(4,c),"semaphore creation");const uint32_t id=c.gpr[2];
++   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
++   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x24040000|id,0x0C000000|((0x12214+7*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
++   // Checked RPC performs SetAlarm then the original WaitSemaphore import.
++   put(0x11400,{0x27BDFFE8,0xAFBF0010,0x3C040001,0x34843000,0x3C050001,0x34A51000,0x00003021,
++      0x0C000000|((0x12014+35*8)>>2),0,0x24040000|id,0x0C000000|((0x12214+8*8)>>2),0,
++      0x3C080001,0x34090001,0xAD093104,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
++   uint32_t result=99;auto st=s.executeRpcFunctionChecked(0x11400,0,0,0,0,0,100000,result);
++   require(st==IopGuestCallStatus::Completed&&!s.resetRequired&&result==0&&s.memory.read32(NEXT)==1,"real held RPC did not resume");
++   std::cout<<"PASS real held MIPS RPC alarm/semaphore continuation\n";
++   // Suppress only SetAlarm's JAL in this authored driver: the real empty wait must fail.
++   s.memory.write32(0x1141C,0);s.memory.write32(NEXT,0);result=99;
++   st=s.executeRpcFunctionChecked(0x11400,0,0,0,0,0,100000,result);
++   require(st==IopGuestCallStatus::ResetRequired&&s.resetRequired&&s.memory.read32(NEXT)==0,"missing-alarm control unexpectedly resumed");
++   std::cout<<"PASS missing-alarm real RPC control\n";
++ }
++ // Real guest FreeSysMemory is the retirement stimulus, not a test hook.
++ const char *selection=std::getenv("GA2_ALARM_RETIRE_MODE");
++ const int selectedMode=selection?std::atoi(selection):-1;
++ for (int mode=0;mode<5;mode++) {
++   if(selection&&selectedMode!=mode)continue;
++   iop_test::Host h;State s(h);prepare(s);
++   const uint32_t backing=s.memory.allocate(0x100,16);require(backing!=0,"active retirement allocation");
++   const uint32_t function=(mode==3||mode==4)?0x11000:backing;
++   std::vector<uint32_t> w={0x27BDFFE8,0xAFBF0010};
++   const auto li=[&](unsigned r,uint32_t a){w.push_back(0x3C000000|(r<<16)|(a>>16));w.push_back(0x34000000|(r<<21)|(r<<16)|(a&65535));};
++   if(mode==1||mode==2) {
++     li(4,function);li(5,MARK);w.insert(w.end(),{0x0C000000|((0x12014+37*8)>>2),0});
++   }
++   if(mode==2) {
++     li(4,CLOCK);li(5,function);li(6,MARK);w.insert(w.end(),{0x0C000000|((0x12014+35*8)>>2),0});
++   }
++   li(4,backing);w.insert(w.end(),{0x0C000000|((0x12414+5*8)>>2),0});
++   li(8,MARK);w.insert(w.end(),{0x24090001,0xAD090000,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
++   uint32_t a=function;for(auto v:w){s.memory.write32(a,v);a+=4;}
++   driver(s,35,function,CLOCK,MARK,mode==3?backing:0);
++   s.runCycles(2000);
++   require(!s.memory.ownsRamRange(backing,4),"guest FreeSysMemory did not retire backing");
++   std::cout<<"OBSERVE guest retirement mode="<<mode<<" post-free-marker="<<s.memory.read32(MARK)<<" reset="<<s.resetRequired<<" pending="<<s.pendingGuestCallbacks.size()<<"\n";
++   if(mode<4) {
++     require(s.resetRequired&&s.memory.read32(MARK)==0,"retired alarm executed post-free instructions");
++     require(s.pendingGuestCallbacks.empty(),"retired replacement registration survived");
++   } else require(!s.resetRequired&&s.memory.read32(MARK)==1,"unrelated retirement stopped live callback");
++#ifndef GA2_ALARM26_COMPARE25
++   require(s.executingAlarm==nullptr,"execution witness escaped checked-call scope");
++#endif
++   require(!s.servicingGuestCallbacks,"callback service scope remained active");
++   std::cout<<"PASS real guest retirement mode="<<mode<<" post-free-marker="<<s.memory.read32(MARK)<<" reset="<<s.resetRequired<<"\n";
++ }
++ return testAllocator27Boundaries<State>();
++}
++}
+diff --git a/ps2xIOP/tests/iop_allocator27_boundaries.inc b/ps2xIOP/tests/iop_allocator27_boundaries.inc
+new file mode 100644
+index 0000000..dd4fef8
+--- /dev/null
++++ b/ps2xIOP/tests/iop_allocator27_boundaries.inc
+@@ -0,0 +1,119 @@
++#include "iop_compat_test_support.h"
++#include <cstdlib>
++namespace ps2x::iop::detail {
++template<class State> bool testAllocator27Boundaries() {
++ const auto require=[](bool b,const char *s){if(!b)throw std::runtime_error(s);};
++ constexpr uint32_t B=IopMemory::HeapBase,E=IopMemory::HeapLimit,H=E-B;
++ const auto prepare=[&](State &s){
++  require(s.memory.zeroRam(0x10000,0x5000),"allocator code RAM");
++  const auto table=[&](uint32_t base,const char *name,unsigned count){
++   s.memory.write32(base,0x41E00000);s.memory.write32(base+4,0);s.memory.write32(base+8,0x101);
++   require(s.memory.writeRam(base+12,name,7),"allocator import name");
++   for(unsigned i=0;i<count;i++){s.memory.write32(base+20+i*8,0x03E00008);s.memory.write32(base+24+i*8,0x24000000|i);}
++  };
++  table(0x12400,"sysmem",16);table(0x12000,"thbase",42);
++ };
++ const auto run=[&](State &s,unsigned ordinal,uint32_t a0=0,uint32_t a1=0,uint32_t a2=0,uint32_t table=0x12400){
++  std::vector<uint32_t> w={0x27BDFFE8,0xAFBF0010};
++  const auto li=[&](unsigned r,uint32_t a){w.push_back(0x3C000000|(r<<16)|(a>>16));w.push_back(0x34000000|(r<<21)|(r<<16)|(a&65535));};
++  li(4,a0);li(5,a1);li(6,a2);
++  w.insert(w.end(),{0x0C000000|((table+20+ordinal*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0});
++  uint32_t pc=0x11200;for(auto v:w){s.memory.write32(pc,v);pc+=4;}
++  uint32_t result=0xffffffff;const auto st=s.executeGuestFunctionWithStackArgumentsChecked(0x11200,0,0,0,0,0,{},100000,result);
++  require(st==IopGuestCallStatus::Completed&&!s.resetRequired,"allocator MIPS did not return");return result;
++ };
++ const char *control=std::getenv("GA2_ALLOCATOR27_CASE");
++ const bool onlyReuse=control&&std::string(control)=="reuse";
++ if(!onlyReuse) {
++  iop_test::Host h;State s(h);prepare(s);
++  require(run(s,7)==H&&run(s,8)==H,"initial max/total");
++  const auto high=run(s,4,1,32),low=run(s,4,0,32);
++  require(high==E-32&&low==B,"mode1 highest placement/unchanged forward cursor");
++  require(s.memory.ownsRamRange(high,32)&&s.memory.ownsRamRange(low,32),"mode ownership");
++  require(run(s,7)==H-64&&run(s,8)==H-64,"mode allocations max/total");
++  std::cout<<"PASS MIPS highest placement and forward cursor\n";
++ }
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  require(run(s,4,0,H)==B&&run(s,5,B)==0,"actual full allocation/free");
++  const auto a=run(s,4,1,41244);
++  std::cout<<"OBSERVE MIPS reuse request mode1 amount41244 return="<<a<<"\n";
++  require(a==E-41248&&s.memory.ownsRamRange(a,41248),"mode1 exhausted cursor failed reusable owned range");
++  require(run(s,7)==H-41248&&run(s,8)==H-41248,"reuse max/total");
++  require(run(s,4,0,H-41248)==B,"mode0 could not allocate advertised maximum");
++  require(run(s,7)==0&&run(s,8)==0,"filled heap queries");
++  require(run(s,5,a)==0&&run(s,4,0,41248)==a,"mode0 top hole reuse");
++  require(run(s,7)==0&&run(s,8)==0,"reused heap queries");
++  std::cout<<"PASS MIPS actual request reuse and advertised maximum\n";
++ }
++ if(onlyReuse)return true;
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  // Fixed records are deliberately inserted in reverse address order.
++  require(run(s,4,2,0x1000,E-0x2000)==E-0x2000,"high fixed blocker");
++  require(run(s,4,2,H-0x4000,B+0x1000)==B+0x1000,"lower fixed blocker");
++  s.memory.write32(B+0x1000,0xcafef00d);s.memory.write32(E-0x2000,0xabcd1234);
++  const auto a=run(s,4,1,64);
++  require(a==E-64,"mode1 did not select highest aligned address in highest fitting hole");
++  require(run(s,7)==0x1000&&run(s,8)==0x3000-64,"unsorted gap max/total");
++  require(run(s,4,0,64)==B,"normal mode0 successful placement changed");
++  require(s.memory.read32(B+0x1000)==0xcafef00d&&s.memory.read32(E-0x2000)==0xabcd1234,"live fixed blocker modified");
++  require(run(s,4,2,0x40,E-0x2020)==0,"fixed overlap accepted");
++  std::cout<<"PASS MIPS unsorted fitting holes and fixed blockers\n";
++ }
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  require(run(s,4,0,H)==B&&run(s,5,B)==0,"interior cursor exhaust");
++  require(run(s,4,2,H-0x2000,B+0x2000)==B+0x2000,"upper interior blocker");
++  require(run(s,4,2,0x1000,B)==B,"lower interior blocker");
++  require(run(s,7)==0x1000&&run(s,8)==0x1000,"interior gap queries");
++  require(run(s,4,0,0x1000)==B+0x1000,"mode0 interior exact fit");
++  require(run(s,7)==0&&run(s,8)==0,"interior exact fit exhaustion");
++  std::cout<<"PASS MIPS interior reuse and exact fit\n";
++ }
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  require(run(s,4,0,H)==B&&run(s,5,B)==0,"fragmented cursor exhaust");
++  require(run(s,4,2,H-0x2000,B+0x1000)==B+0x1000,"fragmented fixed blocker");
++  require(run(s,7)==0x1000&&run(s,8)==0x2000,"max confused with total");
++  require(run(s,4,1,0x1800)==0&&run(s,4,0,0x1800)==0,"noncontiguous total accepted as allocation");
++  require(run(s,7)==0x1000&&run(s,8)==0x2000,"failed placement changed queries");
++  require(run(s,4,1,0x1000)==E-0x1000,"highest hole exact fit");
++  require(run(s,4,0,run(s,7))==B,"remaining maximum could not be allocated");
++  require(run(s,7)==0&&run(s,8)==0,"fragmented heap filled queries");
++  std::cout<<"PASS MIPS distinct max/total and contiguous capacity failure\n";
++ }
++#ifndef GA2_ALLOCATOR27_COMPARE26
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  require(s.memory.allocate(32,16,B+1)==B+1,"unaligned fixed legacy placement");
++  require(s.memory.allocate(H-0x110,16,B+0x101)==B+0x101,"alignment blocker");
++  require(run(s,7)==208&&run(s,8)==240,"alignment max/total geometry");
++  require(s.memory.allocateLast(208,64)==0,"alignment loss accepted");
++  require(run(s,7)==208&&run(s,8)==240,"failed alignment changed state");
++  require(s.memory.allocateLast(192,64)==B+0x40,"highest aligned start incorrect");
++  require(run(s,7)==16&&run(s,8)==48,"aligned allocation queries");
++  require(s.memory.allocateLast(0xffffffff,16)==0&&s.memory.allocate(0xffffffff,16)==0,"size overflow accepted");
++  require(s.memory.allocateLast(16,20)==0&&s.memory.allocate(16,20)==0,"invalid power alignment accepted");
++  require(s.memory.allocate(32,16,0xfffffff0)==0,"fixed arithmetic overflow accepted");
++  require(run(s,7)==16&&run(s,8)==48,"invalid requests changed state");
++  std::cout<<"PASS checked alignment/size/fixed arithmetic\n";
++ }
++#endif
++ {
++  iop_test::Host h;State s(h);prepare(s);
++  const auto code=run(s,4,1,0x100);require(code==E-0x100,"retirement code placement");
++  const uint32_t words[]={0x8c880000,0,0x25080001,0xac880000,0x03e00008,0x00001021};
++  for(unsigned i=0;i<6;i++)s.memory.write32(code+i*4,words[i]);
++  s.memory.write32(0x13000,1000000);s.memory.write32(0x13004,0);
++  require(run(s,35,0x13000,code,0x13100,0x12000)==0&&s.pendingGuestCallbacks.size()==1,"MIPS alarm registration");
++  require(run(s,5,code)==0&&!s.memory.ownsRamRange(code,4)&&s.pendingGuestCallbacks.empty(),"free did not revoke old registration");
++  require(run(s,4,1,0x100)==code&&s.memory.ownsRamRange(code,0x100),"same address not reused owned");
++  s.runCycles(1000001);require(!s.resetRequired&&s.memory.read32(0x13100)==0&&s.pendingGuestCallbacks.empty(),"reused backing revived retired alarm");
++  s.reset();prepare(s);require(run(s,7)==H&&run(s,8)==H,"reset did not restore queries");
++  require(!s.memory.ownsRamRange(code,4),"reset retained reused backing ownership");
++  std::cout<<"PASS MIPS retirement/reuse and cold reset\n";
++ }
++ return true;
++}
++}
+diff --git a/ps2xIOP/tests/iop_compat_test_support.h b/ps2xIOP/tests/iop_compat_test_support.h
+index 21831fe..d19de3e 100644
+--- a/ps2xIOP/tests/iop_compat_test_support.h
++++ b/ps2xIOP/tests/iop_compat_test_support.h
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <functional>
+ #include <iostream>
+ #include <span>
+ #include <stdexcept>
+@@ -94,6 +95,27 @@ namespace iop_test
+         }
+         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+ 
++        bool submitSpuPcm(std::span<const int16_t> samples, uint32_t rate) override
++        {
++            require(rate == 48000u && samples.size() % 2u == 0u, "typed stereo PCM");
++            if (beforePcm) beforePcm();
++            if (!acceptPcm) return false;
++            pcm.insert(pcm.end(), samples.begin(), samples.end());
++            return true;
++        }
++        bool resetSpuPcm() override
++        {
++            ++pcmResets;
++            if (beforePcmReset) beforePcmReset();
++            if (!acceptReset) return false;
++            pcm.clear();
++            return true;
++        }
++        bool acceptPcm = true, acceptReset = true;
++        unsigned pcmResets = 0u;
++        std::vector<int16_t> pcm;
++        std::function<void()> beforePcm, beforePcmReset;
++
+         uint32_t word(uint32_t address) const
+         {
+             uint32_t value = 0u;
+diff --git a/ps2xIOP/tests/iop_spu31_boundaries.inc b/ps2xIOP/tests/iop_spu31_boundaries.inc
+new file mode 100644
+index 0000000..a54c7fd
+--- /dev/null
++++ b/ps2xIOP/tests/iop_spu31_boundaries.inc
+@@ -0,0 +1,347 @@
++#include "iop_compat_test_support.h"
++#include <array>
++extern bool ga2_spu31_fail_next_new;
++
++namespace ps2x::iop::detail {
++void ga2_spu31_boundary_checks() {
++  using namespace ps2x::iop::detail;
++  using iop_test::require;
++  using State = IopEmulator::Impl;
++  constexpr uint32_t base = 0x1f900000u;
++  const auto tsa = [](State &s, unsigned core, uint32_t word) {
++    s.write16(base + core * 0x400u + 0x1a8u, uint16_t(word >> 16u));
++    s.write16(base + core * 0x400u + 0x1aau, uint16_t(word));
++  };
++  const auto dma = [](State &s, unsigned core, uint32_t ram, uint32_t words32,
++                      bool write = true) {
++    const uint32_t chcr = core ? 0x1f801508u : 0x1f8010c8u;
++    s.write32(chcr - 8u, ram);
++    s.write32(chcr - 4u, (1u << 16u) | words32);
++    s.write32(chcr, write ? 0x01000201u : 0x01000200u);
++  };
++  for (unsigned core = 0; core != 2; ++core) {
++    iop_test::Host h;
++    State s(h);
++    require(!s.spu, "unused IOP does not acquire global chip");
++    std::array<uint32_t, 32> input{}, output{};
++    for (unsigned i = 0; i != input.size(); ++i)
++      input[i] = 0x51230000u + i * 0x101u;
++    require(s.writeRam(0x11000u, input.data(), sizeof(input)), "owned source");
++    require(s.writeRam(0x12000u, output.data(), sizeof(output)),
++            "owned destination");
++    tsa(s, core, 0x7000u);
++    dma(s, core, 0x11000u, 32u);
++    const uint32_t chcr = core ? 0x1f801508u : 0x1f8010c8u;
++    require(s.read32(chcr) & 0x01000000u,
++            "CHCR stays active until owner settles");
++    require(!(s.read16(base + core * 0x400u + 0x344u) & 0x80u),
++            "device busy is live");
++    s.advanceIopTime(63u);
++    s.servicePendingDmaInterrupts();
++    require(s.pendingDmaInterrupts.size() == 1u, "no early settlement");
++    s.advanceIopTime(1u);
++    s.servicePendingDmaInterrupts();
++    require(s.pendingDmaInterrupts.empty() && !(s.read32(chcr) & 0x01000000u),
++            "exact owner completion");
++    require(s.read16(base + core * 0x400u + 0x344u) & 0x80u,
++            "ready after device settlement");
++    require(!s.spu->settleOrdinaryDma(core), "cannot settle twice");
++    tsa(s, core, 0x7000u);
++    dma(s, core, 0x12000u, 32u, false);
++    require(s.readRam(0x12000u, output.data(), sizeof(output)) &&
++                input == output,
++            "actual sample RAM roundtrip through both DMA cores");
++    s.write32(chcr, 0u);
++    require(s.pendingDmaInterrupts.empty(),
++            "cancel removes authoritative deadline");
++    s.advanceIopTime(100u);
++    s.servicePendingDmaInterrupts();
++    require(!s.resetRequired, "cancelled event stays retired");
++    tsa(s, core, 0x7000u);
++    const uint16_t first = s.read16(base + core * 0x400u + 0x1acu);
++    require(first == uint16_t(input[0]),
++            "original-width DATA read actual sample");
++    require(s.read16(base + core * 0x400u + 0x1aau) == 0x7001u,
++            "halfword DATA read executes exactly once");
++    dma(s, core, 0x11000u, 32u);
++    s.reset();
++    require(!s.spu && s.pendingDmaInterrupts.empty() && h.pcmResets == 2u,
++            "reset retires device/deadline and host queue");
++    tsa(s, core, 0x7000u);
++    require(s.read16(base + core * 0x400u + 0x1acu) == 0u,
++            "cold sample RAM after reset");
++  }
++  {
++    // Original IRQ36 handler cancels/restarts due IRQ40. Its old captured
++    // completion must not settle the newer transfer.
++    iop_test::Host h;
++    State s(h);
++    std::array<uint32_t, 16> payload{};
++    require(s.writeRam(0x12000u, payload.data(), sizeof(payload)),
++            "handler DMA RAM");
++    const uint32_t code[] = {0x3c081f80u, 0xad001508u, 0x3c090100u, 0x35290201u,
++                             0xad091508u, 0x03e00008u, 0u};
++    require(s.writeRam(0x11000u, code, sizeof(code)), "actual handler code");
++    IopCpuState cpu{};
++    cpu.gpr[4] = 36u;
++    cpu.gpr[6] = 0x11000u;
++    require(s.intrman.dispatchImport(4u, cpu, s), "register actual IRQ36");
++    cpu.gpr[4] = 36u;
++    require(s.intrman.dispatchImport(6u, cpu, s), "enable actual IRQ36");
++    tsa(s, 0u, 0x7000u);
++    tsa(s, 1u, 0x7100u);
++    dma(s, 0u, 0x12000u, 16u);
++    dma(s, 1u, 0x12000u, 16u);
++    const auto oldIdentity = s.pendingDmaInterrupts.at(40).identity;
++    s.advanceIopTime(64u);
++    s.servicePendingDmaInterrupts();
++    require(!s.resetRequired && s.pendingDmaInterrupts.size() == 1u &&
++                s.pendingDmaInterrupts.at(40).identity != oldIdentity,
++            "original handler replaced due transfer identity");
++    require(!(s.read16(base + 0x744u) & 0x80u),
++            "stale completion did not settle replacement");
++    s.advanceIopTime(64u);
++    s.servicePendingDmaInterrupts();
++    require(s.pendingDmaInterrupts.empty() && (s.read16(base + 0x744u) & 0x80u),
++            "replacement settles at own deadline");
++  }
++  {
++    iop_test::Host h;
++    State s(h);
++    s.write16(base + 0x19au, 0u);
++    s.runCycles(767u);
++    require(h.pcm.empty(), "idle fractional clock retained");
++    s.runCycles(1u);
++    require(h.pcm.size() == 2u, "idle sample tick");
++    const uint32_t code[] = {0x24020001u, 0x24420001u, 0x03e00008u, 0u};
++    require(s.writeRam(0x11000u, code, sizeof(code)), "checked timing code");
++    uint32_t result = 0u;
++    require(s.executeGuestFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 100u,
++                                          result) &&
++                result == 2u,
++            "actual checked call");
++    s.runCycles(768u - (s.totalCycles % 768u));
++    require(h.pcm.size() / 2u == s.totalCycles / 768u &&
++                s.spu->lastIopCycle() == (s.totalCycles / 768u) * 768u,
++            "checked+idle partition preserves all ticks");
++    h.acceptPcm = false;
++    s.runCycles(768u);
++    require(s.resetRequired && s.spu->faulted(),
++            "host rejection halts unchecked runtime path");
++    h.acceptPcm = true;
++    s.reset();
++    require(!s.resetRequired && h.pcm.empty(),
++            "reset recovers failed device and drains PCM");
++  }
++  {
++    iop_test::Host h;
++    State s(h);
++    tsa(s, 0u, 0x7000u);
++    s.write16(base + 0x19cu, 0u);
++    s.write16(base + 0x19eu, 0x7001u);
++    s.write16(base + 0x19au, 0x40u);
++    const uint32_t bytes[] = {0x12345678u, 0x98765432u};
++    require(s.writeRam(0x11000u, bytes, sizeof(bytes)), "address IRQ source");
++    dma(s, 0u, 0x11000u, 2u);
++    s.advanceIopTime(768u);
++    require(s.memory.interruptStatus() & (1u << 9u),
++            "address IRQ distinct hardware source");
++    require(s.pendingDmaInterrupts.size() == 1u,
++            "address IRQ does not claim DMA completion");
++  }
++  {
++    iop_test::Host h;
++    State s(h);
++    const uint16_t adpcm[] = {0x0700u, 0x1234u, 0x5678u, 0x2468u,
++                              0x1357u, 0x7f00u, 0x00f7u, 0x4242u};
++    require(s.writeRam(0x12000u, adpcm, sizeof(adpcm)),
++            "authored looping ADPCM source");
++    tsa(s, 0u, 0x2800u);
++    dma(s, 0u, 0x12000u, 4u);
++    s.advanceIopTime(64u);
++    s.servicePendingDmaInterrupts();
++    for (unsigned voice : {0u, 16u}) {
++      const uint32_t reg = base + voice * 16u;
++      s.write16(reg, 0x3fffu);
++      s.write16(reg + 2u, 0x3fffu);
++      s.write16(reg + 4u, 0x1000u);
++      s.write16(reg + 6u, 0u);
++      s.write16(reg + 8u, 0u);
++      s.write16(base + 0x1c0u + voice * 12u, 0u);
++      s.write16(base + 0x1c2u + voice * 12u, 0x2800u);
++    }
++    for (uint32_t reg : {0x188u, 0x18au, 0x190u, 0x192u})
++      s.write16(base + reg, 1u);
++    s.write16(base + 0x198u, 0x0c00u);
++    s.write16(base + 0x598u, 0x000cu);
++    for (uint32_t reg : {0x760u, 0x762u, 0x788u, 0x78au, 0x790u, 0x792u})
++      s.write16(base + reg, 0x3fffu);
++    s.write16(base + 0x19au, 0u);
++    s.write16(base + 0x1a2u, 1u);
++    s.runCycles(512u * 768u);
++    require(s.read16(base + 16u * 16u + 0xau) != 0u,
++            "voice16 actually started");
++    s.write16(base + 0x1a6u, 1u);
++    s.runCycles(128u * 768u);
++    require(s.read16(base + 16u * 16u + 0xau) == 0u,
++            "voice16 actually stopped");
++    const uint32_t sh = 0xa5090000u;
++    require(s.writeRam(0x11000u, &sh, sizeof(sh)), "original SH fixture code");
++    IopCpuState cpu{};
++    cpu.pc = 0x11000u;
++    cpu.gpr[8] = base + 0x1a0u;
++    cpu.gpr[9] = 1u;
++    require(s.step(cpu), "actual CPU halfword key-on");
++    s.runCycles(512u * 768u);
++    require(s.read16(base + 0xau) != 0u &&
++                s.read16(base + 16u * 16u + 0xau) == 0u,
++            "SH starts intended voice without replaying high command shadow");
++    require(std::any_of(h.pcm.begin(), h.pcm.end(),
++                        [](int16_t x) { return x != 0; }),
++            "authored ADPCM produces actual typed PCM through IOP path");
++    const uint32_t nax =
++        (uint32_t(s.read16(base + 0x1c8u)) << 16u) | s.read16(base + 0x1cau);
++    require(nax != 0x2800u, "NAX is actual advancing device state");
++    s.write16(base + 0x1a4u, 1u);
++    s.runCycles(128u * 768u);
++    require(s.read16(base + 0xau) == 0u, "KOFF stops actual IOP voice");
++  }
++  for (unsigned failure = 0u; failure != 5u; ++failure) {
++    iop_test::Host h;
++    State s(h);
++    try {
++      if (failure == 0u)
++        s.write8(base + 0x1a0u, 1u);
++      if (failure == 1u)
++        (void)s.read8(base + 0x1acu);
++      if (failure == 2u)
++        s.write16(base + 1u, 1u);
++      if (failure == 3u)
++        dma(s, 0u, 0x11000u, 4u); // unowned
++      if (failure == 4u)
++        s.write16(base + 0x1b0u, 1u); // AutoDMA
++      require(false, "unsupported input must fail");
++    } catch (const std::exception &) {
++      require(s.resetRequired, "unsupported operation cannot report success");
++    }
++  }
++  {
++    iop_test::Host h;
++    State s(h);
++    s.write16(base + 0x19au, 0u);
++    h.beforePcm = [&] { s.reset(); };
++    s.runCycles(768u);
++    require(s.resetRequired && s.spu && s.spu->faulted(),
++            "callback cannot destroy active device");
++    h.beforePcm = {};
++    s.reset();
++    s.write16(base + 0x19au, 0u);
++    s.runCycles(768u);
++    h.acceptReset = false;
++    const auto undrained = h.pcm;
++    const unsigned beforeFailure = h.pcmResets;
++    require(!undrained.empty(), "failed drain begins with actual queued PCM");
++    try {
++      s.reset();
++      require(false, "failed host reset must fail");
++    } catch (const std::exception &) {
++      require(s.resetRequired, "failed reset remains explicit");
++    }
++    require(s.spu != nullptr && h.pcm == undrained,
++            "failed drain retains device and genuinely undrained PCM for retry");
++    h.acceptReset = true;
++    s.reset();
++    require(!s.spu && !s.resetRequired && h.pcm.empty() && h.pcmResets == beforeFailure + 2u,
++            "retry actually drains host before recovery");
++  }
++  for (bool allocationFailure : {false, true}) {
++    iop_test::Host h; State s(h);
++    const uint32_t payload[] = {0x12345678u, 0x87654321u};
++    require(s.writeRam(0x11000u, payload, sizeof(payload)), "bookkeeping failure owned DMA");
++    tsa(s, 0u, 0x7000u);
++    s.memory.write32(0x1f8010c0u, 0x11000u);
++    s.memory.write32(0x1f8010c4u, 0x00010002u);
++    s.memory.write32(0x1f8010c8u, 0x01000201u);
++    require(!(s.read16(base + 0x344u) & 0x80u), "DMA already consumed before bookkeeping injection");
++    if (allocationFailure) ga2_spu31_fail_next_new = true;
++    else s.nextCallbackIdentity = UINT64_MAX;
++    bool threw = false;
++    try { s.schedulePendingDma(); } catch (...) { threw = true; }
++    require(threw && s.resetRequired && s.pendingDmaInterrupts.empty() &&
++            !ga2_spu31_fail_next_new, "actual map allocation or identity failure latches reset");
++    const auto cycles = s.totalCycles;
++    s.runCycles(768u);
++    require(s.totalCycles == cycles && !s.servicingDmaInterrupts, "failed owner cannot resume unchecked execution");
++    s.reset();
++    require(!s.resetRequired && !s.spu, "failed bookkeeping recovers through quiescent reset");
++  }
++  {
++    iop_test::Host h; State s(h);
++    s.write16(base + 0x19au, 0u); s.runCycles(768u);
++    const auto before = h.pcm;
++    h.beforePcmReset = [&] { s.write16(base + 0x19au, 0u); };
++    bool threw = false;
++    try { s.reset(); } catch (...) { threw = true; }
++    require(threw && s.resetRequired && s.spu && h.pcm == before,
++            "host drain callback cannot reenter device or erase recovery witness");
++    h.beforePcmReset = {}; s.reset();
++    require(!s.resetRequired && !s.spu && h.pcm.empty(), "reentrant failed drain recovered");
++  }
++  {
++    iop_test::Host h; State s(h);
++    h.beforePcmReset = [&] { s.runCycles(768u); };
++    bool threw = false;
++    try { s.write16(base, 0x1234u); } catch (...) { threw = true; }
++    require(threw && s.resetRequired && s.spu && s.totalCycles == 0u && h.pcm.empty() &&
++            s.spu->lastIopCycle() == 0u && s.spu->read16(base) != 0x1234u,
++            "nonthrowing acquisition scheduler reentry cannot advance, submit or finish MMIO");
++    h.beforePcmReset = {}; s.reset();
++    s.write16(base + 0x19au, 0u);
++    h.beforePcm = [&] { s.runCycles(768u); };
++    s.runCycles(768u);
++    require(s.resetRequired && s.spu->faulted() && s.totalCycles == 768u,
++            "nonthrowing PCM scheduler reentry faults device without guest time advance");
++    h.beforePcm = {}; s.reset();
++  }
++  {
++    iop_test::Host firstHost, secondHost;
++    State second(secondHost);
++    {
++      State first(firstHost); first.write16(base + 0x19au, 0u);
++      bool threw = false;
++      try { second.write16(base + 0x19au, 0u); } catch (...) { threw = true; }
++      require(threw && second.resetRequired && !second.spu && secondHost.pcmResets == 0u,
++              "competing chip acquisition fails before draining another host");
++      first.runCycles(768u);
++      require(!first.resetRequired && firstHost.pcm.size() == 2u,
++              "failed competitor preserves original device and host");
++    }
++    second.reset(); second.write16(base + 0x19au, 0u); second.runCycles(768u);
++    require(!second.resetRequired && secondHost.pcm.size() == 2u,
++            "competing owner recovers only after actual original destruction");
++  }
++  for (unsigned teardownFailure : {0u, 1u, 2u}) {
++    const bool failedTeardown = teardownFailure != 0u;
++    iop_test::Host h;
++    {
++      State s(h); s.write16(base + 0x19au, 0u); s.runCycles(768u);
++      require(!h.pcm.empty(), "owner teardown begins with queued device PCM");
++      h.acceptReset = !failedTeardown;
++      if (teardownFailure == 2u) h.beforePcmReset = [] { throw std::runtime_error("teardown drain injection"); };
++    }
++    require(h.pcm.empty() != failedTeardown, "actual teardown honors successful or failed drain");
++    State replacement(h);
++    if (failedTeardown) {
++      const auto before = h.pcm; bool threw = false;
++      try { replacement.write16(base + 0x19au, 0u); } catch (...) { threw = true; }
++      require(threw && replacement.resetRequired && h.pcm == before,
++              "replacement cannot append to undrained previous owner's stream");
++      h.acceptReset = true; h.beforePcmReset = {}; replacement.reset();
++    }
++    replacement.write16(base + 0x19au, 0u);
++    require(h.pcm.empty(), "replacement begins with a checked clean host stream");
++    replacement.runCycles(768u);
++    require(h.pcm.size() == 2u, "replacement submits only its own PCM");
++  }
++}
++} // namespace ps2x::iop::detail
+diff --git a/ps2xIOP/tests/iop_spu31_tests.cpp b/ps2xIOP/tests/iop_spu31_tests.cpp
+new file mode 100644
+index 0000000..b29347f
+--- /dev/null
++++ b/ps2xIOP/tests/iop_spu31_tests.cpp
+@@ -0,0 +1,23 @@
++#include <iostream>
++#include <cstdlib>
++#include <new>
++bool ga2_spu31_fail_next_new = false;
++void *operator new(std::size_t size) {
++  if (ga2_spu31_fail_next_new) { ga2_spu31_fail_next_new = false; throw std::bad_alloc(); }
++  if (void *p = std::malloc(size ? size : 1u)) return p;
++  throw std::bad_alloc();
++}
++void operator delete(void *p) noexcept { std::free(p); }
++void operator delete(void *p, std::size_t) noexcept { std::free(p); }
++namespace ps2x::iop::detail {
++void ga2_spu31_boundary_checks();
++}
++int main() {
++  try {
++    ps2x::iop::detail::ga2_spu31_boundary_checks();
++    std::cout << "SPU31 integration checks passed\n";
++  } catch (const std::exception &e) {
++    std::cerr << e.what() << '\n';
++    return 1;
++  }
++}
+-- 
+2.55.0
+

@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "source_base_commit": "e1c564e",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 15,
+  "entry_hint": "0x00118d90",
+  "total_entry_hints": 42,
+  "canonical_config_sha256": "5f67e1d3890f64c20867e41c5efeaabdefffac4c64b784a7d5110913df785359",
+  "canonical_config_matches_unchanged_ga2_workflow": true,
+  "generated_changed_files": [
+    {
+      "file": "entry_118d90_0x118d98.cpp",
+      "old_sha256": null,
+      "new_sha256": "7fd8dd7d67b0363038d7addae14a74db7981622bd13f523a26424bb09547c268"
+    },
+    {
+      "file": "ps2_recompiled_functions.h",
+      "old_sha256": "e2cd2347eceef8876b3e25c80fc7a8e8081017d1f495cd80cf990441701a368a",
+      "new_sha256": "8345ee1e3bfbe9f22150e1ca31600ad16cda91696ed4ad73b5ac01a03c633618"
+    },
+    {
+      "file": "register_functions.cpp",
+      "old_sha256": "cc5ff9d21ab55780e5dd00487f1ef6373609a5e51241d3b798202a3b68f2b6ed",
+      "new_sha256": "72167346cdd499fe76f42148fe8fed3d845bc984eac87bef65d342f878359936"
+    }
+  ],
+  "old_registry_assignments": 116419,
+  "new_registry_assignments": 116420,
+  "preexisting_owner_drift": [],
+  "new_assignments": [
+    {
+      "address": "0x118d90",
+      "owner": "entry_118d90_0x118d98"
+    }
+  ],
+  "tooling_tests": {
+    "passed": 27,
+    "failed": 0
+  },
+  "native_build": "passed",
+  "binary_sha256_before_capture": "43e6f156e15184452a5cb46afd0ec8b4eca9daf23f87e8452014fc4cfd47725f",
+  "astra_model": "gpt-6-astra",
+  "astra_effort": "ultra",
+  "astra_source_review": "Published3filehashes/42hintcanonicalprofile,originalgeneratedJRreturn,observerC8descriptor256objectwindow andretainedrails accepted",
+  "observer_sha256": "aa8b8d6ef8cbdc4c7b8605c51b5dcaeea9aabc44b457bee05ab63ccec8db2d4e",
+  "batch_decision": {
+    "candidate_count": 41,
+    "candidate_new_assignments": 41,
+    "existing_owner_retargets": 13,
+    "published": false,
+    "conclusion": "existingownerambiguity isseparatefromuniformno-opomission; proceedobserved-only118D90 withzero-drift; no arbitrarycandidatepruning,extraoverrideorglobalrankingchange"
+  },
+  "native_return_verified": true,
+  "opening_story_verified": false,
+  "menu_verified": false,
+  "audio_verified": false,
+  "full_trilogy_verified": false,
+  "native_capture": {
+    "capture": "captures/native-zettai/20261009-110451",
+    "matched_validated_returns": 4,
+    "entry_seconds": [
+      82.74516403395683,
+      82.7697395629948,
+      82.80226618197048,
+      83.04678603098728
+    ],
+    "callee_finish_pc": "0x1193f8",
+    "descriptor": "0x2d3f98",
+    "descriptor_offset": "0xc8",
+    "all_gpr128_FPR_FACC_FCR31_HILO_HILO1_SA_preserved": true,
+    "object_window_bytes_preserved": 256,
+    "stack_window_bytes_preserved": 64,
+    "descriptor_words_original_parity": 20,
+    "effective_alias_owners_checked": 42,
+    "probe_errors": 0,
+    "unavailable_returns": 0,
+    "pending_returns": 0,
+    "rejected_hits": 0,
+    "bounded_missing_target_reports": 0,
+    "trace_sha256": "35c754083be93ed7d17ab16d793f904c4a892acc73a7aca176184be12b944003",
+    "observer_sha256": "aa8b8d6ef8cbdc4c7b8605c51b5dcaeea9aabc44b457bee05ab63ccec8db2d4e",
+    "visuals": "titlelogo60;nearblack90;darkstarfieldwithoutlogo105;noobservedmenu/opening",
+    "limits": [
+      "fourcallbacks only, not all invocations",
+      "boundedlogabsence not completefunctioncoverage",
+      "debuggerexit0 istermination, not gamecompletion",
+      "no audio recording or FPSbenchmark"
+    ]
+  },
+  "astra_native_evidence_review": "Accepted fouruniquepairs tosameobject withrecomputedCPU/window/originaldescriptorparity and42owners;titleonly, fade/darkstarfield,nomenus/opening/audio/FPS",
+  "other_four_binary_identities_unchanged": true,
+  "ordinary_long_capture": {
+    "capture": "captures/native-zettai/20261009-110833",
+    "seconds": 180.679,
+    "input_seconds": [
+      20,
+      24,
+      80,
+      150
+    ],
+    "final_frame": "frame-180.5s.png",
+    "frame_sha256": "4d3af10302a2da0571119d976507edf1ba877753c98ef339ce4020433ac4e21a",
+    "visual": "darkstarfield,logoabsent,no visiblemenuoropening",
+    "missing_target_reports": 0,
+    "debugger": false,
+    "private_harness_ceiling_seconds": 180
+  },
+  "next_observation": {
+    "stopped_active_child_descriptor": "0x2d4880",
+    "previous_title_child_descriptor": "0x2d4398",
+    "layout_semantics_verified": false,
+    "matching_reference_state_verified": false
+  }
+}

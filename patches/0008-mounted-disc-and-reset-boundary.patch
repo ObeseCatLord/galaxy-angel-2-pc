@@ -1,0 +1,1739 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 824cd17..18510c5 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -76,6 +76,11 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_ioman_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_ioman_tests COMMAND ps2_iop_ioman_tests)
+ 
++    add_executable(ps2_iop_reset_boundary_tests tests/iop_reset_boundary_tests.cpp)
++    target_link_libraries(ps2_iop_reset_boundary_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_reset_boundary_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_reset_boundary_tests COMMAND ps2_iop_reset_boundary_tests)
++
+ endif()
+ 
+ install(TARGETS ps2_iop
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index e3f7c0d..e82d557 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -7,6 +7,7 @@
+ #include <cstdint>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace ps2x::iop
+ {
+@@ -62,6 +63,9 @@ namespace ps2x::iop
+         std::array<uint32_t, 5> arguments{};
+     };
+ 
++    struct DiscExtent { uint32_t lba = 0u; uint32_t size = 0u; };
++    struct DiscFile { uint32_t size = 0u; std::vector<DiscExtent> extents; };
++
+     class IopHost
+     {
+     public:
+@@ -108,6 +112,13 @@ namespace ps2x::iop
+         virtual std::string hostPath(HostPathKind kind) const = 0;
+         virtual std::string translateGuestPath(std::string_view path) const = 0;
+         virtual uint64_t openHostFile(std::string_view path) = 0;
++        virtual uint64_t openGuestFile(std::string_view path)
++        {
++            const std::string translated = translateGuestPath(path);
++            return translated.empty() ? 0u : openHostFile(translated);
++        }
++        virtual bool findDiscFile(std::string_view, DiscFile &) const { return false; }
++        virtual uint64_t discGeneration() const { return 0u; }
+         virtual bool hostFileSize(uint64_t handle, uint64_t &size) const = 0;
+         virtual bool readHostFile(uint64_t handle,
+                                   uint64_t offset,
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index dd02bc2..2516e97 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -21,6 +21,8 @@ namespace ps2x::iop
+         IopSubsystem(IopSubsystem &&) noexcept;
+         IopSubsystem &operator=(IopSubsystem &&) noexcept;
+ 
++        // Whole-IOP reset is only safe at a quiescent subsystem boundary.
++        [[nodiscard]] bool tryReset();
+         void reset();
+         // Explicit firmware bootstrap boundary; module entry alone is not boot completion.
+         [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index f01381e..1e6aa0e 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -487,12 +487,14 @@ namespace ps2x::iop::detail
+     private:
+         bool openImage(const std::string &path)
+         {
+-            if (imageHandle != 0u && imageHandlePath != path)
++            const uint64_t generation = host.discGeneration();
++            if (imageHandle != 0u && (imageHandlePath != path || imageGeneration != generation))
+             {
+                 host.closeHostFile(imageHandle);
+                 imageHandle = 0u;
+             }
+             imageHandlePath = path;
++            imageGeneration = generation;
+             if (path.empty())
+                 return false;
+             if (imageHandle == 0u)
+@@ -746,6 +748,20 @@ namespace ps2x::iop::detail
+                 return false;
+ 
+             const std::string guestPath = memory.readString(nameAddress, 1024u);
++            if (!host.hostPath(HostPathKind::CdImage).empty())
++            {
++                DiscFile file;
++                if (!host.findDiscFile(guestPath, file) || file.extents.size() != 1u) return false;
++                std::array<uint8_t, 32u> result{};
++                writeLe32(result.data(), file.extents.front().lba);
++                writeLe32(result.data() + 4u, file.size);
++                const auto parsed = parsePs2Path(guestPath);
++                if (!parsed || parsed.device != Ps2PathDevice::Cdrom) return false;
++                const auto slash = parsed.path.find_last_of('/');
++                const auto leaf = normalizedIsoComponent(parsed.path.substr(slash == std::string::npos ? 0u : slash + 1u));
++                std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
++                return memory.writeRam(resultAddress, result.data(), result.size());
++            }
+             IsoNode *node = findVirtualIsoNode(guestPath);
+             if (!node)
+                 return false;
+@@ -905,6 +921,7 @@ namespace ps2x::iop::detail
+         int interruptEventFlagId = 0;
+         uint64_t imageHandle = 0u;
+         std::string imageHandlePath;
++        uint64_t imageGeneration = 0u;
+         uint32_t fsvReadBuffer = 0u;
+         uint8_t subcommand = 0u;
+         std::vector<uint8_t> subcommandParameters;
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index d6dbc23..45e3dd5 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -155,13 +155,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+ 
+-            const std::string hostPath = m_host.translateGuestPath(guestPath);
+-            if (hostPath.empty())
+-            {
+-                setV0(static_cast<uint32_t>(kErrorNoEntry));
+-                return true;
+-            }
+-            const uint64_t hostHandle = m_host.openHostFile(hostPath);
++            const uint64_t hostHandle = m_host.openGuestFile(guestPath);
+             if (hostHandle == 0u)
+             {
+                 setV0(static_cast<uint32_t>(kErrorNoEntry));
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 4171518..c38af3c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -894,6 +894,11 @@ namespace ps2x::iop::detail
+         m_impl->reset();
+     }
+ 
++    bool IopEmulator::isQuiescent() const noexcept
++    {
++        return m_impl->callDepth == 0u && m_impl->activeCpu == nullptr;
++    }
++
+     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
+         return m_impl->loadModule(path, arguments, argumentSize);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 2fd19f6..2c30fa1 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -21,6 +21,7 @@ namespace ps2x::iop::detail
+         IopEmulator &operator=(const IopEmulator &) = delete;
+ 
+         void reset();
++        [[nodiscard]] bool isQuiescent() const noexcept;
+         [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
+         [[nodiscard]] bool finishBootNotifications();
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 4b45f70..2b445df 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_module_loader.h"
++#include "ps2x/iop/ps2_path.h"
+ 
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_subsystem.h"
+@@ -301,9 +302,10 @@ namespace ps2x::iop::detail
+     bool IopModuleLoader::readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes, int32_t *error)
+     {
+         if (error) *error = -203; // KE_NOFILE
+-        const std::string translated = host.translateGuestPath(guestPath);
+-        const std::string_view path = translated.empty() ? guestPath : std::string_view(translated);
+-        const uint64_t handle = host.openHostFile(path);
++        uint64_t handle = host.openGuestFile(guestPath);
++        const auto parsed = parsePs2Path(guestPath);
++        if (handle == 0u && parsed && parsed.device == Ps2PathDevice::NativeHost)
++            handle = host.openHostFile(guestPath); // retain explicit native module loading
+         if (handle == 0u)
+             return false;
+ 
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 7cc8806..ea3cd64 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -16,6 +16,27 @@ namespace ps2x::iop
+     class IopSubsystem::Impl
+     {
+     public:
++        class ActivityGuard
++        {
++        public:
++            explicit ActivityGuard(const Impl &implRef) noexcept
++                : impl(implRef)
++            {
++                ++impl.activeOperations;
++            }
++
++            ~ActivityGuard()
++            {
++                --impl.activeOperations;
++            }
++
++            ActivityGuard(const ActivityGuard &) = delete;
++            ActivityGuard &operator=(const ActivityGuard &) = delete;
++
++        private:
++            const Impl &impl;
++        };
++
+         explicit Impl(IopHost &hostRef)
+             : host(hostRef),
+               emulator(hostRef)
+@@ -86,6 +107,7 @@ namespace ps2x::iop
+         std::string lastError;
+         detail::IopModuleManager moduleManager;
+         detail::IopEmulator emulator;
++        mutable uint32_t activeOperations = 0u;
+     };
+ 
+     IopSubsystem::IopSubsystem(IopHost &host)
+@@ -99,16 +121,22 @@ namespace ps2x::iop
+ 
+     bool IopSubsystem::beginBootNotifications(uint32_t capacity)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.beginBootNotifications(capacity);
+     }
+ 
+     bool IopSubsystem::finishBootNotifications()
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.finishBootNotifications();
+     }
+ 
+-    void IopSubsystem::reset()
++    bool IopSubsystem::tryReset()
+     {
++        if (m_impl->activeOperations != 0u || !m_impl->emulator.isQuiescent())
++            return false;
++
++        const Impl::ActivityGuard activity(*m_impl);
+         m_impl->moduleManager.reset();
+         m_impl->loadOutcomes.clear();
+         m_impl->loggedLoadPaths.clear();
+@@ -123,10 +151,17 @@ namespace ps2x::iop
+         m_impl->host.resetIopSifRegisters();
+         m_impl->refreshServiceModuleKeys();
+         m_impl->rebuildRoutes();
++        return true;
++    }
++
++    void IopSubsystem::reset()
++    {
++        (void)tryReset();
+     }
+ 
+     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         const ParsedPs2Path parsed = parsePs2Path(path);
+         if (!parsed)
+             return {true, -1, -1};
+@@ -165,11 +200,13 @@ namespace ps2x::iop
+ 
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         if (m_impl->moduleManager.stopHle(moduleId, result))
+         {
+             m_impl->rebuildRoutes();
+@@ -184,11 +221,13 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         for (const auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -205,6 +244,7 @@ namespace ps2x::iop
+ 
+     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         if (m_impl->routes.find(sid) != m_impl->routes.end())
+         {
+             return true;
+@@ -214,6 +254,7 @@ namespace ps2x::iop
+ 
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         const auto route = m_impl->routes.find(request.sid);
+         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
+@@ -227,6 +268,7 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         for (auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -239,36 +281,43 @@ namespace ps2x::iop
+ 
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.allocateMemory(size, alignment);
+     }
+ 
+     bool IopSubsystem::freeMemory(uint32_t address)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.freeMemory(address);
+     }
+ 
+     bool IopSubsystem::readMemory(uint32_t address, void *destination, size_t size) const
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.readMemory(address, destination, size);
+     }
+ 
+     bool IopSubsystem::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.writeMemory(address, source, size);
+     }
+ 
+     bool IopSubsystem::zeroMemory(uint32_t address, size_t size)
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.zeroMemory(address, size);
+     }
+ 
+     bool IopSubsystem::isMemoryRange(uint32_t address, size_t size) const
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         return m_impl->emulator.isMemoryRange(address, size);
+     }
+ 
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
++        const Impl::ActivityGuard activity(*m_impl);
+         DebugSnapshot snapshot;
+         snapshot.emulatorCycles = m_impl->emulator.cycles();
+         snapshot.emulatorInstructions = m_impl->emulator.instructions();
+diff --git a/ps2xIOP/tests/iop_reset_boundary_tests.cpp b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+new file mode 100644
+index 0000000..98fc35a
+--- /dev/null
++++ b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+@@ -0,0 +1,286 @@
++#include "ps2x/iop/iop_subsystem.h"
++#include "emulator/iop_emulator.h"
++
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop;
++
++    constexpr uint32_t kDbcSid = 0x80001300u;
++
++    void require(bool value, const char *message)
++    {
++        if (!value)
++            throw std::runtime_error(message);
++    }
++
++    class Host final : public IopHost
++    {
++    public:
++        Host()
++            : guest(0x20000u, 0u)
++        {
++        }
++
++        bool readGuest(uint32_t address, void *destination, size_t size) const override
++        {
++            if ((size != 0u && !destination) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(destination, guest.data() + address, size);
++            return true;
++        }
++
++        bool writeGuest(uint32_t address, const void *source, size_t size) override
++        {
++            if ((size != 0u && !source) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(guest.data() + address, source, size);
++            return true;
++        }
++
++        bool zeroGuest(uint32_t address, size_t size) override
++        {
++            if (address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memset(guest.data() + address, 0, size);
++            return true;
++        }
++
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override
++        {
++            normalized = address;
++            return address < guest.size();
++        }
++
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind) const override { return {}; }
++        std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
++        uint64_t openHostFile(std::string_view) override { return 0u; }
++        bool hostFileSize(uint64_t, uint64_t &) const override { return false; }
++        bool readHostFile(uint64_t, uint64_t, void *, size_t, size_t &) override { return false; }
++        void closeHostFile(uint64_t) override {}
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        {
++            return false;
++        }
++        void log(LogLevel, std::string_view) override {}
++
++        bool writeSifRegister(SifRegister registerId, uint32_t value) override
++        {
++            if (registerId == SifRegister::SmFlag && value == 0x10000u)
++            {
++                ++guestExecutionCallbacks;
++                if (emulatorProbe)
++                    emulatorWasQuiescentDuringGuestExecution = emulatorProbe->isQuiescent();
++                if (resetTarget)
++                {
++                    resetAcceptedDuringGuestExecution = resetTarget->tryReset();
++                    resetTarget->reset();
++                    voidResetInvokedDuringGuestExecution = true;
++                }
++            }
++            return true;
++        }
++
++        void resetIopSifRegisters() override
++        {
++            ++sifResetCalls;
++        }
++
++        IopSubsystem *resetTarget = nullptr;
++        detail::IopEmulator *emulatorProbe = nullptr;
++        bool resetAcceptedDuringGuestExecution = true;
++        bool voidResetInvokedDuringGuestExecution = false;
++        bool emulatorWasQuiescentDuringGuestExecution = true;
++        uint32_t guestExecutionCallbacks = 0u;
++        uint32_t sifResetCalls = 0u;
++        std::vector<uint8_t> guest;
++    };
++
++#pragma pack(push, 1)
++    struct ElfHeader
++    {
++        uint8_t ident[16];
++        uint16_t type;
++        uint16_t machine;
++        uint32_t version;
++        uint32_t entry;
++        uint32_t phoff;
++        uint32_t shoff;
++        uint32_t flags;
++        uint16_t ehsize;
++        uint16_t phentsize;
++        uint16_t phnum;
++        uint16_t shentsize;
++        uint16_t shnum;
++        uint16_t shstrndx;
++    };
++
++    struct ProgramHeader
++    {
++        uint32_t type;
++        uint32_t offset;
++        uint32_t vaddr;
++        uint32_t paddr;
++        uint32_t filesz;
++        uint32_t memsz;
++        uint32_t flags;
++        uint32_t align;
++    };
++#pragma pack(pop)
++
++    static_assert(sizeof(ElfHeader) == 52u);
++    static_assert(sizeof(ProgramHeader) == 32u);
++
++    void writeGuestResetCallbackIrx(Host &host, uint32_t address)
++    {
++        constexpr uint32_t codeOffset = 0x100u;
++        constexpr uint32_t loadAddress = 0x00010000u;
++        constexpr uint32_t threadAddress = loadAddress + 0x100u;
++        constexpr uint32_t thbaseTableAddress = loadAddress + 0x180u;
++        constexpr uint32_t createThreadStub = thbaseTableAddress + 20u;
++        constexpr uint32_t startThreadStub = createThreadStub + 8u;
++        constexpr uint32_t sifmanTableAddress = loadAddress + 0x1C0u;
++        constexpr uint32_t sifInitStub = sifmanTableAddress + 20u;
++        constexpr uint32_t threadDescriptor = loadAddress + 0x300u;
++
++        ElfHeader header{};
++        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
++        header.ident[4] = header.ident[5] = header.ident[6] = 1u;
++        header.type = 2u; header.machine = 8u; header.version = 1u;
++        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
++        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
++
++        ProgramHeader program{};
++        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
++        program.filesz = 0x400u; program.memsz = 0x400u; program.flags = 7u; program.align = 4u;
++
++        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
++        const uint32_t entry[] = {
++            0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040001u, 0x34840300u, jal(createThreadStub), 0x00000000u,
++            0x00408021u,
++            0x02002021u, 0x00002821u, jal(startThreadStub), 0x00000000u,
++            0x8FBF001Cu, 0x00001021u, 0x27BD0020u, 0x03E00008u, 0x00000000u,
++        };
++        const uint32_t thread[] = {
++            jal(sifInitStub), 0x00000000u,
++            0x00001021u, 0x03E00008u, 0x00000000u,
++        };
++        const uint32_t thbaseImports[] = {
++            0x41E00000u, 0u, 0x00000101u,
++            0x61626874u, 0x00006573u,
++            0x03E00008u, 0x24000004u,
++            0x03E00008u, 0x24000006u,
++            0u, 0u,
++        };
++        const uint32_t sifmanImports[] = {
++            0x41E00000u, 0u, 0x00000101u,
++            0x6D666973u, 0x00006E61u,
++            0x03E00008u, 0x24000005u,
++            0u, 0u,
++        };
++        const uint32_t descriptor[] = {0u, 0u, threadAddress, 0x400u, 10u};
++
++        std::vector<uint8_t> segment(program.filesz, 0u);
++        const auto put = [&](uint32_t offset, const void *source, size_t size)
++        {
++            std::memcpy(segment.data() + offset, source, size);
++        };
++        put(0u, entry, sizeof(entry));
++        put(0x100u, thread, sizeof(thread));
++        put(0x180u, thbaseImports, sizeof(thbaseImports));
++        put(0x1C0u, sifmanImports, sizeof(sifmanImports));
++        put(0x300u, descriptor, sizeof(descriptor));
++
++        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
++        std::memcpy(host.guest.data() + address, &header, sizeof(header));
++        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
++        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
++    }
++
++    void resetIsRejectedDuringGuestThreadExecution()
++    {
++        Host host;
++        IopSubsystem iop(host);
++        host.resetTarget = &iop;
++
++        require(iop.loadModule("rom0:DBCMAN").moduleId > 0, "could not load HLE provider");
++        constexpr uint32_t allocationSize = 64u;
++        const uint32_t allocation = iop.allocateMemory(allocationSize);
++        require(allocation != 0u, "could not allocate IOP-owned resource");
++        const uint32_t sentinel = 0x52455345u;
++        require(iop.writeMemory(allocation, &sentinel, sizeof(sentinel)), "could not write IOP-owned resource");
++
++        writeGuestResetCallbackIrx(host, 0x1000u);
++        const ModuleLoadResult module = iop.loadModuleBuffer(0x1000u);
++        require(module.moduleId > 0 && module.startResult == 0, "could not start guest-thread IRX");
++        require(iop.canBindRpc(kDbcSid), "HLE provider was absent before callback");
++        require(iop.debugSnapshot().emulatorLoadedModules == 1u, "physical module was absent before callback");
++
++        iop.runEeCycles(8u * 256u);
++
++        require(host.guestExecutionCallbacks == 1u, "guest thread did not reach the existing SIF host callback");
++        require(!host.resetAcceptedDuringGuestExecution, "reset succeeded from active guest execution");
++        require(host.voidResetInvokedDuringGuestExecution, "legacy reset did not use the guarded path");
++        require(host.sifResetCalls == 0u, "rejected reset changed host SIF state");
++        require(iop.canBindRpc(kDbcSid), "rejected reset revoked HLE provider");
++        require(iop.debugSnapshot().emulatorLoadedModules == 1u, "rejected reset cleared loaded physical module");
++        uint32_t observed = 0u;
++        require(iop.readMemory(allocation, &observed, sizeof(observed)) && observed == sentinel,
++                "rejected reset changed IOP-owned allocation");
++
++        require(iop.tryReset(), "quiescent reset was rejected");
++        require(host.sifResetCalls == 1u, "quiescent reset did not update host SIF state");
++        require(!iop.canBindRpc(kDbcSid), "quiescent reset retained HLE provider");
++        const DebugSnapshot snapshot = iop.debugSnapshot();
++        require(snapshot.emulatorLoadedModules == 0u && snapshot.emulatorThreads == 0u && snapshot.emulatorRpcServers == 0u,
++                "quiescent reset retained guest module-owned resources");
++        require(iop.allocateMemory(allocationSize) == allocation, "quiescent reset did not revoke allocator ownership");
++    }
++
++    void scheduledGuestThreadIsNotQuiescent()
++    {
++        Host host;
++        detail::IopEmulator emulator(host);
++        host.emulatorProbe = &emulator;
++        writeGuestResetCallbackIrx(host, 0x1000u);
++        const ModuleLoadResult module = emulator.loadModuleBuffer(0x1000u, nullptr, 0u);
++        require(module.moduleId > 0 && module.startResult == 0, "could not start direct guest-thread IRX");
++
++        emulator.runEeCycles(8u * 256u);
++
++        require(host.guestExecutionCallbacks == 1u, "direct guest thread did not reach SIF host callback");
++        require(!host.emulatorWasQuiescentDuringGuestExecution,
++                "scheduled guest execution was treated as quiescent");
++    }
++}
++
++int main()
++{
++    try
++    {
++        scheduledGuestThreadIsNotQuiescent();
++        resetIsRejectedDuringGuestThreadExecution();
++    }
++    catch (const std::exception &error)
++    {
++        return (std::fputs(error.what(), stderr), std::fputc('\n', stderr), 1);
++    }
++    return 0;
++}
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..8887511 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/ps2_iop_host.cpp
++    src/lib/ps2_disc_mount.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_rom_device.cpp
+@@ -506,6 +507,18 @@ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+ )
+ 
++include(FetchContent)
++FetchContent_Declare(nlohmann_json
++    GIT_REPOSITORY https://github.com/nlohmann/json.git
++    GIT_TAG v3.11.3
++    GIT_SHALLOW TRUE)
++FetchContent_MakeAvailable(nlohmann_json)
++target_link_libraries(ps2_runtime PRIVATE nlohmann_json::nlohmann_json)
++find_package(OpenSSL QUIET COMPONENTS Crypto)
++if(TARGET OpenSSL::Crypto)
++    target_link_libraries(ps2_runtime PRIVATE OpenSSL::Crypto)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_DISC_SHA256=1)
++endif()
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..50ecb71 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -235,6 +235,8 @@ namespace ps2_stubs
+         {
+             const uint32_t offset = args.buf & PS2_RAM_MASK;
+             const size_t bytes = clampReadBytes(args.sectors, offset);
++            if (!getCdImagePath().empty() && uint64_t(args.sectors) * kCdSectorSize != bytes)
++            { g_lastCdError = -1; return false; }
+             if (bytes == 0)
+             {
+                 return true;
+@@ -295,7 +297,7 @@ namespace ps2_stubs
+             {
+                 const uint32_t offset = a2 & PS2_RAM_MASK;
+                 const size_t bytes = clampReadBytes(a1, offset);
+-                if (bytes > 0)
++                if (bytes > 0 && getCdImagePath().empty())
+                 {
+                     std::memset(rdram + offset, 0, bytes);
+                 }
+@@ -488,8 +490,11 @@ namespace ps2_stubs
+             }
+ 
+             uint32_t offset = buf & PS2_RAM_MASK;
+-            size_t bytes = static_cast<size_t>(sectors) * kCdSectorSize;
++            const uint64_t requested = uint64_t(sectors) * kCdSectorSize;
++            size_t bytes = static_cast<size_t>(requested);
+             const size_t maxBytes = PS2_RAM_SIZE - offset;
++            if (!getCdImagePath().empty() && requested > maxBytes)
++            { ok = false; break; }
+             if (bytes > maxBytes)
+             {
+                 bytes = maxBytes;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..d6e6fab 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,5 +1,6 @@
+ #include <algorithm>
+ #include <cctype>
++#include "../../../ps2_disc_mount.h"
+ 
+ namespace
+ {
+@@ -189,12 +190,12 @@ namespace
+             return false;
+         }
+ 
+-        if (!g_cdImageSizeValid || g_cdImageSizePath != imagePath)
++        // Recheck size even at the same path; short reads must not use stale bounds.
+         {
+             std::error_code ec;
+             g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
+             g_cdImageSizePath = imagePath;
+-            g_cdImageSizeValid = !ec;
++            g_cdImageSizeValid = !ec && g_cdImageSizeBytes != 0u && g_cdImageSizeBytes % kCdSectorSize == 0u;
+         }
+         if (!g_cdImageSizeValid)
+         {
+@@ -322,8 +323,33 @@ namespace
+         }
+     }
+ 
++    void refreshCdMount()
++    {
++        static uint64_t lookupGeneration = 0u;
++        const uint64_t generation = ps2_disc::generation();
++        if (lookupGeneration == generation) return;
++        lookupGeneration = generation;
++        g_cdFilesByKey.clear(); g_cdLeafIndex.clear(); g_cdLoosePathIndex.clear();
++        g_cdLeafIndexBuilt = false; g_cdLeafIndexRoot.clear();
++        g_cdImageSizePath.clear(); g_cdImageSizeValid = false;
++        g_nextPseudoLbn = kCdPseudoLbnStart;
++        g_cdStreamingLbn = 0u; g_cdStreamingEndLbn = 0xFFFFFFFFu;
++    }
++
+     bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+     {
++        refreshCdMount();
++        if (!getCdImagePath().empty())
++        {
++            ps2_disc::File file;
++            // sceCdlFILE cannot describe noncontiguous multi-extent files.
++            if (!ps2_disc::findFile(ps2Path, file) || file.extents.size() != 1u)
++            { g_lastCdError = -1; return false; }
++            entryOut = {getCdImagePath(), file.size, file.extents.front().lba, sectorsForBytes(file.size)};
++            g_cdFilesByKey[cdPathKey(ps2Path)] = entryOut;
++            g_lastCdError = 0;
++            return true;
++        }
+         const std::string key = cdPathKey(ps2Path);
+         if (key.empty())
+         {
+@@ -399,7 +425,7 @@ namespace
+         return true;
+     }
+ 
+-    bool readHostRange(const std::filesystem::path &path, uint64_t offsetBytes, uint8_t *dst, size_t byteCount)
++    bool readHostRange(const std::filesystem::path &path, uint64_t offsetBytes, uint8_t *dst, size_t byteCount, bool allowPadding = false)
+     {
+         if (!dst)
+         {
+@@ -412,7 +438,11 @@ namespace
+             return true;
+         }
+ 
+-        std::memset(dst, 0, byteCount);
++        const bool mountedImage = !getCdImagePath().empty() && path == getCdImagePath();
++        const uint64_t readGeneration = ps2_disc::generation();
++        if (mountedImage && !ps2_disc::imageReadable())
++        { g_lastCdError = -1; return false; }
++        std::vector<uint8_t> staged(byteCount, 0u);
+         std::ifstream file(path, std::ios::binary);
+         if (!file.is_open())
+         {
+@@ -427,31 +457,28 @@ namespace
+             return false;
+         }
+ 
+-        file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
++        file.read(reinterpret_cast<char *>(staged.data()), static_cast<std::streamsize>(byteCount));
++        if (static_cast<size_t>(file.gcount()) != byteCount && (!allowPadding || !file.eof() || file.bad()))
++        { g_lastCdError = -1; return false; }
++        if (mountedImage && (readGeneration != ps2_disc::generation() || !ps2_disc::imageReadable()))
++        { g_lastCdError = -1; return false; }
++        std::memcpy(dst, staged.data(), byteCount);
+         g_lastCdError = 0;
+         return true;
+     }
+ 
+     bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+     {
+-        for (const auto &[key, entry] : g_cdFilesByKey)
+-        {
+-            const uint32_t endLbn = entry.baseLbn + entry.sectors;
+-            if (lbn < entry.baseLbn || lbn >= endLbn)
+-            {
+-                continue;
+-            }
+-
+-            const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
+-            const uint64_t offset = relativeLbn * kCdSectorSize;
+-            return readHostRange(entry.hostPath, offset, dst, byteCount);
+-        }
+-
++        refreshCdMount();
++        if (uint64_t(byteCount) > uint64_t(sectors) * kCdSectorSize)
++        { g_lastCdError = -1; return false; }
+         const std::filesystem::path cdImage = getCdImagePath();
+         if (!cdImage.empty())
+         {
++            if (!ps2_disc::imageReadable()) { g_lastCdError = -1; return false; }
+             uint64_t totalSectors = 0;
+-            if (tryGetCdImageTotalSectors(totalSectors))
++            if (!tryGetCdImageTotalSectors(totalSectors))
++            { g_lastCdError = -1; return false; }
+             {
+                 const uint64_t start = static_cast<uint64_t>(lbn);
+                 const uint64_t end = start + static_cast<uint64_t>(sectors);
+@@ -466,6 +493,19 @@ namespace
+             return readHostRange(cdImage, offset, dst, byteCount);
+         }
+ 
++        for (const auto &[key, entry] : g_cdFilesByKey)
++        {
++            const uint32_t endLbn = entry.baseLbn + entry.sectors;
++            if (lbn < entry.baseLbn || lbn >= endLbn)
++            {
++                continue;
++            }
++
++            const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
++            const uint64_t offset = relativeLbn * kCdSectorSize;
++            return readHostRange(entry.hostPath, offset, dst, byteCount, true);
++        }
++
+         std::cerr << "sceCdRead unresolved LBN 0x" << std::hex << lbn
+                   << " sectors=" << std::dec << sectors
+                   << " (no mapped file and no configured CD image)" << std::endl;
+@@ -475,6 +515,12 @@ namespace
+ 
+     bool isResolvableCdLbn(uint32_t lbn)
+     {
++        refreshCdMount();
++        if (!getCdImagePath().empty())
++        {
++            uint64_t total = 0u;
++            return ps2_disc::imageReadable() && tryGetCdImageTotalSectors(total) && uint64_t(lbn) < total;
++        }
+         for (const auto &[key, entry] : g_cdFilesByKey)
+         {
+             const uint32_t endLbn = entry.baseLbn + entry.sectors;
+@@ -495,6 +541,7 @@ namespace
+ 
+     bool findRegisteredCdFileForLbn(uint32_t lbn, CdFileEntry &entryOut)
+     {
++        refreshCdMount();
+         for (const auto &[key, entry] : g_cdFilesByKey)
+         {
+             const uint32_t endLbn = entry.baseLbn + entry.sectors;
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+new file mode 100644
+index 0000000..7c465da
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -0,0 +1,276 @@
++#if defined(_WIN32) && !defined(NOMINMAX)
++#define NOMINMAX
++#endif
++#include "ps2_disc_mount.h"
++#include "ps2_runtime.h"
++
++#include <nlohmann/json.hpp>
++#ifdef PS2X_DISC_SHA256
++#include <openssl/evp.h>
++#endif
++#include <algorithm>
++#include <array>
++#include <fstream>
++#include <limits>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <unordered_map>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <sys/stat.h>
++#endif
++
++namespace ps2_disc
++{
++    namespace
++    {
++        std::mutex mutex;
++        uint64_t mountGeneration = 1u;
++        std::filesystem::path verifiedImage;
++        enum class Mode { Raw, NeedsVerification, Verified };
++        Mode mode = Mode::Raw;
++        struct Identity
++        {
++            uint64_t device = 0u, file = 0u, size = 0u;
++            int64_t modified = 0, changed = 0;
++            int64_t modifiedFraction = 0, changedFraction = 0;
++            bool operator==(const Identity &) const = default;
++        };
++        Identity verifiedIdentity;
++        std::unordered_map<std::string, File> files;
++
++        bool identity(const std::filesystem::path &path, Identity &result)
++        {
++#ifdef _WIN32
++            const HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
++                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
++                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++            if (handle == INVALID_HANDLE_VALUE) return false;
++            BY_HANDLE_FILE_INFORMATION info{}; FILE_BASIC_INFO basic{};
++            const bool ok = GetFileInformationByHandle(handle, &info) &&
++                GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic));
++            CloseHandle(handle);
++            if (!ok) return false;
++            result = {info.dwVolumeSerialNumber, uint64_t(info.nFileIndexHigh) << 32u | info.nFileIndexLow,
++                      uint64_t(info.nFileSizeHigh) << 32u | info.nFileSizeLow,
++                      basic.LastWriteTime.QuadPart, basic.ChangeTime.QuadPart, 0, 0};
++#else
++            struct stat info{};
++            if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0) return false;
++#ifdef __APPLE__
++            const auto modified = info.st_mtimespec, changed = info.st_ctimespec;
++#else
++            const auto modified = info.st_mtim, changed = info.st_ctim;
++#endif
++            result = {uint64_t(info.st_dev), uint64_t(info.st_ino), uint64_t(info.st_size),
++                      modified.tv_sec, changed.tv_sec, modified.tv_nsec, changed.tv_nsec};
++#endif
++            return true;
++        }
++
++        void retireLocked(Mode nextMode)
++        {
++            ++mountGeneration;
++            if (mountGeneration == 0u) ++mountGeneration;
++            verifiedImage.clear(); files.clear();
++            mode = nextMode;
++        }
++
++        void refreshIdentityLocked()
++        {
++            if (verifiedImage.empty()) return;
++            Identity current;
++            if (PS2Runtime::getIoPaths().cdImage != verifiedImage ||
++                !identity(verifiedImage, current) || current != verifiedIdentity)
++                retireLocked(Mode::NeedsVerification);
++        }
++
++        bool digestFile(const std::filesystem::path &path, std::string &hex, std::string *snapshot = nullptr)
++        {
++#ifndef PS2X_DISC_SHA256
++            (void)path; (void)hex; (void)snapshot;
++            return false;
++#else
++            std::ifstream stream(path, std::ios::binary);
++            if (!stream) return false;
++            std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
++            if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) return false;
++            std::vector<char> buffer(1024u * 1024u);
++            while (stream)
++            {
++                stream.read(buffer.data(), buffer.size());
++                const auto count = stream.gcount();
++                if (snapshot && count)
++                {
++                    if (snapshot->size() + size_t(count) > 8u * 1024u * 1024u) return false;
++                    snapshot->append(buffer.data(), size_t(count));
++                }
++                if (count && EVP_DigestUpdate(ctx.get(), buffer.data(), size_t(count)) != 1) return false;
++            }
++            if (!stream.eof()) return false;
++            std::array<unsigned char, EVP_MAX_MD_SIZE> result{};
++            unsigned int size = 0u;
++            if (EVP_DigestFinal_ex(ctx.get(), result.data(), &size) != 1 || size != 32u) return false;
++            constexpr char digits[] = "0123456789abcdef";
++            hex.clear();
++            for (unsigned int i = 0u; i < size; ++i)
++            { hex += digits[result[i] >> 4u]; hex += digits[result[i] & 15u]; }
++            return true;
++#endif
++        }
++
++        uint64_t unsignedField(const nlohmann::json &item, const char *name)
++        {
++            const auto &field = item.at(name);
++            if (!field.is_number_unsigned()) throw std::runtime_error("non-unsigned disc metadata field");
++            return field.get<uint64_t>();
++        }
++    }
++
++    std::string pathKey(std::string_view guestPath)
++    {
++        if (guestPath.empty() || guestPath.size() > 1024u) return {};
++        std::string path(guestPath);
++        for (char &c : path)
++        {
++            const unsigned char byte = static_cast<unsigned char>(c);
++            if (byte < 32u || byte > 126u) return {};
++            if (c == '\\') c = '/';
++            else if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
++        }
++        if (path.starts_with("CDROM0:")) path.erase(0u, 7u);
++        else if (path.starts_with("CDROM:")) path.erase(0u, 6u);
++        if (path.find(':') != std::string::npos) return {};
++        while (!path.empty() && path.front() == '/') path.erase(0u, 1u);
++        if (const auto semicolon = path.find(';'); semicolon != std::string::npos)
++        {
++            if (semicolon + 1u == path.size() ||
++                !std::all_of(path.begin() + semicolon + 1u, path.end(), [](char c) { return c >= '0' && c <= '9'; }))
++                return {};
++            path.resize(semicolon);
++        }
++        size_t begin = 0u;
++        while (begin <= path.size())
++        {
++            const auto end = path.find('/', begin);
++            const auto component = path.substr(begin, end == std::string::npos ? end : end - begin);
++            if (component.empty() || component == "." || component == "..") return {};
++            if (end == std::string::npos) break;
++            begin = end + 1u;
++        }
++        return path;
++    }
++
++    void invalidate()
++    {
++        std::lock_guard lock(mutex);
++        // A configured image which opted into verification remains strict across
++        // path reapplication. Only explicit unmount restores legacy raw mode.
++        const bool strict = !PS2Runtime::getIoPaths().cdImage.empty() && mode != Mode::Raw;
++        retireLocked(strict ? Mode::NeedsVerification : Mode::Raw);
++    }
++
++    uint64_t generation()
++    {
++        std::lock_guard lock(mutex);
++        refreshIdentityLocked();
++        return mountGeneration;
++    }
++
++    bool imageReadable()
++    {
++        std::lock_guard lock(mutex);
++        refreshIdentityLocked();
++        return mode != Mode::NeedsVerification;
++    }
++
++    bool mount(const std::filesystem::path &image, const std::filesystem::path &manifest,
++               std::string_view imageSha256, std::string_view manifestSha256, std::string &error)
++    {
++        // Failure retires previously verified metadata, including same-path remounts.
++        invalidate();
++        uint64_t startGeneration;
++        { std::lock_guard lock(mutex); mode = Mode::NeedsVerification; startGeneration = mountGeneration; }
++        error.clear();
++#ifndef PS2X_DISC_SHA256
++        error = "verified disc mounts require OpenSSL Crypto SHA-256 support";
++        return false;
++#endif
++        try
++        {
++            const auto configured = PS2Runtime::getIoPaths().cdImage;
++            if (image.empty() || image.lexically_normal() != configured.lexically_normal())
++                throw std::runtime_error("disc metadata image does not match configured mount");
++            Identity before;
++            if (!identity(image, before)) throw std::runtime_error("disc image identity unavailable");
++            const uint64_t imageSize = before.size;
++            if (imageSize == 0u || imageSize % 2048u != 0u)
++                throw std::runtime_error("invalid disc image size");
++            const uint64_t metadataSize = std::filesystem::file_size(manifest);
++            if (metadataSize == 0u || metadataSize > 8u * 1024u * 1024u)
++                throw std::runtime_error("disc metadata outside bounds");
++            std::string hash, snapshot;
++            if (!digestFile(manifest, hash, &snapshot) || hash != manifestSha256)
++                throw std::runtime_error("disc metadata digest mismatch");
++            if (!digestFile(image, hash) || hash != imageSha256)
++                throw std::runtime_error("disc image digest mismatch");
++            const auto metadata = nlohmann::json::parse(snapshot);
++            if (unsignedField(metadata, "schema_version") != 1u ||
++                unsignedField(metadata.at("iso9660"), "logical_block_size") != 2048u ||
++                unsignedField(metadata.at("iso9660"), "volume_space_size") != imageSize / 2048u)
++                throw std::runtime_error("disc metadata geometry mismatch");
++            const auto &entries = metadata.at("files");
++            if (!entries.is_array() || entries.empty() || entries.size() > 100000u)
++                throw std::runtime_error("disc file table outside bounds");
++            std::unordered_map<std::string, File> pending;
++            for (const auto &entry : entries)
++            {
++                const std::string key = pathKey(entry.at("path").get<std::string>());
++                const uint64_t fileSize = unsignedField(entry, "size");
++                const auto &extents = entry.at("extents");
++                if (key.empty() || fileSize > UINT32_MAX || !extents.is_array() ||
++                    extents.empty() || extents.size() > 256u)
++                    throw std::runtime_error("invalid disc file record");
++                File file{static_cast<uint32_t>(fileSize), {}};
++                uint64_t total = 0u;
++                for (const auto &part : extents)
++                {
++                    const uint64_t lba = unsignedField(part, "lba"), size = unsignedField(part, "size");
++                    if (lba > UINT32_MAX || size > UINT32_MAX || lba * 2048u > imageSize ||
++                        size > imageSize - lba * 2048u)
++                        throw std::runtime_error("disc file extent outside image");
++                    total += size;
++                    file.extents.push_back({static_cast<uint32_t>(lba), static_cast<uint32_t>(size)});
++                }
++                if (total != fileSize || unsignedField(entry, "lba") != file.extents.front().lba ||
++                    !pending.emplace(key, std::move(file)).second)
++                    throw std::runtime_error("duplicate/inconsistent disc file record");
++            }
++            Identity after;
++            if (!identity(image, after) || before != after)
++                throw std::runtime_error("disc image changed during validation");
++            std::lock_guard lock(mutex);
++            if (mountGeneration != startGeneration || PS2Runtime::getIoPaths().cdImage != configured)
++                throw std::runtime_error("disc mount changed during validation");
++            verifiedImage = configured; verifiedIdentity = after;
++            mode = Mode::Verified; files = std::move(pending);
++            return true;
++        }
++        catch (const std::exception &failure)
++        { error = failure.what(); return false; }
++    }
++
++    bool findFile(std::string_view guestPath, File &file)
++    {
++        const std::string key = pathKey(guestPath);
++        std::lock_guard lock(mutex);
++        refreshIdentityLocked();
++        if (verifiedImage.empty() || mode != Mode::Verified) return false;
++        const auto entry = files.find(key);
++        if (entry == files.end()) return false;
++        file = entry->second;
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+new file mode 100644
+index 0000000..a12d2a9
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace ps2_disc
++{
++    struct Extent { uint32_t lba = 0u; uint32_t size = 0u; };
++    struct File { uint32_t size = 0u; std::vector<Extent> extents; };
++
++    // Metadata belongs to the existing IoPaths mount, never to a loose-file map.
++    void invalidate();
++    [[nodiscard]] uint64_t generation();
++    [[nodiscard]] bool imageReadable();
++    [[nodiscard]] bool mount(const std::filesystem::path &image,
++                             const std::filesystem::path &manifest,
++                             std::string_view imageSha256, std::string_view manifestSha256,
++                             std::string &error);
++    [[nodiscard]] bool findFile(std::string_view guestPath, File &file);
++    [[nodiscard]] std::string pathKey(std::string_view guestPath);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 9230483..c861e51 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_iop_host.h"
++#include "ps2x/iop/ps2_path.h"
+ 
+ #include "ps2_runtime.h"
+ #include "ps2_stubs.h"
+@@ -319,6 +320,10 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+     }
+ 
+     const std::filesystem::path hostPath{std::string(path)};
++    const auto image = PS2Runtime::getIoPaths().cdImage;
++    const bool mountedImage = !image.empty() && hostPath.lexically_normal() == image.lexically_normal();
++    const uint64_t generation = mountedImage ? ps2_disc::generation() : 0u;
++    if (mountedImage && !ps2_disc::imageReadable()) return 0u;
+ #if defined(_WIN32)
+     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
+ #else
+@@ -343,7 +348,43 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+     {
+         handle = m_nextHostFileHandle++;
+     }
+-    m_hostFiles.emplace(handle, HostFile{stream, size});
++    if (mountedImage && (generation != ps2_disc::generation() || !ps2_disc::imageReadable()))
++    { std::fclose(stream); return 0u; }
++    m_hostFiles.emplace(handle, HostFile{stream, size, generation, {}});
++    return handle;
++}
++
++uint64_t PS2IopHostAdapter::discGeneration() const
++{ return ps2_disc::generation(); }
++
++bool PS2IopHostAdapter::findDiscFile(std::string_view path, ps2x::iop::DiscFile &file) const
++{
++    ps2_disc::File native;
++    if (!ps2_disc::findFile(path, native)) return false;
++    file.size = native.size; file.extents.clear();
++    for (const auto &extent : native.extents) file.extents.push_back({extent.lba, extent.size});
++    return true;
++}
++
++uint64_t PS2IopHostAdapter::openGuestFile(std::string_view path)
++{
++    const auto parsed = ps2x::iop::parsePs2Path(path);
++    const auto image = PS2Runtime::getIoPaths().cdImage;
++    const uint64_t generation = ps2_disc::generation();
++    if (!parsed || parsed.device != ps2x::iop::Ps2PathDevice::Cdrom || image.empty())
++        return IopHost::openGuestFile(path);
++    ps2_disc::File file;
++    if (!ps2_disc::findFile(path, file) || generation != ps2_disc::generation()) return 0u;
++    const uint64_t handle = openHostFile(image.string());
++    if (handle == 0u) return 0u;
++    bool accepted = false;
++    {
++        std::lock_guard lock(m_hostFileMutex);
++        auto &opened = m_hostFiles.at(handle);
++        accepted = opened.generation == generation && generation == ps2_disc::generation();
++        if (accepted) { opened.size = file.size; opened.extents = std::move(file.extents); }
++    }
++    if (!accepted) { closeHostFile(handle); return 0u; }
+     return handle;
+ }
+ 
+@@ -352,7 +393,8 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
+     size = 0u;
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     const auto it = m_hostFiles.find(handle);
+-    if (it == m_hostFiles.end() || !it->second.stream)
++    if (it == m_hostFiles.end() || !it->second.stream ||
++        (it->second.generation != 0u && it->second.generation != ps2_disc::generation()))
+     {
+         return false;
+     }
+@@ -374,11 +416,45 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
+ 
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     const auto it = m_hostFiles.find(handle);
+-    if (it == m_hostFiles.end() || !it->second.stream)
++    if (it == m_hostFiles.end() || !it->second.stream ||
++        (it->second.generation != 0u && it->second.generation != ps2_disc::generation()))
+     {
+         return false;
+     }
+ 
++    if (!it->second.extents.empty())
++    {
++        const HostFile &file = it->second;
++        if (offset >= file.size || size == 0u) return true;
++        const size_t count = static_cast<size_t>(std::min<uint64_t>(size, file.size - offset));
++        std::vector<uint8_t> staged(count);
++        uint64_t logical = 0u;
++        size_t copied = 0u;
++        for (const auto &part : file.extents)
++        {
++            const uint64_t end = logical + part.size;
++            if (offset < end && copied < count)
++            {
++                const uint64_t within = offset > logical ? offset - logical : 0u;
++                const size_t chunk = static_cast<size_t>(std::min<uint64_t>(count - copied, part.size - within));
++                const uint64_t position = uint64_t(part.lba) * 2048u + within;
++#if defined(_WIN32)
++                const bool seek = position <= uint64_t(INT64_MAX) && _fseeki64(file.stream, int64_t(position), SEEK_SET) == 0;
++#else
++                const bool seek = position <= uint64_t(std::numeric_limits<off_t>::max()) && fseeko(file.stream, off_t(position), SEEK_SET) == 0;
++#endif
++                if (!seek || std::fread(staged.data() + copied, 1u, chunk, file.stream) != chunk)
++                { std::clearerr(file.stream); return false; }
++                copied += chunk; offset += chunk;
++            }
++            logical = end;
++        }
++        if (copied != count || file.generation != ps2_disc::generation() || !ps2_disc::imageReadable()) return false;
++        std::memcpy(destination, staged.data(), count);
++        bytesRead = count;
++        return true;
++    }
++
+ #if defined(_WIN32)
+     if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+         _fseeki64(it->second.stream, static_cast<int64_t>(offset), SEEK_SET) != 0)
+@@ -390,14 +466,22 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
+         return false;
+     }
+ 
+-    bytesRead = size == 0u
+-                    ? 0u
+-                    : std::fread(destination, 1u, size, it->second.stream);
++    std::vector<uint8_t> staged;
++    if (it->second.generation != 0u) staged.resize(size);
++    void *target = staged.empty() ? destination : staged.data();
++    bytesRead = size == 0u ? 0u : std::fread(target, 1u, size, it->second.stream);
+     if (bytesRead < size && std::ferror(it->second.stream))
+     {
+         std::clearerr(it->second.stream);
++        if (it->second.generation != 0u) bytesRead = 0u;
+         return false;
+     }
++    if (it->second.generation != 0u)
++    {
++        if (it->second.generation != ps2_disc::generation() || !ps2_disc::imageReadable())
++        { bytesRead = 0u; return false; }
++        if (bytesRead != 0u) std::memcpy(destination, staged.data(), bytesRead);
++    }
+     return true;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 7dd90d9..4cb2bd2 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ps2x/iop/iop_host.h"
++#include "ps2_disc_mount.h"
+ 
+ #include <cstdint>
+ #include <cstdio>
+@@ -64,6 +65,9 @@ public:
+     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
+     std::string translateGuestPath(std::string_view path) const override;
+     uint64_t openHostFile(std::string_view path) override;
++    uint64_t openGuestFile(std::string_view path) override;
++    bool findDiscFile(std::string_view path, ps2x::iop::DiscFile &file) const override;
++    uint64_t discGeneration() const override;
+     bool hostFileSize(uint64_t handle, uint64_t &size) const override;
+     bool readHostFile(uint64_t handle,
+                       uint64_t offset,
+@@ -104,6 +108,8 @@ private:
+     {
+         std::FILE *stream = nullptr;
+         uint64_t size = 0u;
++        uint64_t generation = 0u;
++        std::vector<ps2_disc::Extent> extents;
+     };
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f4c25d1..cb3540b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "ps2_disc_mount.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -1047,6 +1048,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
+     }
+ 
+     runtimeIoPaths() = normalized;
++    ps2_disc::invalidate();
+ }
+ 
+ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..30667b2 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "lib/ps2_disc_mount.h"
+ #include "games_database.h"
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+ #include "ps2_debug_panel.h"
+@@ -226,6 +227,32 @@ int main(int argc, char *argv[])
+             return 1;
+         }
+ 
++        std::filesystem::path image, metadata;
++        std::string imageHash, metadataHash;
++        for (int index = 2; index < argc; ++index)
++        {
++            const std::string_view option(argv[index]);
++            if (option == "--disc-image" || option == "--disc-manifest" ||
++                option == "--disc-image-sha256" || option == "--disc-manifest-sha256")
++            {
++                if (++index >= argc) throw std::runtime_error("missing disc mount argument");
++                if (option == "--disc-image") image = std::filesystem::absolute(argv[index]).lexically_normal();
++                else if (option == "--disc-manifest") metadata = std::filesystem::absolute(argv[index]).lexically_normal();
++                else if (option == "--disc-image-sha256") imageHash = argv[index];
++                else metadataHash = argv[index];
++            }
++        }
++        if (!image.empty() || !metadata.empty() || !imageHash.empty() || !metadataHash.empty())
++        {
++            if (image.empty() || metadata.empty() || imageHash.empty() || metadataHash.empty())
++                throw std::runtime_error("disc image, metadata and both identities are required together");
++            auto paths = PS2Runtime::getIoPaths(); paths.cdImage = image;
++            PS2Runtime::setIoPaths(paths);
++            std::string error;
++            if (!ps2_disc::mount(image, metadata, imageHash, metadataHash, error))
++                throw std::runtime_error("disc mount failed: " + error);
++            std::cerr << "[disc mount] verified image and metadata, generation " << ps2_disc::generation() << '\n';
++        }
+         runtime.run();
+ 
+ #ifdef _DEBUG
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 5db04b9..72d7a53 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ include(CTest)
++find_package(OpenSSL QUIET COMPONENTS Crypto)
+ if(BUILD_TESTING)
+     add_subdirectory(gs_cache)
+ endif()
+@@ -39,6 +40,13 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_expansion_tests.cpp
+ )
+ 
++if(TARGET OpenSSL::Crypto)
++    target_link_libraries(ps2_test_lib PRIVATE OpenSSL::Crypto)
++    target_sources(ps2_test_lib PRIVATE src/ps2_disc_mount_tests.cpp)
++    target_compile_definitions(ps2_test_lib PRIVATE PS2X_TEST_DISC_SHA256=1)
++    target_include_directories(ps2_test_lib PRIVATE ${CMAKE_SOURCE_DIR}/ps2xIOP/src)
++endif()
++
+ target_include_directories(ps2_test_lib PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}/include
+     ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+@@ -103,3 +111,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
+     EnableFastReleaseMode(ps2_test_lib)
+     EnableFastReleaseMode(ps2x_tests)
+ endif()
++
++if(TARGET OpenSSL::Crypto)
++    target_compile_definitions(ps2x_tests PRIVATE PS2X_TEST_DISC_SHA256=1)
++endif()
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 40a68b1..373c79b 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -7,6 +7,9 @@ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
+ void register_ps2_runtime_io_tests();
++#ifdef PS2X_TEST_DISC_SHA256
++void register_ps2_disc_mount_tests();
++#endif
+ void register_ps2_runtime_kernel_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_memory_tests();
+@@ -29,6 +32,9 @@ int main()
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
+     register_ps2_runtime_io_tests();
++#ifdef PS2X_TEST_DISC_SHA256
++    register_ps2_disc_mount_tests();
++#endif
+     register_ps2_runtime_kernel_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_memory_tests();
+diff --git a/ps2xTest/src/ps2_disc_mount_tests.cpp b/ps2xTest/src/ps2_disc_mount_tests.cpp
+new file mode 100644
+index 0000000..654c63a
+--- /dev/null
++++ b/ps2xTest/src/ps2_disc_mount_tests.cpp
+@@ -0,0 +1,234 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_stubs.h"
++#include "ps2_iop_host.h"
++#include "ps2_disc_mount.h"
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include <nlohmann/json.hpp>
++#include <openssl/evp.h>
++#include <array>
++#include <chrono>
++#include <cstring>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++
++namespace
++{
++    std::string digest(const std::filesystem::path &path)
++    {
++        std::ifstream stream(path, std::ios::binary);
++        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
++        EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr);
++        std::vector<char> buffer(1024u * 1024u);
++        while (stream)
++        { stream.read(buffer.data(), buffer.size()); EVP_DigestUpdate(ctx.get(), buffer.data(), size_t(stream.gcount())); }
++        std::array<unsigned char, 32> hash{}; unsigned int length = 0u;
++        EVP_DigestFinal_ex(ctx.get(), hash.data(), &length);
++        std::string result; constexpr char digits[] = "0123456789abcdef";
++        for (unsigned char byte : hash) { result += digits[byte >> 4]; result += digits[byte & 15]; }
++        return result;
++    }
++
++    struct Env
++    {
++        PS2Runtime::IoPaths previous = PS2Runtime::getIoPaths();
++        std::filesystem::path root = std::filesystem::temp_directory_path() /
++            ("ps2-disc-proof-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++        std::vector<uint8_t> ram = std::vector<uint8_t>(PS2_RAM_SIZE, 0xCCu);
++        R5900Context cpu{};
++        PS2Runtime runtime;
++        PS2IopHostAdapter host{runtime};
++        Env() { std::filesystem::create_directories(root); }
++        ~Env()
++        {
++            // Explicitly unmount this fixture before restoring prior legacy paths.
++            auto empty = previous; empty.cdImage.clear(); PS2Runtime::setIoPaths(empty);
++            PS2Runtime::setIoPaths(previous); std::filesystem::remove_all(root);
++        }
++        void paths(const std::filesystem::path &image)
++        {
++            auto paths = previous; paths.cdRoot = root; paths.cdImage = image;
++            PS2Runtime::setIoPaths(paths);
++        }
++        void image(const std::filesystem::path &path, uint64_t sectors, uint32_t lba, uint8_t byte)
++        {
++            std::ofstream out(path, std::ios::binary);
++            out.seekp(std::streamoff(sectors * 2048u - 1u)); out.put('\0');
++            out.seekp(std::streamoff(uint64_t(lba) * 2048u));
++            std::array<char, 2048> payload{}; payload.fill(char(byte)); out.write(payload.data(), payload.size());
++        }
++        std::filesystem::path metadata(const std::filesystem::path &image, uint32_t lba, uint32_t size = 2048u)
++        {
++            nlohmann::json meta = {
++                {"schema_version",1}, {"iso9660", {{"logical_block_size",2048}, {"volume_space_size",std::filesystem::file_size(image)/2048u}}},
++                {"files", nlohmann::json::array({{{"path","/SAME.BIN"},{"lba",lba},{"size",size},
++                    {"extents", nlohmann::json::array({{{"lba",lba},{"size",size}}})}}})}};
++            auto path = image; path += ".json";
++            std::ofstream(path) << meta.dump(); return path;
++        }
++        bool mount(const std::filesystem::path &image, const std::filesystem::path &meta)
++        {
++            paths(image); std::string error;
++            return ps2_disc::mount(image, meta, digest(image), digest(meta), error);
++        }
++        void reg(int number, uint32_t value) { cpu.r[number] = _mm_set_epi64x(0, value); }
++        uint32_t eeSearch()
++        {
++            std::strcpy(reinterpret_cast<char *>(ram.data()+0x1000u), "cdrom0:\\SAME.BIN;1");
++            reg(4, 0x2000u); reg(5, 0x1000u);
++            ps2_stubs::sceCdSearchFile(ram.data(), &cpu, &runtime);
++            return getRegU32(&cpu, 2);
++        }
++        uint32_t eeRead(uint32_t lba)
++        {
++            reg(4,lba); reg(5,1); reg(6,0x3000u); reg(7,0u);
++            ps2_stubs::sceCdRead(ram.data(), &cpu, &runtime);
++            return getRegU32(&cpu,2);
++        }
++        uint32_t word(uint32_t address)
++        { uint32_t value; std::memcpy(&value, ram.data()+address,4u); return value; }
++        std::pair<uint32_t,uint32_t> iopSearch()
++        {
++            using namespace ps2x::iop::detail;
++            IopMemory memory; IopKernel kernel(memory); IopCdvd cdvd(host,memory,kernel);
++            const char path[]="cdrom0:\\SAME.BIN;1";
++            if (!memory.writeRam(0x1000u,path,sizeof(path))) throw std::runtime_error("fixture path write failed");
++            memory.write32(0x2000u,0xCCCCCCCCu);
++            IopCpuState cpu{}; cpu.gpr[4]=0x2000u; cpu.gpr[5]=0x1000u;
++            if (!cdvd.dispatchImport(10u,cpu)) throw std::runtime_error("IOP search unhandled");
++            return {cpu.gpr[2],memory.read32(0x2000u)};
++        }
++    };
++}
++
++void register_ps2_disc_mount_tests()
++{
++    MiniTest::Case("Verified mounted-disc extents", [](TestCase &tc)
++    {
++    tc.Run("EE and IOP search/read agree and mounted image overrides pseudo LBA collision", [](TestCase &t)
++    {
++        Env env; const auto image=env.root/"large.iso";
++        env.image(image,0x100004u,3u,0x31u);
++        { std::fstream out(image,std::ios::binary|std::ios::in|std::ios::out); out.seekp(std::streamoff(uint64_t(0x100000u)*2048u)); out.put(char(0x79u)); }
++        std::ofstream(env.root/"SAME.BIN") << "conflicting loose bytes";
++        auto meta=env.metadata(image,3u);
++        t.IsTrue(env.mount(image,meta),"verified sparse image mounts");
++        t.Equals(env.eeSearch(),1u,"EE search succeeded"); t.Equals(env.word(0x2000u),3u,"EE real LBA");
++        const auto [success,lba]=env.iopSearch(); t.Equals(success,1u,"IOP search succeeded"); t.Equals(lba,3u,"IOP real LBA");
++        t.Equals(env.eeRead(3u),1u,"EE real sector read"); t.Equals(env.ram[0x3000u],uint8_t(0x31u),"EE image bytes");
++        t.Equals(env.eeRead(0x100000u),1u,"collision LBA raw read"); t.Equals(env.ram[0x3000u],uint8_t(0x79u),"collision reads ISO rather than loose file");
++        const auto handle=env.host.openGuestFile("cdrom0:\\SAME.BIN;1");
++        std::array<uint8_t,2048> data{}; size_t read=0u;
++        t.IsTrue(handle!=0u && env.host.readHostFile(handle,0u,data.data(),data.size(),read),"IOP guest file reads original extent");
++        t.Equals(read,data.size(),"exact logical file bytes"); t.Equals(data[0],uint8_t(0x31u),"guest file image payload"); env.host.closeHostFile(handle);
++    });
++    tc.Run("A to B to A and same-path replacement revoke lookup and file handles", [](TestCase &t)
++    {
++        Env env; const auto a=env.root/"a.iso", b=env.root/"b.iso";
++        env.image(a,12u,3u,0x41u); env.image(b,12u,7u,0x42u);
++        const auto ma=env.metadata(a,3u),mb=env.metadata(b,7u);
++        t.IsTrue(env.mount(a,ma),"mount A"); t.Equals(env.eeSearch(),1u,"search A");
++        const auto old=env.host.openGuestFile("cdrom0:/SAME.BIN");
++        t.IsTrue(env.mount(b,mb),"mount B"); t.Equals(env.eeSearch(),1u,"search B"); t.Equals(env.word(0x2000u),7u,"B extent replaces A");
++        uint64_t size=99u; t.IsFalse(env.host.hostFileSize(old,size),"A handle revoked on B mount");
++        t.IsTrue(env.mount(a,ma),"remount A"); t.Equals(env.eeSearch(),1u,"search A again"); t.Equals(env.word(0x2000u),3u,"A extent restored");
++        t.IsFalse(env.host.hostFileSize(old,size),"original A handle stays revoked after A returns"); env.host.closeHostFile(old);
++        const auto replacement=env.root/"new.iso"; env.image(replacement,12u,5u,0x43u);
++        std::filesystem::rename(replacement,a); const auto newmeta=env.metadata(a,5u);
++        t.IsTrue(env.mount(a,newmeta),"same-path new generation mounts"); t.Equals(env.eeSearch(),1u,"search replaced image"); t.Equals(env.word(0x2000u),5u,"same-path extent refreshed");
++        const auto [success,lba]=env.iopSearch(); t.Equals(success,1u,"IOP replacement search"); t.Equals(lba,5u,"IOP replacement extent");
++    });
++    tc.Run("Unannounced same-size replacement and in-place edits revoke all image readers", [](TestCase &t)
++    {
++        using namespace ps2x::iop::detail;
++        Env env; const auto image=env.root/"live.iso", other=env.root/"other.iso";
++        env.image(image,12u,3u,0x61u); env.image(other,12u,7u,0x62u);
++        const auto metadata=env.metadata(image,3u);
++        t.IsTrue(env.mount(image,metadata),"mount original image");
++        const auto old=env.host.openGuestFile("cdrom0:/SAME.BIN");
++        IopMemory memory; IopKernel kernel(memory); IopCdvd cdvd(env.host,memory,kernel);
++        const uint32_t buffer=memory.allocate(2048u);
++        IopCpuState cpu{}; cpu.gpr[4]=3u; cpu.gpr[5]=1u; cpu.gpr[6]=buffer;
++        t.IsTrue(cdvd.dispatchImport(6u,cpu) && cpu.gpr[2]==1u,"persistent IOP image handle opened");
++        const uint64_t generation=ps2_disc::generation();
++        const auto timestamp=std::filesystem::last_write_time(image);
++        std::filesystem::last_write_time(other,timestamp);
++        std::filesystem::rename(other,image); // Same size AND mtime; no setIoPaths or mount call.
++        t.Equals(env.eeSearch(),0u,"external replacement revokes EE lookup");
++        t.IsTrue(ps2_disc::generation()!=generation,"file identity change advances generation");
++        uint64_t size=0u; t.IsFalse(env.host.hostFileSize(old,size),"old logical IOP handle rejected");
++        env.ram[0x3000u]=0xCCu; t.Equals(env.eeRead(3u),0u,"EE cannot read unverified replacement");
++        t.Equals(env.ram[0x3000u],uint8_t(0xCCu),"EE replacement failure preserves poison");
++        memory.write32(buffer,0xCCCCCCCCu); cpu.gpr[4]=3u; cpu.gpr[5]=1u; cpu.gpr[6]=buffer;
++        t.IsTrue(cdvd.dispatchImport(6u,cpu),"IOP read remains handled"); t.Equals(cpu.gpr[2],0u,"persistent IOP reader rejects replacement");
++        t.Equals(memory.read32(buffer),0xCCCCCCCCu,"IOP replacement failure preserves poison");
++        PS2Runtime::setIoPaths(PS2Runtime::getIoPaths());
++        t.IsFalse(ps2_disc::imageReadable(),"reapplying image paths cannot bypass verification");
++        t.Equals(env.eeRead(3u),0u,"EE raw rejection survives path reapplication");
++        t.Equals(env.host.openHostFile(image.string()),uint64_t(0u),"new IOP raw handle cannot bypass verification");
++        cpu.gpr[4]=3u; cpu.gpr[5]=1u; cpu.gpr[6]=buffer;
++        t.IsTrue(cdvd.dispatchImport(6u,cpu) && cpu.gpr[2]==0u,"persistent IOP raw rejection survives path reapplication");
++        const auto replacementMeta=env.metadata(image,7u);
++        t.IsTrue(env.mount(image,replacementMeta),"explicit replacement identity validates");
++        cpu.gpr[4]=7u; cpu.gpr[5]=1u; cpu.gpr[6]=buffer;
++        t.IsTrue(cdvd.dispatchImport(6u,cpu) && cpu.gpr[2]==1u,"persistent controller reopens verified replacement");
++        t.Equals(memory.read8(buffer),uint8_t(0x62u),"IOP replacement payload matches new file");
++        const auto restoredTime=std::filesystem::last_write_time(image);
++        {std::fstream out(image,std::ios::binary|std::ios::in|std::ios::out);out.seekp(7u*2048u);out.put(char(0x63u));}
++        std::filesystem::last_write_time(image,restoredTime);
++        t.Equals(env.eeSearch(),0u,"change time detects same-size in-place edit with restored mtime");
++        t.IsFalse(ps2_disc::imageReadable(),"modified bytes require explicit SHA verification");
++        env.host.closeHostFile(old);
++    });
++    tc.Run("Invalid metadata and missing/truncated configured images cannot fall back to loose files", [](TestCase &t)
++    {
++        Env env; const auto image=env.root/"small.iso"; env.image(image,12u,3u,0x44u);
++        std::ofstream(env.root/"SAME.BIN") << "loose fallback forbidden";
++        const auto meta=env.metadata(image,3u); t.IsTrue(env.mount(image,meta),"mount fixture");
++        std::string error; t.IsFalse(ps2_disc::mount(image,meta,std::string(64,'0'),digest(meta),error),"wrong image digest rejected");
++        t.Equals(env.eeSearch(),0u,"failed validation revokes prior metadata");
++        nlohmann::json bad; {std::ifstream in(meta); in >> bad;}
++        bad["files"][0]["extents"][0]["lba"] = 12u;
++        const auto malformed = env.root / "outside.json"; std::ofstream(malformed) << bad.dump();
++        t.IsFalse(env.mount(image,malformed),"even digest-matching malformed extents fail validation");
++        t.IsTrue(env.mount(image,meta),"fixture mounts again");
++        std::ofstream(env.root/"MISSING.BIN") << "forbidden absent-file fallback";
++        t.Equals(env.host.openGuestFile("cdrom0:/MISSING.BIN"),uint64_t(0u),"absent ISO file does not open loose copy");
++        env.reg(4,3u); env.reg(5,2u); env.reg(6,PS2_RAM_SIZE-512u); env.reg(7,0u);
++        ps2_stubs::sceCdRead(env.ram.data(),&env.cpu,&env.runtime);
++        t.Equals(getRegU32(&env.cpu,2),0u,"EE destination truncation is rejected");
++        t.Equals(env.ram[PS2_RAM_SIZE-512u],uint8_t(0xCCu),"EE range failure preserves destination");
++        const auto pending = env.host.openGuestFile("cdrom0:/SAME.BIN");
++        std::filesystem::resize_file(image,3u*2048u+100u);
++        std::array<uint8_t,2048> poisoned{}; poisoned.fill(0xCCu); size_t partial=99u;
++        t.IsFalse(env.host.readHostFile(pending,0u,poisoned.data(),poisoned.size(),partial),"short logical file read fails");
++        t.Equals(partial,size_t(0u),"failed logical read reports no committed bytes");
++        t.Equals(poisoned[0],uint8_t(0xCCu),"failed logical read preserves destination"); env.host.closeHostFile(pending);
++        env.ram[0x3000u]=0xCCu; t.Equals(env.eeRead(3u),0u,"unaligned truncated ISO fails"); t.Equals(env.ram[0x3000u],uint8_t(0xCCu),"failed read preserves poison");
++        t.Equals(env.eeSearch(),0u,"truncated image cannot search loose copy");
++        std::filesystem::remove(image); t.Equals(env.eeRead(3u),0u,"missing configured image fails");
++        const auto [success,lba]=env.iopSearch(); t.Equals(success,0u,"IOP missing image search fails"); t.Equals(lba,0xCCCCCCCCu,"IOP failed search preserves result");
++    });
++    tc.Run("Multi extents retain logical file ranges without inventing consecutive sectors", [](TestCase &t)
++    {
++        Env env; const auto image=env.root/"multi.iso"; env.image(image,12u,3u,0x51u);
++        {std::fstream out(image,std::ios::binary|std::ios::in|std::ios::out);out.seekp(7u*2048u);out.write("TAIL",4);}
++        auto meta=env.metadata(image,3u);
++        nlohmann::json data; {std::ifstream in(meta);in>>data;}
++        data["files"][0]["size"]=8u;
++        data["files"][0]["extents"]=nlohmann::json::array({{{"lba",3u},{"size",4u}},{{"lba",7u},{"size",4u}}});
++        std::ofstream(meta)<<data.dump(); t.IsTrue(env.mount(image,meta),"multi extent metadata mounts");
++        const auto handle=env.host.openGuestFile("cdrom0:/SAME.BIN"); std::array<uint8_t,8> payload{}; size_t read=0u;
++        t.IsTrue(handle!=0u && env.host.readHostFile(handle,2u,payload.data(),6u,read),"cross-extent logical range read");
++        t.Equals(read,size_t(6u),"logical range length"); t.Equals(payload[0],uint8_t(0x51u),"first extent byte");
++        t.IsTrue(std::memcmp(payload.data()+2u,"TAIL",4u)==0,"second extent concatenates only for logical file read");
++        env.host.closeHostFile(handle); t.Equals(env.eeSearch(),0u,"single-LBA EE search rejects multi-extent file");
++        const auto [success,lba]=env.iopSearch(); t.Equals(success,0u,"single-LBA IOP search rejects multi-extent file");
++        t.Equals(env.eeRead(4u),1u,"physical sector remains physical"); t.Equals(env.ram[0x3000u],uint8_t(0u),"physical gap is not logical second extent");
++    });
++    });
++}

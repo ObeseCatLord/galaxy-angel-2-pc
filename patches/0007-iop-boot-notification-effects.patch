@@ -1,0 +1,950 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 8ad8184..824cd17 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -62,6 +62,11 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)
+ 
++    add_executable(ps2_iop_boot_notify_tests tests/iop_boot_notify_tests.cpp)
++    target_link_libraries(ps2_iop_boot_notify_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_boot_notify_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_boot_notify_tests COMMAND ps2_iop_boot_notify_tests)
++
+     add_executable(ps2_iop_module_start_tests tests/iop_module_start_tests.cpp)
+     target_link_libraries(ps2_iop_module_start_tests PRIVATE ps2_iop)
+     add_test(NAME ps2_iop_module_start_tests COMMAND ps2_iop_module_start_tests)
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..e3f7c0d 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -27,6 +27,15 @@ namespace ps2x::iop
+         Error = 3,
+     };
+ 
++    // Physical SIF registers; EE software SYSREG cache slots are separate.
++    enum class SifRegister : uint32_t
++    {
++        MainAddress = 0,
++        SubAddress = 1,
++        MsFlag = 2,
++        SmFlag = 4,
++    };
++
+     enum class MemoryCardOperation : uint32_t
+     {
+         Init,
+@@ -131,5 +140,10 @@ namespace ps2x::iop
+         }
+ 
+         virtual void log(LogLevel level, std::string_view message) = 0;
++
++        virtual bool readSifRegister(SifRegister, uint32_t &) const { return false; }
++        // IOP view: MSFLAG clears bits, SMFLAG sets bits, SUBADDR assigns.
++        virtual bool writeSifRegister(SifRegister, uint32_t) { return false; }
++        virtual void resetIopSifRegisters() {}
+     };
+ }
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..dd02bc2 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -22,6 +22,9 @@ namespace ps2x::iop
+         IopSubsystem &operator=(IopSubsystem &&) noexcept;
+ 
+         void reset();
++        // Explicit firmware bootstrap boundary; module entry alone is not boot completion.
++        [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
++        [[nodiscard]] bool finishBootNotifications();
+ 
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+diff --git a/ps2xIOP/src/emulator/imports/iop_loadcore.cpp b/ps2xIOP/src/emulator/imports/iop_loadcore.cpp
+index 600bff8..c45640a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_loadcore.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_loadcore.cpp
+@@ -3,6 +3,7 @@
+ #include "../core/iop_cpu.h"
+ #include "iop_imports.h"
+ #include "../core/iop_memory.h"
++#include "../services/iop_rpc.h"
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -11,7 +12,77 @@ namespace ps2x::iop::detail
+     {
+     }
+ 
+-    bool IopLoadcore::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
++    void IopLoadcore::reset()
++    {
++        m_notifications.clear();
++        m_capacity = 0u;
++        m_collecting = false;
++        m_finishing = false;
++        m_callbackDepth = 0u;
++    }
++
++    bool IopLoadcore::beginBootNotifications(uint32_t capacity)
++    {
++        if (m_collecting || m_finishing || m_callbackDepth != 0u || capacity == 0u || capacity > 256u)
++            return false;
++        m_notifications.clear();
++        m_capacity = capacity;
++        m_collecting = true;
++        return true;
++    }
++
++    bool IopLoadcore::invokeNotification(const Notification &notification, uint32_t next,
++                                         uint32_t delayed, IopGuestExecutor &executor, uint32_t &result)
++    {
++        if (m_callbackDepth >= 32u) return false;
++        const uint32_t record = m_memory.allocate(4u, 4u);
++        if (record == 0u) return false;
++        m_memory.write32(record, next);
++        ++m_callbackDepth;
++        bool returned = false;
++        try
++        {
++            returned = executor.executeGuestFunctionChecked(notification.function, record, delayed,
++                                                             0u, 0u, notification.gp, 100000u, result);
++        }
++        catch (...)
++        {
++            --m_callbackDepth;
++            // An incomplete callback can retain the record; reset owns reclamation.
++            return false;
++        }
++        --m_callbackDepth;
++        if (returned) (void)m_memory.freeAllocation(record);
++        return returned;
++    }
++
++    bool IopLoadcore::finishBootNotifications(IopGuestExecutor &executor)
++    {
++        if (!m_collecting || m_finishing || m_callbackDepth != 0u) return false;
++        m_finishing = true;
++        bool returned = true;
++        for (uint32_t priority = 0u; priority < 4u && returned; ++priority)
++        {
++            // Priority3 runs after the boot registration table is closed.
++            if (priority == 3u) m_collecting = false;
++            for (size_t index = 0u; index < m_notifications.size() && returned; ++index)
++            {
++                const Notification notification = m_notifications[index]; // no reference across guest execution
++                if (notification.priority != priority) continue;
++                const auto &first = m_notifications.front();
++                const uint32_t next = priority == 3u ? notification.function | priority :
++                                                      first.function | first.priority;
++                uint32_t result = 0u;
++                returned = invokeNotification(notification, next, 1u, executor, result);
++            }
++        }
++        m_collecting = false;
++        m_finishing = false;
++        m_notifications.clear();
++        return returned;
++    }
++
++    bool IopLoadcore::dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor *executor)
+     {
+         const uint32_t a0 = cpu.gpr[4];
+         const auto setV0 = [&](uint32_t value)
+@@ -32,10 +103,29 @@ namespace ps2x::iop::detail
+         case 15:
+         case 16:
+         case 17:
+-        case 20:
+         case 21:
+             setV0(0u);
+             return true;
++        case 20: // AddRebootNotifyHandler
++        {
++            const uint32_t output = cpu.gpr[6];
++            if (a0 == 0u || (a0 & 3u) != 0u || !m_memory.ownsRamRange(a0, 4u) ||
++                (output != 0u && ((output & 3u) != 0u || !m_memory.ownsRamRange(output, 4u))))
++                return false;
++            const Notification notification{a0, cpu.gpr[28], cpu.gpr[5] & 3u};
++            if (m_collecting)
++            {
++                if (m_notifications.size() >= m_capacity) return false;
++                m_notifications.push_back(notification);
++                setV0(1u);
++                return true;
++            }
++            uint32_t result = 0u;
++            if (!executor || !invokeNotification(notification, 1u, 0u, *executor, result)) return false;
++            if (output != 0u) m_memory.write32(output, result);
++            setV0(0u);
++            return true;
++        }
+         case 6:
+         case 10:
+             setV0(m_imports.registerExportTable(a0) ? 0u : 0xFFFFFFFFu);
+diff --git a/ps2xIOP/src/emulator/imports/iop_loadcore.h b/ps2xIOP/src/emulator/imports/iop_loadcore.h
+index e457a98..f18223c 100644
+--- a/ps2xIOP/src/emulator/imports/iop_loadcore.h
++++ b/ps2xIOP/src/emulator/imports/iop_loadcore.h
+@@ -1,22 +1,40 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+     struct IopCpuState;
+     class IopImportRegistry;
+     class IopMemory;
++    class IopGuestExecutor;
+ 
+     class IopLoadcore
+     {
+     public:
+         IopLoadcore(IopMemory &memory, IopImportRegistry &imports) noexcept;
+ 
+-        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
++        void reset();
++        [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
++        [[nodiscard]] bool finishBootNotifications(IopGuestExecutor &executor);
++        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor *executor = nullptr);
+ 
+     private:
+         IopMemory &m_memory;
+         IopImportRegistry &m_imports;
++        struct Notification
++        {
++            uint32_t function;
++            uint32_t gp;
++            uint32_t priority;
++        };
++        [[nodiscard]] bool invokeNotification(const Notification &notification, uint32_t next,
++                                              uint32_t delayed, IopGuestExecutor &executor, uint32_t &result);
++        std::vector<Notification> m_notifications;
++        uint32_t m_capacity = 0u;
++        uint32_t m_callbackDepth = 0u;
++        bool m_collecting = false;
++        bool m_finishing = false;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 85cfd5c..4171518 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -123,6 +123,7 @@ namespace ps2x::iop::detail
+             // CDVD owns a dynamically allocated transfer workspace. Retire it
+             // while allocation ownership still refers to the previous epoch.
+             cdvd.reset();
++            loadcore.reset();
+             memory.reset();
+             kernel.reset();
+             modules.clear();
+@@ -270,7 +271,7 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             }
+ 
+-            if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
++            if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu, this))
+                 return ImportDisposition::Handled;
+ 
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+@@ -524,6 +525,20 @@ namespace ps2x::iop::detail
+             return callFunction(address, a0, a1, a2, a3, gp);
+         }
+ 
++        bool executeGuestFunctionChecked(uint32_t address,
++                                      uint32_t a0,
++                                      uint32_t a1,
++                                      uint32_t a2,
++                                      uint32_t a3,
++                                      uint32_t gp,
++                                      uint32_t budget,
++                                      uint32_t &result) override
++        {
++            bool returned = false;
++            result = callFunction(address, a0, a1, a2, a3, gp, budget, &returned);
++            return returned;
++        }
++
+         uint32_t executeGuestFunctionWithBudget(uint32_t address,
+                                                 uint32_t a0,
+                                                 uint32_t a1,
+@@ -864,6 +879,16 @@ namespace ps2x::iop::detail
+ 
+     IopEmulator::~IopEmulator() = default;
+ 
++    bool IopEmulator::beginBootNotifications(uint32_t capacity)
++    {
++        return m_impl->callDepth == 0u && m_impl->loadcore.beginBootNotifications(capacity);
++    }
++
++    bool IopEmulator::finishBootNotifications()
++    {
++        return m_impl->callDepth == 0u && m_impl->loadcore.finishBootNotifications(*m_impl);
++    }
++
+     void IopEmulator::reset()
+     {
+         m_impl->reset();
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..2fd19f6 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -21,6 +21,8 @@ namespace ps2x::iop::detail
+         IopEmulator &operator=(const IopEmulator &) = delete;
+ 
+         void reset();
++        [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
++        [[nodiscard]] bool finishBootNotifications();
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..17a3fb2 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -34,7 +34,11 @@ namespace ps2x::iop::detail
+         switch (ordinal)
+         {
+         case 4: // sceSifDma2Init
++            setV0(0u);
++            return true;
+         case 5: // sceSifInit
++            if (!m_host.writeSifRegister(SifRegister::SmFlag, 0x10000u))
++                return false;
+             m_sifInitialized = true;
+             setV0(0u);
+             return true;
+@@ -122,6 +126,31 @@ namespace ps2x::iop::detail
+         case 8: // sceSifDmaStat
+             setV0(0xFFFFFFFFu);
+             return true;
++        case 21: // sceSifGetMSFlag
++        case 23: // sceSifGetSMFlag
++        case 25: // sceSifGetMainAddr
++        case 26: // sceSifGetSubAddr
++        {
++            const SifRegister reg = ordinal == 21u ? SifRegister::MsFlag :
++                                    ordinal == 23u ? SifRegister::SmFlag :
++                                    ordinal == 25u ? SifRegister::MainAddress : SifRegister::SubAddress;
++            uint32_t value = 0u;
++            if (!m_host.readSifRegister(reg, value)) return false;
++            setV0(value);
++            return true;
++        }
++        case 22: // sceSifSetMSFlag
++        case 24: // sceSifSetSMFlag
++        case 27: // sceSifSetSubAddr
++        {
++            const SifRegister reg = ordinal == 22u ? SifRegister::MsFlag :
++                                    ordinal == 24u ? SifRegister::SmFlag : SifRegister::SubAddress;
++            uint32_t value = 0u;
++            if (!m_host.writeSifRegister(reg, cpu.gpr[4]) ||
++                !m_host.readSifRegister(reg, value)) return false;
++            setV0(value);
++            return true;
++        }
+         case 29: // sceSifCheckInit
+             setV0(m_sifInitialized ? 1u : 0u);
+             return true;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..e9ab065 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -22,6 +22,15 @@ namespace ps2x::iop::detail
+     public:
+         virtual ~IopGuestExecutor() = default;
+ 
++        // Callback completion must be attributed to this invocation.
++        // Executors without that observation cannot report callback success.
++        [[nodiscard]] virtual bool executeGuestFunctionChecked(uint32_t, uint32_t, uint32_t,
++                                                               uint32_t, uint32_t, uint32_t,
++                                                               uint32_t, uint32_t &)
++        {
++            return false;
++        }
++
+         [[nodiscard]] virtual uint32_t executeGuestFunction(uint32_t address,
+                                                             uint32_t a0,
+                                                             uint32_t a1,
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 83b8add..7cc8806 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -97,6 +97,16 @@ namespace ps2x::iop
+     IopSubsystem::IopSubsystem(IopSubsystem &&) noexcept = default;
+     IopSubsystem &IopSubsystem::operator=(IopSubsystem &&) noexcept = default;
+ 
++    bool IopSubsystem::beginBootNotifications(uint32_t capacity)
++    {
++        return m_impl->emulator.beginBootNotifications(capacity);
++    }
++
++    bool IopSubsystem::finishBootNotifications()
++    {
++        return m_impl->emulator.finishBootNotifications();
++    }
++
+     void IopSubsystem::reset()
+     {
+         m_impl->moduleManager.reset();
+@@ -110,6 +120,7 @@ namespace ps2x::iop
+             }
+         }
+         m_impl->emulator.reset();
++        m_impl->host.resetIopSifRegisters();
+         m_impl->refreshServiceModuleKeys();
+         m_impl->rebuildRoutes();
+     }
+diff --git a/ps2xIOP/tests/iop_boot_notify_tests.cpp b/ps2xIOP/tests/iop_boot_notify_tests.cpp
+new file mode 100644
+index 0000000..2966898
+--- /dev/null
++++ b/ps2xIOP/tests/iop_boot_notify_tests.cpp
+@@ -0,0 +1,363 @@
++#include "iop_compat_test_support.h"
++
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_imports.h"
++#include "emulator/imports/iop_loadcore.h"
++#include "emulator/services/iop_rpc.h"
++
++#include <cstdint>
++#include <functional>
++#include <utility>
++#include <vector>
++
++namespace
++{
++    using namespace iop_test;
++    using namespace ps2x::iop::detail;
++
++    constexpr uint32_t kStatusSentinel = 0xDEADC0DEu;
++
++    struct Call
++    {
++        uint32_t address = 0u;
++        uint32_t a0 = 0u;
++        uint32_t next = 0u;
++        uint32_t delayed = 0u;
++        uint32_t a2 = 0u;
++        uint32_t a3 = 0u;
++        uint32_t gp = 0u;
++        uint32_t budget = 0u;
++    };
++
++    class Executor final : public IopGuestExecutor
++    {
++    public:
++        explicit Executor(IopMemory &memory) : m_memory(memory) {}
++
++        bool executeGuestFunctionChecked(uint32_t address, uint32_t a0, uint32_t a1,
++                                         uint32_t a2, uint32_t a3, uint32_t gp,
++                                         uint32_t budget, uint32_t &result) override
++        {
++            calls.push_back({address, a0, m_memory.read32(a0), a1, a2, a3, gp, budget});
++            if (onCall) onCall(calls.size() - 1u);
++            result = resultFor ? resultFor(address) : callbackResult;
++            return complete;
++        }
++
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t,
++                                      uint32_t, uint32_t) override
++        {
++            return 0u;
++        }
++
++        bool complete = true;
++        uint32_t callbackResult = 0u;
++        std::function<uint32_t(uint32_t)> resultFor;
++        std::function<void(size_t)> onCall;
++        std::vector<Call> calls;
++
++    private:
++        IopMemory &m_memory;
++    };
++
++    class UncheckedExecutor final : public IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t,
++                                      uint32_t, uint32_t) override
++        {
++            ++legacyCalls;
++            return 0u;
++        }
++
++        uint32_t legacyCalls = 0u;
++    };
++
++    void installCallback(IopMemory &memory, uint32_t address)
++    {
++        memory.write32(address, 0u);
++        require(memory.ownsRamRange(address, 4u), "synthetic callback was not owned");
++    }
++
++    IopCpuState notification(uint32_t callback, uint32_t priority, uint32_t status, uint32_t gp)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = callback;
++        cpu.gpr[5] = priority;
++        cpu.gpr[6] = status;
++        cpu.gpr[28] = gp;
++        return cpu;
++    }
++
++    void requireCall(const Call &call, uint32_t callback, uint32_t next,
++                     uint32_t delayed, uint32_t gp)
++    {
++        require(call.address == callback, "callback function address changed");
++        require(call.next == next, "callback next record word was wrong");
++        require(call.delayed == delayed, "callback delay argument was wrong");
++        require(call.a2 == 0u && call.a3 == 0u, "callback acquired unexpected arguments");
++        require(call.gp == gp, "callback GP was not preserved");
++        require(call.budget == 100000u, "callback budget changed");
++    }
++
++    void immediateNotificationExecutesAndReportsCompletion()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t callback = 0x1000u;
++        constexpr uint32_t status = 0x1100u;
++        constexpr uint32_t gp = 0xCAFE0000u;
++        installCallback(memory, callback);
++        memory.write32(status, kStatusSentinel);
++        executor.callbackResult = 0x12345678u;
++
++        IopCpuState cpu = notification(callback, 6u, status, gp);
++        require(loadcore.dispatchImport(20u, cpu, &executor), "post-boot notification was unhandled");
++        require(cpu.gpr[2] == 0u, "post-boot notification did not return completion");
++        require(executor.calls.size() == 1u, "post-boot callback did not execute once");
++        requireCall(executor.calls.front(), callback, 1u, 0u, gp);
++        require(memory.read32(status) == executor.callbackResult, "completed callback did not write status");
++        require(!memory.ownsRamRange(executor.calls.front().a0, 4u),
++                "completed callback record was retained");
++    }
++
++    // ps2sdk loadcore.c: deferred registration retains function/GP only;
++    // next.callback is the first registration word for classes 0..2, and the
++    // callback's own word for class 3. Deferred stat is never retained/written.
++    void collectedNotificationsPreserveSdkClassOrder()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t first = 0x1000u;
++        constexpr uint32_t second = 0x1100u;
++        constexpr uint32_t middle = 0x1200u;
++        constexpr uint32_t final = 0x1300u;
++        constexpr uint32_t statusBase = 0x2000u;
++        const uint32_t callbacks[] = {first, second, middle, final};
++        const uint32_t priorities[] = {0u, 0u, 1u, 3u};
++        const uint32_t gps[] = {0xA0u, 0xA1u, 0xA2u, 0xA3u};
++        for (uint32_t callback : callbacks) installCallback(memory, callback);
++        for (uint32_t index = 0u; index < 4u; ++index) memory.write32(statusBase + 4u * index, kStatusSentinel);
++        executor.resultFor = [](uint32_t callback) { return callback ^ 0x00FF00FFu; };
++
++        require(loadcore.beginBootNotifications(8u), "could not enter boot notification collection");
++        for (uint32_t index = 0u; index < 4u; ++index)
++        {
++            IopCpuState cpu = notification(callbacks[index], priorities[index], statusBase + 4u * index, gps[index]);
++            require(loadcore.dispatchImport(20u, cpu), "boot callback registration was unhandled");
++            require(cpu.gpr[2] == 1u, "boot callback registration did not defer");
++            require(memory.read32(statusBase + 4u * index) == kStatusSentinel,
++                    "deferred callback wrote status before completion");
++        }
++
++        require(loadcore.finishBootNotifications(executor), "collected callbacks did not complete");
++        require(executor.calls.size() == 4u, "collected callbacks did not execute once each");
++        requireCall(executor.calls[0], first, first | 0u, 1u, gps[0]);
++        requireCall(executor.calls[1], second, first | 0u, 1u, gps[1]);
++        requireCall(executor.calls[2], middle, first | 0u, 1u, gps[2]);
++        requireCall(executor.calls[3], final, final | 3u, 1u, gps[3]);
++        for (uint32_t index = 0u; index < 4u; ++index)
++            require(memory.read32(statusBase + 4u * index) == kStatusSentinel,
++                    "deferred callback changed optional status contrary to SDK");
++    }
++
++    void invalidRequestsAndMissingExecutorDoNotExecute()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t callback = 0x1000u;
++        constexpr uint32_t status = 0x1100u;
++        installCallback(memory, callback);
++        memory.write32(status, kStatusSentinel);
++
++        const auto reject = [&](uint32_t requestedCallback, uint32_t requestedStatus)
++        {
++            IopCpuState cpu = notification(requestedCallback, 0u, requestedStatus, 0x44u);
++            cpu.gpr[2] = 0xBAD0u;
++            require(!loadcore.dispatchImport(20u, cpu, &executor), "invalid notification was accepted");
++            require(cpu.gpr[2] == 0xBAD0u, "invalid notification changed its return value");
++            require(executor.calls.empty(), "invalid notification executed a callback");
++            require(memory.read32(status) == kStatusSentinel, "invalid notification changed status");
++        };
++
++        reject(0u, status);
++        reject(callback + 2u, status);
++        reject(0x3000u, status);
++        reject(callback, status + 2u);
++        reject(callback, 0x3000u);
++
++        IopCpuState cpu = notification(callback, 0u, status, 0x44u);
++        require(!loadcore.dispatchImport(20u, cpu), "missing checked executor was accepted");
++        require(executor.calls.empty(), "missing executor caused execution");
++        require(memory.read32(status) == kStatusSentinel, "missing executor changed status");
++
++        UncheckedExecutor unchecked;
++        require(!loadcore.dispatchImport(20u, cpu, &unchecked), "unchecked executor was accepted");
++        require(unchecked.legacyCalls == 0u, "unchecked executor used legacy completion");
++        require(memory.read32(status) == kStatusSentinel, "unchecked executor changed status");
++
++        require(loadcore.dispatchImport(20u, cpu, &executor), "valid call was poisoned by prior rejections");
++        require(executor.calls.size() == 1u, "valid call did not execute after rejected requests");
++    }
++
++    void collectionCapacityAndResetAreBounded()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t callback = 0x1000u;
++        installCallback(memory, callback);
++
++        require(!loadcore.beginBootNotifications(0u), "zero notification capacity was accepted");
++        require(!loadcore.beginBootNotifications(257u), "capacity above firmware bound was accepted");
++        require(loadcore.beginBootNotifications(256u), "maximum notification capacity was rejected");
++        require(!loadcore.beginBootNotifications(1u), "collection reentry was accepted");
++        for (uint32_t index = 0u; index < 256u; ++index)
++        {
++            IopCpuState cpu = notification(callback, index, 0u, index);
++            require(loadcore.dispatchImport(20u, cpu), "notification below capacity was rejected");
++            require(cpu.gpr[2] == 1u, "notification below capacity was not deferred");
++        }
++        IopCpuState overflow = notification(callback, 0u, 0u, 0u);
++        require(!loadcore.dispatchImport(20u, overflow), "notification above capacity was accepted");
++
++        loadcore.reset();
++        require(!loadcore.finishBootNotifications(executor), "reset collection could still finish");
++        require(executor.calls.empty(), "reset collection executed a cancelled callback");
++        require(loadcore.beginBootNotifications(1u), "reset did not return to quiescent collection state");
++        IopCpuState queued = notification(callback, 0u, 0u, 0u);
++        require(loadcore.dispatchImport(20u, queued), "notification could not register after reset");
++        loadcore.reset();
++        require(!loadcore.finishBootNotifications(executor), "second reset collection could still finish");
++    }
++
++    void incompleteCallbackDoesNotCompleteOrReplay()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t callback = 0x1000u;
++        constexpr uint32_t status = 0x1100u;
++        installCallback(memory, callback);
++        memory.write32(status, kStatusSentinel);
++        executor.complete = false;
++        executor.callbackResult = 0xFACECAFEu;
++
++        require(loadcore.beginBootNotifications(1u), "could not begin failure test collection");
++        IopCpuState cpu = notification(callback, 0u, status, 0x77u);
++        require(loadcore.dispatchImport(20u, cpu), "failure test callback did not register");
++        require(!loadcore.finishBootNotifications(executor), "incomplete callback reported completion");
++        require(executor.calls.size() == 1u, "incomplete callback did not execute exactly once");
++        require(memory.read32(status) == kStatusSentinel, "incomplete callback wrote status");
++        require(memory.ownsRamRange(executor.calls.front().a0, 4u),
++                "incomplete callback record was released before reset");
++        require(!loadcore.finishBootNotifications(executor), "consumed failed collection could finish again");
++        require(executor.calls.size() == 1u, "failed collection replayed a callback");
++    }
++
++    void samePriorityRegistrationDuringFinishRunsInClassOrder()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        constexpr uint32_t first = 0x1000u;
++        constexpr uint32_t later = 0x1100u;
++        constexpr uint32_t firstStatus = 0x2000u;
++        constexpr uint32_t laterStatus = 0x2100u;
++        installCallback(memory, first);
++        installCallback(memory, later);
++        memory.write32(firstStatus, kStatusSentinel);
++        memory.write32(laterStatus, kStatusSentinel);
++        executor.resultFor = [=](uint32_t address) { return address ^ 0xA5A50000u; };
++
++        require(loadcore.beginBootNotifications(2u), "could not begin same-priority collection");
++        IopCpuState initial = notification(first, 1u, firstStatus, 0x51u);
++        require(loadcore.dispatchImport(20u, initial), "initial callback did not register");
++        bool attemptedBegin = false;
++        executor.onCall = [&](size_t callIndex)
++        {
++            if (callIndex != 0u) return;
++            attemptedBegin = true;
++            require(!loadcore.beginBootNotifications(1u), "callback reentered collection phase");
++            IopCpuState registered = notification(later, 1u, laterStatus, 0x52u);
++            require(loadcore.dispatchImport(20u, registered), "same-priority callback was not accepted while finishing");
++            require(registered.gpr[2] == 1u, "same-priority callback did not defer while finishing");
++            require(memory.read32(laterStatus) == kStatusSentinel,
++                    "same-priority callback wrote status before completion");
++        };
++
++        require(loadcore.finishBootNotifications(executor), "same-priority finish did not complete");
++        require(attemptedBegin, "callback did not exercise finish-phase reentry guard");
++        require(executor.calls.size() == 2u, "same-priority registration did not run in this finish pass");
++        requireCall(executor.calls[0], first, first | 1u, 1u, 0x51u);
++        requireCall(executor.calls[1], later, first | 1u, 1u, 0x52u);
++        require(memory.read32(firstStatus) == kStatusSentinel, "deferred initial callback changed status");
++        require(memory.read32(laterStatus) == kStatusSentinel, "deferred later callback changed status");
++    }
++
++    void callbackExceptionRetainsRecordWithoutReportingCompletion()
++    {
++        IopMemory memory;
++        IopImportRegistry imports(memory);
++        IopLoadcore loadcore(memory, imports);
++        Executor executor(memory);
++        installCallback(memory, 0x1000u);
++        memory.write32(0x1100u, kStatusSentinel);
++        IopCpuState cpu = notification(0x1000u, 0u, 0x1100u, 0x88u);
++        cpu.gpr[2] = 0xBAD0u;
++        executor.onCall = [](size_t) { throw std::runtime_error("callback interrupted"); };
++        require(!loadcore.dispatchImport(20u, cpu, &executor), "exception reported completion");
++        require(cpu.gpr[2] == 0xBAD0u, "exception changed return value");
++        require(memory.read32(0x1100u) == kStatusSentinel, "exception changed output status");
++        require(memory.ownsRamRange(executor.calls.front().a0, 4u), "exception released callback record");
++        executor.onCall = {};
++        require(loadcore.dispatchImport(20u, cpu, &executor), "exception leaked callback depth");
++        require(executor.calls.size() == 2u, "completed retry did not execute once");
++    }
++
++    void absentHostRegistersCannotReportSifInitialization()
++    {
++        Host host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge rpc(host, memory, kernel);
++        IopCpuState cpu{};
++        cpu.gpr[2] = 0xBAD0u;
++        require(!rpc.dispatchSifManImport(5u, cpu), "SIF init succeeded without host effect");
++        require(cpu.gpr[2] == 0xBAD0u, "unsupported init changed return value");
++        for (uint16_t ordinal : {21u, 22u, 23u, 24u, 25u, 26u, 27u})
++        {
++            require(!rpc.dispatchSifManImport(ordinal, cpu), "unsupported register reported success");
++            require(cpu.gpr[2] == 0xBAD0u, "unsupported register changed return value");
++        }
++        require(rpc.dispatchSifManImport(4u, cpu), "DMA2 setup import was unhandled");
++        require(rpc.dispatchSifManImport(29u, cpu), "init check import was unhandled");
++        require(cpu.gpr[2] == 0u, "DMA2 setup fabricated SIF initialization");
++    }
++}
++
++int main()
++{
++    const Test tests[] = {
++        {"LOADCORE immediate notification executes checked callback", immediateNotificationExecutesAndReportsCompletion},
++        {"LOADCORE boot notifications preserve SDK class order", collectedNotificationsPreserveSdkClassOrder},
++        {"LOADCORE rejects invalid notifications and missing executors", invalidRequestsAndMissingExecutorDoNotExecute},
++        {"LOADCORE bounds collection and reset cancels it", collectionCapacityAndResetAreBounded},
++        {"LOADCORE incomplete callback does not complete or replay", incompleteCallbackDoesNotCompleteOrReplay},
++        {"LOADCORE accepts same-priority registration during finish", samePriorityRegistrationDuringFinishRunsInClassOrder},
++        {"LOADCORE callback exception does not report completion", callbackExceptionRetainsRecordWithoutReportingCompletion},
++        {"SIFMAN absent host registers cannot fabricate initialization", absentHostRegistersCannotReportSifInitialization},
++    };
++    return run(tests);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 993821b..9cb0b84 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -220,6 +220,36 @@ namespace ps2_stubs
+         }
+     }
+ 
++    bool readIopSifRegister(uint32_t reg, uint32_t &value)
++    {
++        if (reg != 0u && reg != 1u && reg != 2u && reg != 4u) return false;
++        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++        const auto entry = g_sifRegs.find(reg);
++        value = entry == g_sifRegs.end() ? 0u : entry->second;
++        return true;
++    }
++
++    bool writeIopSifRegister(uint32_t reg, uint32_t value)
++    {
++        if (reg != 1u && reg != 2u && reg != 4u) return false;
++        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++        if (reg == 2u) g_sifRegs[reg] &= ~value;
++        else if (reg == 4u) g_sifRegs[reg] |= value;
++        else g_sifRegs[reg] = value;
++        return true;
++    }
++
++    void resetIopSifRegisters()
++    {
++        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++        // Revoke IOP-owned readiness and addresses; retain unrelated EE state.
++        g_sifRegs[4u] &= ~0x70000u;
++        g_sifRegs[1u] = 0u;
++        g_sifRegs[0x80000001u] = 0u;
++        g_sifRegs[0x80000002u] = 0u;
++        g_sifSregs[0u] = 0u;
++    }
++
+     void resetSifState()
+     {
+         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+@@ -775,7 +805,9 @@ namespace ps2_stubs
+             {
+                 prev = it->second;
+             }
+-            g_sifRegs[reg] = value;
++            if (reg == 2u) g_sifRegs[reg] = prev | value;
++            else if (reg == 4u) g_sifRegs[reg] = prev & ~value;
++            else g_sifRegs[reg] = value;
+             shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
+             if (shouldLog)
+             {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+index 8673e80..f7a9e3f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+@@ -9,6 +9,9 @@ namespace ps2_stubs
+     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void resetSifState();
++    bool readIopSifRegister(uint32_t reg, uint32_t &value);
++    bool writeIopSifRegister(uint32_t reg, uint32_t value);
++    void resetIopSifRegisters();
+     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifAllocIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..9230483 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -267,6 +267,21 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
+                                             receive.size);
+ }
+ 
++bool PS2IopHostAdapter::readSifRegister(ps2x::iop::SifRegister reg, uint32_t &value) const
++{
++    return ps2_stubs::readIopSifRegister(static_cast<uint32_t>(reg), value);
++}
++
++bool PS2IopHostAdapter::writeSifRegister(ps2x::iop::SifRegister reg, uint32_t value)
++{
++    return ps2_stubs::writeIopSifRegister(static_cast<uint32_t>(reg), value);
++}
++
++void PS2IopHostAdapter::resetIopSifRegisters()
++{
++    ps2_stubs::resetIopSifRegisters();
++}
++
+ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
+ {
+     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..7dd90d9 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -85,6 +85,9 @@ public:
+     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
++    bool readSifRegister(ps2x::iop::SifRegister reg, uint32_t &value) const override;
++    bool writeSifRegister(ps2x::iop::SifRegister reg, uint32_t value) override;
++    void resetIopSifRegisters() override;
+ 
+ private:
+     friend class CallScope;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index aace83c..674a60e 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_runtime.h"
+ #include "ps2_iop_host.h"
+ #include "ps2_iop_transport.h"
++#include "ps2x/iop/iop_subsystem.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+ #include "Kernel/Stubs/SIF.h"
+@@ -342,6 +343,64 @@ void register_ps2_sif_dma_tests()
+             t.Equals(getReg(0x80000002u), 0u, "SIF mscom register should default to zero");
+         });
+ 
++        tc.Run("IOP and EE share directional SIF flags and physical addresses", [](TestCase &t)
++        {
++            TestEnv env;
++            PS2IopHostAdapter host(env.runtime);
++            auto setEe = [&](uint32_t reg, uint32_t value)
++            {
++                setRegU32(env.ctx, 4, reg);
++                setRegU32(env.ctx, 5, value);
++                ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
++            };
++            auto getEe = [&](uint32_t reg)
++            {
++                setRegU32(env.ctx, 4, reg);
++                ps2_stubs::sceSifGetReg(env.rdram.data(), &env.ctx, &env.runtime);
++                return ::getRegU32(&env.ctx, 2);
++            };
++            using ps2x::iop::SifRegister;
++            uint32_t value = 0xCCCCCCCCu;
++            t.IsTrue(host.readSifRegister(SifRegister::SmFlag, value), "IOP reads shared SMFLAG");
++            t.Equals(value & 0x40000u, 0u, "legacy CMDINIT does not assert BOOTEND");
++            setEe(2u, 0x100u);
++            setEe(2u, 0x800u);
++            t.IsTrue(host.readSifRegister(SifRegister::MsFlag, value), "IOP reads EE MSFLAG");
++            t.Equals(value, 0x900u, "EE writes set MSFLAG bits");
++            t.IsTrue(host.writeSifRegister(SifRegister::MsFlag, 0x100u), "IOP clears selected MSFLAG");
++            t.Equals(getEe(2u), 0x800u, "EE observes IOP clear without losing other bits");
++            t.IsTrue(host.writeSifRegister(SifRegister::SmFlag, 0x40000u), "IOP sets BOOTEND");
++            t.Equals(getEe(4u), 0x60000u, "IOP writes preserve existing SMFLAG bits");
++            setEe(4u, 0x40000u);
++            t.IsTrue(host.readSifRegister(SifRegister::SmFlag, value), "IOP observes EE clear");
++            t.Equals(value, 0x20000u, "EE clears BOOTEND without replacing other flags");
++            setEe(0u, 0x1230u);
++            t.IsTrue(host.readSifRegister(SifRegister::MainAddress, value), "IOP reads physical main address");
++            t.Equals(value, 0x1230u, "physical main address is shared");
++            t.IsTrue(!host.writeSifRegister(SifRegister::MainAddress, 0x9990u), "main address is read-only from IOP");
++            t.IsTrue(host.writeSifRegister(SifRegister::SubAddress, 0x2340u), "IOP assigns physical sub address");
++            t.Equals(getEe(1u), 0x2340u, "EE reads assigned physical sub address");
++            t.Equals(getEe(0x80000001u), 0u, "EE cached SYSREG is independent of physical address");
++            value = 0xCCCCCCCCu;
++            t.IsTrue(!host.readSifRegister(static_cast<SifRegister>(99u), value), "unsupported register rejected");
++            t.Equals(value, 0xCCCCCCCCu, "rejected register read preserves output");
++            setEe(0x80000001u, 0x7770u);
++            setEe(0x80000002u, 1u);
++            setEe(0x80000022u, 0x8880u);
++            t.IsTrue(host.writeSifRegister(SifRegister::SmFlag, 0x40000u), "prepare old readiness");
++            // Exercise subsystem reset through the actual native host adapter.
++            // PS2Runtime's private resetIop delegates to this same boundary.
++            ps2x::iop::IopSubsystem subsystem(host);
++            subsystem.reset();
++            t.Equals(getEe(4u) & 0x70000u, 0u, "IOP reset revokes its flag bits");
++            t.Equals(getEe(1u), 0u, "IOP reset revokes its physical address");
++            t.Equals(getEe(0x80000001u), 0u, "IOP reset revokes cached sub address");
++            t.Equals(getEe(0x80000002u), 0u, "IOP reset revokes cached RPC initialization");
++            t.Equals(getEe(0u), 0x1230u, "IOP reset retains EE main address");
++            t.Equals(getEe(0x80000022u), 0x8880u, "IOP reset retains unrelated EE state");
++            t.Equals(getEe(2u), 0x800u, "IOP reset retains EE MSFLAG request bits");
++        });
++
+         tc.Run("sceSifExitCmd restores default boot-ready SIF registers", [](TestCase &t)
+         {
+             TestEnv env;

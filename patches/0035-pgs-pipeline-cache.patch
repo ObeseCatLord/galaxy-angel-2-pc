@@ -1,0 +1,148 @@
+From 7fcceedd4936ad2819a22fa14e36961621744b04 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 20:36:36 -0500
+Subject: [PATCH 35/36] ga2: persistent paraLLEl-GS pipeline cache
+
+paraLLEl-GS pre-compiles ~2000 compute pipelines at start (about 500
+CPU-seconds on 8 threads). The bridge now loads/saves the Vulkan pipeline
+cache at $GA2_CACHE_DIR or $XDG_CACHE_HOME/ga2 (~/.cache/ga2), saving at
+10 s, 1, 3 and 10 minutes and at exit. Second launch: 57 CPU-s in the first
+minute instead of 510. GA2_PGS_HIRES is read once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp | 83 ++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 0e9bc6e..1e4e994 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -13,6 +13,8 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <filesystem>
++#include <fstream>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -57,6 +59,8 @@ namespace
+         GSInterface gs;
+         uint32_t ssaa = 1;
+         uint32_t field = 0;
++        int hiresShift = -1; // GA2_PGS_HIRES, read once
++        uint64_t totalSwaps = 0;
+         ReadbackSlot slots[3];
+         uint32_t slotIndex = 0;
+ 
+@@ -73,6 +77,69 @@ namespace
+ 
+     std::atomic<bool> g_rendering{false};
+ 
++    // Persistent Vulkan pipeline cache. paraLLEl-GS pre-compiles ~2000 compute
++    // pipelines at start; without a cache every launch recompiles them.
++    std::filesystem::path pipelineCachePath()
++    {
++        std::filesystem::path base;
++        if (const char *dir = std::getenv("GA2_CACHE_DIR"); dir && *dir)
++            base = dir;
++        else if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
++            base = std::filesystem::path(xdg) / "ga2";
++        else if (const char *home = std::getenv("HOME"); home && *home)
++            base = std::filesystem::path(home) / ".cache" / "ga2";
++        else
++            return {};
++        return base / "pgs-pipeline-cache.bin";
++    }
++
++    void loadPipelineCache(Device &device)
++    {
++        std::vector<uint8_t> data;
++        const auto path = pipelineCachePath();
++        if (!path.empty())
++        {
++            std::ifstream in(path, std::ios::binary);
++            if (in)
++                data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++        }
++        if (!device.init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size()))
++            std::fprintf(stderr, "[pgs] pipeline cache init failed\n");
++        else if (!data.empty())
++            std::fprintf(stderr, "[pgs] loaded pipeline cache %s (%zu KB)\n", path.c_str(), data.size() / 1024);
++    }
++
++    void savePipelineCache(Device &device)
++    {
++        const auto path = pipelineCachePath();
++        if (path.empty())
++            return;
++        // Compile threads may add pipelines between the size query and the
++        // copy; retry with the new size.
++        std::vector<uint8_t> data;
++        size_t size = 0;
++        bool copied = false;
++        for (int attempt = 0; attempt < 4 && !copied; ++attempt)
++        {
++            size = device.get_pipeline_cache_size();
++            if (size == 0)
++                return;
++            data.resize(size);
++            copied = device.get_pipeline_cache_data(data.data(), size);
++        }
++        if (!copied)
++            return;
++        std::error_code ec;
++        std::filesystem::create_directories(path.parent_path(), ec);
++        const auto tmp = path.string() + ".tmp";
++        {
++            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++            if (!out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(size)))
++                return;
++        }
++        std::filesystem::rename(tmp, path, ec);
++    }
++
+     State &state()
+     {
+         // Leaked on purpose: the device must outlive any thread still calling in.
+@@ -119,6 +186,13 @@ namespace
+         }
+         s.device.set_context(s.context);
+         s.device.init_frame_contexts(4);
++        loadPipelineCache(s.device);
++        std::atexit([]
++                    {
++                        State &st = state();
++                        std::unique_lock<std::mutex> lock(st.mutex, std::try_to_lock);
++                        if (lock.owns_lock() && st.ok)
++                            savePipelineCache(st.device); });
+ 
+         GSOptions options = {};
+         const int r = envInt("GA2_PGS_SSAA", 1);
+@@ -320,7 +394,9 @@ namespace ga2_pgs
+         info.crtc_offsets = false;
+         info.raw_circuit_scanout = true;
+         const uint32_t maxShift = s.ssaa >= 16 ? 2u : s.ssaa >= 4 ? 1u : 0u;
+-        const uint32_t shift = std::min<uint32_t>(static_cast<uint32_t>(std::max(0, envInt("GA2_PGS_HIRES", int(maxShift)))), maxShift);
++        if (s.hiresShift < 0)
++            s.hiresShift = std::max(0, envInt("GA2_PGS_HIRES", int(maxShift)));
++        const uint32_t shift = std::min<uint32_t>(static_cast<uint32_t>(s.hiresShift), maxShift);
+         info.high_resolution_scanout = shift >= 1;
+         info.high_resolution_scanout_shift = shift >= 2 ? 2u : 1u;
+ 
+@@ -330,6 +406,11 @@ namespace ga2_pgs
+         const auto t1 = std::chrono::steady_clock::now();
+         s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+         ++s.swaps;
++        // Persist pipelines while start-up pre-compilation is still landing,
++        // since the process may be killed rather than exit.
++        ++s.totalSwaps;
++        if (s.totalSwaps == 600 || s.totalSwaps == 3600 || s.totalSwaps == 10800 || s.totalSwaps == 36000)
++            savePipelineCache(s.device);
+ 
+         const double elapsed = std::chrono::duration<double>(t1 - s.statStart).count();
+         if (elapsed >= 5.0 && std::getenv("GA2_PERF"))
+-- 
+2.55.0
+

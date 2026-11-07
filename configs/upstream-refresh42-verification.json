@@ -1,0 +1,21 @@
+{
+  "date": "2026-10-10",
+  "remote": "https://github.com/ran-j/PS2Recomp.git",
+  "head": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "origin_main": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "feature_previous": "e27a658b3240e755e882fe38fe17eba2750e38ba",
+  "feature_tip": "06ce0c83985c505bfa19779ebfecf83c83fe4556",
+  "fetch_completed": true,
+  "checkout_switched": false,
+  "patch_stack_preserved": true,
+  "feature_delta_sha256": "7e03202123eb02921aa47efa18413fd2dcc7b7ba1fd50d78b2c72e6a8877327d",
+  "review_model": "gpt-6-astra",
+  "review_effort": "ultra",
+  "review_routing_verified": true,
+  "decision": "retain main pin; do not bulk merge feature tip",
+  "endpoint_files_changed": 105,
+  "endpoint_insertions": 7481,
+  "endpoint_deletions": 3399,
+  "new_branch_build_performed": false,
+  "shared_patch_count": 23
+}

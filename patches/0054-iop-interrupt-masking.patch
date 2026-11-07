@@ -1,0 +1,77 @@
+From 8e5b9eae01df8f9c27a3b126b072a53ceba032cb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:03:14 -0500
+Subject: [PATCH] ga2: IOP device interrupts respect CpuSuspendIntr
+
+DMA/SPU interrupt handlers, alarm/CDVD callbacks and timer callbacks ran
+whenever the scheduler reached them, including inside a thread's
+CpuSuspendIntr/CpuDisableIntr critical section (libsd transfer state, for
+one). They now wait until the CPU interrupt enable is set again, and
+masked work no longer counts as a wake-up for an idle IOP (review 55
+H-IOP2).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/iop_emulator.cpp | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 8d3fa32..a5de97e 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -855,8 +855,15 @@ namespace ps2x::iop::detail
+         }
+ 
+         // Not that good to use exception handling for control flow but will do for now
++        // CpuSuspendIntr/CpuDisableIntr (intrman) clear the CPU interrupt
++        // enable: device handlers, alarms and timers wait until it is set again
++        // instead of running inside the caller's critical section.
++        [[nodiscard]] bool interruptsEnabled() const noexcept { return memory.interruptControl() != 0u; }
++
+         void servicePendingDmaInterrupts()
+         {
++            if (!interruptsEnabled())
++                return;
+             if (pendingSpuIrq && !resetRequired && !servicingDmaInterrupts && !syncingSpu)
+             {
+                 // SPU2 address IRQ (I_STAT bit 9). intrman acknowledges the
+@@ -1004,7 +1011,7 @@ namespace ps2x::iop::detail
+ 
+         void servicePendingGuestCallbacks()
+         {
+-            if (resetRequired || servicingGuestCallbacks || pendingGuestCallbacks.empty()) return;
++            if (resetRequired || servicingGuestCallbacks || pendingGuestCallbacks.empty() || !interruptsEnabled()) return;
+             const uint64_t cutoff = totalCycles, watermark = nextCallbackIdentity - 1u;
+             servicingGuestCallbacks = true;
+             struct Guard { bool &flag; ~Guard() { flag = false; } } guard{servicingGuestCallbacks};
+@@ -1071,17 +1078,21 @@ namespace ps2x::iop::detail
+                     if (resetRequired) break;
+                     servicePendingGuestCallbacks();
+                     if (resetRequired) break;
+-                    timrman.serviceDue(totalCycles, *this);
++                    if (interruptsEnabled())
++                        timrman.serviceDue(totalCycles, *this);
+                     if (resetRequired) break;
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+                         uint64_t nextWake = kernel.nextWakeCycle(target);
+-                        for (const auto &[irq, dma] : pendingDmaInterrupts)
+-                            nextWake = std::min(nextWake, dma.deadline);
+-                        if (!pendingGuestCallbacks.empty())
+-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+-                        nextWake = timrman.nextEventCycle(nextWake);
++                        if (interruptsEnabled()) // masked work cannot wake anything
++                        {
++                            for (const auto &[irq, dma] : pendingDmaInterrupts)
++                                nextWake = std::min(nextWake, dma.deadline);
++                            if (!pendingGuestCallbacks.empty())
++                                nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
++                            nextWake = timrman.nextEventCycle(nextWake);
++                        }
+                         advanceIopTime(std::max(totalCycles + 1u, std::min(target, nextWake)) - totalCycles);
+                         continue;
+                     }
+-- 
+2.55.0
+

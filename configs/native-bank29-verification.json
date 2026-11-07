@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "private_diagnostic_only": true,
+  "production_approved": false,
+  "native_binary_unchanged_from_private27": true,
+  "native_sha256": "f089a968b1b7a736ad67f56aa355fc71bd8b2f560f00c78cf87544839c2cacf8",
+  "accepted_public_source_patch_prefix": 23,
+  "accepted_public_native_patch_prefix": 22,
+  "allfive_public_native_binaries_unchanged": true,
+  "native_source_changed": false,
+  "review": {
+    "effective_model": "gpt-6-astra",
+    "effective_effort": "ultra",
+    "bounded_full_initial_bank_and_voice_programming_accepted": true,
+    "sample_ram_pcm_voice_acceptance": false,
+    "full_port_acceptance": false,
+    "adopted_limits": [
+      "original command and supplied DMA bytes, not device playback",
+      "later1492304-byte sample section unproved",
+      "bounded stop, no natural exit",
+      "no scene or physical timing/performance parity",
+      "private allocator/alarm fidelity remains open"
+    ]
+  },
+  "capture": {
+    "id": "20261010-062850",
+    "bounded_seconds": 295.908,
+    "natural_game_exit": false,
+    "native27_gate": "complete",
+    "native29_gate": "complete",
+    "observer_events": 35,
+    "observer_errors": 0,
+    "observer_caps": false,
+    "observer_pending": 0,
+    "owner_scope_end": "returned"
+  },
+  "audio": {
+    "sample_rate": 48000,
+    "channels": 2,
+    "frames": 14398660,
+    "nonzero_channel_samples": 0,
+    "owned_stream_checks": 273,
+    "wav_sha256": "c9efb077d8577eb13f120cf343e24312995ddd6b91ba1df7ae9ea2d9b66dd640"
+  },
+  "checks": {
+    "authored_validator_cases": 21,
+    "actual_runner_validator_loader_check": "passed",
+    "terminal_artifact_identities_reverified": 17
+  },
+  "excluded_captures": {
+    "20261010-062056": "bank/key-on observed; retained enclosing metadata gate incomplete; overall invalid"
+  },
+  "next": "upstream device-core adapter prototype with one existing DMA authority, authoritative IOP time and continuous PCM; original initialization/status and audible reference parity before production",
+  "goal_status": "active",
+  "initial_sample_section": {
+    "bytes": 96704,
+    "dma_and_request_aggregate_equal": true,
+    "all_ranges_owned": true,
+    "sha256": "016bd49e3001059d11990dd344cfdfc07bc08fe0d77f6404caf42533aedf530d",
+    "unique_full_owned_iso_match": true,
+    "iso_offset": 303389824,
+    "requests": [
+      {
+        "bytes": 47296,
+        "destination_bytes": 151952
+      },
+      {
+        "bytes": 47296,
+        "destination_bytes": 199248
+      },
+      {
+        "bytes": 2112,
+        "destination_bytes": 246544
+      }
+    ],
+    "original_completion_and_wait_continuations": 3,
+    "later1492304_byte_section_proved": false,
+    "spu_sample_ram_proved": false,
+    "pcm_proved": false
+  },
+  "original_key_on": {
+    "module": "LIBSD.IRX",
+    "module_offset": "0x3A7C",
+    "bus_width": 16,
+    "address": "0x1F9001A0",
+    "value": 64,
+    "core": 0,
+    "voice": 6,
+    "sample_start_bytes": 155648,
+    "offset_within_section": 3696,
+    "volume_left": 3289,
+    "volume_right": 3289,
+    "pitch": 1705,
+    "adsr1": 33279,
+    "adsr2": 40914,
+    "envx_before_key_on": 0,
+    "device_envelope_motion_proved": false
+  }
+}

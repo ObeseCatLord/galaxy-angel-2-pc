@@ -1,0 +1,68 @@
+From 1ceb812f4a72125db8caca50e1bdb39e7526ec3d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:45:48 -0500
+Subject: [PATCH] ga2: GS IMR reset value and unmask re-evaluation
+
+IMR resets to 0x7F00 (all GS interrupt sources masked) instead of 0, so
+SIGNAL/FINISH no longer raise INTC 0 before the game programs IMR, and
+GsPutIMR raises the GS interrupt when it unmasks SIGNAL or FINISH while
+the CSR bit is still set (level-triggered on CSR & ~IMR) (review 55 G7).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp | 6 ++++++
+ ps2xRuntime/src/lib/ps2_memory.cpp             | 1 +
+ ps2xTest/src/ps2_memory_tests.cpp              | 8 ++++++++
+ 3 files changed, 15 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 60c6357..c9e44c2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -66,6 +66,12 @@ namespace ps2_syscalls
+         {
+             oldImr = runtime->memory().gs().imr;
+             runtime->memory().gs().imr = newImr;
++            // The GS interrupt is level-triggered on CSR & ~IMR: unmasking
++            // SIGNAL (IMR bit 8) or FINISH (bit 9) while its CSR bit (0/1) is
++            // still set raises it.
++            const uint64_t unmasked = (oldImr & ~newImr) >> 8u;
++            if ((runtime->memory().gs().csr.load() & unmasked & 0x3u) != 0u)
++                runtime->eeScheduler().postEventAfterCycles(EeEvent{EeEventType::GsInterrupt, 0, 0}, 0u);
+         }
+         RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
+                                      << " a0_64=0x" << GPR_U64(ctx, 4)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index d3a55cd..879b810 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -356,6 +356,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         // memset zero-fills std::atomic<uint64_t>::csr's bytes, which is not itself
+         // a guaranteed-valid atomic store; make the zero-initialization explicit.
+         gs_regs.csr.store(0);
++        gs_regs.imr = 0x7F00u; // every GS interrupt source masked until GsPutIMR
+         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
+         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
+         gs_regs.dispfb2 = gs_regs.dispfb1;
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 21e30a2..b4b8259 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2006,6 +2006,14 @@ void register_ps2_memory_tests()
+                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+         });
+ 
++        tc.Run("GS IMR resets with every interrupt source masked", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            t.Equals(static_cast<uint64_t>(mem.gs().imr), static_cast<uint64_t>(0x7F00u),
++                     "SIGNAL/FINISH/HSYNC/VSYNC/EDW stay masked until GsPutIMR");
++        });
++
+         tc.Run("DMAC SPR_FROM interleave skips SQWC after every block and TQWC 0 is one block", [](TestCase &t)
+         {
+             for (const bool wholeBlock : {false, true})
+-- 
+2.55.0
+

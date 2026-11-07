@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "profile": {
+    "filename": "SLPM_662.43",
+    "entry": "00100008",
+    "whole_file_crc32": "5e58c415",
+    "native_ee_kernel": "HLE; original EE BIOS payload absent",
+    "arena_physical_begin": "00060000",
+    "arena_physical_end": "00070000",
+    "ownership": "explicit new native HLE allocation, not proof of original Sony free memory",
+    "reservation_bytes": 16384,
+    "capacity": "four cached owner/depth keys; explicit exhaustion"
+  },
+  "runtime_patch": {
+    "file": "0012-native-kernel-callback-arena.patch",
+    "sha256": "10345491032096c2c1b212a5a7d7b4aad6978bf5de10748db01eb3e4ab4e7b9b",
+    "prefix": 12,
+    "reproduced_source_files": 64
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "accepted scoped contract, production corrections and final fixture assertions",
+    "document": "docs/reviews/idle-kernel-stack-ownership.md"
+  },
+  "tests": {
+    "runtime_passed": 475,
+    "runtime_failed": 0,
+    "new_cases": 8,
+    "tooling_passed": 15,
+    "tooling_failed": 0
+  },
+  "native_evidence": {
+    "clean_capture": "20261009-024057",
+    "probe_errors": 0,
+    "resolved_hooks": 11,
+    "sampled_irq_entries": 16,
+    "sampled_counter_stores": 16,
+    "sampled_interrupt_safe_semaphore8_calls": 16,
+    "sampled_main_237770_continuations": 9,
+    "source_breakpoint_irq_sp": "0006ffe0 (after original frame decrement)",
+    "main_sp": "01fff990",
+    "main_gp": "004ee3f0",
+    "coverage": "bounded debugger observations, not total event counts"
+  },
+  "ordinary_capture": {
+    "id": "20261009-024725",
+    "seconds": 20.279,
+    "last_frame": "20.2s magenta rectangle with black borders",
+    "scene_verified": false,
+    "audible_output_verified": false,
+    "natural_exit": false
+  },
+  "cold_load_verified": "synthetic minimal unmatched executable with actual runtime memory; early open failure retains arena, late segment failure clears retired profile, reset does not restore unmatched profile",
+  "unverified": [
+    "exact-game same-process reload",
+    "trilogy switching",
+    "complete retained-kernel payload execution",
+    "native title/story/voiced dialogue",
+    "battle/saves/disc transitions",
+    "presentation and mod features"
+  ],
+  "next_step": "inspect later EE waits and IOP/RPC progress; host wait sample alone does not establish cause"
+}

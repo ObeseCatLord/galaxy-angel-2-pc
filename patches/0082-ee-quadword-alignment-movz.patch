@@ -1,0 +1,102 @@
+From 62e08190622f7ae7d9f51f431eaefab82e5bffcb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 11:32:58 -0500
+Subject: [PATCH] recomp: quadword accesses ignore the low address bits;
+ MOVZ/MOVN are 64-bit
+
+LQ, SQ, LQC2 and SQC2 used the exact address; the EE drops its low four
+bits. MOVZ/MOVN copied all 128 bits; the EE moves the low 64 and keeps
+rd's upper half.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRecomp/src/lib/instruction_translator.cpp |  9 ++++----
+ ps2xRecomp/src/lib/special_translator.cpp     |  5 ++--
+ ps2xTest/src/code_generator_tests.cpp         | 23 +++++++++++++++++++
+ 3 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 7684097..81d10ff 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -195,10 +195,11 @@ namespace ps2recomp
+             return genWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+         case OPCODE_SW:
+             return genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt)) + ";";
++        // LQ/SQ/LQC2/SQC2: the EE ignores the low four address bits.
+         case OPCODE_LQ:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate)));
+         case OPCODE_SQ:
+-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
++            return genWrite(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
+         case OPCODE_LD:
+             return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SD:
+@@ -211,9 +212,9 @@ namespace ps2recomp
+                 inst.rt,
+                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
+         case OPCODE_LDC2:
+-            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate)));
+         case OPCODE_SDC2:
+-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
++            return genWrite(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+         case OPCODE_DADDI:
+             return fmt::format(
+                 "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..04e668e 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -120,10 +120,11 @@ namespace ps2recomp
+             return fmt::format("SET_GPR_U64(ctx, {}, ((int64_t)GPR_S64(ctx, {}) < (int64_t)GPR_S64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
+         case SPECIAL_SLTU:
+             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
++        // MOVZ/MOVN move the low 64 bits; rd's upper half is kept.
+         case SPECIAL_MOVZ:
+-            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MOVN:
+-            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MFSA:
+             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
+         case SPECIAL_MTSA:
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 721c1bc..30b1fd0 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1020,6 +1020,29 @@ void register_code_generator_tests()
+             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
+         });
+ 
++        tc.Run("Quadword loads and stores ignore the low four address bits; MOVZ/MOVN move 64 bits", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++            for (uint8_t opcode : {static_cast<uint8_t>(OPCODE_LQ), static_cast<uint8_t>(OPCODE_SQ),
++                                   static_cast<uint8_t>(OPCODE_LDC2), static_cast<uint8_t>(OPCODE_SDC2)})
++            {
++                Instruction q{};
++                q.opcode = opcode;
++                q.rs = 4;
++                q.rt = 5;
++                q.simmediate = 3;
++                const std::string code = gen.translateInstruction(q);
++                t.IsTrue(code.find("& ~0xFu") != std::string::npos, "quadword address is 16-byte aligned");
++            }
++            Instruction movz{};
++            movz.opcode = OPCODE_SPECIAL;
++            movz.function = SPECIAL_MOVZ;
++            movz.rs = 4;
++            movz.rt = 5;
++            movz.rd = 6;
++            const std::string code = gen.translateInstruction(movz);
++            t.IsTrue(code.find("SET_GPR_U64(ctx, 6, GPR_U64(ctx, 4))") != std::string::npos, "MOVZ moves the low 64 bits");
++        });
++
+         tc.Run("EE SQRT.S reads ft and RSQRT.S divides fs by sqrt(ft)", [](TestCase &t) {
+             CodeGenerator gen({}, {});
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,207 @@
+From 432af6c16d03e5b99f9b601b5774dd75ecc90d94 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:14:57 -0500
+Subject: [PATCH] ga2: VU1 single-pass pipeline commit with next-due tracking,
+ inline operand normalization
+
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h   | 22 ++++++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp | 76 ++++++++++++-------------
+ 2 files changed, 57 insertions(+), 41 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 8404320..702f300 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -280,7 +280,13 @@ private:
+     void startXgkick(uint32_t qwordAddress);
+ 
+     void resetScheduler();
+-    void commitReadyPipelines();
++    // Nothing becomes architecturally visible before the earliest pending
++    // result; skip the scan until then (exact, purely a fast path).
++    void commitReadyPipelines()
++    {
++        if (m_cycle >= m_nextCommitCycle)
++            commitReadyPipelinesSlow();
++    }
+     void advanceOneCycle();
+     void advanceTo(uint64_t targetCycle);
+     void flushPipelines();
+@@ -290,7 +296,19 @@ private:
+     void markPairWrites(const DecodedInstructionPair &decoded);
+     bool pipelinesPending() const;
+ 
+-    float normalizeOperand(float value) const;
++    float normalizeOperand(float value) const
++    {
++        // VU operands: denormals read as signed zero, Inf/NaN as signed max.
++        uint32_t bits;
++        __builtin_memcpy(&bits, &value, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++            bits &= 0x80000000u;
++        else if (exponent == 0xFFu)
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        __builtin_memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
+     float normalizeResult(float value, uint32_t &laneFlags) const;
+     uint32_t microAddressMask() const;
+     int32_t readBranchVi(uint8_t reg) const;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 801cca1..b4703da 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -108,23 +108,6 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+     return normalizeOperand(vf[bc & 3u]);
+ }
+ 
+-float VU1Interpreter::normalizeOperand(float value) const
+-{
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-    if (exponent == 0u)
+-    {
+-        bits &= 0x80000000u;
+-    }
+-    else if (exponent == 0xFFu)
+-    {
+-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+-    }
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
+-}
+-
+ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+ {
+     uint32_t bits = 0;
+@@ -744,30 +727,20 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+     reportReservedInstruction(true, 0xFFFFFFF5u);
+ }
+ 
+-void VU1Interpreter::commitReadyPipelines()
+-{
+-    // Nothing becomes architecturally visible before the earliest pending
+-    // result; skip the scan until then (exact, purely a fast path).
+-    if (m_cycle < m_nextCommitCycle)
+-        return;
+-    commitReadyPipelinesSlow();
+-    uint64_t next = ~0ull;
+-    for (const FlagPipelineEntry &e : m_flagPipeline) if (e.valid) next = std::min(next, e.readyCycle);
+-    if (m_fdiv.valid) next = std::min(next, m_fdiv.readyCycle);
+-    for (const ScalarPipelineEntry &e : m_efu) if (e.valid) next = std::min(next, e.readyCycle);
+-    for (const PendingStore &e : m_storePipeline) if (e.valid) next = std::min(next, e.readyCycle);
+-    for (const PendingVfWrite &e : m_vfWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
+-    for (const PendingViWrite &e : m_viWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
+-    for (const PendingAccWrite &e : m_accWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
+-    m_nextCommitCycle = next;
+-}
+ 
+ void VU1Interpreter::commitReadyPipelinesSlow()
+ {
++    // Commits everything due and records the next due cycle in the same pass.
++    uint64_t next = ~0ull;
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid)
+             continue;
++        if (entry.readyCycle > m_cycle)
++        {
++            next = std::min(next, entry.readyCycle);
++            continue;
++        }
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -785,6 +758,8 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+         entry = {};
+     }
+ 
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        next = std::min(next, m_fdiv.readyCycle);
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+     {
+         m_state.q = m_fdiv.value;
+@@ -795,6 +770,8 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+ 
+     for (ScalarPipelineEntry &entry : m_efu)
+     {
++        if (entry.valid && entry.readyCycle > m_cycle)
++            next = std::min(next, entry.readyCycle);
+         if (entry.valid && entry.readyCycle <= m_cycle)
+         {
+             m_state.p = entry.value;
+@@ -804,8 +781,13 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid)
++            continue;
++        if (store.readyCycle > m_cycle)
++        {
++            next = std::min(next, store.readyCycle);
+             continue;
++        }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -822,8 +804,13 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
+             continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -837,8 +824,13 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
++            continue;
++        }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
+@@ -846,8 +838,13 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
+             continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -858,6 +855,7 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+         }
+         write = {};
+     }
++    m_nextCommitCycle = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+-- 
+2.55.0
+

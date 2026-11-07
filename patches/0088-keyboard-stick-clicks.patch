@@ -1,0 +1,43 @@
+From 0bafc5a4d836fdebc446e0efc3035e2a1fffc6d5 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 04:13:35 -0500
+Subject: [PATCH] pad: keyboard R and F press L3 and R3
+
+Battles switch between the cockpit and the tactical map with L3 and open a
+unit's camera with R3; keyboard players had no way to press them. Verified
+with GA2_PAD_TRACE (R -> 0xfffd, F -> 0xfffb).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_pad.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 4e1a4b1..db9a400 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -138,6 +138,11 @@ namespace
+                 clearBit(PAD_START);
+             if (IsKeyDown(KEY_TAB))
+                 clearBit(PAD_SELECT);
++            // Stick clicks (battles: pilot view / map with L3, unit camera with R3).
++            if (IsKeyDown(KEY_R))
++                clearBit(PAD_L3);
++            if (IsKeyDown(KEY_F))
++                clearBit(PAD_R3);
+         }
+ 
+         // Mouse (ps2_mouse): clicks, wheel, known menus and the on-screen pad.
+@@ -183,7 +188,8 @@ namespace
+         else
+         {
+             for (int key : {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_W, KEY_A, KEY_S, KEY_D, KEY_X, KEY_C, KEY_Z, KEY_V,
+-                            KEY_Q, KEY_E, KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_ESCAPE, KEY_LEFT_SHIFT, KEY_RIGHT_SHIFT})
++                            KEY_Q, KEY_E, KEY_R, KEY_F, KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_ESCAPE, KEY_LEFT_SHIFT,
++                            KEY_RIGHT_SHIFT})
+                 if (IsKeyPressed(key))
+                     style = "keyboard";
+             if (IsGamepadAvailable(0))
+-- 
+2.55.0
+

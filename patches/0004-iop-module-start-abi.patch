@@ -1,0 +1,1042 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f8d3e44..f33df44 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -62,6 +62,10 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)
+ 
++    add_executable(ps2_iop_module_start_tests tests/iop_module_start_tests.cpp)
++    target_link_libraries(ps2_iop_module_start_tests PRIVATE ps2_iop)
++    add_test(NAME ps2_iop_module_start_tests COMMAND ps2_iop_module_start_tests)
++
+ endif()
+ 
+ install(TARGETS ps2_iop
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.h b/ps2xIOP/src/emulator/core/iop_cpu.h
+index f236050..af37e39 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.h
++++ b/ps2xIOP/src/emulator/core/iop_cpu.h
+@@ -23,6 +23,8 @@ namespace ps2x::iop::detail
+         bool stopped = false;
+         bool yielded = false;
+         bool exception = false;
++        bool missingImport = false;
++        bool executionFault = false;
+     };
+ 
+     class IopCpuCore
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 6efa77d..8050152 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -78,6 +78,7 @@ namespace ps2x::iop::detail
+             uint32_t entry = 0;
+             uint32_t gp = 0;
+             bool resident = false;
++            uint32_t metadata = 0u;
+         };
+ 
+         struct GuestCallback
+@@ -311,11 +312,49 @@ namespace ps2x::iop::detail
+                     break;
+                 }
+             }
+-            if (iequals(call.library, "modload") && call.ordinal == 13u)
++            if (iequals(call.library, "modload"))
+             {
+-                checkKelfPathCallback = {a0, cpu.gpr[28]};
+-                setV0(0);
+-                return ImportDisposition::Handled;
++                if (call.ordinal == 13u)
++                {
++                    checkKelfPathCallback = {a0, cpu.gpr[28]};
++                    setV0(0);
++                    return ImportDisposition::Handled;
++                }
++                if (call.ordinal == 7u || call.ordinal == 15u)
++                {
++                    std::string path;
++                    if (!readOwnedString(a0, path) || path.empty())
++                    {
++                        setV0(-201u); // KE_ILLEGAL_OBJECT
++                        return ImportDisposition::Handled;
++                    }
++                    if (call.ordinal == 15u)
++                    {
++                        // Host-backed loading has no PS2 boot-device exclusion.
++                        // This predicate does not promise the file exists.
++                        setV0(0u);
++                        return ImportDisposition::Handled;
++                    }
++                    const int32_t length = static_cast<int32_t>(cpu.gpr[5]);
++                    const uint32_t arguments = cpu.gpr[6], output = cpu.gpr[7];
++                    if (length < 0 || (length != 0 && !memory.ownsRamRange(arguments, uint32_t(length))) ||
++                        (output != 0u && !memory.ownsRamRange(output, 4u)))
++                    {
++                        setV0(-201u);
++                        return ImportDisposition::Handled;
++                    }
++                    std::vector<uint8_t> bytes(static_cast<size_t>(length));
++                    if (length != 0 && !memory.readRam(arguments, bytes.data(), bytes.size()))
++                    {
++                        setV0(-201u);
++                        return ImportDisposition::Handled;
++                    }
++                    const auto loaded = loadModule(path, bytes.data(), uint32_t(length));
++                    if (loaded.moduleId > 0 && output != 0u)
++                        memory.write32(output, uint32_t(loaded.startResult));
++                    setV0(uint32_t(loaded.moduleId));
++                    return ImportDisposition::Handled;
++                }
+             }
+             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+@@ -384,6 +423,7 @@ namespace ps2x::iop::detail
+             if (const auto import = imports.decode(cpu.pc))
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
++                if (disposition == ImportDisposition::Missing) cpu.missingImport = true;
+                 ++totalInstructions;
+                 ++totalCycles;
+                 if (disposition == ImportDisposition::JumpToGuest)
+@@ -394,6 +434,7 @@ namespace ps2x::iop::detail
+             }
+ 
+             const bool running = cpuCore.executeInstruction(cpu);
++            if (cpu.exception && (cpu.cop0[13] & 0x7Cu) != 0u) cpu.executionFault = true;
+             schedulePendingDma();
+             ++totalInstructions;
+             ++totalCycles;
+@@ -403,6 +444,13 @@ namespace ps2x::iop::detail
+         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
+         {
+             CpuState *previous = activeCpu;
++            struct ActiveCpuGuard
++            {
++                CpuState *&active;
++                CpuState *previous;
++                ~ActiveCpuGuard() { active = previous; }
++            };
++            const ActiveCpuGuard activeGuard{activeCpu, previous};
+             activeCpu = &cpu;
+             const uint64_t start = totalInstructions;
+             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+@@ -414,7 +462,6 @@ namespace ps2x::iop::detail
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                     servicePendingGuestCallbacks();
+             }
+-            activeCpu = previous;
+             return static_cast<uint32_t>(totalInstructions - start);
+         }
+ 
+@@ -424,7 +471,8 @@ namespace ps2x::iop::detail
+                               uint32_t a2,
+                               uint32_t a3,
+                               uint32_t gp,
+-                              uint32_t budget = kMaxCallInstructions)
++                              uint32_t budget = kMaxCallInstructions,
++                              bool *returned = nullptr)
+         {
+             struct CallDepthGuard
+             {
+@@ -459,6 +507,7 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            if (returned) *returned = cpu.pc == kCallReturnSentinel && !cpu.missingImport && !cpu.executionFault;
+             return cpu.gpr[2];
+         }
+ 
+@@ -591,9 +640,35 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        bool readOwnedString(uint32_t address, std::string &out)
++        {
++            out.clear();
++            if (address == 0u) return false;
++            for (uint32_t n = 0u; n < 1024u; ++n)
++            {
++                if (uint64_t(address) + n > UINT32_MAX || !memory.ownsRamRange(address + n, 1u))
++                    return false;
++                const uint8_t byte = memory.read8(address + n);
++                if (byte == 0u) return true;
++                out.push_back(char(byte));
++            }
++            return false;
++        }
++
+         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
+         {
+-            ModuleLoadResult result{true, -1, -1};
++            ModuleLoadResult result{true, -201, -1};
++            if ((argumentSize != 0u && arguments == nullptr) || argumentSize > IopMemory::RamSize || nextModuleId > 0xFFFF)
++                return result;
++            std::vector<uint32_t> offsets;
++            const auto *packed = static_cast<const uint8_t *>(arguments);
++            for (uint32_t n = 0u; n < argumentSize;)
++            {
++                offsets.push_back(n);
++                while (n < argumentSize && packed[n] != 0u) ++n;
++                if (n == argumentSize) return result;
++                ++n;
++            }
+             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
+             moduleCursor = loaded.nextModuleCursor;
+             if (!loaded)
+@@ -601,56 +676,120 @@ namespace ps2x::iop::detail
+                 if (loaded.error == IopImageLoadError::InvalidElf)
+                     log(LogLevel::Error, "[IOP] rejected invalid/non-MIPS IRX ELF");
+                 else if (loaded.error == IopImageLoadError::ArenaExhausted)
++                {
++                    result.moduleId = -400;
+                     log(LogLevel::Error, "[IOP] module arena exhausted");
++                }
+                 return result;
+             }
+             if (!loaded.relocationsComplete)
++            {
+                 log(LogLevel::Warning, "[IOP] one or more IRX relocations were unsupported");
++                result.moduleId = -200;
++                return result;
++            }
++            const uint32_t entry = IopMemory::physicalAddress(loaded.entry);
++            if ((entry & 3u) != 0u || entry < loaded.base ||
++                uint64_t(entry) + 4u > uint64_t(loaded.base) + loaded.size ||
++                !memory.ownsRamRange(loaded.entry, 4u))
++                return result;
+ 
+             Module module;
+             module.id = nextModuleId++;
+             module.path = std::move(path);
+             const size_t slash = module.path.find_last_of("/\\:");
+-            module.name = slash == std::string::npos ? module.path : module.path.substr(slash + 1u);
++            module.name = loaded.moduleName.empty()
++                              ? (slash == std::string::npos ? module.path : module.path.substr(slash + 1u))
++                              : loaded.moduleName;
+             module.base = loaded.base;
+             module.size = loaded.size;
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+ 
+-            uint32_t args = 0u;
+-            if (arguments && argumentSize)
++            const uint32_t argc = uint32_t(offsets.size()) + 1u;
++            const uint64_t argvBytes = uint64_t(argc + 1u) * 4u;
++            const uint64_t totalBytes = argvBytes + module.path.size() + 1u + argumentSize;
++            if (totalBytes > IopMemory::RamSize)
++                return result;
++            const uint32_t args = allocate(uint32_t(totalBytes), 16u);
++            module.metadata = allocate(uint32_t(0x30u + module.name.size() + 1u), 16u);
++            if (args == 0u || module.metadata == 0u)
+             {
+-                args = allocate(argumentSize + 1u, 16u);
+-                if (args)
+-                {
+-                    writeRam(args, arguments, argumentSize);
+-                    write8(args + argumentSize, 0u);
+-                }
++                if (args) freeAllocation(args);
++                if (module.metadata) freeAllocation(module.metadata);
++                return {true, -400, -1};
+             }
+-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+-            if (args)
++            const uint32_t strings = args + uint32_t(argvBytes);
++            bool written = memory.writeRam(strings, module.path.c_str(), module.path.size() + 1u);
++            memory.write32(args, strings);
++            const uint32_t packedAddress = strings + uint32_t(module.path.size() + 1u);
++            if (argumentSize) written = written && memory.writeRam(packedAddress, arguments, argumentSize);
++            for (uint32_t n = 0u; n < offsets.size(); ++n)
++                memory.write32(args + (n + 1u) * 4u, packedAddress + offsets[n]);
++            memory.write32(args + argc * 4u, 0u);
++
++            // Serialize the 32-bit IOP ModuleInfo_t layout, never host pointers.
++            written = written && memory.zeroRam(module.metadata, 0x30u) &&
++                      memory.writeRam(module.metadata + 0x30u, module.name.c_str(), module.name.size() + 1u);
++            if (!written)
++            {
+                 freeAllocation(args);
+-            module.resident = startResult == 0u || startResult == 2u;
++                freeAllocation(module.metadata);
++                return result;
++            }
++            memory.write32(module.metadata + 4u, module.metadata + 0x30u);
++            memory.write16(module.metadata + 8u, loaded.moduleVersion);
++            memory.write16(module.metadata + 0xAu, 2u); // starting
++            memory.write16(module.metadata + 0xCu, uint16_t(module.id));
++            memory.write32(module.metadata + 0x10u, module.entry);
++            memory.write32(module.metadata + 0x14u, module.gp);
++            memory.write32(module.metadata + 0x18u, module.base);
++            memory.write32(module.metadata + 0x1Cu, loaded.textSize);
++            memory.write32(module.metadata + 0x20u, loaded.dataSize);
++            memory.write32(module.metadata + 0x24u, loaded.bssSize);
++            bool returned = false;
++            const uint32_t startResult = callFunction(module.entry, argc, args, 0u, module.metadata,
++                                                       module.gp, kMaxCallInstructions, &returned);
++            if (!returned)
++            {
++                // Partial startup can register resources outside the image.
++                // Keep backing storage until reset; range-only cleanup is not
++                // evidence that all references have been retired.
++                log(LogLevel::Error, "[IOP] IRX startup incomplete; backing retained until reset");
++                return {true, -200, -1};
++            }
++            freeAllocation(args);
++            const uint32_t residency = startResult & 3u;
++            module.resident = residency == 0u || residency == 2u;
++            memory.write16(module.metadata + 0xAu, residency == 2u ? 0x13u : residency == 0u ? 3u : 2u);
+             result.moduleId = module.id;
+             result.startResult = static_cast<int32_t>(startResult);
+-            modules[module.id] = std::move(module);
+ 
+             std::ostringstream out;
+             out << "[IOP] loaded IRX id=" << result.moduleId
+-                << " entry=0x" << std::hex << modules[result.moduleId].entry
+-                << " base=0x" << modules[result.moduleId].base
++                << " entry=0x" << std::hex << module.entry
++                << " base=0x" << module.base
+                 << " start=" << std::dec << result.startResult;
+             log(LogLevel::Info, out.str());
++            if (residency != 1u) modules[module.id] = std::move(module);
++            else
++            {
++                kernel.terminateThreadsInRange(module.base, module.size);
++                rpc.removeServersInRange(module.base, module.size);
++                imports.eraseRange(module.base, module.size);
++                log(LogLevel::Warning, "[IOP] released IRX backing retained until reset; complete resource retirement unverified");
++            }
+             return result;
+         }
+ 
+         ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+         {
+             std::vector<uint8_t> image;
+-            if (!IopModuleLoader::readWholeHostFile(host, path, image))
++            int32_t error = -203;
++            if (!IopModuleLoader::readWholeHostFile(host, path, image, &error))
+             {
+                 log(LogLevel::Warning, std::string("[IOP] failed to open IRX '") + std::string(path) + "'");
+-                return {true, -1, -1};
++                return {true, error, -1};
+             }
+             return loadImage(std::string(path), image, arguments, argumentSize);
+         }
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 80e59d6..4b45f70 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -298,14 +298,17 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
+-    bool IopModuleLoader::readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes)
++    bool IopModuleLoader::readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes, int32_t *error)
+     {
++        if (error) *error = -203; // KE_NOFILE
+         const std::string translated = host.translateGuestPath(guestPath);
+         const std::string_view path = translated.empty() ? guestPath : std::string_view(translated);
+         const uint64_t handle = host.openHostFile(path);
+         if (handle == 0u)
+             return false;
+ 
++        if (error) *error = -204; // KE_FILEERR
++
+         uint64_t size = 0u;
+         if (!host.hostFileSize(handle, size) || size == 0u || size > kMaxImageSize)
+         {
+@@ -317,6 +320,7 @@ namespace ps2x::iop::detail
+         size_t bytesRead = 0u;
+         const bool ok = host.readHostFile(handle, 0u, bytes.data(), bytes.size(), bytesRead) && bytesRead == bytes.size();
+         host.closeHostFile(handle);
++        if (ok && error) *error = 0;
+         return ok;
+     }
+ 
+@@ -511,17 +515,56 @@ namespace ps2x::iop::detail
+         result.entry = static_cast<uint32_t>(static_cast<int64_t>(header.entry) + delta);
+         result.gp = 0u;
+         for (const auto &program : programHeaders)
++        {
++            if (program.type != PT_LOAD || program.memsz == 0u) continue;
++            if (uint64_t(result.textSize) + result.dataSize + result.bssSize + program.memsz > span)
++                return result;
++            if ((program.flags & 1u) != 0u) result.textSize += program.filesz;
++            else result.dataSize += program.filesz;
++            result.bssSize += program.memsz - program.filesz;
++        }
++        for (const auto &program : programHeaders)
+         {
+             if (program.type == PT_SCE_IOPMOD && program.filesz >= 12u && checkedRange(image.size(), program.offset, 12u))
+             {
++                uint32_t identity = 0u;
+                 uint32_t entry = 0u;
+                 uint32_t gp = 0u;
++                std::memcpy(&identity, image.data() + program.offset, sizeof(identity));
+                 std::memcpy(&entry, image.data() + program.offset + 4u, sizeof(entry));
+                 std::memcpy(&gp, image.data() + program.offset + 8u, sizeof(gp));
+                 result.entry = static_cast<uint32_t>(static_cast<int64_t>(entry) + delta);
+                 result.gp = gp != 0u
+                                 ? static_cast<uint32_t>(static_cast<int64_t>(gp) + delta)
+                                 : 0u;
++                if (program.filesz >= 24u && checkedRange(image.size(), program.offset, 24u))
++                {
++                    std::memcpy(&result.textSize, image.data() + program.offset + 12u, 4u);
++                    std::memcpy(&result.dataSize, image.data() + program.offset + 16u, 4u);
++                    std::memcpy(&result.bssSize, image.data() + program.offset + 20u, 4u);
++                    if (uint64_t(result.textSize) + result.dataSize + result.bssSize > span)
++                        return result;
++                }
++                if (identity != 0u && identity != 0xFFFFFFFFu)
++                {
++                    const int64_t relocated = int64_t(identity) + delta;
++                    if (relocated < base || uint64_t(relocated) + 6u > uint64_t(base) + span ||
++                        !memory.ownsRamRange(uint32_t(relocated), 6u))
++                        return result;
++                    const uint32_t id = uint32_t(relocated);
++                    const uint32_t name = memory.read32(id);
++                    if (name < base || name >= uint64_t(base) + span) return result;
++                    bool terminated = false;
++                    for (uint32_t n = 0u; n < 256u && uint64_t(name) + n < uint64_t(base) + span; ++n)
++                    {
++                        if (!memory.ownsRamRange(name + n, 1u)) return result;
++                        const uint8_t byte = memory.read8(name + n);
++                        if (byte == 0u) { terminated = true; break; }
++                        result.moduleName.push_back(char(byte));
++                    }
++                    if (!terminated) return result;
++                    result.moduleVersion = memory.read16(id + 4u);
++                }
+                 break;
+             }
+         }
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.h b/ps2xIOP/src/emulator/services/iop_module_loader.h
+index 6cd9ef6..27ba176 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.h
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdint>
+ #include <span>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -31,6 +32,11 @@ namespace ps2x::iop::detail
+         uint32_t gp = 0;
+         uint32_t nextModuleCursor = 0;
+         bool relocationsComplete = true;
++        uint32_t textSize = 0;
++        uint32_t dataSize = 0;
++        uint32_t bssSize = 0;
++        std::string moduleName;
++        uint16_t moduleVersion = 0u;
+ 
+         [[nodiscard]] explicit operator bool() const noexcept
+         {
+@@ -41,7 +47,7 @@ namespace ps2x::iop::detail
+     class IopModuleLoader
+     {
+     public:
+-        [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
++        [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes, int32_t *error = nullptr);
+         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
+         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
+     };
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..83b8add 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -125,10 +125,17 @@ namespace ps2x::iop
+             ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
+             if (physical.moduleId > 0)
+             {
+-                m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
+-                m_impl->rebuildRoutes();
++                const uint32_t residency = uint32_t(physical.startResult) & 3u;
++                if (residency == 0u || residency == 2u)
++                {
++                    m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
++                    m_impl->rebuildRoutes();
++                }
+                 return physical;
+             }
++            // An available but malformed, unreadable or unfinished original
++            // module must not turn into an HLE success for the same filename.
++            if (physical.moduleId != -203) return physical;
+         }
+ 
+         ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
+diff --git a/ps2xIOP/tests/iop_module_start_tests.cpp b/ps2xIOP/tests/iop_module_start_tests.cpp
+new file mode 100644
+index 0000000..6eb2ddd
+--- /dev/null
++++ b/ps2xIOP/tests/iop_module_start_tests.cpp
+@@ -0,0 +1,566 @@
++#include "ps2x/iop/iop_subsystem.h"
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop;
++
++    constexpr uint32_t kChildBase = 0x00010000u;
++    constexpr uint32_t kChildMarker = kChildBase + 0x700u;
++    constexpr uint32_t kChildLeftCanary = kChildMarker - 4u;
++    constexpr uint32_t kChildRightCanary = kChildMarker + 24u;
++    constexpr uint32_t kChildGp = kChildBase + 0x500u;
++    constexpr uint32_t kChildSnapshot = kChildBase + 0x740u;
++    constexpr uint32_t kCallerBase = 0x00018000u;
++    constexpr uint32_t kCallerMarker = kCallerBase + 0x700u;
++    constexpr uint32_t kCanary = 0xC0DEF00Du;
++
++    constexpr uint32_t kPtLoad = 1u;
++    constexpr uint32_t kPtSceIopMod = 0x70000080u;
++
++    void require(bool value, const char *message)
++    {
++        if (!value)
++            throw std::runtime_error(message);
++    }
++
++    class Host final : public IopHost
++    {
++    public:
++        Host()
++            : guest(0x20000u, 0u)
++        {
++        }
++
++        struct File
++        {
++            std::vector<uint8_t> bytes;
++            bool shortRead = false;
++        };
++
++        bool readGuest(uint32_t address, void *destination, size_t size) const override
++        {
++            if ((size != 0u && !destination) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(destination, guest.data() + address, size);
++            return true;
++        }
++        bool writeGuest(uint32_t address, const void *source, size_t size) override
++        {
++            if ((size != 0u && !source) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(guest.data() + address, source, size);
++            return true;
++        }
++        bool zeroGuest(uint32_t address, size_t size) override
++        {
++            if (address > guest.size() || size > guest.size() - address)
++                return false;
++            std::memset(guest.data() + address, 0, size);
++            return true;
++        }
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override
++        {
++            normalized = address;
++            return address < guest.size();
++        }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind) const override { return {}; }
++        std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            const auto found = files.find(std::string(path));
++            if (found == files.end())
++                return 0u;
++            handles[++nextHandle] = &found->second;
++            return nextHandle;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            const auto found = handles.find(handle);
++            if (found == handles.end())
++                return false;
++            size = found->second->bytes.size();
++            return true;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
++                          size_t &bytesRead) override
++        {
++            bytesRead = 0u;
++            const auto found = handles.find(handle);
++            if (found == handles.end() || offset > found->second->bytes.size() ||
++                size > found->second->bytes.size() - offset)
++                return false;
++            if (size != 0u)
++                std::memcpy(destination, found->second->bytes.data() + offset, size);
++            bytesRead = found->second->shortRead && size != 0u ? size - 1u : size;
++            return true;
++        }
++        void closeHostFile(uint64_t handle) override { handles.erase(handle); }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        {
++            return false;
++        }
++        void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
++
++        std::vector<uint8_t> guest;
++        std::map<std::string, File> files;
++        std::map<uint64_t, const File *> handles;
++        uint64_t nextHandle = 0u;
++        std::vector<std::string> logs;
++    };
++
++    class Irx
++    {
++    public:
++        Irx(uint32_t base, uint32_t span, bool iopMod)
++            : base(base), span(span), bytes(0x100u + span, 0u)
++        {
++            put32(0u, 0x464C457Fu);
++            bytes[4] = bytes[5] = bytes[6] = 1u;
++            put16(16u, 2u);
++            put16(18u, 8u);
++            put32(20u, 1u);
++            put32(24u, base);
++            put32(28u, 52u);
++            put16(40u, 52u);
++            put16(42u, 32u);
++            put16(44u, iopMod ? 2u : 1u);
++            program(52u, kPtLoad, 0x100u, base, span, span, 7u);
++        }
++
++        void program(uint32_t offset, uint32_t type, uint32_t fileOffset, uint32_t vaddr,
++                     uint32_t fileSize, uint32_t memorySize, uint32_t flags)
++        {
++            put32(offset, type);
++            put32(offset + 4u, fileOffset);
++            put32(offset + 8u, vaddr);
++            put32(offset + 12u, vaddr);
++            put32(offset + 16u, fileSize);
++            put32(offset + 20u, memorySize);
++            put32(offset + 24u, flags);
++            put32(offset + 28u, 4u);
++        }
++
++        void word(uint32_t segmentOffset, uint32_t value) { put32(0x100u + segmentOffset, value); }
++        void half(uint32_t segmentOffset, uint16_t value) { put16(0x100u + segmentOffset, value); }
++        void data(uint32_t segmentOffset, const void *source, size_t size)
++        {
++            require(segmentOffset <= span && size <= span - segmentOffset, "IRX fixture overflow");
++            std::memcpy(bytes.data() + 0x100u + segmentOffset, source, size);
++        }
++        void string(uint32_t segmentOffset, std::string_view value)
++        {
++            data(segmentOffset, value.data(), value.size());
++            const uint8_t zero = 0u;
++            data(segmentOffset + uint32_t(value.size()), &zero, 1u);
++        }
++
++        uint32_t base;
++        uint32_t span;
++        std::vector<uint8_t> bytes;
++
++    private:
++        void put16(uint32_t offset, uint16_t value)
++        {
++            require(offset <= bytes.size() && 2u <= bytes.size() - offset, "IRX header overflow");
++            bytes[offset] = static_cast<uint8_t>(value);
++            bytes[offset + 1u] = static_cast<uint8_t>(value >> 8u);
++        }
++        void put32(uint32_t offset, uint32_t value)
++        {
++            put16(offset, static_cast<uint16_t>(value));
++            put16(offset + 2u, static_cast<uint16_t>(value >> 16u));
++        }
++    };
++
++    constexpr uint32_t addiu(uint32_t rt, uint32_t rs, int16_t immediate)
++    {
++        return 0x24000000u | (rs << 21u) | (rt << 16u) | static_cast<uint16_t>(immediate);
++    }
++    constexpr uint32_t lui(uint32_t rt, uint16_t immediate) { return 0x3C000000u | (rt << 16u) | immediate; }
++    constexpr uint32_t ori(uint32_t rt, uint32_t rs, uint16_t immediate)
++    {
++        return 0x34000000u | (rs << 21u) | (rt << 16u) | immediate;
++    }
++    constexpr uint32_t lw(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0x8C000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t lbu(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0x90000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t lhu(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0x94000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t sw(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0xAC000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t sb(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0xA0000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t sh(uint32_t rt, uint32_t base, int16_t offset)
++    {
++        return 0xA4000000u | (base << 21u) | (rt << 16u) | static_cast<uint16_t>(offset);
++    }
++    constexpr uint32_t jal(uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); }
++    constexpr uint32_t jump(uint32_t target) { return 0x08000000u | ((target >> 2u) & 0x03FFFFFFu); }
++    constexpr uint32_t jr(uint32_t reg) { return 0x00000008u | (reg << 21u); }
++    constexpr uint32_t addu(uint32_t rd, uint32_t rs, uint32_t rt)
++    {
++        return (rs << 21u) | (rt << 16u) | (rd << 11u) | 0x21u;
++    }
++
++    void emitConstant(std::vector<uint32_t> &code, uint32_t reg, uint32_t value)
++    {
++        code.push_back(lui(reg, static_cast<uint16_t>(value >> 16u)));
++        code.push_back(ori(reg, reg, static_cast<uint16_t>(value)));
++    }
++
++    Irx childIrx(uint32_t base = kChildBase, uint32_t result = 2u, bool missingImport = false,
++                 bool loop = false)
++    {
++        constexpr uint32_t span = 0x800u;
++        Irx image(base, span, true);
++        image.program(84u, kPtSceIopMod, 0x100u + 0x280u, base + 0x280u, 24u, 24u, 0u);
++        image.word(0x280u, base + 0x2A0u);
++        image.word(0x284u, base);
++        image.word(0x288u, base + 0x500u);
++        image.word(0x28Cu, 0x80u);
++        image.word(0x290u, 0x10u);
++        image.word(0x294u, 0x20u);
++        image.word(0x2A0u, base + 0x2B0u);
++        image.half(0x2A4u, 0x0201u);
++        image.string(0x2B0u, "argvmark");
++        image.word(0x6FCu, kCanary);
++        image.word(0x718u, kCanary);
++        image.word(0x714u, kCanary);
++
++        if (loop)
++        {
++            image.word(0u, jump(base));
++            image.word(4u, 0u);
++            return image;
++        }
++        if (missingImport)
++        {
++            image.word(0u, addu(16u, 31u, 0u));
++            image.word(4u, jal(base + 0x340u + 20u));
++            image.word(8u, 0u);
++            image.word(12u, addiu(2u, 0u, 0));
++            image.word(16u, jr(16u));
++            image.word(20u, 0u);
++            const uint32_t imports[] = {0x41E00000u, 0u, 0x0101u, 0x73696D6Du, 0x00676E69u,
++                                        jr(31u), addiu(0u, 0u, 1), 0u, 0u};
++            image.data(0x340u, imports, sizeof(imports));
++            return image;
++        }
++
++        std::vector<uint32_t> code;
++        emitConstant(code, 8u, base + 0x700u);
++        code.push_back(sw(4u, 8u, 0));
++        code.push_back(sw(5u, 8u, 4));
++        code.push_back(sw(28u, 8u, 8));
++        code.push_back(sw(7u, 8u, 12));
++        code.push_back(sw(6u, 8u, 16));
++        // argv is freed after entry returns. Copy the observed arguments into
++        // the child image so the test and external probe inspect entry-time data.
++        code.push_back(lw(9u, 5u, 0));
++        code.push_back(0u);
++        for (uint32_t offset = 0u; offset < 19u; ++offset)
++        {
++            code.push_back(lbu(10u, 9u, static_cast<int16_t>(offset)));
++            code.push_back(0u);
++            code.push_back(sb(10u, 8u, static_cast<int16_t>(0x40u + offset)));
++        }
++        code.push_back(lw(9u, 5u, 4));
++        code.push_back(0u);
++        for (uint32_t offset = 0u; offset < 6u; ++offset)
++        {
++            code.push_back(lbu(10u, 9u, static_cast<int16_t>(offset)));
++            code.push_back(0u);
++            code.push_back(sb(10u, 8u, static_cast<int16_t>(0x54u + offset)));
++        }
++        code.push_back(lw(9u, 5u, 8));
++        code.push_back(0u);
++        code.push_back(lbu(10u, 9u, 0));
++        code.push_back(0u);
++        code.push_back(sb(10u, 8u, 0x5A));
++        code.push_back(lw(10u, 5u, 12));
++        code.push_back(0u);
++        code.push_back(sw(10u, 8u, 0x5C));
++        emitConstant(code, 2u, result);
++        code.push_back(jr(31u));
++        code.push_back(0u);
++        for (uint32_t index = 0u; index < code.size(); ++index)
++            image.word(index * 4u, code[index]);
++        return image;
++    }
++
++    Irx callerIrx()
++    {
++        Irx image(kCallerBase, 0x800u, false);
++        constexpr uint32_t imports = kCallerBase + 0x300u;
++        constexpr uint32_t childPath = kCallerBase + 0x400u;
++        constexpr uint32_t missingPath = kCallerBase + 0x420u;
++        constexpr uint32_t shortPath = kCallerBase + 0x440u;
++        constexpr uint32_t malformedPath = kCallerBase + 0x460u;
++        constexpr uint32_t goodArgs = kCallerBase + 0x480u;
++        constexpr uint32_t badArgs = kCallerBase + 0x490u;
++        const auto stub = [](uint32_t ordinal) { return imports + 20u + ordinal * 8u; };
++
++        image.string(0x400u, "host0:ga2-test.irx");
++        image.string(0x420u, "host0:missing.irx");
++        image.string(0x440u, "host0:short.irx");
++        image.string(0x460u, "host0:bad.irx");
++        constexpr std::array<uint8_t, 7> args = {'a', 'l', 'p', 'h', 'a', 0u, 0u};
++        constexpr std::array<uint8_t, 5> unterminated = {'a', 'l', 'p', 'h', 'a'};
++        image.data(0x480u, args.data(), args.size());
++        image.data(0x490u, unterminated.data(), unterminated.size());
++        for (uint32_t offset = 0u; offset < 0x40u; offset += 4u)
++            image.word(0x700u + offset, kCanary);
++
++        std::vector<uint32_t> code;
++        code.push_back(addu(16u, 31u, 0u));
++        const auto load = [&](uint32_t path, int32_t size, uint32_t arguments, uint32_t output, uint32_t resultOffset)
++        {
++            emitConstant(code, 4u, path);
++            emitConstant(code, 5u, static_cast<uint32_t>(size));
++            emitConstant(code, 6u, arguments);
++            emitConstant(code, 7u, output);
++            code.push_back(jal(stub(7u)));
++            code.push_back(0u);
++            emitConstant(code, 8u, kCallerMarker + resultOffset);
++            code.push_back(sw(2u, 8u, 0));
++        };
++
++        emitConstant(code, 4u, childPath);
++        code.push_back(jal(stub(15u)));
++        code.push_back(0u);
++        emitConstant(code, 8u, kCallerMarker);
++        code.push_back(sw(2u, 8u, 0));
++        load(childPath, 7, goodArgs, kCallerMarker + 8u, 4u);
++        load(missingPath, 0, 0u, kCallerMarker + 16u, 12u);
++        load(childPath, 5, badArgs, kCallerMarker + 24u, 20u);
++        load(childPath, 7, 0x00300000u, kCallerMarker + 32u, 28u);
++        load(childPath, 7, goodArgs, 0x00300000u, 36u);
++        load(shortPath, 0, 0u, kCallerMarker + 44u, 40u);
++        load(malformedPath, 0, 0u, kCallerMarker + 52u, 48u);
++        code.push_back(addiu(2u, 0u, 0));
++        code.push_back(jr(16u));
++        code.push_back(0u);
++        for (uint32_t index = 0u; index < code.size(); ++index)
++            image.word(index * 4u, code[index]);
++
++        image.word(0x300u, 0x41E00000u);
++        image.word(0x304u, 0u);
++        image.word(0x308u, 0x0101u);
++        image.word(0x30Cu, 0x6C646F6Du);
++        image.word(0x310u, 0x0064616Fu);
++        for (uint32_t ordinal = 0u; ordinal <= 15u; ++ordinal)
++        {
++            image.word(0x314u + ordinal * 8u, jr(31u));
++            image.word(0x318u + ordinal * 8u, addiu(0u, 0u, static_cast<int16_t>(ordinal)));
++        }
++        image.word(0x314u + 16u * 8u, 0u);
++        image.word(0x318u + 16u * 8u, 0u);
++        return image;
++    }
++
++    uint32_t word(const IopSubsystem &iop, uint32_t address)
++    {
++        uint32_t value = 0u;
++        require(iop.readMemory(address, &value, sizeof(value)), "expected owned IOP word");
++        return value;
++    }
++
++    uint16_t half(const IopSubsystem &iop, uint32_t address)
++    {
++        uint16_t value = 0u;
++        require(iop.readMemory(address, &value, sizeof(value)), "expected owned IOP halfword");
++        return value;
++    }
++
++    std::string string(const IopSubsystem &iop, uint32_t address)
++    {
++        std::string value;
++        for (uint32_t n = 0u; n < 128u; ++n)
++        {
++            uint8_t byte = 0u;
++            require(iop.readMemory(address + n, &byte, 1u), "expected owned IOP string");
++            if (byte == 0u)
++                return value;
++            value.push_back(static_cast<char>(byte));
++        }
++        throw std::runtime_error("unterminated IOP string");
++    }
++
++    void callerExercisesStartupAbiAndErrors()
++    {
++        Host host;
++        host.files.emplace("host0:caller.irx", Host::File{callerIrx().bytes});
++        host.files.emplace("host0:ga2-test.irx", Host::File{childIrx().bytes});
++        host.files.emplace("host0:short.irx", Host::File{childIrx(0x00011000u).bytes, true});
++        host.files.emplace("host0:bad.irx", Host::File{{0x01u, 0x02u, 0x03u}});
++        IopSubsystem iop(host);
++
++        const ModuleLoadResult caller = iop.loadModule("host0:caller.irx");
++        require(caller.moduleId > 0 && caller.startResult == 0, "synthetic modload caller did not complete");
++        require(word(iop, kCallerMarker) == 0u, "modload ordinal 15 predicate did not succeed");
++        const uint32_t childId = word(iop, kCallerMarker + 4u);
++        require(childId > 0u && word(iop, kCallerMarker + 8u) == 2u, "modload ordinal 7 result/output mismatch");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 12u)) == -203, "missing host file did not report -203");
++        require(word(iop, kCallerMarker + 16u) == kCanary, "missing file modified output buffer");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 20u)) == -201, "unterminated packed args accepted");
++        require(word(iop, kCallerMarker + 24u) == kCanary, "bad packed args modified output buffer");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 28u)) == -201, "invalid packed-args pointer accepted");
++        require(word(iop, kCallerMarker + 32u) == kCanary, "invalid packed-args pointer modified output buffer");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 36u)) == -201, "invalid result pointer accepted");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 40u)) == -204, "short read did not report -204");
++        require(word(iop, kCallerMarker + 44u) == kCanary, "short read modified output buffer");
++        require(static_cast<int32_t>(word(iop, kCallerMarker + 48u)) == -201, "malformed ELF did not report -201");
++        require(word(iop, kCallerMarker + 52u) == kCanary, "malformed ELF modified output buffer");
++        require(iop.debugSnapshot().emulatorLoadedModules == 2u, "failed module starts changed published module count");
++
++        require(word(iop, kChildLeftCanary) == kCanary && word(iop, kChildRightCanary) == kCanary,
++                "child marker canary was overwritten");
++        require(word(iop, kChildMarker) == 3u, "child argc is not filename plus alpha plus empty argument");
++        const std::array<uint8_t, 20> expectedPath = {
++            'h', 'o', 's', 't', '0', ':', 'g', 'a', '2', '-', 't', 'e', 's', 't', '.', 'i', 'r', 'x', 0u, 0u};
++        std::array<uint8_t, 20> observedPath{};
++        require(iop.readMemory(kChildSnapshot, observedPath.data(), observedPath.size()), "missing argv[0] snapshot");
++        require(observedPath == expectedPath, "argv[0] pathname snapshot mismatch");
++        const std::array<uint8_t, 6> expectedAlpha = {'a', 'l', 'p', 'h', 'a', 0u};
++        std::array<uint8_t, 6> observedAlpha{};
++        require(iop.readMemory(kChildSnapshot + 20u, observedAlpha.data(), observedAlpha.size()), "missing argv[1] snapshot");
++        require(observedAlpha == expectedAlpha, "argv[1] snapshot mismatch");
++        uint8_t empty = 1u;
++        require(iop.readMemory(kChildSnapshot + 26u, &empty, 1u) && empty == 0u,
++                "argv[2] is not the packed empty argument");
++        require(word(iop, kChildSnapshot + 28u) == 0u, "argv vector lacks a trailing null");
++        require(word(iop, kChildMarker + 8u) == kChildGp, "module GP was not supplied to entry");
++        require(word(iop, kChildMarker + 16u) == 0u, "module entry a2 is not zero");
++
++        const uint32_t info = word(iop, kChildMarker + 12u);
++        require(string(iop, word(iop, info + 4u)) == "argvmark", "ModuleInfo_t name offset mismatch");
++        require(half(iop, info + 8u) == 0x0201u && half(iop, info + 10u) == 0x0013u,
++                "ModuleInfo_t version or post-start flags mismatch");
++        require(half(iop, info + 12u) == childId, "ModuleInfo_t id offset mismatch");
++        require(word(iop, info + 16u) == kChildBase && word(iop, info + 20u) == kChildGp,
++                "ModuleInfo_t entry or GP mismatch");
++        require(word(iop, info + 24u) == kChildBase && word(iop, info + 28u) == 0x80u &&
++                    word(iop, info + 32u) == 0x10u && word(iop, info + 36u) == 0x20u,
++                "ModuleInfo_t base or segment sizes mismatch");
++    }
++
++    void publicMalformedFileCannotFallBackToHle()
++    {
++        Host host;
++        host.files.emplace("host0:LIBSD.IRX", Host::File{{0x01u, 0x02u, 0x03u}});
++        IopSubsystem iop(host);
++        const ModuleLoadResult result = iop.loadModule("host0:LIBSD.IRX");
++        require(result.moduleId == -201 && result.startResult == -1,
++                "malformed host0:LIBSD.IRX incorrectly became an HLE success");
++    }
++
++    void incompleteStartupIsNegative()
++    {
++        for (const auto &[path, image] : std::array<std::pair<const char *, Irx>, 2>{
++                 std::pair{"host0:loop.irx", childIrx(0x00010000u, 0u, false, true)},
++                 std::pair{"host0:missing-import.irx", childIrx(0x00011000u, 0u, true)},
++             })
++        {
++            Host host;
++            host.files.emplace(path, Host::File{image.bytes});
++            IopSubsystem iop(host);
++            const ModuleLoadResult result = iop.loadModule(path);
++            require(result.moduleId == -200 && result.startResult == -1,
++                    "budgeted or missing-import startup was reported as a success");
++            require(iop.debugSnapshot().emulatorLoadedModules == 0u,
++                    "incomplete startup was published as a loaded module");
++        }
++    }
++
++    void completionResidencyUsesLowBitsButKeepsRawResult()
++    {
++        struct Case { uint32_t result; bool published; };
++        for (const Case test : std::array<Case, 4>{{{0u, true}, {1u, false}, {2u, true}, {3u, true}}})
++        {
++            Host host;
++            host.files.emplace("host0:result.irx", Host::File{childIrx(0x00010000u, test.result).bytes});
++            IopSubsystem iop(host);
++            const ModuleLoadResult result = iop.loadModule("host0:result.irx");
++            require(result.moduleId > 0 && static_cast<uint32_t>(result.startResult) == test.result,
++                    "completed entry result was not preserved");
++            require((iop.debugSnapshot().emulatorLoadedModules != 0u) == test.published,
++                    "entry result low bits produced the wrong publication state");
++        }
++    }
++
++    int emitChild(std::string_view path)
++    {
++        const Irx image = childIrx(0x00040000u);
++        std::ofstream output(std::string(path), std::ios::binary | std::ios::trunc);
++        if (!output.write(reinterpret_cast<const char *>(image.bytes.data()), static_cast<std::streamsize>(image.bytes.size())))
++        {
++            std::cerr << "failed to write child fixture\n";
++            return 1;
++        }
++        return 0;
++    }
++}
++
++int main(int argc, char **argv)
++{
++    if (argc == 3 && std::string_view(argv[1]) == "--emit-child")
++        return emitChild(argv[2]);
++    if (argc != 1)
++    {
++        std::cerr << "usage: ps2_iop_module_start_tests [--emit-child PATH]\n";
++        return 2;
++    }
++
++    const std::array<std::pair<const char *, void (*)()>, 4> tests{{
++        {"modload startup ABI and failure side effects", callerExercisesStartupAbiAndErrors},
++        {"malformed physical module does not fall back to HLE", publicMalformedFileCannotFallBackToHle},
++        {"budget and missing-import startup failures", incompleteStartupIsNegative},
++        {"module completion residency and result", completionResidencyUsesLowBitsButKeepsRawResult},
++    }};
++    size_t failed = 0u;
++    for (const auto &[name, test] : tests)
++    {
++        try
++        {
++            test();
++            std::cout << "PASS " << name << '\n';
++        }
++        catch (const std::exception &error)
++        {
++            ++failed;
++            std::cerr << "FAIL " << name << ": " << error.what() << '\n';
++        }
++    }
++    return failed == 0u ? 0 : 1;
++}

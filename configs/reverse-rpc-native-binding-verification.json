@@ -1,0 +1,46 @@
+{
+  "patch_file": "patches/0023-native-ee-rpc-binding-query.patch",
+  "patch_sha256": "73402d88499fb2cf5f36a23d0c6e92f62237cfd2fd66d196ea4726cef47ab55f",
+  "reviewed_model": "gpt-6-astra",
+  "reviewed_effort": "ultra",
+  "source_applied": true,
+  "reproduced_affected_files": 82,
+  "idempotent_primary_prefix": 23,
+  "reviewed_source_sha256": {
+    "ps2xRuntime/include/ps2_runtime.h": "6b18914cea186a5ae7e6cad6d22ad4892684d5f84c9072dcf5f94d2f2cfcd61d",
+    "ps2xRuntime/src/lib/ps2_runtime.cpp": "d5f774fe388af40466998703ea8330d146f5e29bc6d440c8bb21799151322c10",
+    "ps2xTest/CMakeLists.txt": "d1a567723195c29a9ecd782819cfc394eceb0da49ef1ef73de38ba045a357946",
+    "ps2xTest/src/main.cpp": "90c7387a30d1cb53562fbe2e7b3526a8fc281076b9d4e70510cf70b9443abe4b",
+    "ps2xTest/src/native_ee_rpc_binding_tests23.cpp": "37be7efba546843413de03f81abf4e8860574fe93c9b41a427cd84b274fad19f"
+  },
+  "runtime_tests": {
+    "passed": 561,
+    "failed": 0,
+    "scope": "accepted source22 baseline objects/libraries relinked with exact Runtime23 object and3newpublictests/main; not clean CMake rebuild"
+  },
+  "nested_query": {
+    "actual_IOP_worker": true,
+    "queries": 2,
+    "conflicting_active_vs_scheduler_backing": true,
+    "normal_exit": 0,
+    "wrong_scope_control_exit": 1,
+    "explicit_rejected_Call16_result": -5,
+    "MIPS_continuations": 2,
+    "exact_token_context_values": "source-supported, not directly sampled"
+  },
+  "native_builds": {
+    "last_completed_prefix": 22,
+    "targets": 5,
+    "source23_rebuild_pending": true,
+    "running": false
+  },
+  "limits": [
+    "caller already serialized; no thread marshaling",
+    "current binding snapshot is not registration-incarnation identity or reservation",
+    "validate returned buffer ranges at controller use",
+    "existing alias/absence semantics preserved",
+    "allocation exceptions source-supported; not fault injected",
+    "actual native game controller/STREAM17/packet/audio/gameplay not integrated"
+  ],
+  "optional_public_test_followup": "assert result==0 on unlink/reregister, already covered in standalone fixture"
+}

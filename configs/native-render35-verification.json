@@ -1,0 +1,39 @@
+{
+  "pure_exact_center_renderer_change_accepted": true,
+  "renderer_boundary_cases": 116,
+  "runtime_tests_passed": 561,
+  "hardware_accuracy_accepted": false,
+  "native_speedup_accepted": false,
+  "native_voiced_dialogue_accepted": false,
+  "shipping_change_applied": false,
+  "reviewers": [
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "senior renderer design and exact-center correctness"
+    },
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "additional boundary comparisons"
+    },
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "ultra",
+      "effective_verified": true,
+      "scope": "bounded native A/B and matched-prompt stock audiovisual observations"
+    }
+  ],
+  "private_artifacts": "research/native-render35",
+  "pure_preflight_sha256": "4b7ff152d1b89ef9ac338a76e26055fe9194fc969acc6bbd5306c7180d62a3ac",
+  "candidate_native_sha256": "66cf33554ee5266c39645eca4457b77ce76610f982fed3db33abf1f069d1126e",
+  "public_source_baseline": 23,
+  "allfive_public_native_baseline": 22,
+  "full_goal_complete": false,
+  "bounded_native_stock_observation_accepted": true,
+  "stock_native_scene_timing_parity_accepted": false,
+  "stock_ownership_independently_reconstructed": false,
+  "capture_review_disposition_sha256": "f77eb64ece1554b08479fbf3f9a3f5dc83d52d286c494f92b1be14f3d4a606a7"
+}

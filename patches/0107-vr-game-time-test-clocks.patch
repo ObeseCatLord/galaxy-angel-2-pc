@@ -1,0 +1,153 @@
+From bb89cab5a9f46776451e9235dbea9104e7d9c75c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:10:35 -0500
+Subject: [PATCH] vr: game-time test clocks, scene named even without a stereo
+ frame, pointer off for scripts
+
+ga2_activity::vsyncs / gameSeconds() (guest vblanks / 59.94) drives
+GA2_VR_INPUT_SCRIPT and GA2_VR_DUMP_AT, so a loaded host does not shift scripted
+runs. While a script runs the lasers point at nothing and the window's mouse
+stays out of the menus. A scene named by the game (tactical map, cockpit, unit
+camera) now counts when the picture is not a stereo frame (a paused 3D scene).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_activity.h |  4 +++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp |  2 ++
+ ps2xRuntime/src/lib/ga2_vr.cpp             | 35 ++++++++++++++--------
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    |  1 +
+ 4 files changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_activity.h b/ps2xRuntime/include/runtime/ga2_activity.h
+index 0e08c13..996b729 100644
+--- a/ps2xRuntime/include/runtime/ga2_activity.h
++++ b/ps2xRuntime/include/runtime/ga2_activity.h
+@@ -14,6 +14,10 @@ namespace ga2_activity
+     // steady_clock nanoseconds of a recent VU1 run.
+     extern std::atomic<int64_t> last3dNanos;
+ 
++    // Guest vertical blanks so far (60 Hz game time, independent of how fast the host runs it).
++    extern std::atomic<uint64_t> vsyncs;
++    inline double gameSeconds() { return double(vsyncs.load(std::memory_order_relaxed)) / 59.94; }
++
+     inline int64_t nowNanos()
+     {
+         return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 012af96..d4ec891 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ga2_activity.h"
+ #include "runtime/gs/gs_pgs.h"
+ #include <cstdio>
+ #include <cstdlib>
+@@ -2494,6 +2495,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        ga2_activity::vsyncs.fetch_add(1, std::memory_order_relaxed);
+         // At GA2_FPS the frame clock's ticks scan out while the game waits on it.
+         if (ga2_pgs::rendering() && !frameDriven())
+             ga2_pgs::vsync(m_runtime.memory().gs());
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index caa38b0..2e6bf67 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1176,7 +1176,7 @@ void main() {
+ 
+         // GA2_VR_INPUT_SCRIPT=<file>: scripted controller input for tests without a
+         // headset's hands. Each line "<seconds> name=value ..." sets every input from
+-        // that time (seconds since the window opened, about the process start) until the next line; unnamed
++        // that game time (guest vblanks / 59.94, so a slow host does not shift it) until the next line; unnamed
+         // inputs are 0. Names: circle cross square triangle start select menu l3 r3
+         // fpclick (0/1), l1 r1 l2 r2 trigl trigr (0..1), dpadx dpady lx ly rx ry fpx fpy.
+         struct ScriptStep
+@@ -1520,7 +1520,7 @@ void main() {
+         std::array<Laser, 2> lasers{};
+         float pointerX = 0, pointerY = 0;
+         bool pointerHit = false;
+-        const ga2_vr_input::Inputs *script = scriptedInputs(GetTime());
++        const ga2_vr_input::Inputs *script = scriptedInputs(ga2_activity::gameSeconds());
+         float triggers[2] = {script ? script->trigger[0] : value(g_xr.trigger, 0),
+                              script ? script->trigger[1] : value(g_xr.trigger, 1)};
+         for (int h = 0; h < 2; ++h)
+@@ -1553,6 +1553,14 @@ void main() {
+             }
+         }
+         const bool stereo = stereoShowing();
++        // Scripted input (GA2_VR_INPUT_SCRIPT) replaces the hands entirely: the lasers point at nothing (and the
++        // window's own mouse, which a headless desktop may wiggle, stays out of the menus).
++        const bool pointerOffScreen = script != nullptr;
++        if (pointerOffScreen)
++        {
++            pointerHit = false;
++            pointerX = pointerY = -10000.0f;
++        }
+         {
+             // The active hand's aim for game hooks (the tactical map's pointing).
+             ga2_vrpointer::Aim a;
+@@ -1579,20 +1587,21 @@ void main() {
+                     l.to = l.from + normalize(l.to - l.from) * 0.45f;
+                 }
+         }
+-        ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f && !cheatMenuOpen, false, false, 0.0f);
++        ps2_mouse::setExternalPointer(pointerHit || pointerOffScreen, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f && !cheatMenuOpen, false, false, 0.0f);
+         {
+             ga2_vr_input::Inputs in = script ? *script : sampleActions();
+             in.trigger[0] = triggers[0];
+             in.trigger[1] = triggers[1];
+             in.activeHand = g_xr.activeHand;
+-            if (stereo)
+-                switch (ga2_vrpointer::scene())
+-                {
+-                case ga2_vrpointer::Scene::TacticalMap: in.scene = ga2_vr_input::Scene::TacticalMap; break;
+-                case ga2_vrpointer::Scene::Cockpit: in.scene = ga2_vr_input::Scene::Cockpit; break;
+-                case ga2_vrpointer::Scene::UnitCamera: in.scene = ga2_vr_input::Scene::UnitCamera; break;
+-                default: in.scene = ga2_vr_input::Scene::Stereo; break;
+-                }
++            // A scene the game names counts even when the picture is not a stereo frame (a paused or loading
++            // 3D scene shows the theater screen); otherwise a 3D scene is Stereo and the rest Flat.
++            switch (ga2_vrpointer::scene())
++            {
++            case ga2_vrpointer::Scene::TacticalMap: in.scene = ga2_vr_input::Scene::TacticalMap; break;
++            case ga2_vrpointer::Scene::Cockpit: in.scene = ga2_vr_input::Scene::Cockpit; break;
++            case ga2_vrpointer::Scene::UnitCamera: in.scene = ga2_vr_input::Scene::UnitCamera; break;
++            default: in.scene = stereo ? ga2_vr_input::Scene::Stereo : ga2_vr_input::Scene::Flat; break;
++            }
+             if (cheatMenuOpen)
+                 in.scene = ga2_vr_input::Scene::Stereo; // the trigger is Circle in the menu
+             const ga2_vr_input::Output out = g_xr.mapper.step(in, GetTime());
+@@ -1720,7 +1729,7 @@ void main() {
+                                   V3{eyeWorld.m[12], eyeWorld.m[13], eyeWorld.m[14]}, texture, srcWidth / float(texWidth),
+                                   srcHeight / float(texHeight), wide, lasers);
+                     // GA2_VR_DUMP=<png>: both eyes (eye 1 as <png>-eye1.png) at GA2_VR_DUMP_AT seconds
+-                    // (default 20; diagnostics). A comma list ("480,490") dumps at each time, as
++                    // (game time, as GA2_VR_INPUT_SCRIPT; default 20; diagnostics). A comma list ("480,490") dumps at each time, as
+                     // <png minus .png>-<n>.png and -<n>-eye1.png.
+                     static const std::vector<double> dumpTimes = [] {
+                         std::vector<double> times;
+@@ -1732,7 +1741,7 @@ void main() {
+                     }();
+                     static std::vector<std::array<bool, 2>> dumped(dumpTimes.size(), {false, false});
+                     for (size_t n = 0; v < 2 && n < dumpTimes.size(); ++n)
+-                        if (!dumped[n][v] && GetTime() > dumpTimes[n])
++                        if (!dumped[n][v] && ga2_activity::gameSeconds() > dumpTimes[n])
+                         {
+                             const char *dump = std::getenv("GA2_VR_DUMP");
+                             if (!dump || !*dump)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index b932f26..1d7eae6 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -983,6 +983,7 @@ namespace
+ }
+ 
+ std::atomic<uint64_t> ga2_activity::vu1Runs{0};
++std::atomic<uint64_t> ga2_activity::vsyncs{0};
+ std::atomic<int64_t> ga2_activity::last3dNanos{INT64_MIN / 2};
+ std::atomic<float> ga2_activity::horPlus{1.0f};
+ 
+-- 
+2.55.0
+

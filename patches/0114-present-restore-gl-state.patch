@@ -1,0 +1,44 @@
+From ac250494f4cbc0ebb064276f1ff48dc3b281648d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 14:02:22 -0500
+Subject: [PATCH] present: restore GL blend, depth, scissor and cull state
+ after the 2D shader chain
+
+The Anime4K / smooth passes switched blending off and left it off, so everything raylib drew after
+the picture (the cheat menu, the on-screen pad, the mouse cursor) came out opaque: a solid panel and
+text as filled blocks.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_mpv_shader.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ga2_mpv_shader.cpp b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+index 48298b1..81e7798 100644
+--- a/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
++++ b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+@@ -299,6 +299,10 @@ namespace ga2_mpv
+         std::map<std::string, Image> images;
+         images["MAIN"] = {input, width, height, nullptr};
+ 
++        // The passes draw with their own state; raylib draws the rest of the frame (menus, the on-screen pad)
++        // assuming its own, so what is switched off here is put back at the end.
++        const GLboolean blendWas = glIsEnabled(GL_BLEND), depthWas = glIsEnabled(GL_DEPTH_TEST),
++                        scissorWas = glIsEnabled(GL_SCISSOR_TEST), cullWas = glIsEnabled(GL_CULL_FACE);
+         glDisable(GL_BLEND);
+         glDisable(GL_DEPTH_TEST);
+         glDisable(GL_SCISSOR_TEST);
+@@ -377,6 +381,10 @@ namespace ga2_mpv
+         glUseProgram(0);
+         glActiveTexture(GL_TEXTURE0);
+         glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        (blendWas ? glEnable : glDisable)(GL_BLEND);
++        (depthWas ? glEnable : glDisable)(GL_DEPTH_TEST);
++        (scissorWas ? glEnable : glDisable)(GL_SCISSOR_TEST);
++        (cullWas ? glEnable : glDisable)(GL_CULL_FACE);
+         if (!ok)
+             return 0;
+         const Image &out = images["MAIN"];
+-- 
+2.55.0
+

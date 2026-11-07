@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "source_status": "astra-reviewed-primitives-native-integration-pending",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "source_patch_prefix": 19,
+  "patch_file": "0019-checked-ee-iop-rpc-ownership.patch",
+  "patch_sha256": "fff1a433ce7b1a0cc07f17b545d5e22f2bb611de66cbc23f9e13b4eaaab86f06",
+  "reproduced_affected_files": 76,
+  "idempotent_primary_prefix": 19,
+  "review": {
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "IOP_kernel": "approved after4findings",
+    "EE_runtime_generator": "approved after7findings; normalproductionReturnseam alsoapproved",
+    "disposition": "docs/reviews/checked-ee-iop-waits.md"
+  },
+  "tests": {
+    "runtime": {
+      "passed": 529,
+      "failed": 0,
+      "new_invocation_regressions": 35,
+      "includes_unchecked_controls": true
+    },
+    "standalone_iop_suites": {
+      "passed": 10,
+      "failed": 0
+    },
+    "tooling": {
+      "passed": 27,
+      "failed": 0
+    }
+  },
+  "negative_controls": [
+    {
+      "scope": "deferred-completion transfer revalidation",
+      "total": 522,
+      "failed": 3,
+      "post_fix_all_pass": true
+    },
+    {
+      "scope": "checked-ancestor revocation",
+      "total": 527,
+      "failed": 3,
+      "post_fix_all_pass": true
+    },
+    {
+      "scope": "knownlegacychildcancellation",
+      "total": 529,
+      "failed": 1,
+      "post_fix_all_pass": true
+    }
+  ],
+  "native_code_and_binaries": {
+    "all_five_accepted_binary_prefixes": 19,
+    "private_generation_19": "allfivecomplete; observer-only normalizeddiff; 52248files/54833calls",
+    "private_builds_19": "allfive terminalexit0; actualsizes andSHA256 recorded in native-verification.json",
+    "reverse_Call16": "unsupported; transportnotyetimplemented",
+    "native_gate": "originalopcode999and0handler/replyonEE3thenIOPcontinuation pending"
+  },
+  "limits": "Kernelwait/strictreturn primitives only. No originalreverseRPC handler/reply/audio/fullgameplay or enhancedfeatures claimed."
+}

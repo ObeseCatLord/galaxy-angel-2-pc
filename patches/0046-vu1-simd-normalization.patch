@@ -1,0 +1,221 @@
+From 658d50b7558061cdb5f1b573cd04602f0fb98881 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:37:04 -0500
+Subject: [PATCH] ga2: SIMD VU1 operand normalization and multiply-add exact
+ path
+
+- Operands of upper instructions are normalized four lanes at a time
+  (branchless SSE2; denormal -> signed zero, Inf/NaN -> signed max).
+- MADD/MSUB/MADDA/MSUBA (bc, Q, I and vector forms) compute their exact
+  double results for all lanes at once and classify them with masks
+  (zero, overflow, underflow); a lane exactly on FLT_MAX falls back to the
+  scalar long-double path, OPMSUB stays scalar. Flags are built only when
+  needed.
+
+Verified bit-exact: interpreter vs recorded digests and generated vs
+interpreter, 0 mismatches on 26k captured runs. Replay 11.6 -> ~10 ns per
+VU cycle; Eigou 2 narration ~34 -> ~41 vsync/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1_exec.inl | 159 ++++++++++++++++++-
+ 1 file changed, 153 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+index cc348ed..8551aa2 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+@@ -1,6 +1,9 @@
+ // VU1 instruction execution, inlined into the shared step so generated VU1
+ // programs get every opcode switch folded for their constant instructions.
+ #pragma once
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/ps2_vu1_detail.h"
+ #include "runtime/ps2_memory.h"
+@@ -12,6 +15,38 @@
+ #include <cstring>
+ #include <limits>
+ 
++namespace ga2_vu1
++{
++    // VU operand rule for four lanes at once (VU1Interpreter::normalizeOperand):
++    // denormals read as signed zero, Inf/NaN as signed max. Branchless.
++    __attribute__((always_inline)) inline void normalizeOperands4(const float *in, float *out)
++    {
++#if defined(__SSE2__)
++        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i *>(in));
++        const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
++        const __m128i sign = _mm_and_si128(x, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        const __m128i exponent = _mm_and_si128(x, exponentMask);
++        const __m128i denormal = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
++        const __m128i special = _mm_cmpeq_epi32(exponent, exponentMask);
++        __m128i r = _mm_andnot_si128(_mm_or_si128(denormal, special), x);
++        r = _mm_or_si128(r, _mm_and_si128(denormal, sign));
++        r = _mm_or_si128(r, _mm_and_si128(special, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), r);
++#else
++        for (int i = 0; i < 4; ++i)
++        {
++            uint32_t bits;
++            __builtin_memcpy(&bits, &in[i], sizeof(bits));
++            const uint32_t exponent = (bits >> 23) & 0xFFu;
++            if (exponent == 0u)
++                bits &= 0x80000000u;
++            else if (exponent == 0xFFu)
++                bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++            __builtin_memcpy(&out[i], &bits, sizeof(bits));
++        }
++#endif
++    }
++}
+ using ga2_vu1::laneForComponent;
+ __attribute__((always_inline)) inline float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+ {
+@@ -99,10 +134,125 @@ __attribute__((always_inline)) inline bool VU1Interpreter::isFmacProductSum(uint
+            special == 0x27u || special == 0x29u || special == 0x2Du;
+ }
+ 
++namespace ga2_vu1
++{
++    // acc[c] +/- vs[c] * B with B = vt[bc], Q, I or vt[c]: every accumulating
++    // form except OPMSUB. calculateFmacExactResult computes the same
++    // expression per lane.
++    struct ProductSumShape
++    {
++        bool uniform = false;
++        bool subtract = false;
++        uint8_t source = 0; // 0 vt[bc], 1 Q, 2 I, 3 vt[c]
++        uint8_t bc = 0;
++    };
++
++    __attribute__((always_inline)) inline ProductSumShape productSumShape(uint32_t upper)
++    {
++        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++        const uint8_t code = op < 0x3Cu ? op : static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++        if (code >= 0x08u && code <= 0x0Fu)
++            return {true, code >= 0x0Cu, 0u, static_cast<uint8_t>(code & 3u)};
++        switch (code)
++        {
++        case 0x21u: return {true, false, 1u, 0u};
++        case 0x23u: return {true, false, 2u, 0u};
++        case 0x25u: return {true, true, 1u, 0u};
++        case 0x27u: return {true, true, 2u, 0u};
++        case 0x29u: return {true, false, 3u, 0u};
++        case 0x2Du: return {true, true, 3u, 0u};
++        default: return {};
++        }
++    }
++}
++
+ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest, uint32_t upper,
+                                          uint8_t laneFlags[4], bool flagsNeeded)
+ {
+     const bool productSum = isFmacProductSum(upper);
++#if defined(__SSE2__)
++    const ga2_vu1::ProductSumShape shape = ga2_vu1::productSumShape(upper);
++    if (productSum && shape.uniform)
++    {
++        // The exact (double) result of all four lanes at once; the per-lane
++        // classification below is the same as the scalar path.
++        alignas(16) float vs[4], vt[4], acc[4], b[4];
++        ga2_vu1::normalizeOperands4(m_state.vf[FS(upper)], vs);
++        ga2_vu1::normalizeOperands4(m_state.vf[FT(upper)], vt);
++        ga2_vu1::normalizeOperands4(m_state.acc, acc);
++        const float scalar = shape.source == 0u ? vt[shape.bc]
++                             : shape.source == 1u ? normalizeOperand(m_state.q)
++                                                  : normalizeOperand(m_state.i);
++        for (int c = 0; c < 4; ++c)
++            b[c] = shape.source == 3u ? vt[c] : scalar;
++        const __m128 vs4 = _mm_load_ps(vs), b4 = _mm_load_ps(b), acc4 = _mm_load_ps(acc);
++        const __m128d productLo = _mm_mul_pd(_mm_cvtps_pd(vs4), _mm_cvtps_pd(b4));
++        const __m128d productHi = _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(vs4, vs4)), _mm_cvtps_pd(_mm_movehl_ps(b4, b4)));
++        const __m128d accLo = _mm_cvtps_pd(acc4), accHi = _mm_cvtps_pd(_mm_movehl_ps(acc4, acc4));
++        const __m128d exactLo = shape.subtract ? _mm_sub_pd(accLo, productLo) : _mm_add_pd(accLo, productLo);
++        const __m128d exactHi = shape.subtract ? _mm_sub_pd(accHi, productHi) : _mm_add_pd(accHi, productHi);
++
++        // Classify all lanes (normalizeFmacExactResult, vectorized). The high
++        // dword of each double carries its sign and all-ones compare masks.
++        const auto pack = [](__m128d lo, __m128d hi) {
++            return _mm_castps_si128(_mm_shuffle_ps(_mm_castpd_ps(lo), _mm_castpd_ps(hi), _MM_SHUFFLE(3, 1, 3, 1)));
++        };
++        const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
++        const __m128d maxD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
++        const __m128d minD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
++        const __m128d absLo = _mm_and_pd(exactLo, absMask), absHi = _mm_and_pd(exactHi, absMask);
++        const int destLanes = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
++        const __m128i atMax = pack(_mm_cmpeq_pd(absLo, maxD), _mm_cmpeq_pd(absHi, maxD));
++        if ((_mm_movemask_ps(_mm_castsi128_ps(atMax)) & destLanes) == 0)
++        {
++            const __m128i zero = pack(_mm_cmpeq_pd(exactLo, _mm_setzero_pd()), _mm_cmpeq_pd(exactHi, _mm_setzero_pd()));
++            const __m128i over = pack(_mm_cmpgt_pd(absLo, maxD), _mm_cmpgt_pd(absHi, maxD));
++            const __m128i under = _mm_andnot_si128(zero, pack(_mm_cmplt_pd(absLo, minD), _mm_cmplt_pd(absHi, minD)));
++            const __m128i sign = _mm_and_si128(pack(exactLo, exactHi), _mm_set1_epi32(static_cast<int>(0x80000000u)));
++            const __m128i toZero = _mm_or_si128(zero, under);
++            const __m128i fixed = _mm_or_si128(_mm_and_si128(toZero, sign),
++                                               _mm_and_si128(over, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
++            const __m128i laneSelect = _mm_set_epi32(dest & 1 ? -1 : 0, dest & 2 ? -1 : 0, dest & 4 ? -1 : 0, dest & 8 ? -1 : 0);
++            const __m128i change = _mm_and_si128(_mm_or_si128(toZero, over), laneSelect);
++            const __m128i r = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(result),
++                             _mm_or_si128(_mm_andnot_si128(change, r), _mm_and_si128(change, fixed)));
++            if (flagsNeeded)
++            {
++                const int z = _mm_movemask_ps(_mm_castsi128_ps(zero)), o = _mm_movemask_ps(_mm_castsi128_ps(over));
++                const int u = _mm_movemask_ps(_mm_castsi128_ps(under)), n = _mm_movemask_ps(_mm_castsi128_ps(sign));
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    const int bit = 1 << component;
++                    laneFlags[component] = (destLanes & bit) == 0 ? 0u
++                                           : static_cast<uint8_t>((n & bit ? 0x2u : 0u) | (z & bit ? 0x1u : 0u) |
++                                                                  (o & bit ? 0x8u : 0u) | (u & bit ? 0x5u : 0u));
++                }
++            }
++            else
++                laneFlags[0] = laneFlags[1] = laneFlags[2] = laneFlags[3] = 0u;
++            return;
++        }
++        alignas(16) double exact[4];
++        _mm_store_pd(exact, exactLo);
++        _mm_store_pd(exact + 2, exactHi);
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            laneFlags[component] = 0u;
++            if ((dest & laneForComponent(component)) == 0u)
++                continue;
++            if (std::fabs(exact[component]) == static_cast<double>(std::numeric_limits<float>::max()))
++            {
++                long double precise = 0.0L;
++                calculateFmacExactResult(upper, component, precise);
++                laneFlags[component] = normalizeFmacExactResult(result[component], precise);
++            }
++            else
++                laneFlags[component] = normalizeFmacExactResult(result[component], exact[component]);
++        }
++        return;
++    }
++#endif
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         laneFlags[component] = 0u;
+@@ -528,12 +678,9 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+     float normalizedVs[4];
+     float normalizedVt[4];
+     float normalizedAcc[4];
+-    for (uint32_t component = 0; component < 4u; ++component)
+-    {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+-    }
++    ga2_vu1::normalizeOperands4(m_state.vf[fs], normalizedVs);
++    ga2_vu1::normalizeOperands4(m_state.vf[ft], normalizedVt);
++    ga2_vu1::normalizeOperands4(m_state.acc, normalizedAcc);
+     const float *vs = normalizedVs;
+     const float *vt = normalizedVt;
+     const float *acc = normalizedAcc;
+-- 
+2.55.0
+

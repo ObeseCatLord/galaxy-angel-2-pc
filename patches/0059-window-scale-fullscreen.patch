@@ -1,0 +1,63 @@
+From 0cbca97db1969e1d59c11d33c4acdc2edd6e46ef Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:52:53 -0500
+Subject: [PATCH] ga2: window scale, fullscreen and its hotkey
+
+GA2_WINDOW_SCALE sizes the window as a multiple of the PS2 frame and
+GA2_FULLSCREEN=1 starts borderless fullscreen (both set by the launcher's
+display settings); F11 or Alt+Enter toggles fullscreen while playing, and
+Alt+Enter no longer also presses Start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_pad.cpp     |  2 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 13 ++++++++++++-
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 9c69170..6e53a0e 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -131,7 +131,7 @@ namespace
+                 clearBit(PAD_L2);
+             if (IsKeyDown(KEY_RIGHT_SHIFT))
+                 clearBit(PAD_R2);
+-            if (IsKeyDown(KEY_ENTER))
++            if (IsKeyDown(KEY_ENTER) && !IsKeyDown(KEY_LEFT_ALT) && !IsKeyDown(KEY_RIGHT_ALT)) // Alt+Enter: fullscreen
+                 clearBit(PAD_START);
+             if (IsKeyDown(KEY_TAB))
+                 clearBit(PAD_SELECT);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ceceb81..e188ef3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -902,7 +902,15 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        // GA2_WINDOW_SCALE: window size as a multiple of the PS2 frame (the
++        // launcher's display setting); GA2_FULLSCREEN=1 starts borderless
++        // fullscreen. F11 or Alt+Enter toggles fullscreen while playing.
++        int windowScale = 1;
++        if (const char *scale = std::getenv("GA2_WINDOW_SCALE"))
++            windowScale = std::clamp(std::atoi(scale), 1, 8);
++        InitWindow(HOST_WINDOW_WIDTH * windowScale, HOST_WINDOW_HEIGHT * windowScale, title);
++        if (const char *full = std::getenv("GA2_FULLSCREEN"); full && *full == '1')
++            ToggleBorderlessWindowed();
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+@@ -2920,6 +2928,9 @@ void PS2Runtime::run()
+         }
+         EndDrawing();
+         ps2PadSampleHostInput();
++        if (IsKeyPressed(KEY_F11) ||
++            (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))))
++            ToggleBorderlessWindowed();
+ 
+         if (WindowShouldClose())
+         {
+-- 
+2.55.0
+

@@ -1,0 +1,1048 @@
+From 8f8aa4a56bf1c3db50c2bca21d9d3f065e7cf7cf Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:26:21 -0500
+Subject: [PATCH] dma/gs: PATH2 GIF reassembly, safer IPU/VIF1 DMA, review 55
+ G12/G13/G15
+
+- G13: a PACKED/REGLIST GIF packet split across processVIF1Data calls (the
+  title writes VIF1_FIFO directly) is held until complete and submitted whole;
+  what is still held when the DIRECT ends is passed on incomplete, so a bad
+  packet cannot swallow the next one. The state lives beside the interpreter,
+  not in PS2Memory (its layout is compiled into generated code). VIF1_FIFO
+  writes are counted and logged.
+- G12: fromIPU DMA validates the whole RAM destination before taking output or
+  touching MADR/QWC instead of masking a KSEG/IO address into RAM; a refused
+  toIPU tag leaves the channel registers alone; the VIF1 download honours
+  MADR.SPR and resolves its destination before taking a qword from the GS.
+- G15: GA2_DMA_TRACE reads are bounded; a CHCR read that clears a still-set STR
+  is reported per channel; GA2_IPU_TRACE is read once; GS::reset takes the
+  backend lifetime lock; IMAGE tags no longer apply PRE/PRIM; the PATH3 IMAGE
+  test walks every tag of a submission; the arbiter gives back oversized
+  packet buffers; the pipeline cache is copied under the lock and written from
+  a short-lived thread; larger-than-NLOOP uploads become consecutive IMAGE tags;
+  gamepad sticks get a radial dead zone; the SPU queue push is two memcpys.
+- A5: XGKICK's GIF call-out runs under the default rounding mode, not the
+  VU's round-toward-zero.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp       |  17 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp            |  82 +++++++--
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp   |  49 +++++-
+ ps2xRuntime/src/lib/ps2_audio.cpp            |   4 +-
+ ps2xRuntime/src/lib/ps2_memory.cpp           | 111 +++++++++---
+ ps2xRuntime/src/lib/ps2_pad.cpp              |  35 +++-
+ ps2xRuntime/src/lib/ps2_pcm_queue.h          |  13 +-
+ ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp | 174 +++++++++++++-----
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      |  10 ++
+ ps2xTest/src/ps2_memory_tests.cpp            | 175 +++++++++++++++++++
+ 10 files changed, 568 insertions(+), 102 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 87af7ba..4d94518 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -160,11 +160,16 @@ void GS::reset()
+     m_preferredDisplaySourceFrame = {};
+     m_preferredDisplayDestFbp = 0;
+     m_hasPreferredDisplaySource = false;
+-    if (m_backend)
+     {
+-        m_backend->Flush();
+-        m_backend->Sync(GSSyncReason::Reset);
+-        m_backend->Reset();
++        // Presentation snapshots use the backend outside m_stateMutex; same
++        // order as setRasterBackend (state, then backend lifetime).
++        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
++        if (m_backend)
++        {
++            m_backend->Flush();
++            m_backend->Sync(GSSyncReason::Reset);
++            m_backend->Reset();
++        }
+     }
+     {
+         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+@@ -686,7 +691,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+ 
+-        bool pre = ((tagLo >> 46) & 1) != 0;
++        // PRE/PRIM only exist for PACKED and REGLIST; an IMAGE tag (and the
++        // reserved format) leaves PRIM alone whatever those bits hold.
++        const bool pre = ((tagLo >> 46) & 1) != 0 && (flg == GIF_FMT_PACKED || flg == GIF_FMT_REGLIST);
+         if (pre)
+         {
+             writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 00ff2d7..bc1d0ba 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -24,6 +24,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include <thread>
+ #include <string>
+ #include <vector>
+ 
+@@ -224,7 +225,32 @@ namespace
+             std::fprintf(stderr, "[pgs] loaded pipeline cache %s (%zu KB)\n", path.c_str(), data.size() / 1024);
+     }
+ 
+-    void savePipelineCache(Device &device)
++    // Writing the multi-MB cache is the slow part, so the periodic saves copy
++    // it out of the device (quick, and device access stays under State::mutex)
++    // and write the file from a short-lived thread. Writes are serialised and
++    // the exit-time save waits for any in flight; both go through one temp
++    // file name, so they must not overlap.
++    std::mutex &pipelineCacheWriteMutex()
++    {
++        static std::mutex *mutex = new std::mutex; // outlives static destruction: writers may still run at exit
++        return *mutex;
++    }
++
++    void writePipelineCacheFile(const std::filesystem::path &path, const std::vector<uint8_t> &data)
++    {
++        std::lock_guard<std::mutex> lock(pipelineCacheWriteMutex());
++        std::error_code ec;
++        std::filesystem::create_directories(path.parent_path(), ec);
++        const auto tmp = path.string() + ".tmp";
++        {
++            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++            if (!out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size())))
++                return;
++        }
++        std::filesystem::rename(tmp, path, ec);
++    }
++
++    void savePipelineCache(Device &device, bool background = false)
+     {
+         const auto path = pipelineCachePath();
+         if (path.empty())
+@@ -244,15 +270,19 @@ namespace
+         }
+         if (!copied)
+             return;
+-        std::error_code ec;
+-        std::filesystem::create_directories(path.parent_path(), ec);
+-        const auto tmp = path.string() + ".tmp";
++        if (!background)
+         {
+-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+-            if (!out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(size)))
+-                return;
++            writePipelineCacheFile(path, data);
++            return;
++        }
++        try
++        {
++            std::thread([path, data = std::move(data)]() { writePipelineCacheFile(path, data); }).detach();
++        }
++        catch (const std::exception &)
++        {
++            // No thread available: lose the checkpoint rather than the frame time; the exit save still runs.
+         }
+-        std::filesystem::rename(tmp, path, ec);
+     }
+ 
+     // Minimal PNG writer (stored deflate blocks), for the HUD debug dumps.
+@@ -670,7 +700,19 @@ namespace ga2_pgs
+         if (!data || size == 0)
+             return;
+         // Rebuild the GIF packet the native fast path consumed: A+D setup, then IMAGE.
+-        std::vector<uint8_t> packet(16u + 4u * 16u + 16u + ((size + 15u) & ~size_t(15)));
++        // NLOOP is 15 bits, so a larger upload becomes consecutive IMAGE tags (the
++        // GS continues the same transfer); masking would silently drop the rest.
++        constexpr size_t kMaxImageQwords = 0x7fffu;
++        const size_t qwords = (size + 15u) / 16u;
++        const size_t imageTags = (qwords + kMaxImageQwords - 1u) / kMaxImageQwords;
++        if (imageTags > 1u)
++        {
++            static bool warned = false;
++            if (!warned)
++                std::fprintf(stderr, "[pgs] imageUpload of %zu qwords split into %zu IMAGE tags (NLOOP is 15 bits)\n", qwords, imageTags);
++            warned = true;
++        }
++        std::vector<uint8_t> packet(16u + 4u * 16u + imageTags * 16u + qwords * 16u, 0u);
+         auto store64 = [&](size_t offset, uint64_t v) { std::memcpy(packet.data() + offset, &v, 8); };
+         store64(0, 4ull | (1ull << 15) | (0ull << 58) | (1ull << 60)); // NLOOP=4 EOP PACKED NREG=1
+         store64(8, 0xEull);                                            // A+D
+@@ -680,11 +722,21 @@ namespace ga2_pgs
+             store64(16u + i * 16u, regs[i][0]);
+             store64(24u + i * 16u, regs[i][1]);
+         }
+-        const size_t imageOffset = 16u + 4u * 16u;
+-        const uint64_t qwords = (size + 15u) / 16u;
+-        store64(imageOffset, (qwords & 0x7fffu) | (1ull << 15) | (2ull << 58)); // IMAGE, EOP
+-        store64(imageOffset + 8u, 0);
+-        std::memcpy(packet.data() + imageOffset + 16u, data, size);
++        size_t offset = 16u + 4u * 16u;
++        size_t remaining = qwords;
++        size_t consumed = 0;
++        for (size_t tag = 0; tag < imageTags; ++tag)
++        {
++            const size_t count = std::min(remaining, kMaxImageQwords);
++            const bool last = tag + 1u == imageTags;
++            store64(offset, count | (last ? (1ull << 15) : 0ull) | (2ull << 58)); // IMAGE
++            offset += 16u;
++            const size_t bytes = std::min(count * 16u, size - consumed);
++            std::memcpy(packet.data() + offset, data + consumed, bytes);
++            offset += count * 16u;
++            consumed += bytes;
++            remaining -= count;
++        }
+         gifTransfer(3, packet.data(), packet.size());
+     }
+ 
+@@ -819,7 +871,7 @@ namespace ga2_pgs
+         // since the process may be killed rather than exit.
+         ++s.totalSwaps;
+         if (s.totalSwaps == 600 || s.totalSwaps == 3600 || s.totalSwaps == 10800 || s.totalSwaps == 36000)
+-            savePipelineCache(s.eyes[0].device);
++            savePipelineCache(s.eyes[0].device, true);
+ 
+         const double elapsed = std::chrono::duration<double>(t1 - s.statStart).count();
+         if (elapsed >= 5.0 && std::getenv("GA2_PERF"))
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 76c5fd4..0a9dd57 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -9,13 +9,34 @@ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+ 
+ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+-    if (!data || sizeBytes < 16u)
+-        return false;
+-
+-    uint64_t tagLo = 0;
+-    std::memcpy(&tagLo, data, sizeof(tagLo));
+-    const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+-    return flg == 2u;
++    // A PATH3 submission often opens with an A+D setup packet (BITBLTBUF/TRXPOS/
++    // TRXREG/TRXDIR) and carries the IMAGE tag second, so every tag in the
++    // submission is walked, not only the first. Tags are consumed by their
++    // declared payload; a payload running past the end ends the walk.
++    uint32_t offset = 0u;
++    while (data && offset + 16u <= sizeBytes)
++    {
++        uint64_t tagLo = 0;
++        std::memcpy(&tagLo, data + offset, sizeof(tagLo));
++        offset += 16u;
++        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
++        if (flg == 2u)
++            return true;
++        const uint64_t nloop = tagLo & 0x7FFFu;
++        uint64_t nreg = (tagLo >> 60) & 0xFu;
++        if (nreg == 0u)
++            nreg = 16u;
++        uint64_t payload = 0u;
++        if (flg == 0u)
++            payload = nloop * nreg * 16ull;
++        else if (flg == 1u)
++            payload = (nloop * nreg * 8ull + 15ull) & ~15ull;
++        // flg 3 (reserved) carries no payload in the GS frontend's parser either.
++        if (payload > sizeBytes - offset)
++            return false;
++        offset += static_cast<uint32_t>(payload);
++    }
++    return false;
+ }
+ 
+ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl,
+@@ -82,6 +103,20 @@ void GifArbiter::drain()
+         }
+     }
+     m_count = 0;
++    // The queue keeps its slots (and their buffers) between drains so steady
++    // state allocates nothing; give back the rare oversized upload so one big
++    // packet does not pin its memory in every later frame.
++    constexpr size_t kRetainBytes = 256u * 1024u;
++    for (auto &slot : m_queue)
++    {
++        if (slot.data.capacity() > kRetainBytes)
++            std::vector<uint8_t>().swap(slot.data);
++        if (slot.tapData.capacity() > kRetainBytes)
++            std::vector<uint8_t>().swap(slot.tapData);
++    }
++    constexpr size_t kRetainSlots = 64u;
++    if (m_queue.size() > kRetainSlots)
++        m_queue.resize(kRetainSlots);
+ }
+ 
+ uint8_t GifArbiter::pathPriority(GifPathId id)
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 52e1145..e521210 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -174,7 +174,9 @@ bool PS2AudioBackend::submitSpuPcm(std::span<const int16_t> samples, uint32_t sa
+ #else
+     std::lock_guard lock(m_mutex);
+     if (sampleRate != 48000 || samples.size() % 2u) return false;
+-    // Without an audio device the game must still run; discard the output.
++    // Without an audio device the game must still run; discard the output. The
++    // true returned here is not evidence that audio plays (headless runs, tests):
++    // audio proof needs a device and a recording.
+     if (!m_audioReady) return true;
+     if (samples.empty()) return true;
+     auto observe = [&](bool result) noexcept {
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 9cb045b..e076321 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,4 +1,5 @@
+ #include <cstdio>
++#include <cstdlib>
+ #include <array>
+ #include "runtime/ps2_memory.h"
+ #include "ps2_ipu.h"
+@@ -13,8 +14,19 @@
+ #include <string>
+ #include <vector>
+ 
++// PATH2 GIF stream decoder state lives beside the VIF1 interpreter (ps2_vif1_interpreter.cpp).
++void ps2Vif1ResetPath2Decoder(const PS2Memory *memory);
++void ps2Vif1ForgetPath2Decoder(const PS2Memory *memory);
++
+ namespace
+ {
++    // GA2_IPU_TRACE, read once (these sites run on every IPU register write).
++    bool ipuTraceEnabled()
++    {
++        static const bool enabled = std::getenv("GA2_IPU_TRACE") != nullptr;
++        return enabled;
++    }
++
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+     {
+         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
+@@ -238,6 +250,7 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    ps2Vif1ForgetPath2Decoder(this);
+     if (m_rdram)
+     {
+         delete[] m_rdram;
+@@ -325,6 +338,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_vif1PendingDirectBytes = 0u;
+     m_vif1PendingDirectHl = false;
+     m_vif1DirectTailBytes = 0u;
++    ps2Vif1ResetPath2Decoder(this);
+     resetEeTimers();
+     m_ipu->reset();
+ 
+@@ -1103,6 +1117,12 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     }
+     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+     {
++        // Evidence for the PATH2 fragmentation fix: does the title write the
++        // FIFO directly (16 bytes per call) rather than through DMA?
++        static std::atomic<uint64_t> s_vif1FifoWrites{0};
++        const uint64_t count = s_vif1FifoWrites.fetch_add(1, std::memory_order_relaxed) + 1u;
++        if (count == 1u || count == 1000u || count == 1000000u)
++            std::fprintf(stderr, "[vif1] VIF1_FIFO direct write #%llu\n", static_cast<unsigned long long>(count));
+         alignas(16) uint8_t fifoData[16];
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+         processVIF1Data(fifoData, sizeof(fifoData));
+@@ -1212,7 +1232,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+     if (address == IpuDevice::kControl)
+     {
+-        if (std::getenv("GA2_IPU_TRACE"))
++        if (ipuTraceEnabled())
+             std::fprintf(stderr, "[ipu] ctrl write %08x\n", value);
+         m_ipu->writeControl(value);
+         pumpIpu();
+@@ -1263,7 +1283,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 qwc = 0x10000u;
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+             chcr = value;
+-            if (std::getenv("GA2_IPU_TRACE"))
++            if (ipuTraceEnabled())
+                 std::fprintf(stderr, "[ipu] fromIPU start madr=%08x qwc=%u ofc=%u\n", m_ioRegisters[address + 0x10u], qwc, m_ipu->outputCount());
+             processIpuOutputDma();
+             if ((chcr & 0x100u) != 0u && qwc == 0x10000u)
+@@ -1302,7 +1322,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             if (mode == 0u && qwc == 0u)
+                 qwc = 0x10000u;
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+-            if (std::getenv("GA2_IPU_TRACE"))
++            if (ipuTraceEnabled())
+                 std::fprintf(stderr, "[ipu] toIPU start chcr=%08x madr=%08x qwc=%u tadr=%08x\n", value,
+                              m_ioRegisters[address + 0x10u], m_ioRegisters[address + 0x20u], m_ioRegisters[address + 0x30u]);
+         }
+@@ -1340,6 +1360,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 m_vif1PendingDirectBytes = 0u;
+                 m_vif1PendingDirectHl = false;
+                 m_vif1DirectTailBytes = 0u;
++                ps2Vif1ResetPath2Decoder(this);
+                 m_path3Masked = false;
+                 if (wasPath3Masked)
+                     flushMaskedPath3Packets();
+@@ -1433,7 +1454,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t w[4]{};
+                     try
+                     {
+-                        std::memcpy(w, m_rdram + translateAddress((m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u) + i * 16u), 16);
++                        // Diagnostic only, but a KSEG/IO-range MADR must not read past RDRAM.
++                        const uint32_t physical = translateAddress((m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u) + i * 16u);
++                        if (physical <= PS2_RAM_SIZE - 16u)
++                            std::memcpy(w, m_rdram + physical, 16);
+                     }
+                     catch (const std::exception &)
+                     {
+@@ -1964,38 +1988,64 @@ bool PS2Memory::drainVif1Download()
+     if (!m_localToHostReader)
+         return false;
+     uint32_t count = m_ioRegisters[kVif1 + 0x20u] & 0xFFFFu;
+-    uint32_t address = m_ioRegisters[kVif1 + 0x10u] & 0x7FFFFFF0u;
++    // MADR.SPR (bit 31) selects the scratchpad; the address then wraps in 16 KiB.
++    const uint32_t madrReg = m_ioRegisters[kVif1 + 0x10u];
++    const bool toScratchpad = (madrReg & 0x80000000u) != 0u;
++    uint32_t address = toScratchpad ? (madrReg & (PS2_SCRATCHPAD_SIZE - 1u) & ~15u) : (madrReg & 0x7FFFFFF0u);
+     const uint32_t requested = count;
++    bool badDestination = false;
+     while (count != 0u)
+     {
++        // Resolve the destination first: a qword taken from the GS FIFO and then
++        // dropped would be lost to the retry.
++        uint32_t offset = 0;
++        if (!toScratchpad)
++        {
++            try
++            {
++                offset = translateAddress(address);
++            }
++            catch (const std::exception &)
++            {
++                badDestination = true;
++                break;
++            }
++            if (offset > PS2_RAM_SIZE - 16u)
++            {
++                badDestination = true;
++                break;
++            }
++        }
+         uint8_t qword[16]{};
+         // The GS hands out whole qwords (the last one of a transfer padded).
+         // An empty FIFO stalls the channel as on hardware: no fabricated data.
+         if (m_localToHostReader(qword, 16u) == 0u)
+             break;
+-        uint32_t offset = 0;
+-        try
++        if (toScratchpad)
+         {
+-            offset = translateAddress(address);
++            std::memcpy(m_scratchpad + address, qword, 16u);
++            address = (address + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+         }
+-        catch (const std::exception &)
++        else
+         {
+-            break;
++            std::memcpy(m_rdram + offset, qword, 16u);
++            markModified(offset, 16u);
++            address += 16u;
+         }
+-        if (offset + 16u > PS2_RAM_SIZE)
+-            break;
+-        std::memcpy(m_rdram + offset, qword, 16u);
+-        markModified(offset, 16u);
+-        address += 16u;
+         --count;
+     }
+-    m_ioRegisters[kVif1 + 0x10u] = address;
++    m_ioRegisters[kVif1 + 0x10u] = toScratchpad ? (address | 0x80000000u) : address;
+     m_ioRegisters[kVif1 + 0x20u] = (m_ioRegisters[kVif1 + 0x20u] & ~0xFFFFu) | count;
+     if (count != 0u)
+     {
+         static bool logged = false;
+         if (!logged)
+-            std::fprintf(stderr, "[dma] VIF1 download stalled: GS FIFO empty with %u of %u qwords left\n", count, requested);
++        {
++            if (badDestination)
++                std::fprintf(stderr, "[dma] VIF1 download stalled: destination 0x%08x is not RAM (%u of %u qwords left)\n", address, count, requested);
++            else
++                std::fprintf(stderr, "[dma] VIF1 download stalled: GS FIFO empty with %u of %u qwords left\n", count, requested);
++        }
+         logged = true;
+         return false;
+     }
+@@ -2130,10 +2180,10 @@ void PS2Memory::processIpuInputDma()
+             if (id == 5u || id == 6u)
+                 throw IpuUnsupportedOperation("unsupported IPU DMA tag id " + std::to_string(id));
+ 
+-            qwc = tagQwc;
+             const uint32_t tagAddress = static_cast<uint32_t>(tag >> 32u);
+             if ((tagAddress & 0x80000000u) != 0u)
+                 throw IpuUnsupportedOperation("IPU DMA scratchpad tag is unsupported");
++            qwc = tagQwc; // after every rejection above, so a refused tag leaves QWC/MADR/TADR untouched
+             switch (id)
+             {
+             case 1u: // CNT: data follows the tag, next tag follows the data
+@@ -2192,6 +2242,16 @@ void PS2Memory::processIpuOutputDma()
+     uint32_t &madr = m_ioRegisters[kChannel + 0x10u];
+     uint32_t &qwc = m_ioRegisters[kChannel + 0x20u];
+     const uint32_t count = std::min(qwc, m_ipu->outputCount());
++    // Validate the whole destination run before taking any output or touching
++    // MADR/QWC: a KSEG/IO-range MADR must not be folded into RAM (that
++    // overwrote unrelated guest memory), and a failure must leave the channel
++    // registers as they were. Mirrors the input side's RAM-source check.
++    if ((madr & 0x80000000u) == 0u && count != 0u)
++    {
++        const uint32_t physical = translateAddress(madr);
++        if (physical >= PS2_RAM_SIZE || static_cast<uint64_t>(physical & ~15u) + static_cast<uint64_t>(count) * 16u > PS2_RAM_SIZE)
++            throw IpuUnsupportedOperation("IPU DMA fromIPU destination outside RDRAM");
++    }
+     for (uint32_t i = 0; i < count; ++i)
+     {
+         alignas(16) std::array<uint8_t, 16> qword{};
+@@ -2200,7 +2260,7 @@ void PS2Memory::processIpuOutputDma()
+             std::memcpy(&m_scratchpad[madr & (PS2_SCRATCHPAD_SIZE - 1u) & ~15u], qword.data(), 16);
+         else
+         {
+-            const uint32_t physical = translateAddress(madr) & PS2_RAM_MASK & ~15u;
++            const uint32_t physical = translateAddress(madr) & ~15u;
+             std::memcpy(&m_rdram[physical], qword.data(), 16);
+         }
+         madr += 16u;
+@@ -2948,7 +3008,18 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+                 if (address == 0x10009000u && (m_ioRegisters[address] & 0x101u) == 0x100u &&
+                     (m_ioRegisters[0x10009020u] & 0xFFFFu) != 0u)
+                     return m_ioRegisters[address];
+-                uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
++                // Legacy completion model: a channel the runtime did not complete itself
++                // reads as finished (and clears STR) on its first poll. Report each
++                // channel that still relied on that, so the unmodelled ones are visible.
++                const uint32_t rawStatus = m_ioRegisters[address];
++                if ((rawStatus & 0x100u) != 0u)
++                {
++                    static std::atomic<uint32_t> s_reported{0};
++                    const uint32_t channelBit = 1u << ((address >> 10) & 0x1Fu);
++                    if ((s_reported.fetch_or(channelBit, std::memory_order_relaxed) & channelBit) == 0u)
++                        std::fprintf(stderr, "[dma] CHCR %08x read with STR still set: cleared by the read (completion not modelled)\n", address);
++                }
++                uint32_t channelStatus = rawStatus & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+                 return channelStatus;
+             }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 2bec55b..d40f899 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -55,6 +55,31 @@ namespace
+         data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+     }
+ 
++    // A worn or off-centre analog stick rests a few percent from zero; the games
++    // read the raw byte, so a drifting menu cursor or camera follows. Inside the
++    // radial dead zone the stick reads centred; outside it the range is rescaled
++    // so full deflection still reaches the end of travel.
++    constexpr float kStickDeadzone = 0.12f;
++
++    void applyStickDeadzone(float &x, float &y)
++    {
++        const float magnitude = std::sqrt(x * x + y * y);
++        if (magnitude <= kStickDeadzone)
++        {
++            x = y = 0.0f;
++            return;
++        }
++        const float scaled = std::min((magnitude - kStickDeadzone) / (1.0f - kStickDeadzone), 1.0f) / magnitude;
++        x *= scaled;
++        y *= scaled;
++    }
++
++    uint8_t stickByte(float axis)
++    {
++        const int value = 128 + static_cast<int>(std::lround(std::clamp(axis, -1.0f, 1.0f) * 127.0f));
++        return static_cast<uint8_t>(std::clamp(value, 0, 255));
++    }
++
+     void sampleHostPad(uint8_t *data)
+     {
+         neutralPad(data);
+@@ -104,10 +129,12 @@ namespace
+             float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+             float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+             float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-            data[6] = static_cast<uint8_t>(128 + lx * 127);
+-            data[7] = static_cast<uint8_t>(128 + ly * 127);
+-            data[4] = static_cast<uint8_t>(128 + rx * 127);
+-            data[5] = static_cast<uint8_t>(128 + ry * 127);
++            applyStickDeadzone(lx, ly);
++            applyStickDeadzone(rx, ry);
++            data[6] = stickByte(lx);
++            data[7] = stickByte(ly);
++            data[4] = stickByte(rx);
++            data[5] = stickByte(ry);
+         }
+         else
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+index daa5110..9dd37e7 100644
+--- a/ps2xRuntime/src/lib/ps2_pcm_queue.h
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -4,6 +4,7 @@
+ #include <cstddef>
+ #include <cmath>
+ #include <cstdint>
++#include <cstring>
+ #include <span>
+ 
+ // SPU output (producer: IOP time) to the audio device (consumer: device
+@@ -36,11 +37,13 @@ public:
+             m_count -= drop;
+             m_dropped += drop;
+         }
+-        for (size_t i = 0; i < incoming; ++i)
+-        {
+-            const size_t p = ((m_head + m_count + i) % CapacityFrames) * 2u;
+-            m_samples[p] = samples[2u*i]; m_samples[p+1u] = samples[2u*i+1u];
+-        }
++        // Two contiguous copies (the ring wraps at most once); the device
++        // callback waits on the caller's lock for exactly this long.
++        const size_t tail = (m_head + m_count) % CapacityFrames;
++        const size_t firstFrames = std::min(incoming, CapacityFrames - tail);
++        std::memcpy(&m_samples[tail * 2u], samples.data(), firstFrames * 2u * sizeof(int16_t));
++        if (incoming > firstFrames)
++            std::memcpy(&m_samples[0], samples.data() + firstFrames * 2u, (incoming - firstFrames) * 2u * sizeof(int16_t));
+         m_count += incoming;
+         m_pushed += incoming;
+         if (m_count > TargetLatencyFrames)
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index eef4bea..e5fa00a 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,11 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <atomic>
++#include <cstdio>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -30,57 +35,79 @@ namespace
+ {
+     constexpr uint8_t kGifFmtImage = 2u;
+ 
+-    uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
++    // PATH2 (VIF1 DIRECT/DIRECTHL) GIF stream state. The CPU GS frontend parses
++    // each submitted packet statelessly, but one DIRECT payload reaches
++    // processVIF1Data in arbitrary pieces (16-byte VIF1_FIFO writes, a DMA
++    // chain cut inside a GIF packet). The head of a PACKED or REGLIST packet
++    // whose payload has not fully arrived is therefore held here and submitted
++    // once complete, as the GIF would wait for the rest. What is still held
++    // when the DIRECT command ends is passed on as it is (a packet running over
++    // into a following DIRECT is not reassembled): a malformed packet then
++    // costs that packet only, never the packets after it.
++    // Kept outside PS2Memory so its layout (compiled into generated game code)
++    // is unchanged.
++    struct Path2Decoder
+     {
+-        if (!data || sizeBytes < 16u)
+-            return 0u;
++        std::vector<uint8_t> carry;
++        uint64_t continuedPackets = 0u;
++    };
+ 
+-        uint32_t offset = 0u;
+-        while (offset + 16u <= sizeBytes)
+-        {
+-            uint64_t tagLo = 0u;
+-            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+-            offset += 16u;
++    std::mutex &path2Mutex()
++    {
++        static std::mutex *mutex = new std::mutex;
++        return *mutex;
++    }
+ 
+-            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+-            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+-            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+-            if (nreg == 0u)
+-                nreg = 16u;
++    std::unordered_map<const PS2Memory *, Path2Decoder> &path2Decoders()
++    {
++        static auto *decoders = new std::unordered_map<const PS2Memory *, Path2Decoder>;
++        return *decoders;
++    }
+ 
+-            uint64_t payloadBytes = 0u;
+-            if (flg == 0u) // PACKED
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
+-            }
+-            else if (flg == 1u) // REGLIST, padded to a quadword
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
+-                payloadBytes = (payloadBytes + 15ull) & ~15ull;
+-            }
+-            else if (flg == kGifFmtImage)
+-            {
+-                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
+-                const uint64_t availableBytes = sizeBytes - offset;
+-                if (payloadBytes > availableBytes)
+-                {
+-                    return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
+-                }
+-            }
+-            else
+-            {
+-                return 0u;
+-            }
++    Path2Decoder &path2DecoderFor(const PS2Memory *memory)
++    {
++        std::lock_guard<std::mutex> lock(path2Mutex());
++        return path2Decoders()[memory]; // element references survive rehashing
++    }
+ 
+-            if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
+-                return 0u;
+-            offset += static_cast<uint32_t>(payloadBytes);
++    // Bytes of payload that follow a GIF tag (not counting the tag itself).
++    // IMAGE is reported separately because it streams. The reserved format 3
++    // has no payload, as in GS::processGIFPacket, which parses what is submitted.
++    uint64_t gifTagPayloadBytes(uint64_t tagLo, bool &isImage)
++    {
++        isImage = false;
++        const uint64_t nloop = tagLo & 0x7FFFu;
++        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
++        uint64_t nreg = (tagLo >> 60) & 0xFu;
++        if (nreg == 0u)
++            nreg = 16u;
++        if (flg == 0u) // PACKED
++            return nloop * nreg * 16ull;
++        if (flg == 1u) // REGLIST, padded to a quadword
++            return (nloop * nreg * 8ull + 15ull) & ~15ull;
++        if (flg == kGifFmtImage)
++        {
++            isImage = true;
++            return nloop * 16ull;
+         }
+-
+         return 0u;
+     }
+ }
+ 
++void ps2Vif1ResetPath2Decoder(const PS2Memory *memory)
++{
++    std::lock_guard<std::mutex> lock(path2Mutex());
++    const auto it = path2Decoders().find(memory);
++    if (it != path2Decoders().end())
++        it->second.carry.clear();
++}
++
++void ps2Vif1ForgetPath2Decoder(const PS2Memory *memory)
++{
++    std::lock_guard<std::mutex> lock(path2Mutex());
++    path2Decoders().erase(memory);
++}
++
+ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -303,7 +330,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     uint32_t pos = 0;
+ 
+     // GIF IMAGE continuation applies only to bytes inside an active VIF DIRECT.
+-    // GS packet parsing is still stateless for fragmented PACKED/REGLIST packets.
++    // PACKED/REGLIST packets whose payload is still to come are held in the
++    // PATH2 decoder (see Path2Decoder) and submitted whole.
++    Path2Decoder &decoder = path2DecoderFor(this);
+     auto submitDirectPayload = [&](const uint8_t *payload, uint32_t bytes)
+     {
+         if (m_vif1PendingPath2ImageQwc != 0u)
+@@ -322,11 +351,54 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             payload += chunkQw * 16u;
+             bytes -= chunkQw * 16u;
+         }
+-        if (bytes != 0u)
++        if (bytes == 0u)
++            return;
++
++        // Join with the held head of an incomplete packet, if any.
++        std::vector<uint8_t> joined;
++        const uint8_t *buf = payload;
++        uint32_t len = bytes;
++        if (!decoder.carry.empty())
+         {
+-            submitGifPacket(GifPathId::Path2, payload, bytes, true, m_vif1PendingDirectHl);
+-            m_vif1PendingPath2ImageQwc = pendingGifImageQwc(payload, bytes);
++            joined.swap(decoder.carry);
++            joined.insert(joined.end(), payload, payload + bytes);
++            buf = joined.data();
++            len = static_cast<uint32_t>(joined.size());
++            ++decoder.continuedPackets;
++            static std::atomic<uint32_t> s_logged{0};
++            if (s_logged.fetch_add(1, std::memory_order_relaxed) < 8u)
++                std::fprintf(stderr, "[vif1] PATH2 GIF packet continued across DIRECT payloads (%u bytes now buffered, %llu so far)\n", len,
++                             static_cast<unsigned long long>(decoder.continuedPackets));
++        }
++
++        // Longest prefix of whole packets; a trailing IMAGE streams as far as
++        // it has arrived.
++        uint32_t complete = 0u;
++        while (len - complete >= 16u)
++        {
++            uint64_t tagLo = 0u;
++            std::memcpy(&tagLo, buf + complete, sizeof(tagLo));
++            bool isImage = false;
++            const uint64_t payloadBytes = gifTagPayloadBytes(tagLo, isImage);
++            const uint64_t available = len - complete - 16u;
++            if (payloadBytes > available)
++            {
++                if (isImage)
++                {
++                    m_vif1PendingPath2ImageQwc = static_cast<uint32_t>((payloadBytes - available) / 16u);
++                    complete = len;
++                }
++                break;
++            }
++            complete += 16u + static_cast<uint32_t>(payloadBytes);
+         }
++
++        if (complete != 0u)
++            submitGifPacket(GifPathId::Path2, buf, complete, true, m_vif1PendingDirectHl);
++        if (complete < len)
++            decoder.carry.assign(buf + complete, buf + len);
++        else
++            decoder.carry.clear();
+     };
+ 
+     while (pos < sizeBytes)
+@@ -355,7 +427,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 m_vif1PendingDirectBytes -= count;
+             }
+             if (m_vif1PendingDirectBytes == 0u)
++            {
++                if (!decoder.carry.empty())
++                {
++                    static std::atomic<uint32_t> s_logged{0};
++                    if (s_logged.fetch_add(1, std::memory_order_relaxed) < 8u)
++                        std::fprintf(stderr, "[vif1] DIRECT ended inside a GIF packet (%zu bytes held); passed on incomplete\n",
++                                     decoder.carry.size());
++                    submitGifPacket(GifPathId::Path2, decoder.carry.data(), static_cast<uint32_t>(decoder.carry.size()), true,
++                                    m_vif1PendingDirectHl);
++                    decoder.carry.clear();
++                }
+                 m_vif1PendingDirectHl = false;
++            }
+             continue;
+         }
+         if (sizeBytes - pos < 4u)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 25c67dd..b932f26 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -352,6 +352,16 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++    // The VU1 run executes under round-toward-zero (execute()); the GS/GIF code
++    // XGKICK calls into is not VU arithmetic and must see the default mode, as
++    // it does when the same packet arrives by DMA.
++    struct DefaultRounding
++    {
++        const int previous = std::fegetround();
++        DefaultRounding() { if (previous != FE_TONEAREST) std::fesetround(FE_TONEAREST); }
++        ~DefaultRounding() { if (previous != FE_TONEAREST) std::fesetround(previous); }
++    } defaultRounding;
++
+     if (m_capture)
+         captureGif(m_xgkick.packet.data(), m_xgkick.totalBytes);
+     if (m_gifSink)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index f9676b4..9fc2d45 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2560,4 +2560,179 @@ void register_ps2_memory_tests()
+             t.IsTrue(threwWrite64, "unaligned write64 should throw");
+         });
+     });
++
++    MiniTest::Case("PS2MemoryReview55", [](TestCase &tc)
++    {
++        // A PACKED A+D packet: tag (NLOOP 2) plus two register writes, 48 bytes.
++        const auto makePackedAd = []()
++        {
++            std::vector<uint8_t> packet;
++            appendU64(packet, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
++            appendU64(packet, 0x0Eull); // A+D
++            appendU64(packet, 0x11ull); appendU64(packet, 0x3Au); // PRMODECONT-ish A+D pair
++            appendU64(packet, 0x22ull); appendU64(packet, 0x3Au);
++            return packet;
++        };
++        const auto direct = [](std::vector<uint8_t> &dst, uint16_t qwords, bool hl = false)
++        {
++            appendU32(dst, makeVifCmd(hl ? 0x51u : 0x50u, 0u, qwords));
++        };
++
++        tc.Run("VIF1 DIRECT: a PACKED GIF packet fragmented across calls reaches the GS whole", [&](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t size) { captured.emplace_back(data, data + size); });
++
++            const std::vector<uint8_t> packet = makePackedAd();
++            // The VIF code word and the first qword, then one qword per call as VIF1_FIFO writes arrive.
++            std::vector<uint8_t> head;
++            direct(head, 3u);
++            head.insert(head.end(), packet.begin(), packet.begin() + 16);
++            mem.processVIF1Data(head.data(), static_cast<uint32_t>(head.size()));
++            t.Equals(captured.size(), size_t{0}, "a tag whose payload has not arrived is held, not parsed on its own");
++            mem.processVIF1Data(packet.data() + 16, 16u);
++            t.Equals(captured.size(), size_t{0}, "still incomplete after the first register write");
++            mem.processVIF1Data(packet.data() + 32, 16u);
++            t.Equals(captured.size(), size_t{1}, "the completed packet is submitted once");
++            t.IsTrue(!captured.empty() && captured[0] == packet, "the packet arrives intact and in order");
++        });
++
++        tc.Run("VIF1 DIRECT: REGLIST fragments are reassembled and complete packets pass straight through", [&](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t size) { captured.emplace_back(data, data + size); });
++
++            std::vector<uint8_t> reglist;
++            appendU64(reglist, makeGifTag(3u, GIF_FMT_REGLIST, 1u, true)); // 3 x 8 bytes, padded to 32
++            appendU64(reglist, 0x3Aull);
++            for (uint64_t i = 0; i < 4u; ++i)
++                appendU64(reglist, 0x100u + i);
++            std::vector<uint8_t> whole = makePackedAd();
++            std::vector<uint8_t> stream;
++            direct(stream, static_cast<uint16_t>((reglist.size() + whole.size()) / 16u));
++            stream.insert(stream.end(), whole.begin(), whole.end());
++            stream.insert(stream.end(), reglist.begin(), reglist.begin() + 16);
++            mem.processVIF1Data(stream.data(), static_cast<uint32_t>(stream.size()));
++            t.Equals(captured.size(), size_t{1}, "the complete leading packet is submitted without waiting");
++            mem.processVIF1Data(reglist.data() + 16, 32u);
++            t.Equals(captured.size(), size_t{2}, "the REGLIST packet completes with its padded payload");
++            t.IsTrue(captured.size() == 2u && captured[1] == reglist, "REGLIST bytes intact");
++        });
++
++        tc.Run("VIF1 DIRECT ending inside a GIF packet passes it on incomplete and keeps the next DIRECT clean", [&](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t size) { captured.emplace_back(data, data + size); });
++
++            std::vector<uint8_t> bad;
++            direct(bad, 1u);
++            appendU64(bad, makeGifTag(4u, GIF_FMT_PACKED, 1u, true)); // claims 4 qwords, DIRECT carries none
++            appendU64(bad, 0x0Eull);
++            mem.processVIF1Data(bad.data(), static_cast<uint32_t>(bad.size()));
++            t.Equals(captured.size(), size_t{1}, "the truncated packet is passed on when its DIRECT ends");
++
++            const std::vector<uint8_t> good = makePackedAd();
++            std::vector<uint8_t> next;
++            direct(next, 3u);
++            next.insert(next.end(), good.begin(), good.end());
++            mem.processVIF1Data(next.data(), static_cast<uint32_t>(next.size()));
++            t.Equals(captured.size(), size_t{2}, "the following DIRECT is parsed from its own first tag");
++            t.IsTrue(captured.size() == 2u && captured[1] == good, "no bytes of the earlier packet leak into the next one");
++        });
++
++        tc.Run("VIF1 download honours MADR.SPR and leaves the FIFO alone when the destination is not RAM", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            uint32_t reads = 0u;
++            mem.setLocalToHostReader([&](uint8_t *dst, uint32_t bytes)
++            {
++                ++reads;
++                std::memset(dst, 0x40 + static_cast<int>(reads), bytes);
++                return bytes;
++            });
++            constexpr uint32_t kVif1 = 0x10009000u;
++            t.IsTrue(mem.writeIORegister(kVif1 + 0x10u, 0x80000000u | 0x40u), "MADR with SPR set");
++            t.IsTrue(mem.writeIORegister(kVif1 + 0x20u, 2u), "QWC 2");
++            t.IsTrue(mem.writeIORegister(kVif1, 0x100u), "start the download (DIR = to memory)");
++            t.Equals(reads, 2u, "two qwords are taken from the GS FIFO");
++            t.Equals(static_cast<uint32_t>(mem.getScratchpad()[0x40]), 0x41u, "first qword lands in the scratchpad");
++            t.Equals(static_cast<uint32_t>(mem.getScratchpad()[0x50]), 0x42u, "second qword follows it");
++            t.Equals(mem.readIORegister(kVif1 + 0x10u), 0x80000060u, "MADR advances inside the scratchpad and keeps SPR");
++
++            // A destination outside RAM must not consume FIFO data.
++            reads = 0u;
++            t.IsTrue(mem.writeIORegister(kVif1 + 0x10u, 0x10000000u), "MADR in the IO range");
++            t.IsTrue(mem.writeIORegister(kVif1 + 0x20u, 2u), "QWC 2");
++            t.IsTrue(mem.writeIORegister(kVif1, 0x100u), "start the download");
++            t.Equals(reads, 0u, "no qword is taken from the FIFO for an unwritable destination");
++            t.Equals(mem.readIORegister(kVif1 + 0x20u) & 0xFFFFu, 2u, "QWC is left as programmed");
++        });
++
++        tc.Run("GIF IMAGE tags do not apply PRE/PRIM; PACKED tags do", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            const auto primType = [&gs]() { return gs.getDebugSnapshot().prim.type; };
++            const GSPrimType before = primType();
++
++            std::vector<uint8_t> image;
++            appendU64(image, makeGifTagPrim(0u, GS_PRIM_TRIANGLE, GIF_FMT_IMAGE, 0u, true, true));
++            appendU64(image, 0ull);
++            gs.processGIFPacket(image.data(), static_cast<uint32_t>(image.size()));
++            t.IsTrue(primType() == before, "an IMAGE tag leaves PRIM alone even with PRE set");
++
++            std::vector<uint8_t> packed;
++            appendU64(packed, makeGifTagPrim(0u, GS_PRIM_TRIANGLE, GIF_FMT_PACKED, 1u, true, true));
++            appendU64(packed, 0x0Eull);
++            gs.processGIFPacket(packed.data(), static_cast<uint32_t>(packed.size()));
++            t.IsTrue(primType() == GS_PRIM_TRIANGLE, "a PACKED tag with PRE sets PRIM");
++        });
++
++        tc.Run("GIF arbiter finds a PATH3 IMAGE tag after a setup packet", [](TestCase &t)
++        {
++            std::vector<uint8_t> order;
++            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                if (data && sizeBytes > 0u)
++                    order.push_back(data[0]);
++            });
++            // A+D setup (tag + 4 registers), then IMAGE: the first tag alone is not an image.
++            std::vector<uint8_t> upload;
++            appendU64(upload, makeGifTag(0x04u, GIF_FMT_PACKED, 1u, false)); // first byte 0x04
++            appendU64(upload, 0x0Eull);
++            for (int i = 0; i < 8; ++i) appendU64(upload, 0ull);
++            appendU64(upload, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
++            appendU64(upload, 0ull);
++            appendU64(upload, 0ull); appendU64(upload, 0ull);
++            const std::vector<uint8_t> directHl(16u, 0xD2u);
++            arbiter.submit(GifPathId::Path3, upload.data(), static_cast<uint32_t>(upload.size()));
++            arbiter.submit(GifPathId::Path2, directHl.data(), static_cast<uint32_t>(directHl.size()), true);
++            arbiter.drain();
++            const std::vector<uint8_t> expected{0x04u, 0xD2u};
++            t.IsTrue(order == expected, "DIRECTHL waits behind a PATH3 upload whose IMAGE tag is not the first tag");
++        });
++
++        tc.Run("GIF arbiter keeps working after an oversized packet", [](TestCase &t)
++        {
++            uint32_t seen = 0u;
++            GifArbiter arbiter([&](const uint8_t *, uint32_t size) { seen += size; });
++            std::vector<uint8_t> big(2u * 1024u * 1024u, 0u);
++            const uint64_t tag = makeGifTag(0x7FFFu, GIF_FMT_IMAGE, 0u, true);
++            std::memcpy(big.data(), &tag, sizeof(tag));
++            arbiter.submit(GifPathId::Path3, big.data(), static_cast<uint32_t>(big.size()));
++            arbiter.drain();
++            const std::vector<uint8_t> small(32u, 0u);
++            arbiter.submit(GifPathId::Path2, small.data(), 32u);
++            arbiter.drain();
++            t.Equals(seen, static_cast<uint32_t>(big.size() + 32u), "both packets are delivered in full");
++        });
++    });
+ }
+-- 
+2.55.0
+

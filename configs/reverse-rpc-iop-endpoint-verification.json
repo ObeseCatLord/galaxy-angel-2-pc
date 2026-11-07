@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "source_status": "astra-reviewed-iop-endpoint-ee-transport-pending",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "source_patch_prefix": 20,
+  "patch_file": "0020-async-iop-rpc-endpoint.patch",
+  "patch_sha256": "da88b29de55163d83ad9dd03bb5b421f99087c3bcb39ab8fc2070088063e2c66",
+  "reproduced_affected_files": 77,
+  "idempotent_primary_prefix": 20,
+  "review": {
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "production": "approved after admission/backing-retirement/stack-span corrections",
+    "regressions": "approved after alias, legacy-stack negatives, reuse-target and actual kernel-stack retirement corrections",
+    "disposition": "docs/reviews/reverse-rpc-iop-endpoint.md"
+  },
+  "observed_subset": {
+    "function": 0,
+    "mode": 0,
+    "send_bytes": 40,
+    "receive_bytes": 64,
+    "end_function": 0,
+    "end_parameter": 0,
+    "ABI": "o32 registers client/function/mode/send; stack16..32 sendSize/receive/receiveSize/end/endParameter"
+  },
+  "tests": {
+    "runtime": {
+      "passed": 529,
+      "failed": 0
+    },
+    "standalone_iop_suites": {
+      "passed": 11,
+      "failed": 0
+    },
+    "tooling": {
+      "passed": 27,
+      "failed": 0
+    },
+    "real_mips_import": "two deferred Call16 requests and exactly two continuations without reset",
+    "independent_admission_guard": "same original MIPS fixture now passes guard-before-effect; old full-copy suite excluded"
+  },
+  "native": {
+    "accepted_binary_prefixes": 21,
+    "rebuild_20": "all five terminal exit0; actual SHA256/size in native-verification.json; no new native gameplay acceptance",
+    "host_submission": "default false until original EE transport integration",
+    "native_handler_reply_audio": "unverified"
+  },
+  "limits": "Serialized observed Call16 endpoint only. EE execution lifetime/source21 draft, full SIF/original SDK transport and native gameplay/audio/enhanced features excluded."
+}

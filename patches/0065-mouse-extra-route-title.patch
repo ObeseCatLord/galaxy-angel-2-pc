@@ -1,0 +1,50 @@
+From aa776b575aed85f108e511446cf5d897e34f2b79 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:26:27 -0500
+Subject: [PATCH] ga2: mouse on the Zettai Extra Route title (Mugen disc 2)
+
+The title is recognised from the picture like the system menu; its button
+text crosses the centre rows, so visual menus may test a row at a fixed
+offset from each item's top instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index ba258d3..9a38f00 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -110,6 +110,7 @@ namespace ps2_mouse_menus
+         {
+             std::vector<Item> items;
+             bool horizontal = false; // Left/Right instead of Up/Down
++            int sampleRow = -1;      // row tested, from each item's top (-1: centre)
+         };
+ 
+         const std::vector<VisualMenu> &visualMenus()
+@@ -119,6 +120,10 @@ namespace ps2_mouse_menus
+                 {{{241, 121, 407, 149}, {241, 155, 407, 183}, {241, 188, 407, 216}, {241, 221, 407, 249}}},
+                 // Yes/No prompts (save, load, overwrite): はい / いいえ.
+                 {{{212, 233, 309, 255}, {329, 233, 426, 255}}, true},
++                // Zettai Extra Route title (Mugen disc 2): はじめから / つづきから /
++                // オプション / 無限回廊の鍵; text crosses the centre rows, so the
++                // fill just below each button's top edge is tested.
++                {{{212, 272, 428, 298}, {212, 309, 428, 334}, {212, 346, 428, 371}, {212, 384, 428, 409}}, false, 4},
+             };
+             return table;
+         }
+@@ -129,7 +134,8 @@ namespace ps2_mouse_menus
+             for (size_t i = 0; i < menu.items.size(); ++i)
+             {
+                 const Item &it = menu.items[i];
+-                const int y = static_cast<int>((it.y0 + it.y1) * 0.5f);
++                const int y = menu.sampleRow >= 0 ? static_cast<int>(it.y0) + menu.sampleRow
++                                                  : static_cast<int>((it.y0 + it.y1) * 0.5f);
+                 int r = 0, b = 0, n = 0;
+                 for (int x = static_cast<int>(it.x0) + 15; x < static_cast<int>(it.x1) - 8; x += 6, ++n)
+                 {
+-- 
+2.55.0
+

@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "runtime_patch_sha256": "a68bef511684e229a1b18e86ac32bcf24d80b49d9c00e6a0988863a8c96c6a11",
+  "runtime_tests": {
+    "passed": 558,
+    "failed": 0,
+    "scope": "reviewed source22 copied-byte regression, including15 native hook/SIF lifecycle additions; actual native EE transport unimplemented"
+  },
+  "importer_tests": {
+    "passed": 7,
+    "failed": 0
+  },
+  "builds": [
+    {
+      "disc_id": "eigou-1",
+      "elf_sha256": "37544fc408902b35e5248343afeb3b7c88ea6a24132c483ed4dc6be927996ce7",
+      "binary_size": 404341768,
+      "status": "compiled-gameplay-unverified",
+      "binary_sha256": "1f0940e082889faaa828a83ddda84e0a2fe6d9493ffbc5b79ccc70cec036bfc6",
+      "runtime_patch_prefix": 22
+    },
+    {
+      "disc_id": "eigou-2",
+      "elf_sha256": "f4c47a716634fab0304ae04e70195e796bfc404ca66515cdbe43c1e49b3b0c93",
+      "binary_size": 391995736,
+      "status": "compiled-gameplay-unverified",
+      "binary_sha256": "b4fffcb2ab87c4fcd5a7609f8b1337d3932c1bc4ebe3e2d5c450157b73d67437",
+      "runtime_patch_prefix": 22
+    },
+    {
+      "disc_id": "mugen-1",
+      "elf_sha256": "b895cdb1c3195391bfd2bb85ec2c82ae0997ba85e243d9d5a6a7b291b53c4ab9",
+      "binary_size": 391353016,
+      "status": "compiled-gameplay-unverified",
+      "binary_sha256": "a443914e3b90a102dd6e2f1114542b2a599f1abde069437f2f04ba1aedb69e8b",
+      "runtime_patch_prefix": 22
+    },
+    {
+      "disc_id": "mugen-2",
+      "elf_sha256": "4c7699860da1613291059ae7bdbfed96fa5f5dd31e52bb05a91905fbd7fb3cb0",
+      "binary_size": 366773000,
+      "status": "compiled-gameplay-unverified",
+      "binary_sha256": "2e9a38b336929cb983ffffb164e423c4ccb222eb6c23bcb8fb7f124fdaabf02b",
+      "runtime_patch_prefix": 22
+    },
+    {
+      "disc_id": "zettai",
+      "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+      "binary_size": 365787424,
+      "status": "compiled-gameplay-unverified",
+      "binary_sha256": "4e9998136e76a0090124835c51b77446e317bf783c77d4248a8f4f6a92e554be",
+      "runtime_patch_prefix": 22
+    }
+  ],
+  "zettai_reference": "title-menu-and-opening-story-visually-verified-audio-unverified",
+  "zettai_native": "Title logo/starfield, four opening narration groups and first Kazuya dialogue box render in ordinary captures. Diagnostic original EE-to-IOP bank receive now copies real bytes; original decoder advances to SPU DMA then transfer errors25/18. Voices, full scene, battle, save and enhanced timing/rendering remain unverified.",
+  "mugen_1_native": "magenta-output-ten-second-sample-wrapper-0028e800-v0-zero",
+  "eigou_1_native": "magenta-output-ten-second-sample-scheduler-deadline-wait",
+  "zettai_sdk_bindings_sha256": "138ed28deb200ad82e05dacca111f1e79733584e1fd313fc1da389e7bb068dd5",
+  "iop_images": "all-five-identical-16-ELF-image-inventories; six original native Zettai providers booted, full firmware and other native boots unverified",
+  "runtime_patch_stack": [
+    {
+      "file": "0001-root-stack-heap-bounds.patch",
+      "sha256": "a68bef511684e229a1b18e86ac32bcf24d80b49d9c00e6a0988863a8c96c6a11"
+    },
+    {
+      "file": "0002-iop-cdvd-transfer-buffer.patch",
+      "sha256": "015f2353388d3808bdae0ec90ca164175cfa8d8708b38d6bab9356089f66af66"
+    },
+    {
+      "file": "0003-iop-dvd-sector-transfer.patch",
+      "sha256": "ee6ffa0804670a931460e0e881ac2b514f221744118ed9890fa8ef2c7e637f15"
+    },
+    {
+      "file": "0004-iop-module-start-abi.patch",
+      "sha256": "6d4492ff0662742251c05f8ce2db2261c97a4d4c84ace5e0fbcdc2419395eab7"
+    },
+    {
+      "file": "0005-iop-cdvd-subcommand-fifo.patch",
+      "sha256": "1809b7154e948504bc5f62179ffbf95bc791f7dc2e7dcbf539a3b5ba8c637aaa"
+    },
+    {
+      "file": "0006-iop-boot-dependencies.patch",
+      "sha256": "0f9c1569c5a6e66e03108a9cbfb5112786755906ba8dc437d02106f1d700942b"
+    },
+    {
+      "file": "0007-iop-boot-notification-effects.patch",
+      "sha256": "3c3aca4523b8c089606266574f7f720f74fda2b6253f411e8ba70697d7dc57e6"
+    },
+    {
+      "file": "0008-mounted-disc-and-reset-boundary.patch",
+      "sha256": "154eb9c4dfd92935534ae4a3293399f05fe9a3558f558b9df54f652cc7b048d7"
+    },
+    {
+      "file": "0009-native-iop-image-bootstrap.patch",
+      "sha256": "3a162b48d8fa3e7dd8cbc38d01947f53680068151096b0c8bcda634508b6a0ed"
+    },
+    {
+      "file": "0010-deci2-console-callbacks.patch",
+      "sha256": "96662d4b6714573baf485f15dd903fb485aab961331be021b7b674aecd84dca6"
+    },
+    {
+      "file": "0011-callback-stack-ownership.patch",
+      "sha256": "3279cf5fcc66a42c532576040817ff3db54ffb26242f57786ad327b4f586a4da"
+    },
+    {
+      "file": "0012-native-kernel-callback-arena.patch",
+      "sha256": "10345491032096c2c1b212a5a7d7b4aad6978bf5de10748db01eb3e4ab4e7b9b"
+    },
+    {
+      "file": "0013-ioman-devctl-original-driver.patch",
+      "sha256": "3e22d2eaeed35f6519e0140656e2bb30b5dd62b2a879d71576ffc541b0b96d02"
+    },
+    {
+      "file": "0014-pad-supported-mode-table.patch",
+      "sha256": "8cad8bc4819fd1d1538c92cb85ea4b3ba1c15b5fe958f11045c875e40d22f84f"
+    },
+    {
+      "file": "0015-vif-direct-gif-image-boundaries.patch",
+      "sha256": "1fe0208aa213425b83ccc68a39bd4a764b76cc5f5b5fca9c70b57c231346acee"
+    },
+    {
+      "file": "0016-sif-synchronous-other-data.patch",
+      "sha256": "e9f9ad75dc281bc2972d8457b12490dca8b7c5f2437b1c8710696e2d2cb96f9b"
+    },
+    {
+      "file": "0017-checked-native-rpc-wait.patch",
+      "sha256": "e458c7ec1496802649fe5598a4991fd594aaa093c180001cb4ca10e329825e5a"
+    },
+    {
+      "file": "0018-native-ee-sdk-rpc-binding.patch",
+      "sha256": "501f0a77174f3860f36c4b399a61925acca3223eac4680c8ba2825a3790d497b"
+    },
+    {
+      "file": "0019-checked-ee-iop-rpc-ownership.patch",
+      "sha256": "fff1a433ce7b1a0cc07f17b545d5e22f2bb611de66cbc23f9e13b4eaaab86f06"
+    },
+    {
+      "file": "0020-async-iop-rpc-endpoint.patch",
+      "sha256": "da88b29de55163d83ad9dd03bb5b421f99087c3bcb39ab8fc2070088063e2c66"
+    },
+    {
+      "file": "0021-ee-execution-retirement.patch",
+      "sha256": "d862ddb51360c5fa781919cdad158f30ab212cd8ba1a4624d15868cb27e99bd0"
+    },
+    {
+      "file": "0022-native-ee-rpc-hooks.patch",
+      "sha256": "08f3cc9922dcf753e9110ba1da179b17d5d2dd707b4538bd9c6e6ab1d5da3745"
+    }
+  ],
+  "zettai_native_last_capture": "captures/native-zettai/20261009-130633/capture.json",
+  "original_cdvdman": "all-five-original-startups-returned-in-1782-instructions-full-image-bootstrap-unverified",
+  "native_build_source_commit": "21ea7e2",
+  "native_build_patch_prefix": 22,
+  "native_build_source_state": "All five native targets rebuilt from Astra-reviewed source22; terminal exit0 and actual SHA256/size recorded. Generation19 unchanged; native profiles do not yet enable reverse submission, and no new22 native audio/gameplay acceptance.",
+  "disc_mount_verification": "disc-mount-verification.json",
+  "tooling_tests": {
+    "passed": 27,
+    "failed": 0
+  },
+  "iop_test_suites": {
+    "passed": 11,
+    "failed": 0,
+    "scope": "unchanged accepted20 IOP endpoint and existing suites"
+  },
+  "next_native_blocker": "Original Call16 EE transport remains unimplemented. Execution lifetime/retirement prerequisites are reviewed21. Connect existing SIF delivery and original EE handler/queue/GetNext/RpcLoop to owned actual callback reply; prove original STREAM999/0 and exactly one IOP continuation before bank/chunk/PCM and gameplay.",
+  "native_boot_correctness_review": "Astra gpt-6-astra ultra; scoped fixes accepted; original receiving-consumer route remains open",
+  "deci2_verification": "deci2-verification.json",
+  "zettai_recomp_config_sha256": "5f67e1d3890f64c20867e41c5efeaabdefffac4c64b784a7d5110913df785359",
+  "graphics_entry_verification": "graphics-entry-verification.json",
+  "callback_stack_verification": "callback-stack-verification.json",
+  "callback_stack_correctness_review": "Astra Ultra; attached-owner savedRA correction and API/reset subset accepted; scene/general orphan pool/realELFreload unverified",
+  "later_descriptor_verification": "later-descriptor-verification.json",
+  "idle_kernel_stack_verification": "idle-kernel-stack-verification.json",
+  "idle_kernel_stack_correctness_review": "Astra gpt-6-astra ultra; scoped contract, production fixes and final assertions accepted; 475 tests pass; exact-game same-process reload and complete native scene remain unverified",
+  "ioman_devctl_verification": "ioman-devctl-verification.json",
+  "ioman_devctl_correctness_review": "Astra gpt-6-astra ultra; minimal adapter, fault guards, required nested/ready-thread boundary tests and observer fixes accepted; source signoff plus main-verified475 runtime/9 IOP/15 tooling passes; no scene gate",
+  "object_operation_verification": "object-operation-verification.json",
+  "object_operation_correctness_review": "Astra Ultra independently verified original ELF/table/boundaries/generated5file hashes/registry, exact native27DB70 effect sample+fullSP/GP/RA and later13A290failure; two other setters unobserved, no scene gate",
+  "object_factory_verification": "object-factory-verification.json",
+  "object_factory_correctness_review": "Astra Ultra independently verified originaldescriptor/103words+5zero delays/all11case routes/22resumes/7file hashes and native selector1 ctor/shared-epilogue return/pointer/raw128bitS0 GP SP RA preservation; othercases/helpers unobserved, no scene/audio gate",
+  "descriptor_query_verification": "descriptor-query-verification.json",
+  "descriptor_query_correctness_review": "Astra Ultra accepted source and native selector19 query/case return: result4/output6DB0, raw128GP SP RA/neighbor preservation, all35live tablewords verifiedagainstELF and3outputhashes; otherselectors/registration unobserved, next23ED20, no scene/audio",
+  "resource_initializer_verification": "resource-initializer-verification.json",
+  "resource_initializer_correctness_review": "Astra Ultra accepted source/observer/native selector19-mode0 callback: 12 original packetwords, return12/237AF0, raw128S0..S4 GP SP RA,35wordoriginaltableparity; ordinary memory-card text viewed by main+Astra; other selectors/modes/gameplay/audio unverified",
+  "object_mask_verification": "object-mask-verification.json",
+  "object_mask_correctness_review": "Astra Ultra accepted source/observer and eight correlated native zero-result returns:64bitV0/V1/A0,128bit preservation,original descriptor and bounded object/input parity; partialUI/reference/wait/key-delivery limits accepted; functional input/title/gameplay/audio unverified",
+  "controller_sdk_verification": "controller-sdk-verification.json",
+  "controller_sdk_correctness_review": "Astra gpt-6-astra ultra; source/generated external routes,55pairednative returns/two alignment chains,real backend packets/original queries and visible selection/dismissal accepted; interior/device/full-scene limits remain",
+  "object_collection_verification": "object-collection-verification.json",
+  "object_collection_correctness_review": "Astra gpt-6-astra ultra; exactfourentry/42aliaspreservation+installation andonevalidoriginallookup all32raw128GPR/80stackbytes/28ELFdescriptorword/object/list parity accepted;white30s/black60s viewed,scene/cause/audio/otherbranches remainunproved",
+  "scene_readiness_verification": "scene-readiness-verification.json",
+  "zettai_native_last_diagnostic_capture": "captures/native-zettai/20261009-152827/capture.json",
+  "vif_direct_verification": "vif-direct-verification.json",
+  "vif_direct_correctness_review": "Astra gpt-6-astra ultra; narrowA design/production source andfinaltestdelta signedoff; independent64pair/60phase4 cycle/header/stream andordinarytitle-logo evidence verified; sample/provenance/noFPS/menu/audio limits retained",
+  "return_only_verification": "return-only-verification.json",
+  "return_only_correctness_review": "Astra gpt-6-astra ultra: exactELF2hints/generatedreturnbeforeadjacentstore,4sourcehashes,no116417ownerdiff and42effectivealiases,actualsample1calleeFinish/CPU/object/stack/originaldescriptorparity accepted. Secondmethodunobserved; titlelogo only, no menu/opening/audio/FPS.",
+  "return_only_next_verification": "return-only-next-verification.json",
+  "return_only_next_correctness_review": "Astra gpt-6-astra ultra: observed-only42hintprofile/3sourcehashes/zero116419ownerdiff andobserverC8 fields accepted; independent4pairedreturn1193F8/rawsampledCPU/256object/64stack/20originaldescriptor/42aliasparity. Batch41withheld13ownerdiff unrelatedtonewthunks;no globalrankingoroverride. No menu/opening/audio/FPS gate.",
+  "opening_render_verification": "opening-render-verification.json",
+  "sif_receive_verification": "sif-receive-verification.json",
+  "sif_receive_correctness_review": "Astra gpt-6-astra ultra accepted final mode-0 bridge, sensitive failure tests/mutations, packaged patch/observer and five bounded original native receives; all bank/audio/DMA completion/gameplay limits explicit.",
+  "spu_completion_verification": "spu-completion-verification.json",
+  "spu_completion_correctness_review": "Astra gpt-6-astra ultra independently verified cycle-ordered native empty-wait/busy-error/later-original-callback sequence and reviewed minimal adapter vs server-thread routing. Implementation not yet done; scope/source/PCM limits retained.",
+  "checked_rpc_wait_verification": "checked-rpc-wait-verification.json",
+  "checked_rpc_wait_correctness_review": "Astra gpt-6-astra ultra source-scoped approval after metadata lifetime, immediate token handoff, ordinary exit, pending/acquired and exact-deadline corrections. Original game wait and PCM unverified.",
+  "native_ee_rpc_binding_verification": "native-ee-rpc-binding-verification.json",
+  "source_patch_prefix": 21,
+  "reverse_rpc_ee_retirement_verification": "reverse-rpc-ee-retirement-verification.json",
+  "accepted_runtime_source_patch_prefix": 22
+}

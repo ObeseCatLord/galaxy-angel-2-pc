@@ -1,0 +1,494 @@
+From 9d74ecb0f8786c7c5f57ed2cdac286c9bc750b3a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 13:45:47 -0500
+Subject: [PATCH] ga2: memory cards via HLE MCSERV, generic IOP->EE RPC
+ service, NTSC vblank, smaller fixes
+
+- Memory cards: SIO2 is not emulated, so MCMAN/MCSERV requested by modload
+  always load through the HLE provider (host-file cards); it reports the
+  MCSERV 2.1 / MCMAN 2.3 versions the GA2 discs ship (libmc rejected older
+  ones). Both games now detect a formatted card.
+- Generic reverse RPC: without game-specific hooks, an IOP call to an EE RPC
+  server runs the registered sceSifServeData func(fno, buff, size) as a
+  guest invocation and returns the 64 reply bytes (Mugen needs this).
+- VBlank pacing and cycle period are NTSC 60000/1001 Hz.
+- GIF arbiter reuses packet buffers and skips sorting single packets; pgs
+  readback copies raw pixels on the game thread and converts on the present
+  thread.
+- Diagnostics: GA2_WATCHDOG=<s> samples the EE pc; GA2_SYSCALL_TRACE logs
+  SetSyscall/FindAddress.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/iop_emulator.cpp         | 13 +++-
+ ps2xIOP/src/emulator/iop_emulator.h           |  5 ++
+ ps2xIOP/src/iop_subsystem.cpp                 |  7 ++
+ ps2xIOP/src/modules/mcserv.cpp                |  6 +-
+ ps2xIOP/tests/iop_compatibility_tests.cpp     |  3 +-
+ .../include/runtime/gs/ps2_gif_arbiter.h      |  3 +-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |  5 +-
+ .../src/lib/Kernel/Syscalls/System.cpp        |  5 ++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             | 50 ++++++-------
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    | 22 +++---
+ ps2xRuntime/src/lib/ps2_iop_host.cpp          | 75 ++++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_iop_host.h            |  2 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 18 +++++
+ 13 files changed, 170 insertions(+), 44 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 2600070..a85f181 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_emulator.h"
++#include "ps2x/iop/ps2_path.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+ #include "imports/iop_heaplib.h"
+@@ -556,7 +557,11 @@ namespace ps2x::iop::detail
+                         setV0(-201u);
+                         return ImportDisposition::Handled;
+                     }
+-                    const auto loaded = loadModule(path, bytes.data(), uint32_t(length));
++                    const std::string leaf = ps2PathLeafKey(path);
++                    const bool hardwareHle = leaf == "mcman" || leaf == "xmcman" || leaf == "mcserv" || leaf == "xmcserv";
++                    const auto loaded = hardwareHle && hleModuleLoader
++                                            ? hleModuleLoader(path)
++                                            : loadModule(path, bytes.data(), uint32_t(length));
+                     if (loaded.moduleId > 0 && output != 0u)
+                         memory.write32(output, uint32_t(loaded.startResult));
+                     setV0(uint32_t(loaded.moduleId));
+@@ -1293,6 +1298,7 @@ namespace ps2x::iop::detail
+             return true;
+         }
+ 
++        IopEmulator::HleModuleLoader hleModuleLoader;
+         IopHost &host;
+         IopMemory memory;
+         std::unique_ptr<ga2::spu::Device> spu;
+@@ -1372,6 +1378,11 @@ namespace ps2x::iop::detail
+         return m_impl->callDepth == 0u && m_impl->activeCpu == nullptr;
+     }
+ 
++    void IopEmulator::setHleModuleLoader(HleModuleLoader loader)
++    {
++        m_impl->hleModuleLoader = std::move(loader);
++    }
++
+     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
+         return m_impl->loadModule(path, arguments, argumentSize);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index e93750f..24e34fc 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -4,6 +4,7 @@
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <span>
+ #include <string>
+@@ -29,6 +30,10 @@ namespace ps2x::iop::detail
+         [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
++        // Modules whose hardware is not emulated (memory cards behind SIO2)
++        // load through this provider even when an original IRX is requested.
++        using HleModuleLoader = std::function<ModuleLoadResult(std::string_view path)>;
++        void setHleModuleLoader(HleModuleLoader loader);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 43cc536..b890ddd 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -46,6 +46,13 @@ namespace ps2x::iop
+             coreServices.emplace_back(detail::createLibSdService(host));
+             refreshServiceModuleKeys();
+             rebuildRoutes();
++            emulator.setHleModuleLoader([this](std::string_view path)
++                                        {
++                                            ModuleLoadResult result = moduleManager.loadHle(path);
++                                            if (result.moduleId > 0)
++                                                rebuildRoutes();
++                                            recordLoadOutcome(path, result.moduleId > 0);
++                                            return result; });
+         }
+ 
+         bool serviceActive(const detail::IopService &service) const
+diff --git a/ps2xIOP/src/modules/mcserv.cpp b/ps2xIOP/src/modules/mcserv.cpp
+index ce23759..4d0e6c5 100644
+--- a/ps2xIOP/src/modules/mcserv.cpp
++++ b/ps2xIOP/src/modules/mcserv.cpp
+@@ -19,8 +19,10 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kMcservDev9Sid = 0x80000480u;
+         constexpr int32_t kSucceeded = 0;
+         constexpr int32_t kDenied = -5;
+-        constexpr uint32_t kMcservVersion = 0x0205u;
+-        constexpr uint32_t kMcmanVersion = 0x0206u;
++        // Versions of the MCSERV 2.1 / MCMAN 2.3 modules the GA2 discs ship; the
++        // SDK libmc rejects older modules.
++        constexpr uint32_t kMcservVersion = 0x0210u;
++        constexpr uint32_t kMcmanVersion = 0x0230u;
+         constexpr uint32_t kCreateDirectory = 0x0040u;
+ 
+         enum class Operation
+diff --git a/ps2xIOP/tests/iop_compatibility_tests.cpp b/ps2xIOP/tests/iop_compatibility_tests.cpp
+index 5c3bf40..16ae03c 100644
+--- a/ps2xIOP/tests/iop_compatibility_tests.cpp
++++ b/ps2xIOP/tests/iop_compatibility_tests.cpp
+@@ -108,7 +108,8 @@ namespace
+         IopSubsystem iop(host);
+         require(iop.loadModule("rom0:XMCSERV").moduleId > 0, "XMCSERV load failed");
+         require(iop.handleRpc(request(mcSid, 0xFEu, 16u)).handled, "init RPC failed");
+-        require(host.word(0x800u) == 0u && host.word(0x804u) == 0x0205u && host.word(0x808u) == 0x0206u,
++        // Versions of the MCSERV 2.1 / MCMAN 2.3 modules on the GA2 discs.
++        require(host.word(0x800u) == 0u && host.word(0x804u) == 0x0210u && host.word(0x808u) == 0x0230u,
+                 "new memory-card init layout changed");
+         require(host.word(0x80Cu) == 0xCCCCCCCCu, "new init wrote beyond 12-byte response");
+     }
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 225e67b..0c818db 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -41,12 +41,13 @@ public:
+                 const uint8_t *tapData = nullptr, uint32_t tapBytes = 0u);
+ 
+     void drain();
+-    bool empty() const { return m_queue.empty(); }
++    bool empty() const { return m_count == 0; }
+ 
+ private:
+     ProcessPacketFn m_processFn;
+     TapFn m_tapFn;
+     std::vector<GifArbiterPacket> m_queue;
++    size_t m_count = 0;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+     static uint8_t pathPriority(GifPathId id);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index edb7298..d7d520e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -35,7 +35,8 @@ namespace
+     constexpr uint32_t WEF_OR = 0x01u;
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
++    // NTSC field rate is 60000/1001 Hz (59.94), not 60.
++    constexpr auto kVBlankPeriod = std::chrono::nanoseconds(16683333);
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+@@ -54,7 +55,7 @@ namespace
+         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+     }
+ 
+-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
++    constexpr uint64_t kVBlankPeriodCycles = EeScheduler::kEeClockHz * 1001u / 60000u;
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 32af447..a345c4b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -464,6 +464,8 @@ namespace ps2_syscalls
+         const uint32_t syscallIndex = getRegU32(ctx, 4);
+         const uint32_t handler = getRegU32(ctx, 5);
+         runtime->setEeSyscallOverride(rdram, syscallIndex, handler);
++        if (std::getenv("GA2_SYSCALL_TRACE"))
++            std::cerr << "[SetSyscall] index=0x" << std::hex << syscallIndex << " handler=0x" << handler << std::dec << std::endl;
+ 
+         setReturnS32(ctx, 0);
+     }
+@@ -931,6 +933,9 @@ namespace ps2_syscalls
+                                   matchCount);
+ 
+         setReturnU32(ctx, resultAddr);
++        if (std::getenv("GA2_SYSCALL_TRACE"))
++            std::cerr << "[FindAddress] start=0x" << std::hex << originalStart << " end=0x" << originalEnd
++                      << " target=0x" << target << " -> 0x" << resultAddr << std::dec << std::endl;
+     }
+ 
+     // QueryBootMode (stub): return 0 for now
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 1e4e994..0f2c127 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -68,6 +68,7 @@ namespace
+         std::vector<uint8_t> frame;
+         uint32_t frameWidth = 0, frameHeight = 0;
+         bool frameFresh = false;
++        bool frameBgra = false;
+ 
+         // statistics
+         uint64_t swaps = 0, packets = 0, bytes = 0;
+@@ -217,26 +218,10 @@ namespace
+         const size_t pixels = size_t(slot.width) * slot.height;
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
++            // Raw copy only; the present thread converts (takeFrame).
+             s.frame.resize(pixels * 4u);
+-            const bool bgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+-            uint8_t *dst = s.frame.data();
+-            for (size_t i = 0; i < pixels; ++i)
+-            {
+-                const uint32_t p = src[i];
+-                if (bgra)
+-                {
+-                    dst[i * 4 + 0] = uint8_t(p >> 16);
+-                    dst[i * 4 + 1] = uint8_t(p >> 8);
+-                    dst[i * 4 + 2] = uint8_t(p);
+-                }
+-                else
+-                {
+-                    dst[i * 4 + 0] = uint8_t(p);
+-                    dst[i * 4 + 1] = uint8_t(p >> 8);
+-                    dst[i * 4 + 2] = uint8_t(p >> 16);
+-                }
+-                dst[i * 4 + 3] = 0xff;
+-            }
++            std::memcpy(s.frame.data(), src, pixels * 4u);
++            s.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+             s.frameWidth = slot.width;
+             s.frameHeight = slot.height;
+             s.frameFresh = true;
+@@ -432,13 +417,26 @@ namespace ga2_pgs
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+     {
+         State &s = state();
+-        std::lock_guard<std::mutex> lock(s.frameMutex);
+-        if (!s.frameFresh)
+-            return false;
+-        rgba.swap(s.frame);
+-        width = s.frameWidth;
+-        height = s.frameHeight;
+-        s.frameFresh = false;
++        bool bgra = false;
++        {
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            if (!s.frameFresh)
++                return false;
++            rgba.swap(s.frame);
++            width = s.frameWidth;
++            height = s.frameHeight;
++            bgra = s.frameBgra;
++            s.frameFresh = false;
++        }
++        // Convert to opaque RGBA here, on the present thread.
++        auto *px = reinterpret_cast<uint32_t *>(rgba.data());
++        const size_t pixels = size_t(width) * height;
++        for (size_t i = 0; i < pixels; ++i)
++        {
++            const uint32_t p = px[i];
++            px[i] = bgra ? (((p >> 16) & 0xFFu) | (p & 0xFF00u) | ((p & 0xFFu) << 16) | 0xFF000000u)
++                         : (p | 0xFF000000u);
++        }
+         return true;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index f671e84..88b190c 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -24,18 +24,19 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     if (!data || sizeBytes < 16 || !m_processFn)
+         return;
+ 
+-    GifArbiterPacket pkt;
++    // Packet buffers are reused across drains (the queue keeps its elements).
++    if (m_count == m_queue.size())
++        m_queue.emplace_back();
++    GifArbiterPacket &pkt = m_queue[m_count++];
+     pkt.pathId = pathId;
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
+     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+-    pkt.data.resize(sizeBytes);
+-    std::memcpy(pkt.data.data(), data, sizeBytes);
++    pkt.data.assign(data, data + sizeBytes);
++    pkt.hasTapData = tapData != nullptr;
+     if (tapData)
+-    {
+-        pkt.hasTapData = true;
+         pkt.tapData.assign(tapData, tapData + tapBytes);
+-    }
+-    m_queue.push_back(std::move(pkt));
++    else
++        pkt.tapData.clear();
+ }
+ 
+ void GifArbiter::drain()
+@@ -43,7 +44,8 @@ void GifArbiter::drain()
+     if (!m_processFn)
+         return;
+ 
+-    std::stable_sort(m_queue.begin(), m_queue.end(),
++    if (m_count > 1u)
++        std::stable_sort(m_queue.begin(), m_queue.begin() + static_cast<std::ptrdiff_t>(m_count),
+                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+                      {
+                          // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+@@ -57,7 +59,7 @@ void GifArbiter::drain()
+                          return pathPriority(a.pathId) < pathPriority(b.pathId);
+                      });
+ 
+-    for (size_t i = 0; i < m_queue.size(); ++i)
++    for (size_t i = 0; i < m_count; ++i)
+     {
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+@@ -72,7 +74,7 @@ void GifArbiter::drain()
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+-    m_queue.clear();
++    m_count = 0;
+ }
+ 
+ uint8_t GifArbiter::pathPriority(GifPathId id)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index e74a22d..4bdbc61 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -10,6 +10,8 @@
+ #include "Kernel/Syscalls/Common.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <memory>
+ #include <cstring>
+ #include <filesystem>
+ #include <iostream>
+@@ -171,11 +173,82 @@ bool PS2IopHostAdapter::submitReverseRpc(const ps2x::iop::ReverseRpcRequest &req
+                                         ps2x::iop::ReverseRpcCompletionEndpoint endpoint)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_callMutex);
+-    if (m_activeToken == 0u || !m_nativeEeRpcHooks || !m_nativeEeRpcHooks->submit) return false;
++    if (m_activeToken == 0u) return false;
++    if (!m_nativeEeRpcHooks || !m_nativeEeRpcHooks->submit)
++        return submitGenericReverseRpc(request, std::move(endpoint));
+     NativeEeRpcHookScope hookScope(m_nativeEeRpcHooksActive);
+     return m_nativeEeRpcHooks->submit(request, std::move(endpoint));
+ }
+ 
++// Default IOP->EE RPC service. It does what the SDK's sceSifExecRequest does
++// for the registered sceSifServeData (func at +4, buff at +8): copy the request
++// into the server buffer, run func(fno, buff, size) as a guest invocation on
++// an isolated stack, and return the bytes at the pointer it returns.
++bool PS2IopHostAdapter::submitGenericReverseRpc(const ps2x::iop::ReverseRpcRequest &request,
++                                                ps2x::iop::ReverseRpcCompletionEndpoint endpoint)
++{
++    constexpr uint32_t kReplyBytes = 64u;
++    uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
++    const auto physical = [](uint32_t address) { return address & 0x1FFFFFFFu; };
++    const auto inRam = [&](uint32_t address, uint32_t size)
++    { return physical(address) < PS2_RAM_SIZE && size <= PS2_RAM_SIZE - physical(address); };
++    if (!rdram || !endpoint.isCurrent || !endpoint.complete || !endpoint.isCurrent() ||
++        !inRam(request.serverAddress, 68u) || !inRam(request.bufferAddress, request.send.size()))
++        return false;
++    const auto word = [&](uint32_t address)
++    {
++        uint32_t value = 0;
++        std::memcpy(&value, rdram + physical(address), 4);
++        return value;
++    };
++    const auto putWord = [&](uint32_t address, uint32_t value)
++    { std::memcpy(rdram + physical(address), &value, 4); };
++    const uint32_t sd = request.serverAddress;
++    const uint32_t func = word(sd + 4u);
++    if (word(sd + 8u) != request.bufferAddress || !m_runtime.hasFunction(func))
++        return false;
++
++    std::memcpy(rdram + physical(request.bufferAddress), request.send.data(), request.send.size());
++    putWord(sd + 12u, static_cast<uint32_t>(request.send.size())); // size
++    putWord(sd + 36u, request.function);                           // fno
++    putWord(sd + 40u, request.receiveAddress);                     // receive (IOP)
++    putWord(sd + 44u, kReplyBytes);                                // rsize
++
++    GuestInvocation call{};
++    call.kind = GuestInvocationKind::RpcCallback;
++    call.tag = request.nonce;
++    call.context = m_runtime.cpu();
++    call.context.pc = func;
++    SET_GPR_U32(&call.context, 4, request.function);
++    SET_GPR_U32(&call.context, 5, request.bufferAddress);
++    SET_GPR_U32(&call.context, 6, static_cast<uint32_t>(request.send.size()));
++    SET_GPR_U32(&call.context, 29, 0u);
++    SET_GPR_U32(&call.context, 31, 0u);
++    call.requireGuestReturn = true;
++    auto shared = std::make_shared<ps2x::iop::ReverseRpcCompletionEndpoint>(std::move(endpoint));
++    call.isValid = [shared] { return shared->isCurrent && shared->isCurrent(); };
++    call.onCancel = [shared]
++    {
++        if (shared->isCurrent && shared->isCurrent())
++            shared->complete(-1, {});
++    };
++    call.onComplete = [this, shared, inRam](const R5900Context &returned, R5900Context &)
++    {
++        uint8_t *const ram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
++        const uint32_t reply = getRegU32(&returned, 2);
++        std::array<uint8_t, kReplyBytes> bytes{};
++        if (!ram || !inRam(reply, kReplyBytes))
++        {
++            shared->complete(-1, {});
++            return;
++        }
++        std::memcpy(bytes.data(), ram + (reply & 0x1FFFFFFFu), kReplyBytes);
++        shared->complete(0, bytes);
++    };
++    m_runtime.eeScheduler().queueInvocation(std::move(call));
++    return true;
++}
++
+ void PS2IopHostAdapter::dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram,
+                                                   R5900Context *ctx,
+                                                   void (*original)(uint8_t *, R5900Context *, PS2Runtime *))
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index a488a5b..fe60353 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -105,6 +105,8 @@ public:
+     void configureNativeEeRpcQueueRoot(uint32_t address);
+     bool submitReverseRpc(const ps2x::iop::ReverseRpcRequest &request,
+                           ps2x::iop::ReverseRpcCompletionEndpoint endpoint) override;
++    bool submitGenericReverseRpc(const ps2x::iop::ReverseRpcRequest &request,
++                                 ps2x::iop::ReverseRpcCompletionEndpoint endpoint);
+     void configureNativeEeRpcHooks(NativeEeRpcHooks hooks);
+     void dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram, R5900Context *ctx,
+                                     void (*original)(uint8_t *, R5900Context *, PS2Runtime *));
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7f07e44..f62ab44 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2613,6 +2613,24 @@ void PS2Runtime::run()
+     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
+ 
+     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
++    // GA2_WATCHDOG=<seconds>: periodically print the recent guest dispatch
++    // targets (diagnosing boots that stall before the first vsync).
++    if (const char *watch = std::getenv("GA2_WATCHDOG"); watch && std::atoi(watch) > 0)
++    {
++        const int period = std::atoi(watch);
++        std::thread([this, period]
++                    {
++                        for (;;)
++                        {
++                            std::this_thread::sleep_for(std::chrono::seconds(period));
++                            // Racy sampling is fine for a stall diagnostic.
++                            const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
++                            std::cerr << "[watchdog] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
++                                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u) << std::dec
++                                      << " dispatch history: " << formatDispatchHistory() << std::endl;
++                        } })
++            .detach();
++    }
+ 
+     // A blank image to use as a framebuffer
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+-- 
+2.55.0
+

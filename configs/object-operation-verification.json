@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 13,
+  "missing_target_capture": "20261009-035542",
+  "source": {
+    "descriptor": "002d3bf0",
+    "constructor": "0027da98",
+    "object_pointer_offset": "34",
+    "dispatch": "0027db38",
+    "jalr": "0027db58",
+    "slots": {
+      "0x18": {
+        "adjust": 0,
+        "target": "0x27db70"
+      },
+      "0x20": {
+        "adjust": 0,
+        "target": "0x27db88"
+      },
+      "0x28": {
+        "adjust": 0,
+        "target": "0x27dba0"
+      }
+    },
+    "verified_instruction_comment_words": 20,
+    "unregistered_adjacent_helpers": [
+      "0027dbb0",
+      "0027dbb8"
+    ]
+  },
+  "generation": {
+    "method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+    "entry_hints_total": 17,
+    "config_sha256": "4b90ee56ace7c1dd4ebcd4396b1fd8de0f37830749b2c2e62a761a315af7be80",
+    "changed_files": [
+      {
+        "file": "entry_27db70_0x27db88.cpp",
+        "old_sha256": null,
+        "new_sha256": "78ffa7da29dd42136298439c62996b53d72b61571ab4df731cec58e6c3214969"
+      },
+      {
+        "file": "entry_27db88_0x27dba0.cpp",
+        "old_sha256": null,
+        "new_sha256": "2be9110e2a99fbe6ef16b44e3be8a1a3dfaa7ef3ac7ff14e0a1f97d56a38eb62"
+      },
+      {
+        "file": "entry_27dba0_0x27dbc0.cpp",
+        "old_sha256": null,
+        "new_sha256": "4b709eb4502e33047a4cf192f85e536041ee282f1965be2dcec1ec89a43e027f"
+      },
+      {
+        "file": "ps2_recompiled_functions.h",
+        "old_sha256": "bff9bb6319e8632618c849ebb7efb8a08dc7aed1909f2bb177e05260ce3912d5",
+        "new_sha256": "6dd38f8867886541f18c65051d8838fbbf647c8aa7aac86709b50f8c6303a854"
+      },
+      {
+        "file": "register_functions.cpp",
+        "old_sha256": "ab87ff176e242b80b7a82cd0f7b26b1edd63adba699d385cd9f3c7d214da65bf",
+        "new_sha256": "216f66a00c1797c48205c30f6eb7f187195fbd875898de7758c7fd7b4c568d8e"
+      }
+    ],
+    "obsolete_files": [],
+    "registry_indices": [
+      390874,
+      390880,
+      390886
+    ]
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "Astra Ultra accepted final source, widened observer, focused native entry/return and next missing-target evidence; same-value stores and two unobserved setters explicitly limited",
+    "document": "docs/reviews/object-operation-entries.md"
+  },
+  "tests": {
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "runtime": "production unchanged from475 passing runtime tests and9 IOP suites"
+  },
+  "native": {
+    "build": "target rebuild completed successfully",
+    "entries_verified": [
+      "0027db70"
+    ],
+    "effects_verified": [
+      "0027db70 final64byteobjectsample matches expected effects; same-value stores indistinguishable"
+    ],
+    "scene_verified": false,
+    "audio_verified": false,
+    "binary_sha256": "1a3603f266b28262d7852d570fe81e50383f95fb62fc350c81f39b877e8559fe",
+    "binary_size": 364360248,
+    "focused_capture": "20261009-041203",
+    "resolved_hooks": 3,
+    "probe_errors": 0,
+    "observed_entries": {
+      "0027db70": 1
+    },
+    "observed_returns": {
+      "0027db70": 1
+    },
+    "unobserved_entries": [
+      "0027db88",
+      "0027dba0"
+    ],
+    "return_pc": "0027db60",
+    "sp": "01fffee0",
+    "gp": "004ee3f0",
+    "ra": "0027db60",
+    "preservation": "all128bits SP/GP/RA equal",
+    "v0": 1,
+    "changed_object_offsets": [
+      "04:0->1",
+      "08:ffffffff->1"
+    ],
+    "unchanged_store_limit": [
+      "0c:0->0 delay store not independently observed",
+      "10:1->1 store not independently observed"
+    ],
+    "ordinary_capture": "20261009-041005",
+    "ordinary_last_frame": "25.2s magenta rectangle with black borders; visually inspected",
+    "next_missing_target": "0013a290",
+    "next_missing_source": "00103410",
+    "earlier_unobserved_probe": "20261009-040942;3hooksresolved/noerrors but noentry withinboundedwindow",
+    "bounded_stop": true,
+    "debugger_exit_code": 0,
+    "natural_exit_code": null
+  }
+}

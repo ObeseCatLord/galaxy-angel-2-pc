@@ -1,0 +1,112 @@
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -311,6 +311,11 @@
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
+     // Exact-executable SDK metadata supplied by a verified game override.
+     void configureNativeEeRpcQueueRoot(uint32_t address);
++    // Caller must already be on the serialized executor; this does not marshal work.
++    // Momentary SDK observation only: no reservation or registration-incarnation identity.
++    // result==0 may mean absence. SDK aliases are retained; validate transfer buffer
++    // ranges and revalidate lifetime/authority at each controller use boundary.
++    ps2x::iop::GuestRpcBinding inspectNativeEeRpcBinding(uint32_t sid);
+     // Serialized, quiescent configuration. Replacement requires retirement of
+     // every old execution context, including queued callbacks.
+     void configureNativeEeRpcHooks(NativeEeRpcHooks hooks);
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -592,6 +592,14 @@
+ void PS2Runtime::configureNativeEeRpcQueueRoot(uint32_t address)
+ {
+     m_iopHost->configureNativeEeRpcQueueRoot(address);
++}
++
++ps2x::iop::GuestRpcBinding PS2Runtime::inspectNativeEeRpcBinding(uint32_t sid)
++{
++    uint8_t *rdram = m_eeScheduler->rdram();
++    if (!rdram) rdram = m_boundRdram ? m_boundRdram : m_memory.getRDRAM();
++    auto scope = m_iopHost->enterCycleCall(rdram);
++    return m_iopHost->lookupGuestRpcBinding(sid);
+ }
+ 
+ void PS2Runtime::configureNativeEeRpcHooks(NativeEeRpcHooks hooks)
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -31,6 +31,7 @@
+     src/ps2_runtime_kernel_tests.cpp
+     src/ee_owner_tests21.cpp
+     src/native_ee_rpc_hooks_tests22.cpp
++    src/native_ee_rpc_binding_tests23.cpp
+     src/ps2_execution_counter_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_invocation_stack_tests.cpp
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -14,6 +14,7 @@
+ void register_ps2_runtime_kernel_tests();
+ void register_ee_owner_tests21();
+ void register_native_ee_rpc_hooks_tests22();
++void register_native_ee_rpc_binding_tests23();
+ void register_ps2_execution_counter_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_invocation_stack_tests();
+@@ -46,6 +47,7 @@
+     register_ps2_runtime_kernel_tests();
+     register_ee_owner_tests21();
+     register_native_ee_rpc_hooks_tests22();
++    register_native_ee_rpc_binding_tests23();
+     register_ps2_execution_counter_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_invocation_stack_tests();
+--- /dev/null
++++ b/ps2xTest/src/native_ee_rpc_binding_tests23.cpp
+@@ -0,0 +1,50 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++#include <array>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++namespace {
++constexpr uint32_t kRoot=0x41000,kQueue=0x42000,kServer=0x43000,kBuffer=0x44000,kSid=0x12344321;
++void put(uint8_t *ram,uint32_t address,uint32_t value){std::memcpy(ram+address,&value,4u);}
++struct Fixture {
++ PS2Runtime runtime;
++ uint8_t *ram;
++ Fixture(){if(!runtime.memory().initialize())throw std::runtime_error("binding RAM initialization failed");ram=runtime.memory().getRDRAM();}
++ void seed(uint8_t *backing,uint32_t buffer=kBuffer){
++  const std::array<uint32_t,6> queue={3u,0u,kServer,0u,0u,0u};
++  std::array<uint32_t,17> server{};server[0]=kSid;server[2]=buffer;server[16]=kQueue;
++  put(backing,kRoot,kQueue);std::memcpy(backing+kQueue,queue.data(),sizeof(queue));std::memcpy(backing+kServer,server.data(),sizeof(server));
++ }
++ void configure(){seed(ram);runtime.configureNativeEeRpcQueueRoot(kRoot);}
++};
++}
++void register_native_ee_rpc_binding_tests23(){
++ MiniTest::Case("NativeEeRpcBinding23",[](TestCase &tc){
++  tc.Run("query reads live original membership without changing RAM or retaining scope",[](TestCase &t){
++   Fixture f;auto b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.result,-48,"unconfigured authority unsupported");
++   f.configure();std::vector<uint8_t> before(f.ram,f.ram+PS2_RAM_SIZE);
++   b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.result,0,"completed lookup");t.Equals(b.serverAddress,kServer,"original server");t.Equals(b.bufferAddress,kBuffer,"original buffer");
++   t.IsTrue(std::memcmp(before.data(),f.ram,PS2_RAM_SIZE)==0,"query leaves guest bytes unchanged");
++   f.runtime.configureNativeEeRpcQueueRoot(kRoot); // would reject if query leaked its scope
++   put(f.ram,kQueue+8u,0u);b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.serverAddress,0u,"unlink is immediately visible");
++   put(f.ram,kQueue+8u,kServer);put(f.ram,kServer+8u,kBuffer+256u);b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.bufferAddress,kBuffer+256u,"re-register is immediately visible");
++   f.runtime.configureNativeEeRpcQueueRoot(0u);t.Equals(f.runtime.inspectNativeEeRpcBinding(kSid).result,-48,"disabled authority unsupported");
++  });
++  tc.Run("query preserves pointer aliases and rejects physical cycles and truncated nodes",[](TestCase &t){
++   Fixture f;f.configure();f.runtime.configureNativeEeRpcQueueRoot(kRoot|0x80000000u);
++   put(f.ram,kRoot,kQueue|0xA0000000u);put(f.ram,kQueue+8u,kServer|0x80000000u);
++   auto b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.result,0,"aliased lookup completes");t.Equals(b.serverAddress,kServer|0x80000000u,"raw SDK alias retained");
++   put(f.ram,kServer+56u,kServer|0xA0000000u);t.Equals(f.runtime.inspectNativeEeRpcBinding(kSid+1u).result,-5,"server physical cycle rejected");
++   put(f.ram,kServer+56u,0u);put(f.ram,kQueue+20u,kQueue|0x80000000u);t.Equals(f.runtime.inspectNativeEeRpcBinding(kSid+1u).result,-5,"queue physical cycle rejected");
++   put(f.ram,kQueue+20u,0u);put(f.ram,kQueue+8u,PS2_RAM_SIZE-4u);t.Equals(f.runtime.inspectNativeEeRpcBinding(kSid).result,-2,"truncated descriptor rejected");
++   f.runtime.configureNativeEeRpcQueueRoot(kRoot); // failed lookup also releases scope
++  });
++  tc.Run("ordinary query uses scheduler supplied EE backing",[](TestCase &t){
++   std::vector<uint8_t> external(PS2_RAM_SIZE,0u);Fixture f;f.configure();f.seed(external.data(),kBuffer+512u);
++   R5900Context cpu{};f.runtime.eeScheduler().reset(external.data(),cpu);
++   const auto b=f.runtime.inspectNativeEeRpcBinding(kSid);t.Equals(b.result,0,"external backing lookup completes");t.Equals(b.bufferAddress,kBuffer+512u,"query uses active scheduler backing");
++  });
++ });
++}

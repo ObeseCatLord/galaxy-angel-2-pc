@@ -1,0 +1,164 @@
+From 15108b0c9c2514db81457123ca24a209aef24032 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 22:34:33 -0500
+Subject: [PATCH 77/78] gs: GA2_GS_CAPTURE records the GIF stream for a time
+ window
+
+Developer aid for rendering bugs: GA2_GS_CAPTURE=<file> writes every GIF
+packet (and the privileged registers at each vsync) for
+GA2_GS_CAPTURE_SECS seconds, from GA2_GS_CAPTURE_AT seconds after the
+first packet and/or each time F10 is pressed (<file>.<n>);
+tools/gs_capture_decode.py lists the draws.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |  2 +
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       | 76 +++++++++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp     |  3 +
+ 3 files changed, 81 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index d2d9297..c3699b0 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -38,6 +38,8 @@ namespace ga2_pgs
+     void setTexturePacks(const std::vector<std::string> &dirs);
+     // Button prompt style for the detected input device (gs_texpacks.h).
+     void setButtonStyle(const std::string &style);
++    // Developer aid (GA2_GS_CAPTURE, gs_pgs.cpp): record the GIF stream from now.
++    void captureNow();
+     // Game thread, at vblank: flush, scan out with the live CRTC registers and
+     // queue an asynchronous readback of the frame.
+     void vsync(const GSRegisters &regs);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index ab9d884..8703786 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -41,6 +41,77 @@ namespace
+         return v && *v ? std::atoi(v) : fallback;
+     }
+ 
++    // Developer aid: GA2_GS_CAPTURE=<file> records the GIF stream for
++    // GA2_GS_CAPTURE_SECS (default 0.2) seconds, from GA2_GS_CAPTURE_AT seconds
++    // after the first packet and/or whenever F10 is pressed (captureNow; each
++    // press writes <file>.<n>). Records: u32 path, u32 size, then the data;
++    // path 0xFFFFFFFF marks a vsync (data = the privileged registers).
++    class GifCapture
++    {
++    public:
++        void request() { m_requested.store(true); }
++
++        void write(uint32_t path, const void *data, size_t size)
++        {
++            if (m_path.empty())
++                return;
++            const auto now = std::chrono::steady_clock::now();
++            if (!m_started)
++            {
++                m_started = true;
++                if (const char *at = std::getenv("GA2_GS_CAPTURE_AT"); at && *at)
++                    open(m_path, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                                           std::chrono::duration<double>(std::atof(at))));
++            }
++            if (m_requested.exchange(false))
++                open(m_path + "." + std::to_string(m_count++), now);
++            if (!m_file || now < m_from)
++                return;
++            if (now > m_from + m_length)
++            {
++                std::fclose(m_file);
++                m_file = nullptr;
++                std::fprintf(stderr, "[gs capture] done\n");
++                return;
++            }
++            const uint32_t header[2] = {path, uint32_t(size)};
++            std::fwrite(header, sizeof(header), 1, m_file);
++            std::fwrite(data, 1, size, m_file);
++        }
++
++    private:
++        void open(const std::string &name, std::chrono::steady_clock::time_point from)
++        {
++            if (m_file)
++                std::fclose(m_file);
++            m_file = std::fopen(name.c_str(), "wb");
++            m_from = from;
++            if (m_file)
++                std::fprintf(stderr, "[gs capture] %s\n", name.c_str());
++        }
++
++        std::string m_path = [] {
++            const char *v = std::getenv("GA2_GS_CAPTURE");
++            return std::string(v ? v : "");
++        }();
++        std::chrono::steady_clock::duration m_length = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++            std::chrono::duration<double>([] {
++                const char *v = std::getenv("GA2_GS_CAPTURE_SECS");
++                return v && *v ? std::atof(v) : 0.2;
++            }()));
++        std::atomic<bool> m_requested{false};
++        bool m_started = false;
++        int m_count = 0;
++        std::chrono::steady_clock::time_point m_from;
++        FILE *m_file = nullptr;
++    };
++
++    GifCapture &gifCapture()
++    {
++        static GifCapture capture;
++        return capture;
++    }
++
+     struct ReadbackSlot
+     {
+         BufferHandle buffer;
+@@ -351,6 +422,7 @@ namespace ga2_pgs
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
++        gifCapture().write(path, data, size & ~size_t(15));
+         const bool changed = ga2_texpacks::takeChanged();
+         const auto t0 = std::chrono::steady_clock::now();
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+@@ -388,6 +460,8 @@ namespace ga2_pgs
+         gifTransfer(3, packet.data(), packet.size());
+     }
+ 
++    void captureNow() { gifCapture().request(); }
++
+     void setVramMirror(const uint8_t *vram) { ga2_texpacks::setVram(vram); }
+ 
+     void setTexturePacks(const std::vector<std::string> &dirs) { ga2_texpacks::setPacks(dirs); }
+@@ -415,6 +489,7 @@ namespace ga2_pgs
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
++        gifCapture().write(0xFFFFFFFFu, &r, sizeof(r));
+         const auto t0 = std::chrono::steady_clock::now();
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+         {
+@@ -542,6 +617,7 @@ namespace ga2_pgs
+     bool active() { return false; }
+     bool rendering() { return false; }
+     void gifTransfer(uint32_t, const uint8_t *, size_t) {}
++    void captureNow() {}
+     void setVramMirror(const uint8_t *) {}
+     void setTexturePacks(const std::vector<std::string> &) {}
+     void setButtonStyle(const std::string &) {}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 090d9ae..728b42a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3026,6 +3026,9 @@ void PS2Runtime::run()
+                               static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+         ga2_cheat_menu::update(m_memory.getRDRAM());
+         ps2PadSampleHostInput();
++        // Developer aid: GA2_GS_CAPTURE + F10 records the GIF stream (gs_pgs.cpp).
++        if (IsKeyPressed(KEY_F10) && std::getenv("GA2_GS_CAPTURE"))
++            ga2_pgs::captureNow();
+         // Developer aid: GA2_RAM_DUMP_DIR + F12 writes EE RAM to ram-<vsync>.bin.
+         if (IsKeyPressed(KEY_F12))
+             if (const char *dir = std::getenv("GA2_RAM_DUMP_DIR"); dir && *dir)
+-- 
+2.55.0
+

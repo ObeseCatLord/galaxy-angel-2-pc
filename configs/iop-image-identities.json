@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "images": [
+    {
+      "disc_id": "zettai",
+      "image_path": "/MODULES/IOPRP300.IMG",
+      "image_size": 275345,
+      "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+      "modules": 16,
+      "runtime_status": "inventoried-not-booted"
+    },
+    {
+      "disc_id": "mugen-1",
+      "image_path": "/MODULES/IOPRP300.IMG",
+      "image_size": 275345,
+      "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+      "modules": 16,
+      "runtime_status": "inventoried-not-booted"
+    },
+    {
+      "disc_id": "mugen-2",
+      "image_path": "/MODULES/IOPRP300.IMG",
+      "image_size": 275345,
+      "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+      "modules": 16,
+      "runtime_status": "inventoried-not-booted"
+    },
+    {
+      "disc_id": "eigou-1",
+      "image_path": "/MODULES/IOPRP300.IMG",
+      "image_size": 275345,
+      "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+      "modules": 16,
+      "runtime_status": "inventoried-not-booted"
+    },
+    {
+      "disc_id": "eigou-2",
+      "image_path": "/MODULES/IOPRP300.IMG",
+      "image_size": 275345,
+      "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+      "modules": 16,
+      "runtime_status": "inventoried-not-booted"
+    }
+  ],
+  "all_identical": true
+}

@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "source_base_commit": "33748bf",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 14,
+  "production_changes": false,
+  "all_five_native_binary_identities_unchanged": true,
+  "original_sites": {
+    "descriptor": "0x2d4398",
+    "update_slot": "0x14 -> 0x13b328",
+    "phase_field": "0x68",
+    "substate_field": "0x6c",
+    "selector_field": "0x44",
+    "selected_handle_field": "0x10 + 4 * selector",
+    "readiness_entry": "0x121ce0",
+    "caller_call": "0x13bcc8",
+    "return_pc": "0x13bcd0",
+    "predicate": "nonzero handle, word+8==4, flags+0x10 & 0x4; otherwise return0"
+  },
+  "diagnostic_limits": {
+    "words_per_snapshot": 1024,
+    "words_per_read": 128,
+    "collection_records": 64,
+    "child_records": 8,
+    "readiness_attempts": 6,
+    "reference_probe_deadline_seconds": 2,
+    "reference_consistency": "sequential reads, not atomic",
+    "native_consistency": "stopped reads; harness-verified extracted ELF SHA and stopped entry-word guard; no full live RAM hash",
+    "complete_scope": "requested bounded walker scope, not all game state"
+  },
+  "native": {
+    "capture": "captures/native-zettai/20261009-085336",
+    "matched_returns": 6,
+    "sparse_snapshots": 9,
+    "call_seconds": [
+      24.153,
+      26.608,
+      29.054,
+      31.487,
+      33.918,
+      36.323
+    ],
+    "handle_time_floats": [
+      0.01668335124850273,
+      0.03336670249700546,
+      0.050050053745508194,
+      0.06673340499401093,
+      0.08341675996780396,
+      0.10010011494159698
+    ],
+    "coverage": {
+      "kind": "scene-stop-coverage",
+      "remaining_deadlines": [],
+      "readiness_attempts": 6,
+      "readiness_entries": 6,
+      "readiness_pending": []
+    },
+    "expected_vs_actual": true,
+    "state": 4,
+    "substate": 0,
+    "selector": 0,
+    "handle": "0x008a31c0",
+    "handle_state": 4,
+    "handle_flags": "0x60000701",
+    "actual_v0_low64": 0,
+    "post_input_final_screenshot": false,
+    "prior_confirmation_captures": [
+      "20261009-084508 six pairs",
+      "20261009-084907 five pairs before deadline"
+    ]
+  },
+  "reference": {
+    "captures": [
+      "captures/reference-zettai/20261009-084909/capture.json",
+      "captures/reference-zettai/20261009-083806/capture.json"
+    ],
+    "phase": 4,
+    "substate": 1,
+    "selector": 0,
+    "handle": "0x008a31c0",
+    "handle_state": 4,
+    "handle_flags": "0x60000404",
+    "predicted_v0": 1,
+    "actual_function_return_observed": false,
+    "late_snapshots_completed_words": 217,
+    "early_partial_handles_explicit": true,
+    "separate_opening_story_visual_capture": "captures/reference-zettai/20261009-083348/frame-48.3s.png"
+  },
+  "verification": {
+    "tooling_tests_passed": 27,
+    "tooling_tests_failed": 0,
+    "new_diagnostic_cases": 8,
+    "runtime_tests": 477,
+    "iop_suites": 9,
+    "runtime_iop_scope": "prior passes retained, production unchanged/not rerun",
+    "private_source_check": "research/scene-source-check.json",
+    "private_native_check": "research/scene-readiness-native-check.json",
+    "private_test_log": "research/scene-snapshot-tooling-tests.log"
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effective_effort": "ultra",
+    "disposition": "docs/reviews/scene-readiness.md"
+  },
+  "source_sha256": {
+    "tools/capture_boot.py": "b5fe7dcdc7b42661dc38a3174e9d121c4bfd372172ba3891dd62966d282e9cc0",
+    "tools/scene_snapshot.py": "e74b364185bffc96a7ce32af885295bc853d83c8db3aebfec6a2f05d470e8fc7",
+    "tools/gdb_scene_snapshot.py": "069a6a8aec400709674b7e77f68d1340d017c5d392dd62d21b5ab3d96c53d4ac",
+    "tools/gdb_scene_stopped.py": "e8d12ee8681a4e5a5d237a1f2fcc00b6f62ce42aa10d1208c89aa988056b0660",
+    "tests/test_scene_snapshot.py": "d729f5527d84036c563c5d53ded7bad0d4abefd9152d212cbec1f6f548dfa825",
+    "tests/test_scene_pine_transport.py": "645705594084cb48e7f945df7f0e4066212daeab33b68550579eaaa00a3b3a81"
+  },
+  "limits": [
+    "No native recognizable scene/title/gameplay/audio/save acceptance",
+    "Different memory-card state and scene phases; reference reads sequential",
+    "Observed slow debugger progression is not an ordinary-run FPS benchmark",
+    "Readiness returns are correct for sampled flags; flags/slow progression/render cause unknown",
+    "No guest writes, forced readiness, production adapter or subsystem rewrite"
+  ],
+  "next": "Measure host/guest advancement and produced render/resource effects at matching original phase before correction."
+}

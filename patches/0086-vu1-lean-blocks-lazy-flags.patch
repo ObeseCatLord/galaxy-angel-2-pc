@@ -1,0 +1,1065 @@
+From b86ec901c5c965e349ae1d96ceef0ad2f06f6414 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 01:50:38 -0500
+Subject: [PATCH] vu1: leaner scheduled blocks and lazy flag commits
+
+- Blocks are split at branch targets and may end in a branch and its delay
+  slot; they run only while PATH1 is idle, so pairs inside need no PATH1 or
+  stop checks (one m_blockOff flag), and advance with ++m_cycle.
+- VF0/VI0 are reset only after pairs that can write register 0 (decoder
+  flag writesReg0); register save/restore around exec only where needed;
+  the branch-read backup only where a branch can read it.
+- MAC/status/clip results are committed when read (the flag-reading lower
+  instructions, FDIV status commit, a full ring, run end, flush) instead of
+  every cycle; queueStore is inline; the write-only current-upper field is
+  gone.
+- GA2_VU1_BLOCKSTATS=1 (ga2_vu1_check) prints block entry/guard statistics.
+
+Callgrind (generated path): narration 823.8M -> 592.5M Ir, map 754.3M ->
+543.6M. ga2_vu1_check --reference: 0 mismatches on narration, map, battle,
+tutorial; random-program fuzzing against the previous interpreter (4.5M
+programs) and block steps (6M trials): 0 mismatches. ps2x_tests 579/579.
+In game: Zettai battle 21:9, Mugen 1 tutorial battle, Eigou 2 narration.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h        |  74 ++++++--
+ ps2xRuntime/include/runtime/ps2_vu1_exec.inl |  29 ++-
+ ps2xRuntime/include/runtime/ps2_vu1_step.inl | 167 ++++++++++-------
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      | 179 +++++++++++++------
+ ps2xTest/src/ga2_vu1_gen.cpp                 |  79 ++++++--
+ ps2xTest/src/ga2_vu1_replay.cpp              |  18 ++
+ 6 files changed, 391 insertions(+), 155 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 2d1231e..25a1569 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -120,6 +120,8 @@ public:
+         bool writesClip = false;
+         bool delaysNextBranchRead = false;
+         bool reserved = false;
++        // Writes VF0 or VI0 (the write is discarded by the per-pair reset).
++        bool writesReg0 = false;
+     };
+ 
+     struct DecodedInstructionPair
+@@ -193,13 +195,15 @@ public:
+     StepResult stepGeneric(const StepArgs &args);
+ 
+     // ---- Statically scheduled blocks (ga2_vu1_gen)
+-    // A block is a run of consecutive pairs with no branch, E/D/T bit,
+-    // XGKICK or reserved instruction, entered at its first pair. When nothing
+-    // issued before the block can delay any of its pairs (the guards), every
+-    // pair issues at a fixed offset from the block's entry cycle, so the
+-    // generator works the timing out ahead of time (scheduleBlockForCodegen
+-    // runs the block through stepPairAfter on a scratch VU from an idle
+-    // pipeline) and the block runs without ready-cycle bookkeeping.
++    // A block is a run of consecutive pairs with no E/D/T bit, XGKICK or
++    // reserved instruction, entered at its first pair (so it starts at every
++    // branch target). It may end with a branch and its delay slot; no other
++    // branch is part of a block. When PATH1 is idle and nothing issued before
++    // the block can delay any of its pairs (the guards), every pair issues at
++    // a fixed offset from the block's entry cycle, so the generator works the
++    // timing out ahead of time (scheduleBlockForCodegen runs the block through
++    // stepPairAfter on a scratch VU from an idle pipeline) and the block runs
++    // without ready-cycle bookkeeping.
+     enum class BlockGuardKind : uint8_t
+     {
+         Vf,      // m_vfReady[reg][lane] <= entry + offset
+@@ -240,18 +244,39 @@ public:
+         uint32_t finalCount = 0;
+     };
+     static constexpr uint32_t kMaxBlockPairs = 64u;
+-    // Whether this pair may be part of a block.
++    // Whether this pair may be part of a block. A branch pair may only be the
++    // second last pair of a block, followed by its (blockable) delay slot.
+     static bool blockablePair(const DecodedInstructionPair &decoded);
++    static bool blockableBranchPair(const DecodedInstructionPair &decoded);
+     static bool scheduleBlockForCodegen(const DecodedInstructionPair *pairs, uint32_t count, BlockSchedule &out);
+     // Generated code: whether the block may run on its schedule from now;
+     // lastIssue is the last pair's issue offset.
+-    inline bool blockMayRun(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue, const StepArgs &args) const;
++    inline bool blockMayRun(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue, uint32_t pairCount,
++                            const StepArgs &args) const;
+     // One pair of a block: stall cycles are known; no ready bookkeeping.
+-    inline StepResult stepPairScheduled(const DecodedInstructionPair &decoded, uint32_t stallCycles, const StepArgs &args);
+-    // After the block: its writes' ready cycles, as the pairs would have left them.
+-    inline void finishBlock(uint64_t entryCycle, const BlockFinal *finals, uint32_t finalCount, uint32_t regWriteReady);
++    // A block only runs with PATH1 idle, and it cannot start an XGKICK, so
++    // no PATH1 upkeep is needed. PC and the cycle counter in the state are
++    // written by finishBlock. The branch-read backup of the previous VI
++    // write (readBranchVi) is only kept when the next pair reads it: the
++    // block's last pair and the pair before a final branch.
++    inline StepResult stepPairScheduled(const DecodedInstructionPair &decoded, uint32_t stallCycles, bool keepBranchBackup,
++                                        const StepArgs &args);
++    // After the block: its writes' ready cycles, as the pairs would have left
++    // them, and the state's PC (endPc, or the branch target when the block
++    // ends in a taken branch and its delay slot) and cycle counter.
++    inline void finishBlock(uint64_t entryCycle, const BlockFinal *finals, uint32_t finalCount, uint32_t regWriteReady,
++                            uint32_t endPc, bool endsInBranch);
++
++    // GA2_VU1_BLOCKSTATS=1 (ga2_vu1_check): how often blocks run and why not.
++    struct BlockStats
++    {
++        uint64_t entries = 0, ran = 0, pairsRan = 0, cyclesRan = 0;
++        uint64_t failBudget = 0, failStop = 0, failPath1 = 0, failGuard[6] = {};
++        uint64_t pairsFailed = 0;
++    };
++    static bool s_blockStatsOn;
++    static BlockStats &blockStats();
+     uint64_t currentCycle() const { return m_cycle; }
+-    bool stopRequested() const { return m_stopRequested; }
+ 
+ private:
+ 
+@@ -315,11 +340,17 @@ private:
+     uint64_t m_cachedCodeGeneration = 0;
+     bool m_decodedCodeCacheValid = false;
+ 
++    // MAC/status/clip results queue here and are committed to the state when
++    // something reads them (syncFlags), when the ring is full, with an FDIV
++    // result's status bits, and at the end of a run; commits happen in order
++    // either way, so this is the same as committing every cycle.
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{}; // ring
+     uint32_t m_flagHead = 0;
+     uint32_t m_flagCount = 0;
+     FlagPipelineEntry *allocFlagEntry()
+     {
++        if (m_flagCount == kMaxFlagEntries)
++            syncFlags();
+         if (m_flagCount == kMaxFlagEntries)
+             return nullptr;
+         FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount++) & (kMaxFlagEntries - 1u)];
+@@ -338,6 +369,13 @@ private:
+     uint64_t m_nextCommitCycle = ~0ull;
+     void noteReady(uint64_t cycle) { if (cycle < m_nextCommitCycle) m_nextCommitCycle = cycle; }
+     void commitReadyPipelinesSlow();
++    void syncFlagsSlow();
++    // Commits the flag results due by now.
++    __attribute__((always_inline)) void syncFlags()
++    {
++        if (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
++            syncFlagsSlow();
++    }
+ 
+ public:
+     struct PerfSample { uint64_t runs, cycles, nanos; };
+@@ -347,7 +385,6 @@ public:
+ private:
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
+-    uint32_t m_currentUpperInstruction = 0;
+     int32_t m_viBranchBackupValue = 0;
+     uint8_t m_viBranchBackupReg = 0;
+     bool m_viBranchBackupValid = false;
+@@ -356,6 +393,10 @@ private:
+     GS *m_activeGs = nullptr;
+     PS2Memory *m_activeMemory = nullptr;
+     bool m_stopRequested = false;
++    // Blocks of generated programs cannot run: PATH1 is active, the unit was
++    // stopped or block statistics are on (see updateBlockOff).
++    bool m_blockOff = false;
++    void updateBlockOff() { m_blockOff = m_xgkick.active || m_stopRequested || s_blockStatsOn; }
+     bool m_pendingHaltD = false;
+     bool m_pendingHaltT = false;
+     bool m_lastRunEnded = true;
+@@ -426,7 +467,7 @@ private:
+     void queueFcset(uint32_t clip);
+     void queueQ(float value, uint32_t latency, uint32_t statusDi);
+     void queueP(float value, uint32_t latency);
+-    void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
++    inline void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
+     void startXgkick(uint32_t qwordAddress);
+ 
+     void resetScheduler();
+@@ -438,6 +479,9 @@ private:
+             commitReadyPipelinesSlow();
+     }
+     inline void advanceOneCycle();
++    inline void advanceBlockCycle();
++    bool blockMayRunCounted(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue, uint32_t pairCount,
++                            const StepArgs &args) const;
+     void advanceTo(uint64_t targetCycle);
+     void flushPipelines();
+     void progressXgkick();
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+index 4d6e44a..c8963cd 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+@@ -103,6 +103,22 @@ __attribute__((always_inline)) inline void VU1Interpreter::recordViWriteForBranc
+     m_viBranchBackupValid = true;
+ }
+ 
++__attribute__((always_inline)) inline void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
++{
++    // A store becomes visible one cycle after issue. Every pair ends by
++    // advancing one cycle, which commits it before PATH1 reads its next
++    // qword, and no other lower instruction can issue in between; so writing
++    // at issue is observationally identical and keeps the commit path idle.
++    if (!m_activeVuData || address + 16u > m_activeVuDataSize)
++        return;
++    uint8_t *dst = m_activeVuData + address;
++    for (uint32_t component = 0; component < 4u; ++component)
++    {
++        if ((laneMask & laneForComponent(component)) != 0u)
++            std::memcpy(dst + component * 4u, words + component, sizeof(uint32_t));
++    }
++}
++
+ __attribute__((always_inline)) inline void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+ {
+     if (dest & 0x8u)
+@@ -616,7 +632,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::updateFmacFlags(const
+ 
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency; noteReady(entry->readyCycle);
++    entry->readyCycle = m_cycle + kFmacLatency;
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -676,7 +692,6 @@ using ga2_vu1::vuFloatToInt;
+ // ============================================================================
+ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t instr, uint8_t flagMode)
+ {
+-    m_currentUpperInstruction = instr;
+     uint8_t dest = DEST(instr);
+     uint8_t ft = FT(instr);
+     uint8_t fs = FS(instr);
+@@ -1327,6 +1342,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x10: // FCEQ
+     {
++        syncFlags();
+         uint32_t imm24 = instr & 0xFFFFFF;
+         if (1 != 0)
+             m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
+@@ -1339,6 +1355,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x12: // FCAND
+     {
++        syncFlags();
+         uint32_t imm24 = instr & 0xFFFFFF;
+         if (1 != 0)
+             m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
+@@ -1346,6 +1363,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x13: // FCOR
+     {
++        syncFlags();
+         uint32_t imm24 = instr & 0xFFFFFF;
+         if (1 != 0)
+             m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
+@@ -1353,6 +1371,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x14: // FSEQ
+     {
++        syncFlags();
+         const uint8_t it = VIT(instr);
+         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+         if (it != 0)
+@@ -1367,6 +1386,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x16: // FSAND
+     {
++        syncFlags();
+         const uint8_t it = VIT(instr);
+         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+         if (it != 0)
+@@ -1375,6 +1395,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x17: // FSOR
+     {
++        syncFlags();
+         const uint8_t it = VIT(instr);
+         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
+         if (it != 0)
+@@ -1383,6 +1404,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x18: // FMEQ
+     {
++        syncFlags();
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+         if (it != 0)
+@@ -1391,6 +1413,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x1A: // FMAND
+     {
++        syncFlags();
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+         if (it != 0)
+@@ -1399,6 +1422,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x1B: // FMOR
+     {
++        syncFlags();
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+         if (it != 0)
+@@ -1407,6 +1431,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execLower(uint32_t in
+     }
+     case 0x1C: // FCGET
+     {
++        syncFlags();
+         const uint8_t it = VIT(instr);
+         if (it != 0)
+             m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0x0FFFu);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_step.inl b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+index 3f453f7..9a3f6bd 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_step.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+@@ -19,6 +19,14 @@ __attribute__((always_inline)) inline void VU1Interpreter::advanceOneCycle()
+         progressXgkick();
+ }
+ 
++// advanceOneCycle inside a block: m_state.cycles is written by finishBlock and
++// PATH1 is idle.
++__attribute__((always_inline)) inline void VU1Interpreter::advanceBlockCycle()
++{
++    ++m_cycle;
++    commitReadyPipelines();
++}
++
+ __attribute__((always_inline)) inline uint64_t VU1Interpreter::usageReadyCycle(const InstructionUsage &usage, uint64_t ready) const
+ {
+     // Written without loops over pointers so that constant usages fold.
+@@ -281,11 +289,14 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+     if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+         recordViWriteForBranch(writtenVi, oldVi);
+ 
+-    m_state.vf[0][0] = 0.0f;
+-    m_state.vf[0][1] = 0.0f;
+-    m_state.vf[0][2] = 0.0f;
+-    m_state.vf[0][3] = 1.0f;
+-    m_state.vi[0] = 0;
++    if (decoded.upperUsage.writesReg0 || decoded.lowerUsage.writesReg0)
++    {
++        m_state.vf[0][0] = 0.0f;
++        m_state.vf[0][1] = 0.0f;
++        m_state.vf[0][2] = 0.0f;
++        m_state.vf[0][3] = 1.0f;
++        m_state.vi[0] = 0;
++    }
+ 
+     uint32_t nextPc = m_state.pc + 8u;
+     if (nextPc >= a.codeSize)
+@@ -345,10 +356,14 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+ // ---- Statically scheduled blocks (see ps2_vu1.h)
+ 
+ __attribute__((always_inline)) inline bool VU1Interpreter::blockMayRun(const BlockGuard *guards, uint32_t guardCount,
+-                                                                        uint32_t lastIssue, const StepArgs &a) const
++                                                                        uint32_t lastIssue, uint32_t pairCount,
++                                                                        const StepArgs &a) const
+ {
++    if (__builtin_expect(m_blockOff, 0))
++        return blockMayRunCounted(guards, guardCount, lastIssue, pairCount, a);
++    (void)pairCount;
+     const uint64_t entry = m_cycle;
+-    if (entry + lastIssue >= a.budgetEnd || m_stopRequested)
++    if (entry + lastIssue >= a.budgetEnd)
+         return false;
+     bool ok = true;
+ #pragma clang loop unroll(full)
+@@ -386,11 +401,11 @@ __attribute__((always_inline)) inline bool VU1Interpreter::blockMayRun(const Blo
+ // and the ready cycles are written once by finishBlock.
+ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPairScheduled(const DecodedInstructionPair &decoded,
+                                                                                                 uint32_t stallCycles,
++                                                                                                bool keepBranchBackup,
+                                                                                                 const StepArgs &a)
+ {
+-    (void)a;
+-    if (stallCycles != 0u)
+-        advanceTo(m_cycle + stallCycles);
++    for (uint32_t cycle = 0; cycle < stallCycles; ++cycle)
++        advanceBlockCycle();
+ 
+     uint8_t writtenVi = 0u;
+     int32_t oldVi = 0;
+@@ -404,30 +419,24 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         }
+     }
+ 
+-    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+-    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-    const bool hasUpperWrite = upperWrite.reg != 0u;
+-    const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+-    const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+-    float oldUpperVf[4]{};
+-    float oldLowerVf[4]{};
+-    float oldAcc[4]{};
+-    if (hasUpperWrite)
++    if (decoded.upperVfShadowReg != 0u && !decoded.iBit)
++    {
++        // The lower instruction sees the register the upper one writes as it
++        // was before the pair; the lanes the upper one does not write keep
++        // their old values.
++        const VfAccess upperWrite = decoded.upperUsage.vfWrite;
++        const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
++        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++        const bool hasDistinctLowerWrite = hasLowerWrite && lowerWrite.reg != upperWrite.reg;
++        float oldUpperVf[4]{};
++        float oldLowerVf[4]{};
++        float oldAcc[4]{};
+         std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-    if (hasDistinctLowerWrite)
+-        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-    if (decoded.upperUsage.accWrite != 0u)
+-        std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++        if (hasDistinctLowerWrite)
++            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++        if (decoded.upperUsage.accWrite != 0u)
++            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+ 
+-    if (decoded.iBit)
+-    {
+-        execUpper(decoded.upper, decoded.flagMode);
+-        float immediate = 0.0f;
+-        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+-        m_state.i = normalizeOperand(immediate);
+-    }
+-    else if (decoded.upperVfShadowReg != 0u)
+-    {
+         float oldVf[4]{};
+         float upperVf[4]{};
+         std::memcpy(oldVf, m_state.vf[decoded.upperVfShadowReg], sizeof(oldVf));
+@@ -436,58 +445,82 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         std::memcpy(m_state.vf[decoded.upperVfShadowReg], oldVf, sizeof(oldVf));
+         execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
+         std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
++
++        if (upperWrite.lanes != 0u)
++        {
++            float *reg = m_state.vf[upperWrite.reg];
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((upperWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
++                    reg[component] = oldUpperVf[component];
++        }
++        else
++            std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
++        if (hasDistinctLowerWrite && lowerWrite.lanes != 0u)
++        {
++            float *reg = m_state.vf[lowerWrite.reg];
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((lowerWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
++                    reg[component] = oldLowerVf[component];
++        }
++        else if (hasDistinctLowerWrite)
++            std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++        if (decoded.upperUsage.accWrite != 0u)
++        {
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((decoded.upperUsage.accWrite & ga2_vu1::laneForComponent(component)) == 0u)
++                    m_state.acc[component] = oldAcc[component];
++        }
+     }
+     else
+     {
++        // Without a shared register every write goes through applyDest with
++        // the lanes the decoder reports, so nothing needs restoring.
+         execUpper(decoded.upper, decoded.flagMode);
+-        execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
++        if (decoded.iBit)
++        {
++            float immediate = 0.0f;
++            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++            m_state.i = normalizeOperand(immediate);
++        }
++        else
++            execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
+     }
+ 
+-    m_viBranchBackupValid = false;
++    if (keepBranchBackup)
++        m_viBranchBackupValid = false;
+ 
+-    if (hasUpperWrite && upperWrite.lanes != 0u)
+-    {
+-        float *reg = m_state.vf[upperWrite.reg];
+-        for (uint32_t component = 0; component < 4u; ++component)
+-            if ((upperWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                reg[component] = oldUpperVf[component];
+-    }
+-    else if (hasUpperWrite)
+-        std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+-    if (hasDistinctLowerWrite && lowerWrite.lanes != 0u)
+-    {
+-        float *reg = m_state.vf[lowerWrite.reg];
+-        for (uint32_t component = 0; component < 4u; ++component)
+-            if ((lowerWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                reg[component] = oldLowerVf[component];
+-    }
+-    else if (hasDistinctLowerWrite)
+-        std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+-    if (decoded.upperUsage.accWrite != 0u)
+-    {
+-        for (uint32_t component = 0; component < 4u; ++component)
+-            if ((decoded.upperUsage.accWrite & ga2_vu1::laneForComponent(component)) == 0u)
+-                m_state.acc[component] = oldAcc[component];
+-    }
+     if (writtenVi != 0u)
+         m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
+-    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++    if (keepBranchBackup && writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+         recordViWriteForBranch(writtenVi, oldVi);
+ 
+-    m_state.vf[0][0] = 0.0f;
+-    m_state.vf[0][1] = 0.0f;
+-    m_state.vf[0][2] = 0.0f;
+-    m_state.vf[0][3] = 1.0f;
+-    m_state.vi[0] = 0;
++    if (decoded.upperUsage.writesReg0 || decoded.lowerUsage.writesReg0)
++    {
++        m_state.vf[0][0] = 0.0f;
++        m_state.vf[0][1] = 0.0f;
++        m_state.vf[0][2] = 0.0f;
++        m_state.vf[0][3] = 1.0f;
++        m_state.vi[0] = 0;
++    }
+ 
+-    m_state.pc += 8u;
+-    advanceOneCycle();
++    advanceBlockCycle();
+     return StepResult::Continue;
+ }
+ 
+ __attribute__((always_inline)) inline void VU1Interpreter::finishBlock(uint64_t entryCycle, const BlockFinal *finals,
+-                                                                        uint32_t finalCount, uint32_t regWriteReady)
++                                                                        uint32_t finalCount, uint32_t regWriteReady,
++                                                                        uint32_t endPc, bool endsInBranch)
+ {
++    if (endsInBranch && m_state.branchPending)
++    {
++        // The branch pair counted its delay down and its slot took the jump.
++        m_state.pc = m_state.branchTarget & microAddressMask();
++        m_state.branchPending = false;
++        m_state.branchDelay = 0u;
++    }
++    else
++        m_state.pc = endPc;
++    m_state.cycles = m_cycle;
+ #pragma clang loop unroll(full)
+     for (uint32_t k = 0; k < finalCount; ++k)
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index cbc6fbb..babe710 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -41,6 +41,8 @@ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lan
+ 
+ void VU1Interpreter::addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+ {
++    if (reg == 0u && lanes != 0u)
++        usage.writesReg0 = true;
+     if (reg == 0u || lanes == 0u)
+         return;
+     if (usage.vfWrite.reg == 0u)
+@@ -86,6 +88,7 @@ void VU1Interpreter::resetScheduler()
+     m_stopRequested = false;
+     m_pendingHaltD = false;
+     m_pendingHaltT = false;
++    updateBlockOff();
+ }
+ 
+ void VU1Interpreter::reset()
+@@ -115,7 +118,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+     }
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency; noteReady(entry->readyCycle);
++    entry->readyCycle = m_cycle + kFmacLatency;
+     entry->status = static_cast<uint32_t>(immediate) & 0xFC0u;
+     entry->writesSticky = true;
+ }
+@@ -131,7 +134,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+     }
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency; noteReady(entry->readyCycle);
++    entry->readyCycle = m_cycle + kFmacLatency;
+     entry->clip = m_workingClip;
+     entry->writesClip = true;
+ }
+@@ -152,7 +155,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+     }
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency; noteReady(entry->readyCycle);
++    entry->readyCycle = m_cycle + kFmacLatency;
+     entry->clip = m_workingClip;
+     entry->writesClip = true;
+ }
+@@ -186,71 +189,70 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+     reportReservedInstruction(false, 0xFFFFFFF9u);
+ }
+ 
+-void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
++void VU1Interpreter::syncFlagsSlow()
+ {
+-    // A store becomes visible one cycle after issue. Every pair ends by
+-    // advancing one cycle, which commits it before PATH1 reads its next
+-    // qword, and no other lower instruction can issue in between; so writing
+-    // at issue is observationally identical and keeps the commit path idle.
+-    if (!m_activeVuData || address + 16u > m_activeVuDataSize)
+-        return;
+-    uint32_t merged[4]{};
+-    std::memcpy(merged, m_activeVuData + address, sizeof(merged));
+-    for (uint32_t component = 0; component < 4u; ++component)
+-    {
+-        if ((laneMask & laneForComponent(component)) != 0u)
+-            merged[component] = words[component];
+-    }
+-    std::memcpy(m_activeVuData + address, merged, sizeof(merged));
+-}
+-
+-void VU1Interpreter::commitReadyPipelinesSlow()
+-{
+-    // Commits everything due and records the next due cycle in the same pass.
+-    uint64_t next = ~0ull;
+     // Flag entries all have the FMAC latency and commit exactly at their ready
+     // cycle, so they leave the ring in issue order.
+-    while (m_flagCount != 0u)
++    const uint64_t cycle = m_cycle;
++    uint32_t count = m_flagCount;
++    uint32_t head = m_flagHead;
++    uint32_t mac = m_state.mac, status = m_state.status, clip = m_state.clip;
++    while (count != 0u)
+     {
+-        FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
+-        if (entry.readyCycle > m_cycle)
+-        {
+-            next = std::min(next, entry.readyCycle);
++        FlagPipelineEntry &entry = m_flagPipeline[head];
++        if (entry.readyCycle > cycle)
+             break;
+-        }
+         if (entry.writesMac)
+-            m_state.mac = entry.mac;
++            mac = entry.mac;
+         if (entry.writesStatus)
+         {
+             const uint32_t current = entry.status & 0xFu;
+-            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++            status = (status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+         }
+         if (entry.writesSticky)
+-        {
+-            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+-        }
++            status = (status & 0x03Fu) | (entry.status & 0xFC0u);
+         if (entry.writesClip)
+-            m_state.clip = entry.clip;
+-        entry = {};
+-        m_flagHead = (m_flagHead + 1u) & (kMaxFlagEntries - 1u);
+-        --m_flagCount;
++            clip = entry.clip;
++        // allocFlagEntry clears an entry before reuse.
++        entry.valid = false;
++        head = (head + 1u) & (kMaxFlagEntries - 1u);
++        --count;
+     }
++    m_state.mac = mac;
++    m_state.status = status;
++    m_state.clip = clip;
++    m_flagHead = head;
++    m_flagCount = count;
++}
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
+-        next = std::min(next, m_fdiv.readyCycle);
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++void VU1Interpreter::commitReadyPipelinesSlow()
++{
++    // Commits everything due and records the next due cycle in the same pass.
++    // Flag results are not scheduled here (see syncFlags).
++    const uint64_t cycle = m_cycle;
++    uint64_t next = ~0ull;
++    if (m_fdiv.valid)
+     {
+-        m_state.q = m_fdiv.value;
+-        const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+-        m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+-        m_fdiv = {};
++        if (m_fdiv.readyCycle > cycle)
++            next = m_fdiv.readyCycle;
++        else
++        {
++            // Flag results due by now go first, as the status bits overlap.
++            syncFlags();
++            m_state.q = m_fdiv.value;
++            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
++            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
++            m_fdiv = {};
++        }
+     }
+ 
+     for (ScalarPipelineEntry &entry : m_efu)
+     {
+-        if (entry.valid && entry.readyCycle > m_cycle)
++        if (!entry.valid)
++            continue;
++        if (entry.readyCycle > cycle)
+             next = std::min(next, entry.readyCycle);
+-        if (entry.valid && entry.readyCycle <= m_cycle)
++        else
+         {
+             m_state.p = entry.value;
+             entry = {};
+@@ -354,6 +356,7 @@ void VU1Interpreter::finishXgkick()
+         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
+     }
+     m_xgkick.active = false;
++    updateBlockOff();
+ }
+ 
+ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -367,6 +370,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+     m_xgkick.issueCycle = m_cycle;
++    m_blockOff = true;
+ }
+ 
+ void VU1Interpreter::advanceTo(uint64_t targetCycle)
+@@ -382,9 +386,9 @@ bool VU1Interpreter::pipelinesPending() const
+     for (const ScalarPipelineEntry &entry : m_efu)
+         if (entry.valid)
+             return true;
+-    for (const FlagPipelineEntry &entry : m_flagPipeline)
+-        if (entry.valid)
+-            return true;
++    // Flag results are pending until the newest one is due.
++    if (m_flagCount != 0u && m_flagPipeline[(m_flagHead + m_flagCount - 1u) & (kMaxFlagEntries - 1u)].readyCycle > m_cycle)
++        return true;
+     if (m_regWriteReady > m_cycle)
+         return true;
+     return false;
+@@ -394,6 +398,7 @@ void VU1Interpreter::flushPipelines()
+ {
+     while (pipelinesPending())
+         advanceOneCycle();
++    syncFlags();
+ }
+ 
+ VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
+@@ -499,6 +504,8 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
+     {
+         if (reg != 0u)
+             usage.viWrite |= static_cast<uint16_t>(1u << reg);
++        else
++            usage.writesReg0 = true;
+     };
+ 
+     switch (opHi)
+@@ -903,6 +910,7 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
+               << " instruction=0x" << instruction
+               << std::dec << '\n');
+     m_stopRequested = true;
++    m_blockOff = true;
+ }
+ 
+ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -991,6 +999,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+     m_activeMemory = memory;
++    updateBlockOff();
+ 
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+@@ -1032,6 +1041,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         m_pendingHaltD = false;
+         m_pendingHaltT = false;
+     }
++    syncFlags();
+     m_state.cycles = m_cycle;
+     m_lastRunEnded = programEnded;
+     if (useVuRounding && previousRoundingMode != -1)
+@@ -1213,19 +1223,84 @@ bool VU1Interpreter::upperProducesFmacFlags(uint32_t upper)
+     return produced;
+ }
+ 
++bool VU1Interpreter::s_blockStatsOn = false;
++
++VU1Interpreter::BlockStats &VU1Interpreter::blockStats()
++{
++    static BlockStats stats;
++    return stats;
++}
++
++bool VU1Interpreter::blockMayRunCounted(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue,
++                                        uint32_t pairCount, const StepArgs &a) const
++{
++    // Reached when blocks are off (PATH1 active or stopped) or statistics are on.
++    BlockStats &stats = blockStats();
++    const bool counting = s_blockStatsOn;
++    if (counting)
++        ++stats.entries;
++    const auto fail = [&](uint64_t &counter) {
++        if (counting)
++        {
++            ++counter;
++            stats.pairsFailed += pairCount;
++        }
++        return false;
++    };
++    if (m_stopRequested)
++        return fail(stats.failStop);
++    if (m_xgkick.active)
++        return fail(stats.failPath1);
++    const uint64_t entry = m_cycle;
++    if (entry + lastIssue >= a.budgetEnd)
++        return fail(stats.failBudget);
++    for (uint32_t k = 0; k < guardCount; ++k)
++    {
++        const BlockGuard &g = guards[k];
++        const uint64_t limit = entry + g.offset;
++        bool ok = true;
++        switch (g.kind)
++        {
++        case BlockGuardKind::Vf: ok = m_vfReady[g.reg][g.lane] <= limit; break;
++        case BlockGuardKind::Vi: ok = m_viReady[g.reg] <= limit; break;
++        case BlockGuardKind::Acc: ok = m_accReady[g.lane] <= limit; break;
++        case BlockGuardKind::Fdiv: ok = !m_fdiv.valid || m_fdiv.readyCycle <= limit; break;
++        case BlockGuardKind::EfuUnit: ok = m_efuResourceReady <= limit; break;
++        case BlockGuardKind::EfuAll:
++            ok = (!m_efu[0].valid || m_efu[0].readyCycle <= limit) && (!m_efu[1].valid || m_efu[1].readyCycle <= limit);
++            break;
++        }
++        if (!ok)
++            return fail(stats.failGuard[static_cast<uint32_t>(g.kind)]);
++    }
++    if (counting)
++    {
++        ++stats.ran;
++        stats.pairsRan += pairCount;
++        stats.cyclesRan += lastIssue + 1u;
++    }
++    return true;
++}
++
+ bool VU1Interpreter::blockablePair(const DecodedInstructionPair &d)
+ {
+     return !d.upperUsage.reserved && !d.lowerUsage.reserved && !d.eBit && !d.dBit && !d.tBit &&
+            d.lowerUsage.pipeline != PipelineBranch && d.lowerUsage.pipeline != PipelineXgkick;
+ }
+ 
++bool VU1Interpreter::blockableBranchPair(const DecodedInstructionPair &d)
++{
++    return !d.upperUsage.reserved && !d.lowerUsage.reserved && !d.eBit && !d.dBit && !d.tBit &&
++           d.lowerUsage.pipeline == PipelineBranch;
++}
++
+ bool VU1Interpreter::scheduleBlockForCodegen(const DecodedInstructionPair *pairs, uint32_t count, BlockSchedule &out)
+ {
+     out = BlockSchedule{};
+     if (count == 0u || count > kMaxBlockPairs)
+         return false;
+     for (uint32_t i = 0; i < count; ++i)
+-        if (!blockablePair(pairs[i]))
++        if (!blockablePair(pairs[i]) && !(i + 2u == count && blockableBranchPair(pairs[i]) && blockablePair(pairs[i + 1u])))
+             return false;
+ 
+     // Timing: run the block on a scratch VU whose pipelines are idle. Timing
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index 8f416a6..88120eb 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -35,12 +35,12 @@ namespace
+                       "{.vfRead={{{%u,%u},{%u,%u}}},.vfWrite={%u,%u},.vfReadCount=%u,.viRead=%u,.viWrite=%u,"
+                       ".accRead=%u,.accWrite=%u,.latency=%u,.vfLatency=%u,.viLatency=%u,"
+                       ".pipeline=static_cast<VU::Pipeline>(%u),.waitQ=%d,.waitP=%d,.readsClip=%d,.writesClip=%d,"
+-                      ".delaysNextBranchRead=%d,.reserved=%d}",
++                      ".delaysNextBranchRead=%d,.reserved=%d,.writesReg0=%d}",
+                       u.vfRead[0].reg, u.vfRead[0].lanes, u.vfRead[1].reg, u.vfRead[1].lanes,
+                       u.vfWrite.reg, u.vfWrite.lanes, u.vfReadCount, u.viRead, u.viWrite,
+                       u.accRead, u.accWrite, u.latency, u.vfLatency, u.viLatency,
+                       static_cast<unsigned>(u.pipeline), u.waitQ, u.waitP, u.readsClip, u.writesClip,
+-                      u.delaysNextBranchRead, u.reserved);
++                      u.delaysNextBranchRead, u.reserved, u.writesReg0);
+         return buf;
+     }
+ 
+@@ -222,6 +222,24 @@ namespace
+         return f;
+     }
+ 
++    // Pairs that direct branches jump to. Control enters a block there, so a
++    // block starts at each of them rather than running across one.
++    std::vector<bool> branchTargets(const std::vector<uint8_t> &code)
++    {
++        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++        std::vector<bool> target(pairs, false);
++        for (uint32_t b = 0; b < pairs; ++b)
++        {
++            const uint32_t lower = ps2_vu1_reach::word(code.data(), b, 0), upper = ps2_vu1_reach::word(code.data(), b, 1);
++            if ((upper >> 31) != 0u || !ps2_vu1_reach::isDirectBranch(lower >> 25))
++                continue;
++            int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
++            if (imm & 0x400) imm -= 0x800;
++            target[static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs)] = true;
++        }
++        return target;
++    }
++
+     std::string pair(const VU::DecodedInstructionPair &p, uint8_t flagMode)
+     {
+         char head[96];
+@@ -262,6 +280,7 @@ namespace
+     {
+         uint32_t first = 0;
+         std::vector<uint32_t> pairs;
++        bool endsInBranch = false; // the last two pairs are a branch and its delay slot
+         VU::BlockSchedule schedule;
+     };
+ 
+@@ -323,6 +342,7 @@ namespace
+         }
+         const std::vector<uint8_t> modes = flagModes(code, target.entryProgram ? &inSet : nullptr);
+         EntryFacts facts = entryFacts(code);
++        const std::vector<bool> isTarget = branchTargets(code);
+         if (target.entryProgram)
+             for (uint32_t i : selected)
+                 if (i == 0u || !std::binary_search(selected.begin(), selected.end(), i - 1u))
+@@ -405,30 +425,47 @@ namespace
+                        pair(VU::decodeForCodegen(code.data(), index * 8u), modes[index]) + ";\n";
+             }
+             // Blocks: runs of consecutive pairs that fall through to each
+-            // other, with nothing pending from a branch, E bit or halt.
++            // other, with nothing pending from a branch, E bit or halt, and
++            // entered only at their first pair (so split at branch targets).
+             std::unordered_map<uint32_t, Block> blockAt;
+             if (blocksEnabled)
+             {
+                 const std::vector<uint32_t> &ch = chunks[c];
+-                auto inBlock = [&](size_t k) {
++                // A pair may be entered with nothing pending from the pair before it.
++                auto clean = [&](size_t k) {
+                     const uint32_t index = ch[k];
+-                    return index + 1u < pairs && !facts.mayBranch[index] && !facts.mayEnd[index] && !facts.mayHalt[index] &&
+-                           VU::blockablePair(decoded[k]);
++                    return index + 1u < pairs && !facts.mayEnd[index] && !facts.mayHalt[index];
+                 };
++                auto inBlock = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockablePair(decoded[k]); };
++                // A block may end with a branch and its delay slot.
++                auto branchPair = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockableBranchPair(decoded[k]); };
++                auto slotPair = [&](size_t k) { return clean(k) && VU::blockablePair(decoded[k]); };
++                auto follows = [&](size_t e) { return e < ch.size() && ch[e] == ch[e - 1] + 1u && !isTarget[ch[e]]; };
+                 for (size_t k = 0; k < ch.size();)
+                 {
+-                    if (!inBlock(k))
++                    size_t e = k;
++                    if (inBlock(k))
++                    {
++                        ++e;
++                        while (e - k < VU::kMaxBlockPairs - 2u && follows(e) && inBlock(e))
++                            ++e;
++                    }
++                    bool branchEnd = false;
++                    if (e < ch.size() && (e == k || follows(e)) && branchPair(e) && follows(e + 1u) && slotPair(e + 1u))
++                    {
++                        e += 2u;
++                        branchEnd = true;
++                    }
++                    if (e == k)
+                     {
+                         ++k;
+                         continue;
+                     }
+-                    size_t e = k + 1;
+-                    while (e < ch.size() && e - k < VU::kMaxBlockPairs && ch[e] == ch[e - 1] + 1u && inBlock(e))
+-                        ++e;
+                     if (e - k >= 2u)
+                     {
+                         Block b;
+                         b.first = ch[k];
++                        b.endsInBranch = branchEnd;
+                         b.pairs.assign(ch.begin() + static_cast<long>(k), ch.begin() + static_cast<long>(e));
+                         if (VU::scheduleBlockForCodegen(decoded.data() + k, static_cast<uint32_t>(e - k), b.schedule))
+                         {
+@@ -484,24 +521,28 @@ namespace
+                     const Block &b = bit->second;
+                     const VU::BlockSchedule &sc = b.schedule;
+                     const uint32_t last = b.pairs.back();
++                    const std::string endPc = std::to_string((last + 1u) * 8u) + "u";
+                     out += "    if (vu.blockMayRun(" + (sc.guardCount ? "kG" + n : std::string("nullptr")) + ", " +
+-                           std::to_string(sc.guardCount) + "u, " + std::to_string(sc.issue[sc.count - 1u]) + "u, a))\n    {\n"
++                           std::to_string(sc.guardCount) + "u, " + std::to_string(sc.issue[sc.count - 1u]) + "u, " +
++                           std::to_string(sc.count) + "u, a))\n    {\n"
+                            "        const uint64_t e = vu.currentCycle();\n";
+-                    const std::string finish = "vu.finishBlock(e, " + (sc.finalCount ? "kF" + n : std::string("nullptr")) +
+-                                               ", " + std::to_string(sc.finalCount) + "u, " + std::to_string(sc.regWriteReady) + "u);";
+                     for (uint32_t k = 0; k < sc.count; ++k)
+                     {
+                         const uint32_t stall = k == 0 ? sc.issue[0] : sc.issue[k] - sc.issue[k - 1] - 1u;
+-                        out += "        vu.stepPairScheduled(kP" + std::to_string(b.pairs[k]) + ", " + std::to_string(stall) + "u, a);\n";
+-                        // Only a PATH1 transfer already running can fail and stop the unit.
+-                        out += "        if (vu.stopRequested())\n        {\n            " + finish +
+-                               "\n            return VU::StepResult::Stop;\n        }\n";
++                        // A branch reads and links from its own pc.
++                        if (b.endsInBranch && k + 2u == sc.count)
++                            out += "        vu.state().pc = " + std::to_string(b.pairs[k] * 8u) + "u;\n";
++                        const bool keep = k + 1u == sc.count || (b.endsInBranch && k + 3u == sc.count);
++                        out += "        vu.stepPairScheduled(kP" + std::to_string(b.pairs[k]) + ", " + std::to_string(stall) + "u, " +
++                               (keep ? "true" : "false") + ", a);\n";
+                     }
+-                    out += "        " + finish + "\n"
++                    out += "        vu.finishBlock(e, " + (sc.finalCount ? "kF" + n : std::string("nullptr")) + ", " +
++                           std::to_string(sc.finalCount) + "u, " + std::to_string(sc.regWriteReady) + "u, " + endPc + ", " +
++                           (b.endsInBranch ? "true" : "false") + ");\n"
+                            "        if (!vu.stepLoopHeadAfterPair(a))\n            return VU::StepResult::Stop;\n";
+                     const bool nextHere = std::binary_search(chunks[c].begin(), chunks[c].end(), last + 1u);
+                     if (nextHere)
+-                        out += "        if (vu.state().pc == " + std::to_string((last + 1u) * 8u) + "u)\n            goto L" +
++                        out += "        if (vu.state().pc == " + endPc + ")\n            goto L" +
+                                std::to_string(last + 1u) + ";\n";
+                     out += "        continue;\n    }\n";
+                 }
+diff --git a/ps2xTest/src/ga2_vu1_replay.cpp b/ps2xTest/src/ga2_vu1_replay.cpp
+index a6a9072..b88ea22 100644
+--- a/ps2xTest/src/ga2_vu1_replay.cpp
++++ b/ps2xTest/src/ga2_vu1_replay.cpp
+@@ -4,6 +4,9 @@
+ //
+ //   ga2_vu1_replay <capture>... [--repeat N] [--verbose] [--reference]
+ //
++// GA2_VU1_BLOCKSTATS=1 prints how often the statically scheduled blocks of
++// generated programs ran and why not.
++//
+ // --reference: compare against this build's interpreter instead of the
+ // recorded digests, ignoring only the status flag (generated programs skip
+ // status results when no instruction reads them; see ga2_vu1_gen). MAC is
+@@ -41,6 +44,9 @@ int main(int argc, char **argv)
+         return 2;
+     }
+     std::printf("capture: %zu runs, %zu code images\n", cap.runs.size(), cap.codes.size());
++    const char *statsEnv = std::getenv("GA2_VU1_BLOCKSTATS");
++    const bool blockStats = statsEnv && *statsEnv && *statsEnv != '0';
++    VU1Interpreter::s_blockStatsOn = blockStats;
+ 
+     ga2_vu1cap::Replayer replayer;
+     ga2_vu1cap::Replayer interpreter;
+@@ -101,5 +107,17 @@ int main(int argc, char **argv)
+     std::printf("replayed %zu runs x %d: %llu mismatches; %.3f s, %.2f us/run, %.1f ns/VU cycle\n",
+                 cap.runs.size(), repeat, static_cast<unsigned long long>(mismatches), seconds, perRun * 1e6,
+                 cycles ? seconds * 1e9 / static_cast<double>(cycles) : 0.0);
++    if (blockStats)
++    {
++        const VU1Interpreter::BlockStats &st = VU1Interpreter::blockStats();
++        const auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
++        const auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0; };
++        std::printf("blocks: %llu entries, %llu ran (%.1f%%)\n", u(st.entries), u(st.ran), pct(st.ran, st.entries));
++        std::printf("blocks failed: PATH1 active %llu, budget %llu, stopped %llu, guards vf %llu vi %llu acc %llu fdiv %llu efu-unit %llu efu-all %llu\n",
++                    u(st.failPath1), u(st.failBudget), u(st.failStop), u(st.failGuard[0]), u(st.failGuard[1]), u(st.failGuard[2]),
++                    u(st.failGuard[3]), u(st.failGuard[4]), u(st.failGuard[5]));
++        std::printf("pairs: %llu ran in blocks, %llu in failed block entries; cycles in blocks %llu of %llu (%.1f%%)\n",
++                    u(st.pairsRan), u(st.pairsFailed), u(st.cyclesRan), u(cycles), pct(st.cyclesRan, cycles));
++    }
+     return mismatches == 0 ? 0 : 1;
+ }
+-- 
+2.55.0
+

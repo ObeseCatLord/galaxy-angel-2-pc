@@ -1,0 +1,510 @@
+From 80c8c204d7f1af63f5059e9b055b4ad9d7219d50 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:08:55 -0500
+Subject: [PATCH] mouse: battle views (map, cockpit, unit camera, rear):
+ buttons, drags, wheel, edge scroll, battle pause menu
+
+The game side (ga2_battlepointer.cpp) publishes the running view and the game's pad map
+through ps2_mouse::setBattleState; the mouse then presses the game's own buttons:
+map left/right/middle, Ctrl+click for order all, double click to focus, right drag to pan,
+wheel to zoom, edge scrolling; cockpit left held = fire, right held = charge; unit camera
+drag/wheel; middle held on the map = L2 (the angel list), wheel steps its cursor.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_mouse.cpp       | 331 +++++++++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_mouse.h         |  65 +++++
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp |   2 +
+ 3 files changed, 390 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 1cd81f1..8c9553c 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -6,8 +6,12 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
++#include <deque>
++#include <mutex>
+ 
+ namespace ps2_mouse
+ {
+@@ -50,7 +54,7 @@ namespace ps2_mouse
+         struct Input
+         {
+             Vector2 pos{}, delta{};
+-            bool down[3]{}, pressed[3]{};
++            bool down[5]{}, pressed[5]{}; // left, right, middle, back, forward
+             float wheel = 0.0f;
+         };
+         Input g_in;
+@@ -61,7 +65,7 @@ namespace ps2_mouse
+             bool down[3]{};
+             float wheel = 0.0f;
+         } g_external;
+-        bool g_externalWasDown[3]{};
++        bool g_externalWasDown[5]{};
+         Vector2 g_externalLast{};
+ 
+         void sampleInput()
+@@ -70,8 +74,9 @@ namespace ps2_mouse
+             {
+                 g_in.pos = GetMousePosition();
+                 g_in.delta = GetMouseDelta();
+-                const int buttons[3] = {MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_MIDDLE};
+-                for (int i = 0; i < 3; ++i)
++                const int buttons[5] = {MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_SIDE,
++                                        MOUSE_BUTTON_EXTRA};
++                for (int i = 0; i < 5; ++i)
+                 {
+                     g_in.down[i] = IsMouseButtonDown(buttons[i]);
+                     g_in.pressed[i] = IsMouseButtonPressed(buttons[i]);
+@@ -83,11 +88,11 @@ namespace ps2_mouse
+             g_in.pos = Vector2{g_game.x + g_external.x * sx, g_game.y + g_external.y * sy};
+             g_in.delta = Vector2{g_in.pos.x - g_externalLast.x, g_in.pos.y - g_externalLast.y};
+             g_externalLast = g_in.pos;
+-            for (int i = 0; i < 3; ++i)
++            for (int i = 0; i < 5; ++i)
+             {
+-                g_in.pressed[i] = g_external.down[i] && !g_externalWasDown[i];
+-                g_in.down[i] = g_external.down[i];
+-                g_externalWasDown[i] = g_external.down[i];
++                g_in.pressed[i] = i < 3 && g_external.down[i] && !g_externalWasDown[i];
++                g_in.down[i] = i < 3 && g_external.down[i];
++                g_externalWasDown[i] = i < 3 && g_external.down[i];
+             }
+             g_in.wheel = g_external.wheel;
+             g_external.wheel = 0.0f;
+@@ -158,6 +163,253 @@ namespace ps2_mouse
+         }
+     }
+ 
++
++    // ---- battle views (see ps2_mouse.h) ----------------------------------------
++    namespace
++    {
++        constexpr uint16_t kL3 = 0x0002u, kR3 = 0x0004u;
++        constexpr int64_t kBattleLapseNanos = 400'000'000;
++
++        std::mutex g_battleLock;
++        BattleState g_battle;
++        int64_t g_battleStamp = 0;
++        BattleEvents g_events;
++        bool g_eventDragging = false;
++
++        struct Track
++        {
++            bool down = false, dragged = false, suppressed = false, ctrl = false;
++            Vector2 start{};
++        };
++        std::array<Track, 5> g_track{};
++        std::mutex g_pulseLock; // the pulse queue is also filled from the game thread (battlePulse)
++        std::deque<uint16_t> g_pulses;
++        uint16_t g_pulseNow = 0;
++        int g_pulseFrames = 0;
++        double g_lastLeftPress = -10.0;
++        Vector2 g_lastLeftPos{};
++        bool g_lastLeftOnUnit = false; // the first click's pointer was on a unit (the camera glides away from it)
++
++        // GA2_BATTLE_EDGE_SCROLL=0 turns the map's edge scrolling off.
++        const bool g_edgeScrollEnabled = [] {
++            const char *v = std::getenv("GA2_BATTLE_EDGE_SCROLL");
++            return !(v && *v == '0');
++        }();
++
++        int64_t steadyNanos()
++        {
++            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++                .count();
++        }
++
++        // One press is kPulseOn frames on and 3 off: long enough for a loaded
++        // host (the game polls the pad once per game frame, which can be
++        // several presented frames apart), with a gap so that a following
++        // press is a new one.
++        constexpr int kPulseOn = 9;
++        void pulse(uint16_t bits)
++        {
++            std::lock_guard<std::mutex> lock(g_pulseLock);
++            if (bits && g_pulses.size() < 8)
++            {
++                g_pulses.push_back(bits);
++                if (std::getenv("GA2_BATTLE_MOUSE_DEBUG"))
++                    std::fprintf(stderr, "[battle mouse] pulse %04x\n", bits);
++            }
++        }
++        uint16_t pulseStep()
++        {
++            std::lock_guard<std::mutex> lock(g_pulseLock);
++            if (g_pulseFrames == 0)
++            {
++                if (g_pulses.empty())
++                    return 0;
++                g_pulseNow = g_pulses.front();
++                g_pulses.pop_front();
++                g_pulseFrames = kPulseOn + 3;
++            }
++            --g_pulseFrames;
++            return g_pulseFrames >= 3 ? g_pulseNow : 0;
++        }
++
++        bool ctrlDown() { return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL); }
++
++        // The pad bits the battle view's mouse input holds this frame.
++        uint16_t battleHeld(const BattleState &st, bool inWindow, bool overGame, bool padHit, bool ownsMenu)
++        {
++            const BattleButtons &b = st.buttons;
++            const uint16_t circle = b.circle ? b.circle : kCircle, cross = b.cross ? b.cross : kCross;
++            const uint16_t square = b.square ? b.square : kSquare, triangle = b.triangle ? b.triangle : kTriangle;
++            const uint16_t start = b.start ? b.start : kStart, l2 = b.l2 ? b.l2 : kL2;
++            const uint16_t l3 = b.l3 ? b.l3 : kL3, r3 = b.r3 ? b.r3 : kR3;
++            const uint16_t fire = b.fire ? b.fire : kCross, charge = b.charge ? b.charge : kCircle;
++            const Vector2 mouse = g_in.pos;
++            const bool ctrl = ctrlDown();
++            const float threshold = std::max(4.0f, g_game.width * 0.006f);
++            static const bool debug = std::getenv("GA2_BATTLE_MOUSE_DEBUG") != nullptr;
++            if (debug)
++            {
++                static BattleView shownView = BattleView::None;
++                if (shownView != st.view)
++                {
++                    shownView = st.view;
++                    std::fprintf(stderr, "[battle mouse] view %d (0 none, 1 map, 2 cockpit, 3 unit camera, 4 rear)\n", int(st.view));
++                }
++                for (int i = 0; i < 5; ++i)
++                    if (g_in.pressed[i])
++                        std::fprintf(stderr, "[battle mouse] button %d pressed at (%.0f, %.0f): inWindow %d overGame %d padHit %d owns %d\n", i,
++                                     mouse.x, mouse.y, inWindow, overGame, padHit, ownsMenu);
++            }
++            uint16_t held = 0;
++            bool dragging = false;
++            const double now = GetTime();
++
++            for (int i = 0; i < 5; ++i)
++            {
++                Track &t = g_track[i];
++                bool started = false, released = false;
++                if (g_in.pressed[i])
++                {
++                    t = Track{};
++                    t.down = inWindow && overGame && !padHit && !ownsMenu;
++                    t.start = mouse;
++                    t.ctrl = ctrl;
++                    started = t.down;
++                }
++                if (!g_in.down[i])
++                {
++                    released = t.down;
++                    t.down = false;
++                }
++                if (t.down && !t.dragged)
++                {
++                    const float dx = mouse.x - t.start.x, dy = mouse.y - t.start.y;
++                    t.dragged = dx * dx + dy * dy > threshold * threshold;
++                }
++
++                switch (st.view)
++                {
++                case BattleView::Map:
++                    if (i == 0)
++                    {
++                        if (started)
++                        {
++                            const float dx = mouse.x - g_lastLeftPos.x, dy = mouse.y - g_lastLeftPos.y;
++                            if (t.ctrl)
++                            {
++                                pulse(square);
++                                pulse(circle);
++                                t.suppressed = true;
++                            }
++                            else if (now - g_lastLeftPress < 0.35 && dx * dx + dy * dy < 100.0f && g_lastLeftOnUnit)
++                            {
++                                std::lock_guard<std::mutex> lock(g_battleLock);
++                                g_events.doubleClick = true;
++                                t.suppressed = true;
++                                g_lastLeftPress = -10.0;
++                            }
++                            if (!t.suppressed)
++                            {
++                                g_lastLeftPress = now;
++                                g_lastLeftPos = mouse;
++                                g_lastLeftOnUnit = st.pointerOnUnit;
++                            }
++                        }
++                        if (t.down && !t.suppressed)
++                            held |= circle;
++                    }
++                    else if (i == 1)
++                    {
++                        dragging = dragging || (t.down && t.dragged);
++                        if (released && !t.dragged)
++                            pulse(t.ctrl ? r3 : cross);
++                    }
++                    else if (i == 2)
++                    {
++                        // Ctrl: pause. On a unit: its H-Weapon. Elsewhere held: the angel list (L2).
++                        if (started && (t.ctrl || st.pointerOnUnit))
++                        {
++                            pulse(t.ctrl ? start : triangle);
++                            t.suppressed = true;
++                        }
++                        if (t.down && !t.suppressed && l2)
++                        {
++                            held |= l2;
++                            std::lock_guard<std::mutex> lock(g_battleLock);
++                            g_events.listHeld = true;
++                        }
++                    }
++                    else if (started)
++                        pulse(i == 3 ? l3 : r3);
++                    break;
++                case BattleView::Cockpit:
++                    if (i == 0 && t.down)
++                        held |= fire;
++                    else if (i == 1 && t.down)
++                        held |= charge;
++                    else if (i == 2 && started)
++                        pulse(t.ctrl ? start : l3);
++                    else if (i == 3 && started)
++                        pulse(b.l1 ? b.l1 : 0x0400u);
++                    else if (i == 4 && started)
++                        pulse(b.r1 ? b.r1 : 0x0800u);
++                    break;
++                case BattleView::Rear:
++                    if (i == 0 && t.down)
++                        held |= circle;
++                    else if (i == 1 && t.down)
++                        held |= cross;
++                    else if (i == 2 && started)
++                        pulse(t.ctrl ? start : l3);
++                    else if (i == 3 && started)
++                        pulse(l3);
++                    break;
++                case BattleView::UnitCamera:
++                    if (i <= 1)
++                    {
++                        dragging = dragging || (t.down && t.dragged);
++                        if (released && !t.dragged)
++                            pulse(i == 0 ? circle : r3);
++                    }
++                    else if (i == 2 && started)
++                        pulse(start);
++                    else if (i == 3 && started)
++                        pulse(r3);
++                    break;
++                default:
++                    break;
++                }
++            }
++
++            {
++                std::lock_guard<std::mutex> lock(g_battleLock);
++                g_eventDragging = dragging;
++                if (g_in.wheel != 0.0f && inWindow && overGame && !padHit)
++                {
++                    const int notches = g_in.wheel > 0.0f ? 1 : -1;
++                    if (st.view != BattleView::Cockpit)
++                        g_events.wheel += notches;
++                }
++            }
++
++            // The picture's edge pans the map with the game's own D-pad scroll.
++            if (st.view == BattleView::Map && st.edgeScroll && g_edgeScrollEnabled && inWindow && !padHit && overGame &&
++                IsWindowFocused() && GetTime() - g_lastMove < 6.0 && !g_track[1].down)
++            {
++                const float band = std::clamp(g_game.width * 0.008f, 3.0f, 10.0f);
++                if (mouse.x < g_game.x + band && b.left)
++                    held |= b.left;
++                else if (mouse.x >= g_game.x + g_game.width - band && b.right)
++                    held |= b.right;
++                if (mouse.y < g_game.y + band && b.up)
++                    held |= b.up;
++                else if (mouse.y >= g_game.y + g_game.height - band && b.down)
++                    held |= b.down;
++            }
++            return held | pulseStep();
++        }
++    }
++
+     void beginFrame(Rect game, float sourceWidth, float sourceHeight)
+     {
+         g_game = game;
+@@ -202,6 +454,32 @@ namespace ps2_mouse
+             g_pressOwned = pad != nullptr || ps2_mouse_menus::ownsClick();
+         if (!g_in.down[0])
+             g_pressOwned = false;
++        BattleState battle;
++        {
++            std::lock_guard<std::mutex> lock(g_battleLock);
++            battle = g_battle;
++            if (steadyNanos() - g_battleStamp > kBattleLapseNanos)
++                battle.view = BattleView::None;
++        }
++        if (battle.view != BattleView::None && !battle.modal)
++        {
++            g_held |= battleHeld(battle, inWindow, overGame, pad != nullptr, g_pressOwned || ps2_mouse_menus::ownsClick());
++            return;
++        }
++        // Not in a battle view: whatever was in flight ends.
++        {
++            std::lock_guard<std::mutex> lock(g_pulseLock);
++            g_pulses.clear();
++            g_pulseFrames = 0;
++        }
++        for (Track &t : g_track)
++            t = Track{};
++        {
++            std::lock_guard<std::mutex> lock(g_battleLock);
++            g_eventDragging = false;
++            g_events = BattleEvents{};
++        }
++
+         if (!pad && overGame && g_in.down[0] && !g_pressOwned && !ps2_mouse_menus::ownsClick())
+             g_held |= kCircle;
+         if (g_in.down[1])
+@@ -327,6 +605,43 @@ namespace ps2_mouse
+     }
+     bool clickedGame() { return g_clickedGame; }
+ 
++    void setBattleState(const BattleState &state)
++    {
++        std::lock_guard<std::mutex> lock(g_battleLock);
++        g_battle = state;
++        g_battleStamp = steadyNanos();
++    }
++
++    BattleEvents takeBattleEvents()
++    {
++        std::lock_guard<std::mutex> lock(g_battleLock);
++        BattleEvents out = g_events;
++        out.dragging = g_eventDragging;
++        g_events = BattleEvents{};
++        return out;
++    }
++
++    void battlePulse(uint16_t bits) { pulse(bits); }
++
++    int battlePulsesPending()
++    {
++        std::lock_guard<std::mutex> lock(g_pulseLock);
++        return int(g_pulses.size()) + (g_pulseFrames > 0 ? 1 : 0);
++    }
++
++    bool pointerAnywhere(float &x, float &y)
++    {
++        const Vector2 mouse = g_in.pos;
++        if (g_game.width <= 0 || g_game.height <= 0 || mouse.x < 0 || mouse.y < 0 || mouse.x >= GetScreenWidth() ||
++            mouse.y >= GetScreenHeight())
++            return false;
++        x = (mouse.x - g_game.x) * g_sourceWidth / g_game.width;
++        y = (mouse.y - g_game.y) * g_sourceHeight / g_game.height;
++        if (ga2_activity::wideFrame())
++            x = 320.0f + (x - 320.0f) * ga2_activity::horPlus.load();
++        return true;
++    }
++
+     bool pointer(float &x, float &y)
+     {
+         const Vector2 mouse = g_in.pos;
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.h b/ps2xRuntime/src/lib/ps2_mouse.h
+index 3d8828d..1b7820e 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.h
++++ b/ps2xRuntime/src/lib/ps2_mouse.h
+@@ -29,6 +29,9 @@ namespace ps2_mouse
+ 
+     // Pointer over the game image, in PS2 frame coordinates.
+     bool pointer(float &x, float &y);
++    // The window mouse in the same coordinates even outside the picture
++    // (drags that leave it); false while the mouse is not over the window.
++    bool pointerAnywhere(float &x, float &y);
+     // Left button went down this frame over the game image (not on the pad).
+     bool clickedGame();
+ 
+@@ -36,4 +39,66 @@ namespace ps2_mouse
+     void setFrame(const uint8_t *rgba, uint32_t width, uint32_t height);
+     // Its pixel at PS2 frame coordinates (640x448 scale); false without one.
+     bool pixel(int x, int y, uint8_t rgb[3]);
++
++    // ---- battle views ----------------------------------------------------
++    // While a battle view runs (the game side, native/compat/ga2_battlepointer
++    // .cpp, calls setBattleState every frame; it lapses a moment after the
++    // last call) the mouse buttons mean what the view needs instead of the
++    // generic Circle / Cross / Select / wheel-as-D-pad:
++    //   map:      left = Circle, Ctrl+left = order all angels (Square, then
++    //             Circle), a quick second click on a unit = focus on it, right
++    //             click = Cross, right drag = pan (BattleEvents), middle click
++    //             on a unit = its H-Weapon (Triangle), middle button held on
++    //             empty map = L2 (the game's angel list opens; the wheel moves
++    //             its cursor; releasing jumps the camera to that angel),
++    //             Ctrl+middle = Start (pause; while paused the generic mapping
++    //             gives the middle button Select, the system menu), the back
++    //             button = L3 (cockpit view), Ctrl+right or the forward button =
++    //             R3 (unit camera), wheel = zoom (BattleEvents), the picture's
++    //             edge scrolls with the game's D-pad;
++    //   cockpit:  left held = fire, right held = charged shot, middle = L3
++    //             (leave), Ctrl+middle = Start, back / forward = L1 / R1 (boost);
++    //   rear (chase) view: left = Circle, right = Cross, middle or the back
++    //             button = L3 (the aiming cockpit view), Ctrl+middle = Start;
++    //   unit camera: dragging with either button turns the camera, a click
++    //             without drag: left = Circle, right = R3 (leave); middle =
++    //             Start; wheel zooms.
++    enum class BattleView : uint8_t
++    {
++        None,
++        Map,
++        Cockpit,
++        UnitCamera,
++        Rear
++    };
++    // PS2 pad bits (the game's own current mapping, 0 = unknown: the default
++    // layout is used) of the logical buttons the views use.
++    struct BattleButtons
++    {
++        uint16_t circle = 0, cross = 0, square = 0, triangle = 0, start = 0, l3 = 0, r3 = 0, l2 = 0;
++        uint16_t fire = 0, charge = 0, l1 = 0, r1 = 0;
++        uint16_t up = 0, down = 0, left = 0, right = 0;
++    };
++    struct BattleState
++    {
++        BattleView view = BattleView::None;
++        BattleButtons buttons;
++        bool pointerOnUnit = false; // map: the pointer is on a unit icon
++        bool modal = false;         // a menu or pause is up: generic pointer behaviour
++        bool edgeScroll = true;     // map: the picture's edge pans
++    };
++    void setBattleState(const BattleState &state);
++    struct BattleEvents
++    {
++        bool dragging = false;     // right (map) or left/right (unit camera) button dragging now
++        int wheel = 0;             // notches since the last call, + = away from the user (zoom in)
++        bool doubleClick = false;  // a quick second left click on the unit the first one was on (its Circle was not sent)
++        bool listHeld = false;     // the middle button is held on empty map: L2 is down (the angel list is open)
++    };
++    // Called by the game side once per frame; clears the counters.
++    BattleEvents takeBattleEvents();
++    // A press (3 frames and more, then a gap) of the given pad bits, queued.
++    void battlePulse(uint16_t bits);
++    // Presses still waiting or in progress.
++    int battlePulsesPending();
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index d555105..f32d7f0 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -119,6 +119,8 @@ namespace ps2_mouse_menus
+             static const std::vector<VisualMenu> table = {
+                 // System menu (Select in dialogue): ロード / セーブ / オプション / ゲームをやめる.
+                 {{{241, 121, 407, 149}, {241, 155, 407, 183}, {241, 188, 407, 216}, {241, 221, 407, 249}}},
++                // Battle pause menu (Start to pause, then Select): オプション / ゲームをやめる.
++                {{{247, 156, 393, 186}, {247, 190, 393, 222}}},
+                 // Yes/No prompts (save, load, overwrite): はい / いいえ.
+                 {{{212, 233, 309, 255}, {329, 233, 426, 255}}, true},
+                 // Zettai Extra Route title (Mugen disc 2): はじめから / つづきから /
+-- 
+2.55.0
+

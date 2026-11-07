@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "kind": "spu-transfer-wait-causality",
+  "source_commit": "d5ea25a",
+  "runtime_patch_prefix": 16,
+  "production_change_this_stage": false,
+  "original_elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "original_scream_irx_sha256": "87a969e317d72199f2a459bf586a772c9a83d66febe0dcd6db2cc4d95d5981a1",
+  "capture": "captures/native-zettai/20261009-132815",
+  "actual_seconds": 291.656,
+  "observer_sha256": "adf3125fa787675e383f39eec4c5493ee073fde96c742aa71ea94f9471abece9",
+  "event_sha256": "773d7515615246e7836a4f1b15c498aa36b31aab87f5bf55ae0cd27d75de1e9c",
+  "diagnostic": {
+    "units_recompiled_O0": 4,
+    "production_unchanged": true,
+    "scope": "memory/emulator/stdio/intrman units rebuilt in isolated archive/executable; not ordinary timing or audio acceptance"
+  },
+  "events_recorded": 50,
+  "observer_errors": [],
+  "caps": {},
+  "pending_finishes": 0,
+  "scream_module": {
+    "id": 14,
+    "base": 512768,
+    "size": 100352
+  },
+  "sequence": [
+    {
+      "event": "DMA start-register write",
+      "cycle": 19269812,
+      "madr": 1984320,
+      "chcr": 16777729,
+      "bcr": 48431120,
+      "runtime_transfer_words": 11824,
+      "payload_prefix_bytes": 4096,
+      "payload_prefix_sha256": "95c527b899315e8e2fafc8d043ddab9861ce72322a341f90e988de8bfb00874a"
+    },
+    {
+      "event": "Original WaitSema11 returns from empty semaphore without owner/yield",
+      "cycle": 19269873,
+      "semaphore_count_before": 0,
+      "current_thread_null": true,
+      "call_depth": 1,
+      "v0_before": 589824,
+      "v0_after": 589824,
+      "yielded_after": false,
+      "busy_before_after": [
+        1,
+        1
+      ]
+    },
+    {
+      "event": "Original SCREAM error25",
+      "cycle": 19270054
+    },
+    {
+      "event": "Original SCREAM error18",
+      "cycle": 19270107
+    },
+    {
+      "event": "IRQ36 host dispatch begins",
+      "cycle": 19293460,
+      "enabled": true
+    },
+    {
+      "event": "Original SCREAM6CD8 busy-clear store observed before write",
+      "cycle": 19293577,
+      "busy_before": 1,
+      "write_value": 0
+    },
+    {
+      "event": "Original callback iSignalSema11 call",
+      "cycle": 19293585,
+      "return_offset": "0x6d00"
+    },
+    {
+      "event": "IRQ host dispatch returns; busy word now0",
+      "cycle": 19293603,
+      "dispatch_accepted": true,
+      "busy_after": 0
+    }
+  ],
+  "conclusion": "The empty detached WaitSema bypass precedes original busy errors. The scheduled IRQ later invokes original busy clear and semaphore signal. Preserve existing DMA/IRQ authority; repair the wait/continuation boundary first.",
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_settings_verified": "parent targeted read-only model metadata",
+    "status": "causal sequence verified; frame-preserving adapter and explicit host failure design preferred with required ownership/budget/contention guards"
+  },
+  "implementation_requirements": [
+    "Permit event pumping only for the exact held CPU of an intended checked native RPC invocation. Preserve its C++ continuation; do not discard/yield a detached local CPU or borrow a different thread owner.",
+    "Use existing kernel semaphore accounting and scheduler. Verify no competing waiter; observed contention reopens the actual server-thread design. Preserve invalid semaphore error behavior.",
+    "One absolute instruction/cycle budget covers all waits and nested execution. Existing call budget is2000000instructions.",
+    "Add checked pumping with ownership restoration and fault propagation through the existing scheduling loop. Do not duplicate scheduling policy.",
+    "Extend the existing RpcResult with a signed default-zero failureResult. Consume failures before host completion, preserve receive bytes, suppress callback/dispatch/signals, and clear busy only for the current matching client binding.",
+    "Prove original callback signal, one token acquisition, original continuation and subsequent chunks; test failure/no fallback/stale binding."
+  ],
+  "limits": [
+    "Duplicate store observations at the same guest PC/cycle do not establish multiple DMA transfers.",
+    "DMA payload equality is limited to4KiBprefix; no actual SPU sample RAM/PCM effect is proved.",
+    "dispatch_return=true is host acceptance, not by itself original handler completion; actual busy-clear/signal effects provide positive evidence.",
+    "Semaphore count after signal and competing waiters were not recorded by this observer.",
+    "Native RPC caller/return tracing and complete bank/voice/gameplay acceptance remain open.",
+    "Earlier fixed-base/relocated-identity probe132012 invalid; valid175s132336 only initialization before first transfer. Neither provides negative transfer evidence."
+  ]
+}

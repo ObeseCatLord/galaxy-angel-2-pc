@@ -1,0 +1,702 @@
+From a4875b3b4426a9b3045123fd1c8f61006073fa63 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 13:55:11 -0500
+Subject: [PATCH] texpacks: remember region hashes by VRAM content instead of
+ decoding every texture
+
+replace() decoded and hashed every texture region the GS created. The game
+re-creates the same texture (same registers, same VRAM bytes) tens of times a
+second, so ~99.9% of those decodes produced a hash already seen. The hash is
+over decoded RGBA (through the palette), so it cannot be computed from raw
+data; instead the hash is memoised under (layout, palette, 256-bit digest of
+every GS page the decode can read). The digest is a linear pass over the
+pages, ~20-60x cheaper than decode+hash; equal inputs decode to equal pixels,
+so results are exact. Hash definition, dump names and replacement logic are
+unchanged (decode is only deferred until a dump or a button composition needs
+the pixels). The pure decode/hash/digest code moves to gs_texregion.h (no
+Vulkan/raylib) so tests can drive it.
+
+Measured (thread time inside replace(), instrumented with GA2_TEXSTATS=1):
+  Zettai prebattle, 560 s, 1.04M calls: 101.1 s -> 8.0 s (97 us -> 6.7 us per call);
+    game-thread CPU share 66.9% -> 51.6% of a core.
+  Zettai + English pack 560 s: 93.7 s -> 11.8 s; game thread 62.7% -> 53.8%.
+  Eigou 2 narration 90 s: 6.87 s / 61.7k calls (111 us) -> 0.31 s / 159k calls (1.9 us).
+  Mugen 1 opening 120 s: 165k calls, 1.07 s total.
+Equality: GA2_TEXCHECK=1 recomputes every memo hit: 873k hits in a Zettai run
+and 46k in Eigou 2, 0 mismatches. Same replaced hashes (5 button textures in
+Eigou 2; 22 in Zettai with the English pack; title label with the test mod);
+Eigou 2 and Mugen 1 dump directory listings identical (44 / 26 names); Zettai
+listings differ only by timing-dependent animation frames, as between two
+baseline runs. New tests prove the digest covers every page a decode reads
+(mutation-checked: dropping the page-spill fails them); 613 tests pass.
+
+Switches: GA2_TEXMEMO=0 (old behaviour), GA2_TEXCHECK=1, GA2_TEXSTATS=1.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 223 +++++++++++++++++++------
+ ps2xRuntime/src/lib/gs/gs_texpacks.h   |   6 +
+ ps2xRuntime/src/lib/gs/gs_texregion.h  | 160 ++++++++++++++++++
+ ps2xTest/CMakeLists.txt                |   1 +
+ ps2xTest/src/main.cpp                  |   2 +
+ ps2xTest/src/ps2_texregion_tests.cpp   | 109 ++++++++++++
+ 6 files changed, 448 insertions(+), 53 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_texregion.h
+ create mode 100644 ps2xTest/src/ps2_texregion_tests.cpp
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index d733c2d..3b939e2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -9,6 +9,7 @@
+ 
+ #if defined(PS2X_HAVE_PGS)
+ 
++#include "gs_texregion.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/gs_clut_snapshot.h"
+ #include <nlohmann/json.hpp>
+@@ -17,12 +18,15 @@
+ #include "device.hpp"
+ #include "gs_interface.hpp"
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <map>
+ #include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -30,6 +34,7 @@
+ 
+ using namespace Vulkan;
+ using namespace ParallelGS;
++using namespace ga2_texregion;
+ 
+ namespace ga2_texpacks
+ {
+@@ -180,11 +185,43 @@ namespace ga2_texpacks
+         }
+         std::unordered_set<uint64_t> g_dumped;
+ 
+-        uint32_t expand16(uint32_t c)
++        // GA2_TEXSTATS=1: where replace() spends its time, by region size and format,
++        // and the replacements made (stderr, every 15 s).
++        struct TexStat
+         {
+-            const uint32_t r = (c & 31u) << 3, g = ((c >> 5) & 31u) << 3, b = ((c >> 10) & 31u) << 3;
+-            const uint32_t a = (c & 0x8000u) ? 0x80u : 0u;
+-            return r | (g << 8) | (b << 16) | (a << 24);
++            uint64_t calls = 0, ns = 0, repeats = 0, matched = 0;
++        };
++        const bool g_stats = [] { const char *v = std::getenv("GA2_TEXSTATS"); return v && *v && *v != '0'; }();
++        const bool g_memoOn = [] { const char *v = std::getenv("GA2_TEXMEMO"); return !(v && *v == '0'); }();
++        const bool g_memoCheck = [] { const char *v = std::getenv("GA2_TEXCHECK"); return v && *v && *v != '0'; }();
++        uint64_t g_memoHits = 0, g_memoMisses = 0, g_memoMismatches = 0, g_digestNs = 0;
++        std::map<std::array<uint32_t, 3>, TexStat> g_statMap; // w, h, psm
++        std::unordered_set<uint64_t> g_statSeen, g_statReplaced;
++        uint64_t g_lastHash = 0;
++        uint64_t g_statTotalNs = 0, g_statCalls = 0, g_statSkipNs = 0, g_statSkipCalls = 0;
++        std::chrono::steady_clock::time_point g_statLast = std::chrono::steady_clock::now();
++        uint64_t nowNs()
++        {
++            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch()).count());
++        }
++        void statReport()
++        {
++            std::vector<std::pair<std::array<uint32_t, 3>, TexStat>> rows(g_statMap.begin(), g_statMap.end());
++            std::sort(rows.begin(), rows.end(), [](auto &a, auto &b) { return a.second.ns > b.second.ns; });
++            std::fprintf(stderr,
++                         "[texstats] calls %llu total %.1f ms (skipped-early calls %llu %.1f ms) memo hits %llu misses %llu mismatches %llu digest %.1f ms\n",
++                         (unsigned long long)g_statCalls, g_statTotalNs / 1e6, (unsigned long long)g_statSkipCalls,
++                         g_statSkipNs / 1e6, (unsigned long long)g_memoHits, (unsigned long long)g_memoMisses,
++                         (unsigned long long)g_memoMismatches, g_digestNs / 1e6);
++            for (size_t i = 0; i < rows.size() && i < 14; ++i)
++            {
++                const auto &r = rows[i];
++                std::fprintf(stderr,
++                             "[texstats]  %4ux%-4u psm %02x calls %6llu repeat %6llu matched %4llu  total %8.1f ms\n",
++                             r.first[0], r.first[1], r.first[2], (unsigned long long)r.second.calls,
++                             (unsigned long long)r.second.repeats, (unsigned long long)r.second.matched, r.second.ns / 1e6);
++            }
+         }
+ 
+         // One CLUT entry (CSM1 layout) for index i.
+@@ -207,26 +244,18 @@ namespace ga2_texpacks
+             return GSMem::ReadCT32(vram, cbp, 1, x, y);
+         }
+ 
+-        // A region of the texture as RGBA (PS2 alpha, 0x80 = opaque); false
+-        // for formats not handled here.
+-        bool decode(uint64_t tex0, uint32_t rx, uint32_t ry, uint32_t &w, uint32_t &h, std::vector<uint32_t> &out)
++        // The palette a paletted TEX0 samples through (256 entries for 8-bit
++        // formats, 16 for 4-bit).
++        void buildPalette(uint64_t tex0, uint32_t (&palette)[256])
+         {
+             uint8_t *vram = const_cast<uint8_t *>(g_vram);
+-            const uint32_t tbp = uint32_t(tex0 & 0x3FFFu), tbw = uint32_t((tex0 >> 14) & 0x3Fu);
+             const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
+-            const uint32_t tw = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 26) & 0xFu));
+-            const uint32_t th = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 30) & 0xFu));
+-            if (rx >= tw || ry >= th)
+-                return false;
+-            w = std::min(w, tw - rx);
+-            h = std::min(h, th - ry);
+             const uint32_t cbp = uint32_t((tex0 >> 37) & 0x3FFFu), cpsm = uint32_t((tex0 >> 51) & 0xFu);
+-            out.resize(size_t(w) * h);
+-            uint32_t palette[256] = {};
+-            const bool p8 = psm == 0x13u || psm == 0x1Bu, p4 = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
++            std::fill(std::begin(palette), std::end(palette), 0u);
++            const bool p8 = psm == 0x13u || psm == 0x1Bu;
+             const uint32_t cld = uint32_t((tex0 >> 61) & 7u), csm = uint32_t((tex0 >> 55) & 1u), csa = uint32_t((tex0 >> 56) & 0x1Fu);
+             std::array<uint16_t, 512> buffer{};
+-            if ((p8 || p4) && cld == 0u && ga2_gs::clutSnapshot(buffer))
++            if (cld == 0u && ga2_gs::clutSnapshot(buffer))
+             {
+                 // The palette loaded earlier (CLD = 0 reuses the GS CLUT buffer),
+                 // looked up like GSCpuBackend::LookupCLUT.
+@@ -241,44 +270,35 @@ namespace ga2_texpacks
+                     palette[i] = sixteen ? expand16(buffer[index]) : cpsm == 0x01u ? (raw & 0x00FFFFFFu) | 0x80000000u : raw;
+                 }
+             }
+-            else if (p8 || p4)
++            else
+                 // This TEX0 loads its palette from CBP now (CSM1 layout).
+                 for (uint32_t i = 0; i < (p8 ? 256u : 16u); ++i)
+                     palette[i] = clutEntry(vram, cbp, cpsm, p8, i);
+-            for (uint32_t oy = 0; oy < h; ++oy)
+-                for (uint32_t ox = 0; ox < w; ++ox)
+-                {
+-                    const uint32_t x = rx + ox, y = ry + oy;
+-                    uint32_t c = 0;
+-                    switch (psm)
+-                    {
+-                    case 0x00u: c = GSMem::ReadCT32(vram, tbp, tbw, x, y); break;
+-                    case 0x01u: c = GSMem::ReadCT24(vram, tbp, tbw, x, y) | 0x80000000u; break;
+-                    case 0x02u: c = expand16(GSMem::ReadCT16(vram, tbp, tbw, x, y)); break;
+-                    case 0x0Au: c = expand16(GSMem::ReadCT16S(vram, tbp, tbw, x, y)); break;
+-                    case 0x13u: c = palette[GSMem::ReadP8(vram, tbp, tbw, x, y) & 255u]; break;
+-                    case 0x1Bu: c = palette[GSMem::ReadP8H(vram, tbp, tbw, x, y) & 255u]; break;
+-                    case 0x14u: c = palette[GSMem::ReadP4(vram, tbp, tbw, x, y) & 15u]; break;
+-                    case 0x24u: c = palette[GSMem::ReadP4HL(vram, tbp, tbw, x, y) & 15u]; break;
+-                    case 0x2Cu: c = palette[GSMem::ReadP4HH(vram, tbp, tbw, x, y) & 15u]; break;
+-                    default: return false;
+-                    }
+-                    out[size_t(oy) * w + ox] = c;
+-                }
+-            return true;
+         }
+ 
+-        uint64_t hashPixels(const std::vector<uint32_t> &px, uint32_t w, uint32_t h)
++        // ---- decoded-hash memo ------------------------------------------
++        // Decoding and hashing a region is the cost; the game re-creates the
++        // same texture (same registers, same VRAM bytes) over and over, so the
++        // region's hash is remembered by what it was computed from: the
++        // layout, the palette and a digest of every GS page the decode can
++        // read. The digest is far cheaper than the decode (a linear pass over
++        // the pages), and the memo is exact: equal inputs decode to equal
++        // pixels. GA2_TEXMEMO=0 turns it off; GA2_TEXCHECK=1 recomputes every
++        // hit and reports differences.
++        struct MemoKey
+         {
+-            uint64_t hash = 0x9E3779B97F4A7C15ull ^ (uint64_t(w) << 32 | h);
+-            for (uint32_t v : px)
++            uint64_t layout0 = 0, layout1 = 0, d0 = 0, d1 = 0;
++            bool operator==(const MemoKey &o) const
+             {
+-                hash ^= v;
+-                hash *= 0x100000001B3ull;
+-                hash ^= hash >> 29;
++                return layout0 == o.layout0 && layout1 == o.layout1 && d0 == o.d0 && d1 == o.d1;
+             }
+-            return hash;
+-        }
++        };
++        struct MemoKeyHash
++        {
++            size_t operator()(const MemoKey &k) const { return size_t(k.d0 ^ (k.d1 * 0x9E3779B97F4A7C15ull) ^ k.layout0); }
++        };
++        std::unordered_map<MemoKey, uint64_t, MemoKeyHash> g_memo;
++        constexpr size_t kMemoLimit = 1u << 17;
+ 
+         void buildIndex()
+         {
+@@ -334,6 +354,42 @@ namespace ga2_texpacks
+         {
+         public:
+             ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, Device &device) override
++            {
++                if (!g_stats)
++                    return replaceInner(desc, tex0, device, nullptr);
++                TexStat local;
++                const uint64_t t0 = nowNs();
++                ImageHandle result = replaceInner(desc, tex0, device, &local);
++                const uint64_t dt = nowNs() - t0;
++                std::lock_guard<std::mutex> lock(g_mutex);
++                g_statCalls++;
++                g_statTotalNs += dt;
++                if (result && g_statReplaced.insert(g_lastHash).second)
++                    std::fprintf(stderr, "[texrepl] %016llx %ux%u\n", (unsigned long long)g_lastHash, desc.rect.width,
++                                 desc.rect.height);
++                if (local.calls)
++                {
++                    local.ns = dt;
++                    TexStat &acc = g_statMap[{desc.rect.width, desc.rect.height, uint32_t((tex0 >> 20) & 0x3Fu)}];
++                    acc.calls++;
++                    acc.ns += dt;
++                    acc.repeats += local.repeats;
++                    acc.matched += local.matched;
++                }
++                else
++                {
++                    g_statSkipCalls++;
++                    g_statSkipNs += dt;
++                }
++                if (std::chrono::steady_clock::now() - g_statLast > std::chrono::seconds(15))
++                {
++                    g_statLast = std::chrono::steady_clock::now();
++                    statReport();
++                }
++                return result;
++            }
++
++            ImageHandle replaceInner(const TextureDescriptor &desc, uint64_t tex0, Device &device, TexStat *st)
+             {
+                 // Render targets (post-process inputs, frame copies) are not
+                 // art: new pixels every frame, and the CPU VRAM mirror does not
+@@ -348,14 +404,75 @@ namespace ga2_texpacks
+                 const bool buttons = g_style != "playstation" && !g_buttonMap.empty();
+                 if (g_index.empty() && g_dumpDir.empty() && !buttons)
+                     return {};
+-                std::vector<uint32_t> px;
+                 uint32_t w = desc.rect.width, h = desc.rect.height;
+-                if (!w || !h || !decode(tex0, desc.rect.x, desc.rect.y, w, h, px))
++                const uint32_t rx = desc.rect.x, ry = desc.rect.y;
++                if (!w || !h || !clampRegion(tex0, rx, ry, w, h))
+                     return {};
+                 // A replacement must cover the whole cached region.
+                 if (w != desc.rect.width || h != desc.rect.height)
+                     return {};
+-                const uint64_t hash = hashPixels(px, w, h);
++                const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
++                uint32_t palette[256];
++                const bool paletted = isPaletted(psm);
++                if (paletted)
++                    buildPalette(tex0, palette);
++                std::vector<uint32_t> px;
++                const auto pixels = [&]() -> const std::vector<uint32_t> & {
++                    if (px.empty())
++                        decodePixels(g_vram, tex0, rx, ry, w, h, palette, px);
++                    return px;
++                };
++                const uint64_t t0 = st ? nowNs() : 0;
++                uint64_t hash = 0;
++                bool known = false;
++                MemoKey memoKey;
++                if (g_memoOn)
++                {
++                    Digest digest;
++                    if (paletted)
++                        digestWords(digest, reinterpret_cast<const uint8_t *>(palette), sizeof(palette));
++                    digestRegion(g_vram, tex0, rx, ry, w, h, digest);
++                    memoKey.layout0 = (tex0 & 0x3FFFFFFull) | uint64_t(rx) << 26 | uint64_t(ry) << 36 | uint64_t(w) << 46;
++                    memoKey.layout1 = uint64_t(h) | uint64_t(paletted);
++                    memoKey.d0 = digest.a ^ (digest.c << 1 | digest.c >> 63);
++                    memoKey.d1 = digest.b ^ (digest.d << 7 | digest.d >> 57);
++                    if (const auto hit = g_memo.find(memoKey); hit != g_memo.end())
++                    {
++                        hash = hit->second;
++                        known = true;
++                    }
++                    if (st)
++                        g_digestNs += nowNs() - t0;
++                }
++                if (known)
++                    ++g_memoHits;
++                if (!known || g_memoCheck)
++                {
++                    const uint64_t computed = hashPixels(pixels(), w, h);
++                    if (known && computed != hash)
++                    {
++                        ++g_memoMismatches;
++                        std::fprintf(stderr, "[texpacks] MEMO MISMATCH tex0 %016llx rect %u,%u %ux%u: memo %016llx computed %016llx\n",
++                                     (unsigned long long)tex0, rx, ry, w, h, (unsigned long long)hash,
++                                     (unsigned long long)computed);
++                    }
++                    hash = computed;
++                    if (g_memoOn)
++                    {
++                        if (!known)
++                            ++g_memoMisses;
++                        if (g_memo.size() >= kMemoLimit)
++                            g_memo.clear();
++                        g_memo[memoKey] = hash;
++                    }
++                }
++                if (st)
++                {
++                    g_lastHash = hash;
++                    st->calls = 1;
++                    st->repeats = g_statSeen.insert(hash).second ? 0 : 1;
++                    st->matched = g_index.count(hash) || g_buttonMap.count(hash) ? 1 : 0;
++                }
+                 char name[32];
+                 std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
+                 // Full-height 64-pixel strips are the games' copies of the
+@@ -364,7 +481,7 @@ namespace ga2_texpacks
+                 if (!g_dumpDir.empty() && !frameStrip && g_dumped.insert(hash).second)
+                 {
+                     // PNG alpha 255 = opaque (the GS's 0x80 doubled).
+-                    std::vector<uint32_t> png(px);
++                    std::vector<uint32_t> png(pixels());
+                     for (uint32_t &c : png)
+                     {
+                         const uint32_t a = std::min<uint32_t>(255u, (c >> 24) * 2u);
+@@ -385,7 +502,7 @@ namespace ga2_texpacks
+                     if (const auto cached = g_images.find(key); cached != g_images.end())
+                         return cached->second;
+                     ::Image composed{};
+-                    if (!composeButtons(px, w, h, spots->second, composed))
++                    if (!composeButtons(pixels(), w, h, spots->second, composed))
+                     {
+                         UnloadImage(composed);
+                         return {};
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index 5a7cc8f..90de1e6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -4,6 +4,12 @@
+ //                                       (first folder wins; any resolution)
+ //   GA2_TEX_DUMP=<dir>                  writes every texture the GS samples
+ //                                       as <hash>.png (alpha 255 = opaque)
++//   GA2_TEXSTATS=1                      where the hook spends its time (stderr)
++//   GA2_TEXMEMO=0                       decode and hash every texture (the
++//                                       hash of an unchanged region is
++//                                       otherwise remembered)
++//   GA2_TEXCHECK=1                      recompute every remembered hash and
++//                                       report differences (verification)
+ #pragma once
+ 
+ #include <cstdint>
+diff --git a/ps2xRuntime/src/lib/gs/gs_texregion.h b/ps2xRuntime/src/lib/gs/gs_texregion.h
+new file mode 100644
+index 0000000..697a41e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_texregion.h
+@@ -0,0 +1,160 @@
++// Pure helpers of the texture-pack hook (gs_texpacks.cpp), kept in a header
++// without Vulkan or raylib so the tests can drive them: decoding a texture
++// region from GS memory, the region hash that names textures in dumps, packs
++// and the button map, and a digest of the GS pages a decode reads.
++#pragma once
++
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace ga2_texregion
++{
++
++    inline uint32_t expand16(uint32_t c)
++    {
++        const uint32_t r = (c & 31u) << 3, g = ((c >> 5) & 31u) << 3, b = ((c >> 10) & 31u) << 3;
++        const uint32_t a = (c & 0x8000u) ? 0x80u : 0u;
++        return r | (g << 8) | (b << 16) | (a << 24);
++    }
++
++    inline bool isPaletted(uint32_t psm)
++    {
++        return psm == 0x13u || psm == 0x1Bu || psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
++    }
++
++    inline bool supportedPsm(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case 0x00u: case 0x01u: case 0x02u: case 0x0Au:
++        case 0x13u: case 0x1Bu: case 0x14u: case 0x24u: case 0x2Cu:
++            return true;
++        default:
++            return false;
++        }
++    }
++
++    // The region the replacement hook is asked about, clipped to the
++    // texture; false outside it or for formats not handled here.
++    inline bool clampRegion(uint64_t tex0, uint32_t rx, uint32_t ry, uint32_t &w, uint32_t &h)
++    {
++        const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
++        const uint32_t tw = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 26) & 0xFu));
++        const uint32_t th = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 30) & 0xFu));
++        if (rx >= tw || ry >= th || !supportedPsm(psm))
++            return false;
++        w = std::min(w, tw - rx);
++        h = std::min(h, th - ry);
++        return true;
++    }
++
++    template <class Read>
++    inline void fillRegion(std::vector<uint32_t> &out, uint32_t rx, uint32_t ry, uint32_t w, uint32_t h, Read read)
++    {
++        uint32_t *dst = out.data();
++        for (uint32_t oy = 0; oy < h; ++oy)
++            for (uint32_t ox = 0; ox < w; ++ox)
++                *dst++ = read(rx + ox, ry + oy);
++    }
++
++    // The (clamped, supported) region as RGBA (PS2 alpha, 0x80 = opaque).
++    inline void decodePixels(const uint8_t *gsVram, uint64_t tex0, uint32_t rx, uint32_t ry, uint32_t w, uint32_t h, const uint32_t *palette,
++                      std::vector<uint32_t> &out)
++    {
++        uint8_t *vram = const_cast<uint8_t *>(gsVram);
++        const uint32_t tbp = uint32_t(tex0 & 0x3FFFu), tbw = uint32_t((tex0 >> 14) & 0x3Fu);
++        const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
++        out.resize(size_t(w) * h);
++        switch (psm)
++        {
++        case 0x00u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return GSMem::ReadCT32(vram, tbp, tbw, x, y); }); break;
++        case 0x01u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return GSMem::ReadCT24(vram, tbp, tbw, x, y) | 0x80000000u; }); break;
++        case 0x02u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return expand16(GSMem::ReadCT16(vram, tbp, tbw, x, y)); }); break;
++        case 0x0Au: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return expand16(GSMem::ReadCT16S(vram, tbp, tbw, x, y)); }); break;
++        case 0x13u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return palette[GSMem::ReadP8(vram, tbp, tbw, x, y) & 255u]; }); break;
++        case 0x1Bu: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return palette[GSMem::ReadP8H(vram, tbp, tbw, x, y) & 255u]; }); break;
++        case 0x14u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return palette[GSMem::ReadP4(vram, tbp, tbw, x, y) & 15u]; }); break;
++        case 0x24u: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return palette[GSMem::ReadP4HL(vram, tbp, tbw, x, y) & 15u]; }); break;
++        case 0x2Cu: fillRegion(out, rx, ry, w, h, [&](uint32_t x, uint32_t y) { return palette[GSMem::ReadP4HH(vram, tbp, tbw, x, y) & 15u]; }); break;
++        default: break; // clampRegion refused these
++        }
++    }
++
++    struct Digest
++    {
++        uint64_t a = 0x243F6A8885A308D3ull, b = 0x13198A2E03707344ull, c = 0xA4093822299F31D0ull, d = 0x082EFA98EC4E6C89ull;
++    };
++
++    inline void digestWords(Digest &s, const uint8_t *p, size_t bytes)
++    {
++        // bytes is a multiple of 32; four independent lanes keep the
++        // multiplies pipelined.
++        uint64_t a = s.a, b = s.b, c = s.c, d = s.d;
++        for (const uint8_t *end = p + bytes; p != end; p += 32)
++        {
++            uint64_t w0, w1, w2, w3;
++            std::memcpy(&w0, p, 8);
++            std::memcpy(&w1, p + 8, 8);
++            std::memcpy(&w2, p + 16, 8);
++            std::memcpy(&w3, p + 24, 8);
++            a = (a ^ w0) * 0x9E3779B97F4A7C15ull;
++            b = (b ^ w1) * 0xC2B2AE3D27D4EB4Full;
++            c = (c ^ w2) * 0x165667B19E3779F9ull;
++            d = (d ^ w3) * 0xD6E8FEB86659FD93ull;
++            a ^= a >> 32;
++            b ^= b >> 32;
++            c ^= c >> 32;
++            d ^= d >> 32;
++        }
++        s.a = a; s.b = b; s.c = c; s.d = d;
++    }
++
++    // Page extent in pixels of the GS storage mode (the swizzle's unit).
++    inline void pageExtent(uint32_t psm, uint32_t &pw, uint32_t &ph)
++    {
++        switch (psm)
++        {
++        case 0x02u: case 0x0Au: pw = 64; ph = 64; break;
++        case 0x13u: pw = 128; ph = 64; break;
++        case 0x14u: pw = 128; ph = 128; break;
++        default: pw = 64; ph = 32; break; // 32/24-bit and the high-nibble modes
++        }
++    }
++
++    // Digest of the GS pages a decode of this region can read: those the
++    // region's pixels fall in (GSMem::PixelStorageTraits::PageId) and the
++    // page after each, where the block offset of a texture that does not
++    // start on a page boundary spills over.
++    inline void digestRegion(const uint8_t *vram, uint64_t tex0, uint32_t rx, uint32_t ry, uint32_t w, uint32_t h, Digest &digest)
++    {
++        constexpr uint32_t kPageBytes = 8192, kPages = 4u * 1024u * 1024u / kPageBytes; // 512
++        const uint32_t tbp = uint32_t(tex0 & 0x3FFFu), tbw = uint32_t((tex0 >> 14) & 0x3Fu);
++        const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
++        uint32_t pw, ph;
++        pageExtent(psm, pw, ph);
++        const uint32_t basePage = tbp / 32u, perRow = (tbw * 64u) / pw;
++        const uint32_t spill = (tbp % 32u) ? 1u : 0u;
++        const uint32_t row0 = ry / ph, row1 = (ry + h - 1u) / ph, col0 = rx / pw, col1 = (rx + w - 1u) / pw;
++        for (uint32_t row = row0; row <= row1; ++row)
++            for (uint32_t page = basePage + row * perRow + col0, last = basePage + row * perRow + col1 + spill; page <= last;
++                 ++page)
++                digestWords(digest, vram + size_t(page % kPages) * kPageBytes, kPageBytes);
++    }
++
++    inline uint64_t hashPixels(const std::vector<uint32_t> &px, uint32_t w, uint32_t h)
++    {
++        uint64_t hash = 0x9E3779B97F4A7C15ull ^ (uint64_t(w) << 32 | h);
++        for (uint32_t v : px)
++        {
++            hash ^= v;
++            hash *= 0x100000001B3ull;
++            hash ^= hash >> 29;
++        }
++        return hash;
++    }
++
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 0ba452f..b3cdec9 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -43,6 +43,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
++    src/ps2_texregion_tests.cpp
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 434f3a8..2a889aa 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -24,6 +24,7 @@ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
++void register_ps2_texregion_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+@@ -58,6 +59,7 @@ int main()
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
++    register_ps2_texregion_tests();
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+diff --git a/ps2xTest/src/ps2_texregion_tests.cpp b/ps2xTest/src/ps2_texregion_tests.cpp
+new file mode 100644
+index 0000000..5db3481
+--- /dev/null
++++ b/ps2xTest/src/ps2_texregion_tests.cpp
+@@ -0,0 +1,109 @@
++#include "MiniTest.h"
++#include "gs/gs_texregion.h"
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <cstdint>
++#include <vector>
++
++namespace
++{
++    struct Rng
++    {
++        uint64_t s;
++        uint32_t next()
++        {
++            s ^= s << 13;
++            s ^= s >> 7;
++            s ^= s << 17;
++            return uint32_t(s >> 16);
++        }
++    };
++
++    uint64_t makeTex0(uint32_t tbp, uint32_t tbw, uint32_t psm, uint32_t tw, uint32_t th)
++    {
++        return uint64_t(tbp) | uint64_t(tbw) << 14 | uint64_t(psm) << 20 | uint64_t(tw) << 26 | uint64_t(th) << 30;
++    }
++}
++
++void register_ps2_texregion_tests()
++{
++    MiniTest::Case("TexRegion", [](TestCase &tc)
++    {
++        tc.Run("the region digest covers every GS page a decode reads", [](TestCase &t)
++        {
++            GSMem::InitLookupTables();
++            constexpr size_t kVram = 4u * 1024u * 1024u, kPage = 8192u;
++            const uint32_t psms[] = {0x00u, 0x01u, 0x02u, 0x0Au, 0x13u, 0x1Bu, 0x14u, 0x24u, 0x2Cu};
++            Rng rng{0x9E3779B97F4A7C15ull};
++            std::vector<uint8_t> vram(kVram);
++            uint32_t palette[256];
++            uint32_t uncovered = 0, trials = 0, readPages = 0;
++            for (uint32_t psm : psms)
++                for (int trial = 0; trial < 8; ++trial)
++                {
++                    for (size_t i = 0; i < kVram; i += 4)
++                    {
++                        const uint32_t v = rng.next() ^ rng.next() << 16;
++                        std::memcpy(&vram[i], &v, 4);
++                    }
++                    for (uint32_t &c : palette)
++                        c = rng.next() ^ rng.next() << 16;
++                    // Mix aligned and unaligned bases, narrow and wide buffers,
++                    // and bases near the end of GS memory (the wrap).
++                    uint32_t tbp = rng.next() % 16384u;
++                    if (trial % 3 == 0)
++                        tbp &= ~31u;
++                    if (trial % 7 == 6)
++                        tbp = 16384u - 1u - rng.next() % 96u;
++                    const uint32_t tbw = 1u + rng.next() % 10u;
++                    const uint32_t twLog = 3u + rng.next() % 5u, thLog = 3u + rng.next() % 5u; // 8..128 px
++                    uint64_t tex0 = makeTex0(tbp, tbw, psm, twLog, thLog);
++                    const uint32_t tw = 1u << twLog, th = 1u << thLog;
++                    uint32_t rx = rng.next() % tw, ry = rng.next() % th;
++                    uint32_t w = 1u + rng.next() % 100u, h = 1u + rng.next() % 100u;
++                    t.IsTrue(ga2_texregion::clampRegion(tex0, rx, ry, w, h), "region inside the texture");
++
++                    std::vector<uint32_t> base, changed;
++                    ga2_texregion::decodePixels(vram.data(), tex0, rx, ry, w, h, palette, base);
++                    ga2_texregion::Digest d0;
++                    ga2_texregion::digestRegion(vram.data(), tex0, rx, ry, w, h, d0);
++                    for (size_t page = 0; page < kVram / kPage; ++page)
++                    {
++                        uint8_t *p = vram.data() + page * kPage;
++                        for (size_t i = 0; i < kPage; ++i)
++                            p[i] ^= 0xFFu;
++                        ga2_texregion::decodePixels(vram.data(), tex0, rx, ry, w, h, palette, changed);
++                        ga2_texregion::Digest d1;
++                        ga2_texregion::digestRegion(vram.data(), tex0, rx, ry, w, h, d1);
++                        const bool decodeChanged = changed != base;
++                        const bool digestChanged = d0.a != d1.a || d0.b != d1.b || d0.c != d1.c || d0.d != d1.d;
++                        if (decodeChanged)
++                        {
++                            ++readPages;
++                            if (!digestChanged)
++                                ++uncovered;
++                        }
++                        for (size_t i = 0; i < kPage; ++i)
++                            p[i] ^= 0xFFu;
++                    }
++                    ++trials;
++                }
++            t.IsTrue(trials >= 72 && readPages > 100, "the sweep read pages");
++            t.Equals(uncovered, 0u, "pages the decode reads but the digest misses");
++        });
++
++        tc.Run("the region digest is stable for equal contents and differs for changed ones", [](TestCase &t)
++        {
++            GSMem::InitLookupTables();
++            std::vector<uint8_t> vram(4u * 1024u * 1024u, 0x5Au);
++            const uint64_t tex0 = makeTex0(96, 10, 0x13u, 10, 9);
++            ga2_texregion::Digest a, b, c;
++            ga2_texregion::digestRegion(vram.data(), tex0, 0, 0, 640, 480, a);
++            ga2_texregion::digestRegion(vram.data(), tex0, 0, 0, 640, 480, b);
++            t.IsTrue(a.a == b.a && a.b == b.b && a.c == b.c && a.d == b.d, "equal contents, equal digest");
++            vram[96u * 256u + 1000u] ^= 1u;
++            ga2_texregion::digestRegion(vram.data(), tex0, 0, 0, 640, 480, c);
++            t.IsTrue(a.a != c.a || a.b != c.b || a.c != c.c || a.d != c.d, "a changed byte changes the digest");
++        });
++    });
++}
+-- 
+2.55.0
+

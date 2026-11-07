@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 13,
+  "source": {
+    "descriptor": "0x002d3db0",
+    "installer": "0x00113c30",
+    "observed_call": "0x001148b4",
+    "guest_return": "0x001148bc",
+    "pair_format": "signed16 adjustment at slot; function at slot+4;8byte pairs",
+    "missing_entries": {
+      "0x08": "0x00113c50",
+      "0x10": "0x00113c78",
+      "0x18": "0x00113ca8",
+      "0x20": "0x00113cd8",
+      "0x28": "0x00113d00",
+      "0x30": "0x00113d28",
+      "0x38": "0x00113d50",
+      "0x40": "0x00113d78",
+      "0x48": "0x00113d98",
+      "0x50": "0x00113dc0",
+      "0x58": "0x00113de8"
+    },
+    "native_method": "0x00113c78",
+    "native_formula": "sext32(A) & ~sext32(B) & A1_low64; A=word32(002b6848+offset), B=word32(002b6850+offset), offset=(index<<2) mod2^32, address sums mod2^32",
+    "emitted_words_verified": 108,
+    "omitted_zero_words_verified": [
+      "0x113d94",
+      "0x113e04"
+    ],
+    "body_hashes": {
+      "entry_113c50_0x113c78.cpp": "296b719d71a1794a78f0e0a6dcd144eaf1ed2ee2f73601c4a9ef6d4c76bdd074",
+      "entry_113c78_0x113ca8.cpp": "da7ed9e777ef3f2c2b5b99ef09d85cb12708cbccced79c225935eedeabeb2027",
+      "entry_113ca8_0x113cd8.cpp": "af80dcd91725e8528145207a3dd24974218e37df3290c6b9ecc8d096869df5ac",
+      "entry_113cd8_0x113d00.cpp": "72998670865c93ad7af9cb9c14865907ebfa5431335dbf576193fce533215017",
+      "entry_113d00_0x113d28.cpp": "d6092d570974e3cdf62cc608507f71898ca266c19aefc70afc07c055c0d9e14d",
+      "entry_113d28_0x113d50.cpp": "76bbf8868bced747057bb0abee6f5783244cc9b290f5820959910175c3cc1cd6",
+      "entry_113d50_0x113d78.cpp": "af2a02b98407d7d106af64716c97ec7cfa0c0e941c6900cf77308e59b3ceb18e",
+      "entry_113d78_0x113d98.cpp": "44aab5925ec57ec6944202a01dac8d3068abb360b5c8837fb13e72572689272e",
+      "entry_113d98_0x113dc0.cpp": "d6d716cbdcc076e4294000a66851cf318ee15a6598d5b8d37a1454ae10e988e1",
+      "entry_113dc0_0x113de8.cpp": "506c77f18d22fee2d9aa69a348bf35f10f0e01713639c23c1689baa8b09ae684",
+      "entry_113de8_0x113e08.cpp": "170a50839a452aa3873590576bc0fb85afb357e788cfa46be907a0a242584cc2"
+    },
+    "methods_source_verified": 11,
+    "generation_files_changed": 13,
+    "index_field": "object+4",
+    "all_nonzero_original_descriptor_methods_registered": true,
+    "native_formula_width": 64,
+    "native_modifies_gprs": [
+      2,
+      3,
+      4
+    ],
+    "adjacent_descriptor": "002d3e18 unobserved; entries not added"
+  },
+  "generation": {
+    "method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+    "entry_hints_total": 35,
+    "config_sha256": "e00625b1b736546e64345e00c272ad015023666f159dcc2f4dabb2a27f5a5cb9",
+    "config_artifact": "private analysis/zettai/recomp.toml",
+    "entry_profile_artifact": "configs/recomp-entry-points.json",
+    "entry_profile_sha256": "5bd5ad551fb6b335ff19f55a8fc67516aab1d496da9eb0765442a5e6bca02a81",
+    "changed_files": [
+      {
+        "file": "entry_113c50_0x113c78.cpp",
+        "old_sha256": null,
+        "new_sha256": "296b719d71a1794a78f0e0a6dcd144eaf1ed2ee2f73601c4a9ef6d4c76bdd074"
+      },
+      {
+        "file": "entry_113c78_0x113ca8.cpp",
+        "old_sha256": null,
+        "new_sha256": "da7ed9e777ef3f2c2b5b99ef09d85cb12708cbccced79c225935eedeabeb2027"
+      },
+      {
+        "file": "entry_113ca8_0x113cd8.cpp",
+        "old_sha256": null,
+        "new_sha256": "af80dcd91725e8528145207a3dd24974218e37df3290c6b9ecc8d096869df5ac"
+      },
+      {
+        "file": "entry_113cd8_0x113d00.cpp",
+        "old_sha256": null,
+        "new_sha256": "72998670865c93ad7af9cb9c14865907ebfa5431335dbf576193fce533215017"
+      },
+      {
+        "file": "entry_113d00_0x113d28.cpp",
+        "old_sha256": null,
+        "new_sha256": "d6092d570974e3cdf62cc608507f71898ca266c19aefc70afc07c055c0d9e14d"
+      },
+      {
+        "file": "entry_113d28_0x113d50.cpp",
+        "old_sha256": null,
+        "new_sha256": "76bbf8868bced747057bb0abee6f5783244cc9b290f5820959910175c3cc1cd6"
+      },
+      {
+        "file": "entry_113d50_0x113d78.cpp",
+        "old_sha256": null,
+        "new_sha256": "af2a02b98407d7d106af64716c97ec7cfa0c0e941c6900cf77308e59b3ceb18e"
+      },
+      {
+        "file": "entry_113d78_0x113d98.cpp",
+        "old_sha256": null,
+        "new_sha256": "44aab5925ec57ec6944202a01dac8d3068abb360b5c8837fb13e72572689272e"
+      },
+      {
+        "file": "entry_113d98_0x113dc0.cpp",
+        "old_sha256": null,
+        "new_sha256": "d6d716cbdcc076e4294000a66851cf318ee15a6598d5b8d37a1454ae10e988e1"
+      },
+      {
+        "file": "entry_113dc0_0x113de8.cpp",
+        "old_sha256": null,
+        "new_sha256": "506c77f18d22fee2d9aa69a348bf35f10f0e01713639c23c1689baa8b09ae684"
+      },
+      {
+        "file": "entry_113de8_0x113e08.cpp",
+        "old_sha256": null,
+        "new_sha256": "170a50839a452aa3873590576bc0fb85afb357e788cfa46be907a0a242584cc2"
+      },
+      {
+        "file": "ps2_recompiled_functions.h",
+        "old_sha256": "7c881645eced99405191fc8e81ccd7b256a7f5ecadffc8a8e40a30fdc39f0db7",
+        "new_sha256": "bfd026bf6eca1cb910cd31e51405b0203da3a85b6bc73c6ca1039a02973ff948"
+      },
+      {
+        "file": "register_functions.cpp",
+        "old_sha256": "ec8b40169cc1ec597a0f728b97a02c049df543751ec9a3631ef8d6acf25713c0",
+        "new_sha256": "bfdfc8a5004ead380bfd8c2ea742f18cfb3093a479f0c2825de1b3055efc0dc1"
+      }
+    ],
+    "obsolete_files": []
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "Astra Ultra accepted original eleven-entry source, corrected observer and independently verified eight-call native zero-result proof; additional wait/reference/input claims accepted with explicit limits",
+    "document": "docs/reviews/object-mask-entries.md",
+    "observer_sha256": "f6e0384e419461e57fa1964393c9442cc46a8dda897a640ba7c82de8021980b3"
+  },
+  "tests": {
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "runtime": "production unchanged from475 runtime tests/9 IOP suites"
+  },
+  "native": {
+    "build": "native target rebuild completed successfully",
+    "binary_sha256": "d13211cce596fcc947b41a7e43bd135393f4d47a627af899fd158c2bee21bddb",
+    "binary_size": 364425752,
+    "focused_capture": "20261009-053843",
+    "resolved_hooks": 1,
+    "probe_errors": 0,
+    "entry_samples": 8,
+    "return_samples": 8,
+    "sample_cap_events": 1,
+    "pending_samples": 0,
+    "all_descriptor_words_match_original": true,
+    "all_mask_results_match_original_64bit_formula": true,
+    "all_unmodified_gprs_128_unchanged": true,
+    "four_object_words_and_two_input_words_unchanged": true,
+    "samples": [
+      {
+        "sample_id": 1,
+        "index": 0,
+        "mask_u64": 139264,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 2,
+        "index": 0,
+        "mask_u64": 557056,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 3,
+        "index": 0,
+        "mask_u64": 32,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 4,
+        "index": 0,
+        "mask_u64": 64,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 5,
+        "index": 0,
+        "mask_u64": 139264,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 6,
+        "index": 0,
+        "mask_u64": 557056,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 7,
+        "index": 0,
+        "mask_u64": 32,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      },
+      {
+        "sample_id": 8,
+        "index": 0,
+        "mask_u64": 64,
+        "input_words": [
+          4294967295,
+          4294967295
+        ],
+        "result_u64": 0,
+        "return_pc": "0x1148bc"
+      }
+    ],
+    "nonzero_result_samples": 0,
+    "ordinary_capture": "20261009-053844",
+    "ordinary_last_frame": "25.2s blue/red two-button dialog panel on black; text/labels absent; main viewed",
+    "mask_query_return_verified": true,
+    "dialog_geometry_visually_observed": true,
+    "scene_verified": false,
+    "audio_verified": false,
+    "input_verified": false,
+    "missing_target_records_in_bounded_captures": 0,
+    "native_unobserved": "other ten methods, nonzero query results, other indices, functional button input, complete dialog text/title/gameplay/audio",
+    "debugger_exit_code": 0,
+    "natural_exit_code": null,
+    "bounded_stop": true,
+    "next_diagnosis": "missing dialog text and functional PAD/memory-card behavior; source maskquery currently correct for sampled zero-result cases",
+    "followup": {
+      "reference_capture": "20261009-054103",
+      "reference_last_frame": "25.3s title menu visually inspected; isolated profile, memory-card state not matched",
+      "native_wait_capture": "20261009-054103",
+      "ee_main": "runnable/drawing; three other EE threads sleeping",
+      "iop_wait_coverage": "not found in stopped stack",
+      "rpc_history_services": [
+        "80000400",
+        "12345",
+        "123456"
+      ],
+      "input_capture": "20261009-054320",
+      "input_events": "Circle c delivered to named native window at8.128/12.237s; no observed dialog transition at25.4s",
+      "input_guest_effect_verified": false
+    },
+    "changed_v0_v1_a0_low64_and_upper64_verified": true
+  }
+}

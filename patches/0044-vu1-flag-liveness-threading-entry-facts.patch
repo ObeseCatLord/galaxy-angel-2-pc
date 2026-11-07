@@ -1,0 +1,1118 @@
+From 57fb04d9bf4ac6ad693d2d335ad5a31c0bebe021 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:24:53 -0500
+Subject: [PATCH 44/45] ga2: leaner generated VU1 programs (flag liveness,
+ threading, entry facts)
+
+- ga2_vu1_gen analyses the whole code image: status flags are dead unless
+  FSAND/FSEQ/FSOR exist; an FMAC MAC result is dead when every path
+  supersedes it (a later MAC-writing FMAC at least 4 pairs before any
+  FMAND/FMEQ/FMOR; program end keeps the last result; JR/JALR count as
+  readers). Pairs carry flagMode; values are computed identically.
+  GA2_VU1GEN_ALLFLAGS=1 keeps all flags (a strict digest-mode oracle).
+- Threaded dispatch: sequential pairs fall through behind one compare.
+- PairEntry facts: what the previous image pair (and branches whose delay
+  slot carries E/D/T) can leave pending; runs resuming in a delay slot step
+  generically first.
+- FMAC normalization: single-rounding ops classify from the float result
+  (exact path only at 0/FLT_MAX, and only when flags are needed).
+- ga2_vu1_replay --reference compares generated programs with this build's
+  interpreter (status masked; MAC, run end, data, GIF and cycles compared).
+- Warnings when an elided-flag program is followed by another code image or
+  hits the cycle budget (the analysis assumptions).
+
+Verified: interpreter vs recorded digests and generated vs interpreter, 0
+mismatches on 26k captured runs; all-flags build matches the recorded
+digests. Replay 14.3 -> 11.6 ns per VU cycle; in game ~30 -> ~12.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h        |  47 +++-
+ ps2xRuntime/include/runtime/ps2_vu1_exec.inl | 155 +++++++-----
+ ps2xRuntime/include/runtime/ps2_vu1_step.inl |  28 ++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      |  56 ++++-
+ ps2xTest/src/ga2_vu1_gen.cpp                 | 242 ++++++++++++++++++-
+ ps2xTest/src/ga2_vu1_replay.cpp              |  41 +++-
+ 6 files changed, 482 insertions(+), 87 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 2c41c9d..272e898 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -134,7 +134,11 @@ public:
+         bool tBit = false;
+         uint8_t upperVfShadowReg = 0;
+         uint8_t suppressedLowerVf = 0;
++        // Observable FMAC flag results (kFlagMac | kFlagStatus); generated
++        // programs clear what no instruction can read.
++        uint8_t flagMode = 3;
+     };
++    static constexpr uint8_t kFlagMac = 1u, kFlagStatus = 2u, kFlagAll = 3u;
+ 
+     enum class StepResult : uint8_t
+     {
+@@ -154,12 +158,30 @@ public:
+     };
+     // A generated program runs the run() loop for one VU1 code image.
+     using JitProgram = StepResult (*)(VU1Interpreter &vu, const StepArgs &args);
+-    static void registerJitProgram(uint64_t codeHash, JitProgram program);
++    // elidesFlags: the program skips flag results its own code image never
++    // reads (ga2_vu1_gen); switching to another image afterwards is reported.
++    static void registerJitProgram(uint64_t codeHash, JitProgram program, bool elidesFlags = false);
++    bool lastRunEnded() const { return m_lastRunEnded; }
+     static DecodedInstructionPair decodeForCodegen(const uint8_t *vuCode, uint32_t pc);
++    // Codegen: whether this upper instruction queues MAC/status flag results.
++    static bool upperProducesFmacFlags(uint32_t upper);
+     // Codegen coverage: counts interpreted pairs by pc/8 (2048 entries).
+     void setPcHitCounter(uint64_t *counts) { m_pcHits = counts; }
+     inline bool stepLoopHead(const StepArgs &args);
+     inline StepResult stepPair(const DecodedInstructionPair &decoded, const StepArgs &args);
++    // What the previous pair in the code image can leave pending for this
++    // one (generated code passes constants; stepPair assumes everything).
++    // Valid whenever a run did not start or resume in a delay slot.
++    struct PairEntry
++    {
++        bool mayBranch = true; // previous pair is a branch/jump
++        bool mayEnd = true;    // previous pair has the E bit
++        bool mayHalt = true;   // previous pair has a D or T bit
++    };
++    inline StepResult stepPairAfter(const DecodedInstructionPair &decoded, PairEntry entry, const StepArgs &args);
++    // stepLoopHead right after a pair: its pipelines are already committed.
++    inline bool stepLoopHeadAfterPair(const StepArgs &args);
++    bool resumesInDelaySlot() const { return m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot; }
+     StepResult stepGeneric(const StepArgs &args);
+ 
+ private:
+@@ -307,23 +329,36 @@ private:
+     const PS2Memory *m_jitMemory = nullptr;
+     uint64_t m_jitGeneration = ~0ull;
+     JitProgram lookupJitProgram(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
++    bool m_jitEnabled = true;
++    bool m_jitElidesFlags = false;
++    bool m_elidedFlagsRan = false;
++    uint64_t m_jitHash = 0;
++
++public:
++    // Reference runs (ga2_vu1_replay --reference) use the interpreter only.
++    void setGeneratedProgramsEnabled(bool enabled) { m_jitEnabled = enabled; m_jitMemory = nullptr; }
++
++private:
+     const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+ 
+-    void execUpper(uint32_t instr);
++    void execUpper(uint32_t instr, uint8_t flagMode = kFlagAll);
+     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+ 
+     void applyDest(float *dst, const float *result, uint8_t dest);
+     void applyDestAcc(const float *result, uint8_t dest);
+-    void applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper);
+-    void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper);
+-    void normalizeFmacResult(float *result, uint8_t dest, uint32_t upper, uint8_t laneFlags[4]);
++    void produceFmacFlags(float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
++    void applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
++    void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
++    static bool isFmacProductSum(uint32_t upper);
++    void normalizeFmacResult(float *result, uint8_t dest, uint32_t upper, uint8_t laneFlags[4], bool flagsNeeded = true);
+     template <typename T>
+     bool calculateFmacExactResult(uint32_t upper, uint32_t component, T &result) const;
+     template <typename T>
+     uint8_t normalizeFmacExactResult(float &value, T exactResult) const;
+     uint32_t calculateFmacProductSticky(uint32_t upper, uint8_t dest) const;
+-    void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
++    void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky,
++                         bool writesStatus = true, bool writesMac = true);
+     void queueFsset(uint16_t immediate);
+     void queueClip(uint32_t clip);
+     void queueFcset(uint32_t clip);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+index dd24fc0..cc348ed 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+@@ -85,15 +85,48 @@ __attribute__((always_inline)) inline void VU1Interpreter::applyDestAcc(const fl
+     applyDest(m_state.acc, result, dest);
+ }
+ 
++// Accumulating instructions (MADD/MSUB/OPMSUB and their ACC, Q and I forms)
++// round twice in float, so their value and flags need the exact result.
++__attribute__((always_inline)) inline bool VU1Interpreter::isFmacProductSum(uint32_t upper)
++{
++    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++    const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
++    return (op >= 0x08u && op <= 0x0Fu) ||
++           op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
++           op == 0x29u || op == 0x2Du || op == 0x2Eu ||
++           (special >= 0x08u && special <= 0x0Fu) ||
++           special == 0x21u || special == 0x23u || special == 0x25u ||
++           special == 0x27u || special == 0x29u || special == 0x2Du;
++}
++
+ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest, uint32_t upper,
+-                                         uint8_t laneFlags[4])
++                                         uint8_t laneFlags[4], bool flagsNeeded)
+ {
++    const bool productSum = isFmacProductSum(upper);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         laneFlags[component] = 0u;
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
++        if (!productSum)
++        {
++            // One rounding toward zero from normalized operands: the float
++            // result classifies exactly like the exact one, except that 0
++            // hides exact zero vs underflow and FLT_MAX hides overflow; those
++            // differ only in flags, never in the value.
++            uint32_t bits = 0u;
++            std::memcpy(&bits, &result[component], sizeof(bits));
++            const uint32_t magnitude = bits & 0x7FFFFFFFu;
++            if (!flagsNeeded || (magnitude != 0u && magnitude != 0x7F7FFFFFu))
++            {
++                uint32_t flags = 0u;
++                result[component] = normalizeResult(result[component], flags);
++                laneFlags[component] = static_cast<uint8_t>(flags);
++                continue;
++            }
++        }
++
+         // float*float is exact in double and every flag threshold except
+         // FLT_MAX classifies identically under round-to-zero, so double is
+         // used unless the double result sits exactly on FLT_MAX.
+@@ -390,7 +423,7 @@ __attribute__((always_inline)) inline uint32_t VU1Interpreter::calculateFmacProd
+ }
+ 
+ __attribute__((always_inline)) inline void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+-                                     uint32_t extraSticky)
++                                     uint32_t extraSticky, bool writesStatus, bool writesMac)
+ {
+     if (dest == 0u)
+         return;
+@@ -428,23 +461,37 @@ __attribute__((always_inline)) inline void VU1Interpreter::updateFmacFlags(const
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+-    entry->writesMac = true;
+-    entry->writesStatus = true;
++    entry->writesMac = writesMac;
++    entry->writesStatus = writesStatus;
+ }
+ 
+-__attribute__((always_inline)) inline void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper)
++// flagMode (kFlagMac | kFlagStatus) says which flag results a later
++// instruction can observe; the generator clears bits it proves dead. Result
++// values are computed identically either way.
++__attribute__((always_inline)) inline void VU1Interpreter::produceFmacFlags(float *result, uint8_t dest, uint32_t upper,
++                                                                          uint8_t flagMode)
+ {
+     uint8_t laneFlags[4]{};
+-    normalizeFmacResult(result, dest, upper, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest));
++    normalizeFmacResult(result, dest, upper, laneFlags, flagMode != 0u);
++    if (flagMode == kFlagAll)
++        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest));
++    else if (flagMode == kFlagMac)
++        updateFmacFlags(laneFlags, dest, 0u, false);
++    else if (flagMode == kFlagStatus)
++        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest), true, false);
++}
++
++__attribute__((always_inline)) inline void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper,
++                                                                       uint8_t flagMode)
++{
++    produceFmacFlags(result, dest, upper, flagMode);
+     applyDest(dst, result, dest);
+ }
+ 
+-__attribute__((always_inline)) inline void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper)
++__attribute__((always_inline)) inline void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper,
++                                                                          uint8_t flagMode)
+ {
+-    uint8_t laneFlags[4]{};
+-    normalizeFmacResult(result, dest, upper, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest));
++    produceFmacFlags(result, dest, upper, flagMode);
+     applyDestAcc(result, dest);
+ }
+ 
+@@ -468,7 +515,7 @@ using ga2_vu1::vuFloatToInt;
+ // ============================================================================
+ // Upper instructions (FMAC pipeline)
+ // ============================================================================
+-__attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t instr)
++__attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t instr, uint8_t flagMode)
+ {
+     m_currentUpperInstruction = instr;
+     uint8_t dest = DEST(instr);
+@@ -505,7 +552,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         float bc = broadcast(vt, op & 3);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] + bc;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     }
+     case 0x04:
+@@ -516,7 +563,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         float bc = broadcast(vt, op & 3);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] - bc;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     }
+     case 0x08:
+@@ -527,7 +574,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         float bc = broadcast(vt, op & 3);
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] + vs[c] * bc;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     }
+     case 0x0C:
+@@ -538,7 +585,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         float bc = broadcast(vt, op & 3);
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] - vs[c] * bc;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     }
+     case 0x10:
+@@ -571,13 +618,13 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         float bc = broadcast(vt, op & 3);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] * bc;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     }
+     case 0x1C: // MULq
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] * q;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x1D: // MAXi
+         for (int c = 0; c < 4; c++)
+@@ -587,7 +634,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+     case 0x1E: // MULi
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] * i;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x1F: // MINIi
+         for (int c = 0; c < 4; c++)
+@@ -597,57 +644,57 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+     case 0x20: // ADDq
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] + q;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x21: // MADDq
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] + vs[c] * q;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x22: // ADDi
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] + i;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x23: // MADDi
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] + vs[c] * i;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x24: // SUBq
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] - q;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x25: // MSUBq
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] - vs[c] * q;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x26: // SUBi
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] - i;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x27: // MSUBi
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] - vs[c] * i;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x28: // ADD
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] + vt[c];
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x29: // MADD
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] + vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x2A: // MUL
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x2B: // MAX
+         for (int c = 0; c < 4; c++)
+@@ -657,19 +704,19 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+     case 0x2C: // SUB
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] - vt[c];
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x2D: // MSUB
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] - vs[c] * vt[c];
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x2E: // OPMSUB
+         result[0] = acc[0] - vs[1] * vt[2];
+         result[1] = acc[1] - vs[2] * vt[0];
+         result[2] = acc[2] - vs[0] * vt[1];
+         result[3] = 0.0f;
+-        applyFmacDest(vd, result, dest, instr);
++        applyFmacDest(vd, result, dest, instr, flagMode);
+         return;
+     case 0x2F: // MINI
+         for (int c = 0; c < 4; c++)
+@@ -699,7 +746,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+             float bc = broadcast(vt, specialOp & 3);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + bc;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         }
+         case 0x04:
+@@ -710,7 +757,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+             float bc = broadcast(vt, specialOp & 3);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] - bc;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         }
+         case 0x08:
+@@ -721,7 +768,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+             float bc = broadcast(vt, specialOp & 3);
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] + vs[c] * bc;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         }
+         case 0x0C:
+@@ -732,7 +779,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+             float bc = broadcast(vt, specialOp & 3);
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] - vs[c] * bc;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         }
+         case 0x10: // ITOF0
+@@ -811,13 +858,13 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+             float bc = broadcast(vt, specialOp & 3);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] * bc;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         }
+         case 0x1C: // MULAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] * q;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x1D: // ABS
+             for (int c = 0; c < 4; c++)
+@@ -827,7 +874,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         case 0x1E: // MULAi
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] * i;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x1F: // CLIP
+         {
+@@ -864,74 +911,74 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+         case 0x20: // ADDAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + q;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x21: // MADDAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] + vs[c] * q;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x22: // ADDAi
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + i;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x23: // MADDAi
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] + vs[c] * i;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x24: // SUBAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] - q;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x25: // MSUBAq
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] - vs[c] * q;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x26: // SUBAi
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] - i;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x27: // MSUBAi
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] - vs[c] * i;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x28: // ADDA
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + vt[c];
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x29: // MADDA
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] + vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x2A: // MULA
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x2C: // SUBA
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] - vt[c];
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x2D: // MSUBA
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] - vs[c] * vt[c];
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x2E: // OPMULA
+             result[0] = vs[1] * vt[2];
+             result[1] = vs[2] * vt[0];
+             result[2] = vs[0] * vt[1];
+             result[3] = 0.0f;
+-            applyFmacDestAcc(result, dest, instr);
++            applyFmacDestAcc(result, dest, instr, flagMode);
+             return;
+         case 0x2F:
+         case 0x30: // NOP
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_step.inl b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+index 40fd17d..a85cc14 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_step.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+@@ -132,7 +132,18 @@ __attribute__((always_inline)) inline bool VU1Interpreter::stepLoopHead(const St
+     return m_state.pc + 8u <= a.codeSize;
+ }
+ 
++__attribute__((always_inline)) inline bool VU1Interpreter::stepLoopHeadAfterPair(const StepArgs &a)
++{
++    return m_cycle < a.budgetEnd && !m_stopRequested && m_state.pc + 8u <= a.codeSize;
++}
++
+ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPair(const DecodedInstructionPair &decoded, const StepArgs &a)
++{
++    return stepPairAfter(decoded, PairEntry{}, a);
++}
++
++__attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPairAfter(const DecodedInstructionPair &decoded,
++                                                                                            PairEntry entry, const StepArgs &a)
+ {
+     bool programEnded = false;
+     if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+@@ -184,7 +195,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+ 
+     if (decoded.iBit)
+     {
+-        execUpper(decoded.upper);
++        execUpper(decoded.upper, decoded.flagMode);
+         float immediate = 0.0f;
+         std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+         m_state.i = normalizeOperand(immediate);
+@@ -196,7 +207,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         std::memcpy(oldVf,
+                     m_state.vf[decoded.upperVfShadowReg],
+                     sizeof(oldVf));
+-        execUpper(decoded.upper);
++        execUpper(decoded.upper, decoded.flagMode);
+         std::memcpy(upperVf,
+                     m_state.vf[decoded.upperVfShadowReg],
+                     sizeof(upperVf));
+@@ -210,7 +221,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+     }
+     else
+     {
+-        execUpper(decoded.upper);
++        execUpper(decoded.upper, decoded.flagMode);
+         execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
+     }
+ 
+@@ -281,7 +292,8 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         nextPc = 0u;
+     m_state.pc = nextPc;
+ 
+-    if (m_state.branchPending)
++    // A branch pair counts its own delay down; its delay slot takes the jump.
++    if ((entry.mayBranch || decoded.lowerUsage.pipeline == PipelineBranch) && m_state.branchPending)
+     {
+         if (m_state.branchDelay == 0u)
+         {
+@@ -299,13 +311,17 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+     const bool haltBit = dHalt || tHalt;
+     const bool haltBranch = haltBit && decoded.lowerUsage.pipeline == PipelineBranch;
+ 
+-    if (m_state.haltAfterDelaySlot)
++    if (!entry.mayEnd && !entry.mayHalt && !decoded.eBit && !decoded.dBit && !decoded.tBit)
++    {
++        // Nothing can end the program at this pair.
++    }
++    else if (entry.mayHalt && m_state.haltAfterDelaySlot)
+     {
+         m_state.stoppedByD = m_pendingHaltD;
+         m_state.stoppedByT = m_pendingHaltT;
+         programEnded = true;
+     }
+-    else if (m_state.ebit)
++    else if (entry.mayEnd && m_state.ebit)
+         programEnded = true;
+     else if (haltBit && !haltBranch)
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 7303208..ee8fd36 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1019,7 +1019,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const StepArgs args{vuCode, vuData, dataSize, &gs, memory, codeSize, budgetEnd};
+     StepResult result = StepResult::Stop;
+     if (const JitProgram jit = lookupJitProgram(vuCode, codeSize, memory))
++    {
+         result = jit(*this, args);
++        m_elidedFlagsRan = m_elidedFlagsRan || m_jitElidesFlags;
++        // MAC liveness assumes programs run to their end; a budget cut-off
++        // followed by a new entry point could read a skipped MAC result.
++        if (m_jitElidesFlags && result == StepResult::Stop && m_cycle >= budgetEnd)
++        {
++            static bool warned = false;
++            if (!warned)
++                std::fprintf(stderr, "[vu1jit] a generated program hit the %u-cycle budget\n", maxCycles);
++            warned = true;
++        }
++    }
+     else
+     {
+         while (stepLoopHead(args))
+@@ -1054,16 +1066,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ // GA2_VU1_DUMP=<dir> writes code images that have no generated program.
+ namespace
+ {
+-    std::unordered_map<uint64_t, VU1Interpreter::JitProgram> &jitRegistry()
++    struct RegisteredProgram
++    {
++        VU1Interpreter::JitProgram program = nullptr;
++        bool elidesFlags = false;
++    };
++
++    std::unordered_map<uint64_t, RegisteredProgram> &jitRegistry()
+     {
+-        static std::unordered_map<uint64_t, VU1Interpreter::JitProgram> registry;
++        static std::unordered_map<uint64_t, RegisteredProgram> registry;
+         return registry;
+     }
+ }
+ 
+-void VU1Interpreter::registerJitProgram(uint64_t codeHash, JitProgram program)
++void VU1Interpreter::registerJitProgram(uint64_t codeHash, JitProgram program, bool elidesFlags)
+ {
+-    jitRegistry()[codeHash] = program;
++    jitRegistry()[codeHash] = {program, elidesFlags};
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeForCodegen(const uint8_t *vuCode, uint32_t pc)
+@@ -1072,6 +1090,20 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeForCodegen(const ui
+     return decoder.decodeInstructionPair(vuCode, pc);
+ }
+ 
++bool VU1Interpreter::upperProducesFmacFlags(uint32_t upper)
++{
++    // Execute it on a scratch unit and see whether a flag entry was queued.
++    // Only entries that write MAC count: CLIP queues a clip-only entry.
++    static VU1Interpreter scratch(Unit::VU1);
++    scratch.reset();
++    scratch.execUpper(upper);
++    bool produced = false;
++    for (uint32_t k = 0; k < scratch.m_flagCount; ++k)
++        produced = produced || scratch.m_flagPipeline[(scratch.m_flagHead + k) & (kMaxFlagEntries - 1u)].writesMac;
++    scratch.reset();
++    return produced;
++}
++
+ VU1Interpreter::StepResult VU1Interpreter::stepGeneric(const StepArgs &args)
+ {
+     return stepPair(getDecodedInstructionPairForPc(args.vuCode, args.codeSize, args.memory, m_state.pc), args);
+@@ -1083,7 +1115,7 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+         const char *v = std::getenv("GA2_VU1JIT");
+         return v && std::strcmp(v, "0") == 0;
+     }();
+-    if (disabled || m_unit != Unit::VU1 || !memory || vuCode != memory->getVU1Code())
++    if (disabled || !m_jitEnabled || m_unit != Unit::VU1 || !memory || vuCode != memory->getVU1Code())
+         return nullptr;
+     const uint64_t generation = memory->getVU1CodeGeneration();
+     if (m_jitMemory == memory && m_jitGeneration == generation)
+@@ -1093,7 +1125,19 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+     const uint64_t hash = digestBytes(vuCode, codeSize);
+     const auto &registry = jitRegistry();
+     const auto it = registry.find(hash);
+-    m_jitProgram = it != registry.end() ? it->second : nullptr;
++    m_jitProgram = it != registry.end() ? it->second.program : nullptr;
++    // Flag elision assumes a program's flags are only read by its own image.
++    if (m_elidedFlagsRan && hash != m_jitHash)
++    {
++        static bool warned = false;
++        if (!warned)
++            std::fprintf(stderr, "[vu1jit] code image %016llx follows a program with elided flags; "
++                                 "MAC/status it reads may differ from hardware\n",
++                         static_cast<unsigned long long>(hash));
++        warned = true;
++    }
++    m_jitHash = hash;
++    m_jitElidesFlags = it != registry.end() && it->second.elidesFlags;
+ 
+     static std::unordered_map<uint64_t, bool> reported;
+     if (!m_jitProgram && !registry.empty() && !reported[hash])
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index acc0bc2..6e71c5e 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -11,7 +11,12 @@
+ // The program registers itself under the image hash.
+ #include "ga2_vu1_capture.h"
+ 
++#include <algorithm>
++
++#include <cstdlib>
++#include <cstring>
+ #include <string>
++#include <utility>
+ 
+ namespace
+ {
+@@ -34,13 +39,180 @@ namespace
+         return buf;
+     }
+ 
+-    std::string pair(const VU::DecodedInstructionPair &p)
++    // Which FMAC flag results can any instruction observe? (Whole-program.)
++    //
++    // Status: only FSAND/FSEQ/FSOR read it, so it is dead everywhere unless the
++    // image contains one. MAC: FMAND/FMEQ/FMOR read the MAC of the latest FMAC
++    // result whose 4-cycle latency has elapsed. A result p is dead when, on
++    // every path, a later flag-producing instruction q sits at least 4 pairs
++    // (so at least 4 cycles) before the reader; at a program end only the
++    // last result survives; indirect jumps lead anywhere, so they count as
++    // readers. Values are unaffected: only flag bookkeeping is skipped.
++    std::vector<uint8_t> flagModes(const std::vector<uint8_t> &code)
++    {
++        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++        auto word = [&](uint32_t index, uint32_t half) {
++            uint32_t w = 0;
++            std::memcpy(&w, code.data() + index * 8u + half * 4u, 4);
++            return w;
++        };
++        constexpr int kEnd = -1, kAnywhere = -2;
++        std::vector<bool> macReader(pairs), statusReader(pairs), producer(pairs);
++        std::vector<std::vector<int>> succ(pairs);
++        bool statusRead = false;
++        for (uint32_t i = 0; i < pairs; ++i)
++        {
++            const uint32_t lower = word(i, 0), upper = word(i, 1);
++            const bool iBit = (upper >> 31) != 0u;
++            producer[i] = VU::upperProducesFmacFlags(upper);
++            const uint32_t op = lower >> 25;
++            if (!iBit)
++            {
++                macReader[i] = op == 0x18u || op == 0x1Au || op == 0x1Bu;   // FMEQ, FMAND, FMOR
++                statusReader[i] = op == 0x14u || op == 0x16u || op == 0x17u; // FSEQ, FSAND, FSOR
++                statusRead = statusRead || statusReader[i];
++            }
++            succ[i].push_back(static_cast<int>((i + 1u) % pairs));
++        }
++        // Branch, jump and end effects apply after the delay slot (pair i + 1).
++        for (uint32_t i = 0; i < pairs; ++i)
++        {
++            const uint32_t lower = word(i, 0), upper = word(i, 1);
++            const uint32_t slot = (i + 1u) % pairs;
++            if ((upper >> 30) & 1u) // E bit: the delay slot ends the program
++            {
++                succ[slot] = {kEnd};
++                continue;
++            }
++            if ((upper >> 31) != 0u)
++                continue;
++            const uint32_t op = lower >> 25;
++            const bool direct = op == 0x20u || op == 0x21u || (op >= 0x28u && op <= 0x2Fu && op != 0x2Au && op != 0x2Bu);
++            const bool indirect = op == 0x24u || op == 0x25u;
++            if (indirect)
++                succ[slot] = {kAnywhere};
++            else if (direct)
++            {
++                int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
++                if (imm & 0x400) imm -= 0x800;
++                const int target = static_cast<int>((static_cast<int64_t>(i) + 1 + imm + pairs) % pairs);
++                const bool conditional = op >= 0x28u;
++                succ[slot] = {target};
++                if (conditional)
++                    succ[slot].push_back(static_cast<int>((i + 2u) % pairs));
++            }
++        }
++        // GA2_VU1GEN_ALLFLAGS=1: keep every flag result (a strict oracle build
++        // for digest-mode replay).
++        if (const char *all = std::getenv("GA2_VU1GEN_ALLFLAGS"); all && *all == '1')
++            return std::vector<uint8_t>(pairs, VU::kFlagAll);
++        std::vector<uint8_t> modes(pairs, statusRead ? VU::kFlagStatus : 0u);
++        for (uint32_t p = 0; p < pairs; ++p)
++        {
++            if (!producer[p])
++                continue;
++            // State: pairs since the latest later producer (-1: none yet).
++            std::vector<uint8_t> seen(pairs * 6u, 0);
++            std::vector<std::pair<int, int>> stack;
++            for (int n : succ[p])
++                stack.emplace_back(n, -1);
++            bool live = false;
++            while (!stack.empty() && !live)
++            {
++                auto [node, since] = stack.back();
++                stack.pop_back();
++                if (since >= 4)
++                    continue;                       // superseded for every later reader
++                if (node == kEnd)
++                {
++                    live = since < 0;               // the end keeps the last result
++                    continue;
++                }
++                if (node == kAnywhere || macReader[static_cast<uint32_t>(node)])
++                {
++                    live = true;
++                    continue;
++                }
++                const uint32_t n = static_cast<uint32_t>(node);
++                if (seen[n * 6u + static_cast<uint32_t>(since + 1)]++)
++                    continue;
++                const int next = producer[n] ? 1 : (since < 0 ? -1 : since + 1);
++                for (int s : succ[n])
++                    stack.emplace_back(s, next);
++            }
++            if (live)
++                modes[p] |= VU::kFlagMac;
++        }
++        return modes;
++    }
++
++    // What can be pending when a pair starts (see VU1Interpreter::PairEntry).
++    // A pending branch is consumed by the branch's image successor (its delay
++    // slot). The E bit and halt bits act after the pair that follows them, so
++    // with a branch before them they take effect at the branch's destination:
++    // its target, its fall-through, or (for JR/JALR) anywhere.
++    struct EntryFacts
++    {
++        std::vector<bool> mayBranch, mayEnd, mayHalt;
++    };
++
++    EntryFacts entryFacts(const std::vector<uint8_t> &code)
++    {
++        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++        auto word = [&](uint32_t index, uint32_t half) {
++            uint32_t w = 0;
++            std::memcpy(&w, code.data() + (index % pairs) * 8u + half * 4u, 4);
++            return w;
++        };
++        auto isBranch = [&](uint32_t index) {
++            const uint32_t lower = word(index, 0), upper = word(index, 1), op = lower >> 25;
++            return (upper >> 31) == 0u &&
++                   (op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || (op >= 0x28u && op <= 0x2Fu));
++        };
++        EntryFacts f{std::vector<bool>(pairs), std::vector<bool>(pairs), std::vector<bool>(pairs)};
++        for (uint32_t i = 0; i < pairs; ++i)
++        {
++            const uint32_t prev = (i + pairs - 1u) % pairs;
++            f.mayBranch[i] = isBranch(prev);
++            f.mayEnd[i] = ((word(prev, 1) >> 30) & 1u) != 0u;
++            f.mayHalt[i] = ((word(prev, 1) >> 27) & 3u) != 0u; // D (bit 28), T (bit 27)
++        }
++        for (uint32_t b = 0; b < pairs; ++b)
++        {
++            if (!isBranch(b))
++                continue;
++            const uint32_t slotUpper = word(b + 1u, 1);
++            const bool end = ((slotUpper >> 30) & 1u) != 0u, halt = ((slotUpper >> 27) & 3u) != 0u;
++            if (!end && !halt)
++                continue;
++            const uint32_t op = word(b, 0) >> 25;
++            std::vector<uint32_t> targets;
++            if (op == 0x24u || op == 0x25u)
++                for (uint32_t t = 0; t < pairs; ++t)
++                    targets.push_back(t);
++            else
++            {
++                int32_t imm = static_cast<int32_t>(word(b, 0) & 0x7FFu);
++                if (imm & 0x400) imm -= 0x800;
++                targets.push_back(static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs));
++                targets.push_back((b + 2u) % pairs);
++            }
++            for (uint32_t t : targets)
++            {
++                f.mayEnd[t] = f.mayEnd[t] || end;
++                f.mayHalt[t] = f.mayHalt[t] || halt;
++            }
++        }
++        return f;
++    }
++
++    std::string pair(const VU::DecodedInstructionPair &p, uint8_t flagMode)
+     {
+         char head[96];
+         std::snprintf(head, sizeof(head), "{.lower=0x%08Xu,.upper=0x%08Xu,", p.lower, p.upper);
+-        char tail[160];
+-        std::snprintf(tail, sizeof(tail), ",.iBit=%d,.eBit=%d,.mBit=%d,.dBit=%d,.tBit=%d,.upperVfShadowReg=%u,.suppressedLowerVf=%u}",
+-                      p.iBit, p.eBit, p.mBit, p.dBit, p.tBit, p.upperVfShadowReg, p.suppressedLowerVf);
++        char tail[192];
++        std::snprintf(tail, sizeof(tail), ",.iBit=%d,.eBit=%d,.mBit=%d,.dBit=%d,.tBit=%d,.upperVfShadowReg=%u,.suppressedLowerVf=%u,.flagMode=%u}",
++                      p.iBit, p.eBit, p.mBit, p.dBit, p.tBit, p.upperVfShadowReg, p.suppressedLowerVf, flagMode);
+         return std::string(head) + ".lowerUsage=" + usage(p.lowerUsage) + ",.upperUsage=" + usage(p.upperUsage) + tail;
+     }
+ 
+@@ -65,6 +237,11 @@ namespace
+         char base[64];
+         std::snprintf(base, sizeof(base), "vu1_%016llx", static_cast<unsigned long long>(hash));
+         const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++        if (pairs == 0u || (pairs & (pairs - 1u)) != 0u)
++        {
++            std::fprintf(stderr, "%s: code image of %u pairs is not a power of two\n", base, pairs);
++            return false;
++        }
+         std::vector<uint32_t> selected;
+         for (uint32_t i = 0; i < pairs; ++i)
+             if (hits.empty() || hits[i] != 0u)
+@@ -80,6 +257,19 @@ namespace
+             chunks.back().push_back(index);
+         }
+ 
++        const std::vector<uint8_t> modes = flagModes(code);
++        const EntryFacts facts = entryFacts(code);
++        size_t macLive = 0, producers = 0;
++        for (uint32_t i = 0; i < pairs; ++i)
++            if (VU::upperProducesFmacFlags(static_cast<uint32_t>(code[i * 8u + 4u] | code[i * 8u + 5u] << 8 |
++                                                                  code[i * 8u + 6u] << 16 | uint32_t(code[i * 8u + 7u]) << 24)))
++            {
++                ++producers;
++                macLive += (modes[i] & VU::kFlagMac) != 0u;
++            }
++        std::printf("flags: status %s; MAC live for %zu of %zu flag-producing pairs\n",
++                    modes.empty() || (modes[0] & VU::kFlagStatus) ? "live" : "dead", macLive, producers);
++
+         std::string dispatch = header() + "\n";
+         for (size_t c = 0; c < chunks.size(); ++c)
+             dispatch += "VU::StepResult " + std::string(base) + "_chunk" + std::to_string(c) + "(VU &vu, const VU::StepArgs &a);\n";
+@@ -96,6 +286,12 @@ namespace
+                     "// returns Continue with the loop head done for a pc outside itself.\n"
+                     "VU::StepResult run(VU &vu, const VU::StepArgs &a)\n{\n"
+                     "    if (!vu.stepLoopHead(a))\n        return VU::StepResult::Stop;\n"
++                    "    // Pairs assume nothing is pending from a pair that did not just run;\n"
++                    "    // a run that starts or resumes inside a delay slot steps it generically.\n"
++                    "    while (vu.resumesInDelaySlot())\n    {\n"
++                    "        const VU::StepResult r = vu.stepGeneric(a);\n"
++                    "        if (r != VU::StepResult::Continue)\n            return r;\n"
++                    "        if (!vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n    }\n"
+                     "    for (;;)\n    {\n"
+                     "        const uint32_t pc = vu.state().pc;\n"
+                     "        const Chunk chunk = (pc & 7u) == 0u ? kChunks[(pc >> 3) & " + std::to_string(pairs - 1) + "u] : nullptr;\n"
+@@ -103,9 +299,10 @@ namespace
+                     "        if (r != VU::StepResult::Continue)\n            return r;\n"
+                     "        if (!chunk && !vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n"
+                     "    }\n}\n\n";
+-        char reg[160];
+-        std::snprintf(reg, sizeof(reg), "struct Register\n{\n    Register() { VU::registerJitProgram(0x%016llxull, run); }\n} registerProgram;\n}\n",
+-                      static_cast<unsigned long long>(hash));
++        char reg[192];
++        const bool elides = std::any_of(modes.begin(), modes.end(), [](uint8_t m) { return m != VU::kFlagAll; });
++        std::snprintf(reg, sizeof(reg), "struct Register\n{\n    Register() { VU::registerJitProgram(0x%016llxull, run, %s); }\n} registerProgram;\n}\n",
++                      static_cast<unsigned long long>(hash), elides ? "true" : "false");
+         dispatch += reg;
+         if (!write(outdir + "/" + base + ".cpp", dispatch))
+             return false;
+@@ -115,17 +312,36 @@ namespace
+             std::string out = header() + "\nnamespace\n{\n";
+             for (uint32_t index : chunks[c])
+                 out += "constexpr VU::DecodedInstructionPair kP" + std::to_string(index) + " = " +
+-                       pair(VU::decodeForCodegen(code.data(), index * 8u)) + ";\n";
++                       pair(VU::decodeForCodegen(code.data(), index * 8u), modes[index]) + ";\n";
++            // Threaded: the switch is only taken on entry and after a jump; a
++            // pair whose successor is the next pair of this chunk falls
++            // through behind one well-predicted compare.
+             out += "}\n\nVU::StepResult " + std::string(base) + "_chunk" + std::to_string(c) +
+-                   "(VU &vu, const VU::StepArgs &a)\n{\n    for (;;)\n    {\n        VU::StepResult r;\n"
++                   "(VU &vu, const VU::StepArgs &a)\n{\n    for (;;)\n    {\n"
+                    "        const uint32_t pc = vu.state().pc;\n"
+                    "        if ((pc & 7u) != 0u)\n            return VU::StepResult::Continue;\n"
+                    "        switch (pc >> 3)\n        {\n";
+             for (uint32_t index : chunks[c])
+-                out += "        case " + std::to_string(index) + ": r = vu.stepPair(kP" + std::to_string(index) + ", a); break;\n";
+-            out += "        default: return VU::StepResult::Continue;\n        }\n"
+-                   "        if (r != VU::StepResult::Continue)\n            return r;\n"
+-                   "        if (!vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n    }\n}\n";
++                out += "        case " + std::to_string(index) + ": goto L" + std::to_string(index) + ";\n";
++            out += "        default: return VU::StepResult::Continue;\n        }\n";
++            for (size_t k = 0; k < chunks[c].size(); ++k)
++            {
++                const uint32_t index = chunks[c][k];
++                const std::string n = std::to_string(index);
++                const bool prevBranch = facts.mayBranch[index];
++                const bool prevEnd = facts.mayEnd[index];
++                const bool prevHalt = facts.mayHalt[index];
++                out += "    L" + n + ":\n    {\n        const VU::StepResult r = vu.stepPairAfter(kP" + n + ", VU::PairEntry{" +
++                       (prevBranch ? "true" : "false") + ", " + (prevEnd ? "true" : "false") + ", " +
++                       (prevHalt ? "true" : "false") + "}, a);\n"
++                       "        if (r != VU::StepResult::Continue)\n            return r;\n"
++                       "        if (!vu.stepLoopHeadAfterPair(a))\n            return VU::StepResult::Stop;\n";
++                if (k + 1 < chunks[c].size() && chunks[c][k + 1] == index + 1u)
++                    out += "        if (vu.state().pc == " + std::to_string((index + 1u) * 8u) + "u)\n            goto L" +
++                           std::to_string(index + 1u) + ";\n";
++                out += "        continue;\n    }\n";
++            }
++            out += "    }\n}\n";
+             if (!write(outdir + "/" + base + "_" + std::to_string(c) + ".cpp", out))
+                 return false;
+         }
+diff --git a/ps2xTest/src/ga2_vu1_replay.cpp b/ps2xTest/src/ga2_vu1_replay.cpp
+index 8d1115e..a6a9072 100644
+--- a/ps2xTest/src/ga2_vu1_replay.cpp
++++ b/ps2xTest/src/ga2_vu1_replay.cpp
+@@ -2,7 +2,14 @@
+ // generated VU1 programs linked in) and checks every run against the digests
+ // the capturing build recorded. Also reports time per run (a microbenchmark).
+ //
+-//   ga2_vu1_replay <capture>... [--repeat N] [--verbose]
++//   ga2_vu1_replay <capture>... [--repeat N] [--verbose] [--reference]
++//
++// --reference: compare against this build's interpreter instead of the
++// recorded digests, ignoring only the status flag (generated programs skip
++// status results when no instruction reads them; see ga2_vu1_gen). MAC is
++// compared: its liveness analysis promises exact MAC wherever it can be read,
++// including at program end. Digest mode stays a strict oracle for programs
++// generated with GA2_VU1GEN_ALLFLAGS=1.
+ #include "ga2_vu1_capture.h"
+ 
+ #include <chrono>
+@@ -12,6 +19,7 @@ int main(int argc, char **argv)
+ {
+     int repeat = 1;
+     bool verbose = false;
++    bool reference = false;
+     ga2_vu1cap::Capture cap;
+     for (int i = 1; i < argc; ++i)
+     {
+@@ -19,6 +27,8 @@ int main(int argc, char **argv)
+             repeat = std::max(1, std::atoi(argv[++i]));
+         else if (!std::strcmp(argv[i], "--verbose"))
+             verbose = true;
++        else if (!std::strcmp(argv[i], "--reference"))
++            reference = true;
+         else if (!ga2_vu1cap::load(argv[i], cap))
+         {
+             std::perror(argv[i]);
+@@ -33,6 +43,12 @@ int main(int argc, char **argv)
+     std::printf("capture: %zu runs, %zu code images\n", cap.runs.size(), cap.codes.size());
+ 
+     ga2_vu1cap::Replayer replayer;
++    ga2_vu1cap::Replayer interpreter;
++    interpreter.vu().setGeneratedProgramsEnabled(false);
++    auto maskedDigest = [](VU1State state) {
++        state.status = 0u;
++        return VU1Interpreter::digestState(state);
++    };
+     uint64_t mismatches = 0, cycles = 0;
+     double seconds = 0.0;
+     for (int pass = 0; pass < repeat; ++pass)
+@@ -44,7 +60,28 @@ int main(int argc, char **argv)
+             replayer.run(cap, run);
+             seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+             cycles += replayer.vu().cycle() - run.cycleBefore;
+-            if (pass != 0 || replayer.matches(run))
++            if (pass != 0)
++                continue;
++            if (reference)
++            {
++                interpreter.run(cap, run);
++                const bool state = maskedDigest(replayer.vu().state()) == maskedDigest(interpreter.vu().state());
++                const bool data = std::memcmp(replayer.memory().getVU1Data(), interpreter.memory().getVU1Data(),
++                                              run.data.size()) == 0;
++                const bool gif = replayer.gif().digest == interpreter.gif().digest &&
++                                 replayer.gif().bytes == interpreter.gif().bytes;
++                const bool timing = replayer.vu().cycle() == interpreter.vu().cycle() &&
++                                    replayer.vu().lastRunEnded() == interpreter.vu().lastRunEnded();
++                if (state && data && gif && timing)
++                    continue;
++                ++mismatches;
++                if (verbose || mismatches <= 10)
++                    std::printf("MISMATCH run %zu kind=%u pc=%#x vs interpreter: state %s data %s gif %s cycles %s\n", i,
++                                run.kind, run.startPC, state ? "ok" : "DIFF", data ? "ok" : "DIFF", gif ? "ok" : "DIFF",
++                                timing ? "ok" : "DIFF");
++                continue;
++            }
++            if (replayer.matches(run))
+                 continue;
+             ++mismatches;
+             if (verbose || mismatches <= 10)
+-- 
+2.55.0
+

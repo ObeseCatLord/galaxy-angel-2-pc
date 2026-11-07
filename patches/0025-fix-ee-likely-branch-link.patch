@@ -1,0 +1,264 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -465,17 +465,13 @@
+         const bool likely = isLikelyBranch();
+         const std::string branchTakenVar = fmt::format("branch_taken_0x{:x}", m_branchInst.address);
+         std::string unconditionalLinkCode;
+-        std::string conditionalLinkCode;
+ 
+         if (m_branchInst.opcode == OPCODE_REGIMM)
+         {
+-            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL)
++            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL ||
++                m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
+             {
+                 unconditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
+-            }
+-            else if (m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
+-            {
+-                conditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
+             }
+         }
+ 
+@@ -490,10 +486,6 @@
+         if (likely)
+         {
+             m_ss << "        if (" << branchTakenVar << ") {\n";
+-            if (!conditionalLinkCode.empty())
+-            {
+-                m_ss << "            " << conditionalLinkCode << "\n";
+-            }
+             emitDelaySlot("            ");
+ 
+             if (isInternalTarget(target))
+@@ -509,11 +501,6 @@
+         }
+         else
+         {
+-            if (!conditionalLinkCode.empty())
+-            {
+-                m_ss << "        if (" << branchTakenVar << ") { " << conditionalLinkCode << " }\n";
+-            }
+-
+             emitDelaySlot("        ");
+ 
+             m_ss << "        if (" << branchTakenVar << ") {\n";
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -9,6 +9,7 @@
+ find_package(OpenSSL QUIET COMPONENTS Crypto)
+ if(BUILD_TESTING)
+     add_subdirectory(branch_scalar)
++    add_subdirectory(branch_link)
+     add_subdirectory(gs_cache)
+ endif()
+ 
+diff --git a/ps2xTest/branch_link/CMakeLists.txt b/ps2xTest/branch_link/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_link/CMakeLists.txt
+@@ -0,0 +1,27 @@
++# Execute authored decoded/generated EE link cases without game data.
++if(CMAKE_CROSSCOMPILING OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++    return()
++endif()
++
++add_executable(ps2_ee_link_fixture_generator emit_fixtures.cpp)
++target_link_libraries(ps2_ee_link_fixture_generator PRIVATE ps2_recomp_lib)
++
++set(link_fixture_source "${CMAKE_CURRENT_BINARY_DIR}/link_fixture_generated.cpp")
++set(link_fixture_words "${CMAKE_CURRENT_BINARY_DIR}/link_fixture_words.tsv")
++add_custom_command(
++    OUTPUT "${link_fixture_source}"
++    BYPRODUCTS "${link_fixture_words}"
++    COMMAND $<TARGET_FILE:ps2_ee_link_fixture_generator> "${link_fixture_source}" "${link_fixture_words}"
++    DEPENDS ps2_ee_link_fixture_generator
++    VERBATIM
++)
++add_executable(ps2_ee_branch_link_tests execute_fixtures.cpp "${link_fixture_source}")
++target_include_directories(ps2_ee_branch_link_tests PRIVATE
++    "${CMAKE_SOURCE_DIR}/ps2xRuntime/include"
++    "${CMAKE_SOURCE_DIR}/ps2xIOP/include"
++)
++if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
++    target_compile_options(ps2_ee_branch_link_tests PRIVATE -msse4.1)
++endif()
++add_test(NAME codegen.ee_likely_branch_link COMMAND ps2_ee_branch_link_tests)
++set_tests_properties(codegen.ee_likely_branch_link PROPERTIES LABELS "codegen;ee" TIMEOUT 30)
+diff --git a/ps2xTest/branch_link/emit_fixtures.cpp b/ps2xTest/branch_link/emit_fixtures.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_link/emit_fixtures.cpp
+@@ -0,0 +1,70 @@
++#include "ps2recomp/code_generator.h"
++#include "ps2recomp/r5900_decoder.h"
++
++#include <array>
++#include <fstream>
++#include <vector>
++
++using namespace ps2recomp;
++
++int main(int argc, char** argv)
++{
++    if (argc != 3)
++        return 2;
++
++    struct Fixture
++    {
++        const char* name;
++        uint32_t branch;
++        uint32_t slot;
++        uint32_t destination;
++    };
++    // BLTZALL/BGEZALL s1, +7 at 0x1000: target 0x1020, link/fallthrough 0x1008.
++    // The first two instruction pairs preserve the original branch46 authored words.
++    constexpr std::array<Fixture, 6> fixtures{{
++        {"bltz_increment", 0x06320007u, 0x26520001u, 18}, // ADDIU s2,s2,1
++        {"bgez_increment", 0x06330007u, 0x26520001u, 18},
++        {"bltz_read_ra",   0x06320007u, 0x03E0902Du, 18}, // DADDU s2,ra,zero
++        {"bgez_read_ra",   0x06330007u, 0x03E0902Du, 18},
++        {"bltz_write_ra",  0x06320007u, 0x0260F82Du, 31}, // DADDU ra,s3,zero
++        {"bgez_write_ra",  0x06330007u, 0x0260F82Du, 31},
++    }};
++    std::vector<Symbol> symbols;
++    std::vector<Section> sections;
++    CodeGenerator generator(symbols, sections);
++    R5900Decoder decoder;
++    std::ofstream code(argv[1]), words(argv[2]);
++    if (!code || !words)
++        return 3;
++    code << "#include \"ps2_runtime_macros.h\"\n";
++    words << "name\tbranch_address\tbranch_word\tdelay_address\tdelay_word\trs\n";
++    for (const auto& fixture : fixtures)
++    {
++        const auto branch = decoder.decodeInstruction(0x1000, fixture.branch, false);
++        const auto slot = decoder.decodeInstruction(0x1004, fixture.slot, false);
++        if (!branch.isBranch || !branch.isCall || !branch.hasDelaySlot || branch.rs != 17 ||
++            branch.opcode != OPCODE_REGIMM || branch.simmediate != 7 ||
++            (branch.rt != REGIMM_BLTZALL && branch.rt != REGIMM_BGEZALL))
++            return 4;
++        if (fixture.slot == 0x26520001u)
++        {
++            if (slot.opcode != OPCODE_ADDIU || slot.rs != 18 || slot.rt != 18 || slot.simmediate != 1)
++                return 5;
++        }
++        else if (slot.opcode != OPCODE_SPECIAL || slot.function != SPECIAL_DADDU || slot.rt != 0 ||
++                 slot.rd != fixture.destination || slot.rs != (fixture.destination == 18 ? 31u : 19u))
++            return 6;
++
++        Function function{};
++        function.name = fixture.name;
++        function.start = 0x1000;
++        function.end = 0x1008;
++        function.isRecompiled = true;
++        CodeGenerator::AnalysisResult analysis{}; // Existing external-target PC return path.
++        code << "void " << fixture.name << "(R5900Context* ctx) {\n"
++             << generator.handleBranchDelaySlots(branch, slot, function, analysis) << "}\n";
++        words << fixture.name << std::hex << "\t1000\t" << fixture.branch << "\t1004\t" << fixture.slot
++              << "\t" << branch.rs << '\n';
++    }
++    return code && words ? 0 : 7;
++}
+diff --git a/ps2xTest/branch_link/execute_fixtures.cpp b/ps2xTest/branch_link/execute_fixtures.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_link/execute_fixtures.cpp
+@@ -0,0 +1,95 @@
++#include "ps2_runtime_macros.h"
++
++#include <array>
++#include <bit>
++#include <cstring>
++#include <iomanip>
++#include <iostream>
++
++void bltz_increment(R5900Context*);
++void bgez_increment(R5900Context*);
++void bltz_read_ra(R5900Context*);
++void bgez_read_ra(R5900Context*);
++void bltz_write_ra(R5900Context*);
++void bgez_write_ra(R5900Context*);
++
++// Expected outputs are authored constants from EE manual v6 pp.34/42 operation
++// blocks, plus each authored ADDIU/DADDU delay instruction. No rs=31 branches.
++// The exact same harness/object is used for source24 and the candidate.
++int main()
++{
++    using Function = void (*)(R5900Context*);
++    struct Case
++    {
++        const char* name;
++        Function function;
++        uint64_t source;
++        uint32_t expected_pc;
++        uint64_t expected_ra;
++        uint64_t expected_s2;
++    };
++    constexpr uint64_t negative64 = 0x8000000000000000ull;
++    constexpr uint64_t positive_bit31 = 0x0000000080000000ull;
++    constexpr uint64_t overwrite_value = 0xFEDCBA9876543210ull;
++    const std::array<Case, 14> cases{{
++        {"bltz_inc_negative64", bltz_increment, negative64,     0x1020, 0x1008, 8},
++        {"bltz_inc_positive31", bltz_increment, positive_bit31, 0x1008, 0x1008, 7},
++        {"bltz_inc_zero",       bltz_increment, 0,              0x1008, 0x1008, 7},
++        {"bgez_inc_negative64", bgez_increment, negative64,     0x1008, 0x1008, 7},
++        {"bgez_inc_positive31", bgez_increment, positive_bit31, 0x1020, 0x1008, 8},
++        {"bgez_inc_zero",       bgez_increment, 0,              0x1020, 0x1008, 8},
++        {"bltz_read_taken",     bltz_read_ra, negative64,        0x1020, 0x1008, 0x1008},
++        {"bltz_read_annulled",  bltz_read_ra, positive_bit31,    0x1008, 0x1008, 7},
++        {"bgez_read_taken",     bgez_read_ra, positive_bit31,    0x1020, 0x1008, 0x1008},
++        {"bgez_read_annulled",  bgez_read_ra, negative64,        0x1008, 0x1008, 7},
++        {"bltz_write_taken",    bltz_write_ra, negative64,       0x1020, overwrite_value, 7},
++        {"bltz_write_annulled", bltz_write_ra, positive_bit31,   0x1008, 0x1008, 7},
++        {"bgez_write_taken",    bgez_write_ra, positive_bit31,   0x1020, overwrite_value, 7},
++        {"bgez_write_annulled", bgez_write_ra, negative64,       0x1008, 0x1008, 7},
++    }};
++
++    unsigned failures = 0;
++    for (unsigned index = 0; index < cases.size(); ++index)
++    {
++        const auto& test = cases[index];
++        const uint64_t upper = (index & 1) ? 0xFEDCBA9876543210ull : 0x7654321012345678ull;
++        R5900Context ctx{};
++        for (unsigned reg = 1; reg < 32; ++reg)
++            ctx.r[reg] = _mm_set_epi64x(std::bit_cast<long long>(upper), 0x12340000 + reg);
++        ctx.r[17] = _mm_set_epi64x(std::bit_cast<long long>(~test.source), std::bit_cast<long long>(test.source));
++        ctx.r[18] = _mm_set_epi64x(std::bit_cast<long long>(upper), 7);
++        ctx.r[19] = _mm_set_epi64x(std::bit_cast<long long>(upper), std::bit_cast<long long>(overwrite_value));
++        ctx.r[31] = _mm_set_epi64x(std::bit_cast<long long>(upper), 0x1122334455667788ll);
++        ctx.pc = 0x1000;
++        ctx.branch_pc = 0xCAFEBABE;
++        const auto before = ctx;
++
++        test.function(&ctx); // All tested instruction semantics execute in generated C++.
++
++        const auto low = [](const __m128i& reg) { return static_cast<uint64_t>(_mm_cvtsi128_si64(reg)); };
++        const auto high = [](const __m128i& reg) { return static_cast<uint64_t>(_mm_extract_epi64(reg, 1)); };
++        const bool pc_ok = ctx.pc == test.expected_pc;
++        const bool ra_ok = low(ctx.r[31]) == test.expected_ra;
++        const bool ra_upper_ok = high(ctx.r[31]) == upper;
++        const bool slot_effect_ok = low(ctx.r[18]) == test.expected_s2 && high(ctx.r[18]) == upper;
++        const bool slot_state_ok = !ctx.in_delay_slot &&
++            ctx.branch_pc == (test.expected_pc == 0x1020 ? 0x1000u : 0xCAFEBABEu);
++        bool other_registers_ok = true;
++        for (unsigned reg = 0; reg < 32; ++reg)
++            if (reg != 18 && reg != 31)
++                other_registers_ok &= std::memcmp(&ctx.r[reg], &before.r[reg], sizeof(ctx.r[reg])) == 0;
++        const bool pass = pc_ok && ra_ok && ra_upper_ok && slot_effect_ok && slot_state_ok && other_registers_ok;
++        failures += !pass;
++        std::cout << std::boolalpha << "{\"case\":\"" << test.name << "\",\"actual\":{\"pc\":\"0x" << std::hex
++                  << ctx.pc << "\",\"ra\":\"0x" << low(ctx.r[31]) << "\",\"ra_upper\":\"0x" << high(ctx.r[31])
++                  << "\",\"s2\":\"0x" << low(ctx.r[18]) << "\",\"in_delay_slot\":" << ctx.in_delay_slot
++                  << "},\"expected\":{\"pc\":\"0x" << test.expected_pc << "\",\"ra\":\"0x" << test.expected_ra
++                  << "\",\"ra_upper\":\"0x" << upper << "\",\"s2\":\"0x" << test.expected_s2
++                  << "\"},\"checks\":{\"pc\":" << pc_ok << ",\"ra_low64\":" << ra_ok
++                  << ",\"ra_upper64\":" << ra_upper_ok << ",\"delay_effect\":" << slot_effect_ok
++                  << ",\"delay_state\":" << slot_state_ok << ",\"other_registers\":" << other_registers_ok
++                  << "},\"pass\":" << pass << "}\n" << std::dec;
++    }
++    std::cout << "{\"cases\":" << cases.size() << ",\"failures\":" << failures << "}\n";
++    return failures ? 1 : 0; // Always active, including builds with NDEBUG.
++}

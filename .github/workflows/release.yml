@@ -1,0 +1,84 @@
+# Release builds for Linux, on Ubuntu 20.04 (glibc 2.31) so they run on any
+# distribution from 2020 on. The game executables are compiled from code
+# generated from the discs, which cannot be part of this public repository:
+# it is fetched from a private repository (secret GA2_GENERATED_REPO, e.g.
+# owner/name, read with the deploy key in secret GA2_GENERATED_DEPLOY_KEY),
+# which holds generated52.tar.zst (tools/ga2.py generate output).
+name: Release builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the builds to (e.g. v0.8.0)
+        required: true
+      arm64:
+        description: Also build Linux ARM64
+        type: boolean
+        default: false
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ubuntu:20.04
+    timeout-minutes: 360
+    env:
+      GA2_PRIVATE_ROOT: ${{ github.workspace }}/private
+    steps:
+      - name: Skip ARM64 unless asked
+        if: matrix.arch == 'arm64' && !inputs.arm64
+        run: echo "ARM64 not requested" && exit 0
+      - name: Git
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q git
+      - uses: actions/checkout@v4
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        with:
+          submodules: recursive
+      - name: Dependencies
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        run: tools/ci/deps-ubuntu.sh release
+      - name: Generated game code
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        env:
+          KEY: ${{ secrets.GA2_GENERATED_DEPLOY_KEY }}
+          REPO: ${{ secrets.GA2_GENERATED_REPO }}
+        run: |
+          mkdir -p ~/.ssh private && printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone -q --depth 1 "git@github.com:$REPO.git" generated-src
+          tar -I zstd -xf generated-src/generated52.tar.zst -C private
+          rm -rf generated-src ~/.ssh/id_ed25519
+      - name: Build
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        run: |
+          git config --global user.name ci && git config --global user.email ci@localhost
+          git config --global --add safe.directory '*'
+          tools/ci/build-linux-release.sh "dist/galaxy-angel-2-pc-${{ inputs.tag }}-linux-${{ matrix.arch }}"
+          tar -C dist -cJf "galaxy-angel-2-pc-${{ inputs.tag }}-linux-${{ matrix.arch }}.tar.xz" \
+            "galaxy-angel-2-pc-${{ inputs.tag }}-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        if: matrix.arch == 'x86_64' || inputs.arm64
+        with:
+          name: linux-${{ matrix.arch }}
+          path: galaxy-angel-2-pc-*.tar.xz
+          retention-days: 7
+
+  publish:
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" artifacts/*/*.tar.xz --clobber --repo "${{ github.repository }}"

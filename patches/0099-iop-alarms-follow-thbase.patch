@@ -1,0 +1,741 @@
+From fcc4a0fd5b734eafb4df170515038d19cbd72941 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:17:47 -0500
+Subject: [PATCH] iop: alarms follow thbase and return kernel errors; callbacks
+ are never silently truncated (H-IOP6, H-IOP8, ALM-1/2)
+
+Alarms (H-IOP6, ALM-1/ALM-2): SetAlarm/CancelAlarm used to shut the IOP down
+on a duplicate pair, a zero delay, a full table, bad pointers, a callback that
+did not return or returned non-zero. They now follow thbase.c / thcommon.c:
+- a duplicate (callback, argument) pair is KE_FOUND_HANDLER, a full table
+  KE_NO_MEMORY, a bad callback KE_ILLEGAL_ENTRY, a bad time pointer KE_ERROR
+- delays below min_wait (USec2SysClock(2000)) are raised to it (zero is legal)
+- an alarm leaves the queue before its callback runs: a self-cancel is
+  KE_NOTFOUND_HANDLER (ALM-2, was 0) and the callback can re-arm itself
+- a non-zero return reschedules at previous target + max(ret, min_wait)
+- a callback that never returns (budget, fault, blocking call) is dropped and
+  logged; other alarms and the IOP are unaffected
+
+Callbacks (H-IOP8): interrupt, timer, CDVD and alarm callbacks ran with an
+unchecked 100000-instruction budget and were cut off with no trace. The budget
+is now 1,000,000 (kCallbackInstructionBudget) and any callback abandoned before
+it returns (budget, tried to block, fault, unimplemented import) is logged once
+per entry point.
+
+Tests: the stale iop_alarm25_boundaries.inc (never compiled, clashed with the
+RPC test name) is replaced by a live iop_alarm_boundaries.inc run from the
+ioman test target (SetAlarm/CancelAlarm/repeat/self-cancel/re-arm/limits/hung
+callback/retirement/reset). The test-only friend declarations in the
+production header are now compiled only for the test targets (H-IOP14).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/imports/iop_intrman.cpp |   5 +-
+ ps2xIOP/src/emulator/imports/iop_timrman.cpp |   3 +-
+ ps2xIOP/src/emulator/iop_emulator.cpp        | 137 ++++++++++-----
+ ps2xIOP/src/emulator/iop_emulator.h          |   5 +-
+ ps2xIOP/src/emulator/iop_emulator_const.h    |   7 +-
+ ps2xIOP/tests/iop_alarm25_boundaries.inc     | 170 -------------------
+ ps2xIOP/tests/iop_alarm_boundaries.inc       | 159 +++++++++++++++++
+ ps2xIOP/tests/iop_ioman_tests.cpp            |   2 +
+ 8 files changed, 268 insertions(+), 220 deletions(-)
+ delete mode 100644 ps2xIOP/tests/iop_alarm25_boundaries.inc
+ create mode 100644 ps2xIOP/tests/iop_alarm_boundaries.inc
+
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+index f500211..f5e485e 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_intrman.h"
++#include "../iop_emulator_const.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+@@ -67,7 +68,7 @@ namespace ps2x::iop::detail
+             return true;
+         case 14:
+             setV0(a0 != 0u
+-                      ? executor.executeGuestFunctionWithBudget(a0, a1, a2, a3, 0u, cpu.gpr[28], 100000u)
++                      ? executor.executeGuestFunctionWithBudget(a0, a1, a2, a3, 0u, cpu.gpr[28], kCallbackInstructionBudget)
+                       : 0u);
+             return true;
+         case 15:
+@@ -109,7 +110,7 @@ namespace ps2x::iop::detail
+                                                       0u,
+                                                       0u,
+                                                       handler->second.gp,
+-                                                      100000u);
++                                                      kCallbackInstructionBudget);
+         return true;
+     }
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+index 3d80897..aa8d839 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_timrman.h"
++#include "../iop_emulator_const.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../services/iop_rpc.h"
+@@ -445,7 +446,7 @@ namespace ps2x::iop::detail
+                                                                                   0u,
+                                                                                   0u,
+                                                                                   callback.gp,
+-                                                                                  100000u)
++                                                                                  kCallbackInstructionBudget)
+                                         : 0u;
+             if (!timer.running)
+                 continue;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index eb331cf..3dccc1f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -22,6 +22,7 @@
+ #include <cctype>
+ #include <map>
+ #include <optional>
++#include <set>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
+@@ -93,13 +94,12 @@ namespace ps2x::iop::detail
+ 
+         struct ScheduledGuestCallback
+         {
+-            // One authoritative queue. Alarm records remain here during delivery.
++            // One authoritative queue; an alarm leaves it before its callback runs.
+             uint32_t function = 0u;
+             uint32_t gp = 0u;
+             uint32_t argument = 0u;
+             uint64_t identity = 0u;
+             bool alarm = false;
+-            bool delivering = false;
+         };
+ 
+         explicit Impl(IopHost &hostRef)
+@@ -188,7 +188,9 @@ namespace ps2x::iop::detail
+             rpcAbort = false;
+             rpcFailReason = nullptr;
+             callStackExhaustionLogged = false;
++            abandonedCallbacks.clear();
+             cannotWaitLogged = false;
++            alarmRefusalLogged = false;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+@@ -785,9 +787,31 @@ namespace ps2x::iop::detail
+             runCpu(cpu, budget);
+             const bool completed = !resetRequired && cpu.pc == kCallReturnSentinel && !cpu.yielded && !cpu.missingImport && !cpu.executionFault;
+             if (returned) *returned = completed;
++            else if (!completed && !resetRequired && !rpcAbort)
++                noteAbandonedCallback(address, cpu, budget);
+             return cpu.gpr[2];
+         }
+ 
++        // A callback whose caller does not inspect completion (interrupt, timer,
++        // CDVD and similar handlers) can still be cut short: by its budget, by
++        // trying to block, by a fault or by an unimplemented import. It is
++        // abandoned, which must never be invisible. One line per entry point.
++        void noteAbandonedCallback(uint32_t address, const CpuState &cpu, uint32_t budget)
++        {
++            if (!abandonedCallbacks.insert(address).second || abandonedCallbacks.size() > 64u)
++                return;
++            std::ostringstream out;
++            out << "[IOP] guest callback 0x" << std::hex << address << " was abandoned before returning (pc=0x" << cpu.pc
++                << std::dec << ": "
++                << (cpu.missingImport ? "unimplemented import"
++                    : cpu.executionFault ? "CPU exception"
++                    : cpu.yielded ? "tried to block outside a thread"
++                                  : "instruction budget of ")
++                << (cpu.missingImport || cpu.executionFault || cpu.yielded ? std::string() : std::to_string(budget))
++                << ")";
++            log(LogLevel::Warning, out.str());
++        }
++
+         bool rpcBudgetExhausted() const noexcept
+         {
+             return totalInstructions >= rpcInstructionDeadline || totalCycles >= rpcCycleDeadline;
+@@ -976,19 +1000,26 @@ namespace ps2x::iop::detail
+                 else ++it;
+         }
+ 
+-        ImportDisposition alarmUnsupported(CpuState &cpu, const char *reason) noexcept
++        // Alarms follow thbase's SetAlarm/CancelAlarm/timer_handler:
++        // - a (callback, argument) pair may be pending once (KE_FOUND_HANDLER),
++        // - delays shorter than the kernel's min_wait (2 ms) are raised to it,
++        // - an alarm leaves the queue before its callback runs, so a callback
++        //   that cancels itself sees KE_NOTFOUND_HANDLER and may re-arm itself,
++        // - a non-zero return reschedules the alarm that many ticks (at least
++        //   min_wait) after its previous target; zero ends it.
++        // Failures are SCE error codes for the caller, never an IOP shutdown.
++        void alarmRefused(CpuState &cpu, int32_t code, const char *reason) noexcept
+         {
+-            markResetRequired(__LINE__);
+-            cpu.gpr[2] = uint32_t(-5);
+-            // Diagnostic scope only; never invent successful unsupported behavior.
+-            try { log(LogLevel::Error, reason); } catch (...) {}
+-            return ImportDisposition::Handled;
++            cpu.gpr[2] = uint32_t(code);
++            if (alarmRefusalLogged) return;
++            alarmRefusalLogged = true;
++            try { log(LogLevel::Warning, std::string("[IOP] alarm request refused: ") + reason); } catch (...) {}
+         }
+ 
+         ImportDisposition dispatchAlarmImport(uint16_t ordinal, CpuState &cpu)
+         {
+-            // This private candidate supports observed relative one-shot alarms.
+-            // Generic duplicate/error/repeat semantics are not yet oracle-verified.
++            constexpr int32_t kFoundHandler = -104, kNotFoundHandler = -105, kNoMemory = -400, kIllegalEntry = -402, kError = -1;
++            constexpr size_t kMaxAlarms = 64u;
+             const uint32_t function = cpu.gpr[ordinal <= 36u ? 5 : 4];
+             const uint32_t argument = cpu.gpr[ordinal <= 36u ? 6 : 5];
+             auto matching = pendingGuestCallbacks.end();
+@@ -1001,11 +1032,10 @@ namespace ps2x::iop::detail
+                 }
+             if (ordinal >= 37u)
+             {
++                // CancelAlarm / iCancelAlarm
+                 if (matching == pendingGuestCallbacks.end())
+                 {
+-                    // CancelAlarm's ordinary not-found result must not fault the IOP.
+-                    // PS2SDK thbase.c / kerr.h: KE_NOTFOUND_HANDLER == -105.
+-                    cpu.gpr[2] = uint32_t(-105);
++                    cpu.gpr[2] = uint32_t(kNotFoundHandler);
+                     return ImportDisposition::Handled;
+                 }
+                 pendingGuestCallbacks.erase(matching);
+@@ -1016,20 +1046,25 @@ namespace ps2x::iop::detail
+             const uint32_t canonicalFunction = IopMemory::physicalAddress(function);
+             const auto validAlias = [](uint32_t a) { return a < IopMemory::RamSize ||
+                 (a >= 0x80000000u && a < 0x80200000u) || (a >= 0xA0000000u && a < 0xA0200000u); };
+-            if (matching != pendingGuestCallbacks.end() || alarms >= 64u ||
+-                !validAlias(clock) || !validAlias(function) || (clock & 3u) || !memory.ownsRamRange(clock, 8u) ||
+-                (function & 3u) || !memory.ownsRamRange(canonicalFunction, 4u))
+-                return alarmUnsupported(cpu, "[IOP alarm diagnostic] unsupported registration");
+-            const uint64_t delay = uint64_t(memory.read32(clock)) | (uint64_t(memory.read32(clock + 4u)) << 32u);
+-            if (!delay || delay > UINT64_MAX - totalCycles)
+-                return alarmUnsupported(cpu, "[IOP alarm diagnostic] unsupported delay");
++            if (!validAlias(clock) || (clock & 3u) || !memory.ownsRamRange(clock, 8u))
++            { alarmRefused(cpu, kError, "the time argument is not owned aligned IOP RAM"); return ImportDisposition::Handled; }
++            if (!validAlias(function) || (function & 3u) || !memory.ownsRamRange(canonicalFunction, 4u))
++            { alarmRefused(cpu, kIllegalEntry, "the callback is not owned aligned IOP code"); return ImportDisposition::Handled; }
++            if (matching != pendingGuestCallbacks.end())
++            { cpu.gpr[2] = uint32_t(kFoundHandler); return ImportDisposition::Handled; }
++            if (alarms >= kMaxAlarms)
++            { alarmRefused(cpu, kNoMemory, "too many pending alarms"); return ImportDisposition::Handled; }
++            uint64_t delay = uint64_t(memory.read32(clock)) | (uint64_t(memory.read32(clock + 4u)) << 32u);
++            if (delay < kAlarmMinWaitCycles) delay = kAlarmMinWaitCycles;
++            if (delay > UINT64_MAX - totalCycles)
++            { alarmRefused(cpu, kError, "the delay overflows the system clock"); return ImportDisposition::Handled; }
+             try
+             {
+                 const uint64_t identity = reserveCallbackIdentity();
+                 pendingGuestCallbacks.emplace(totalCycles + delay,
+-                    ScheduledGuestCallback{function, cpu.gpr[28], argument, identity, true, false});
++                    ScheduledGuestCallback{function, cpu.gpr[28], argument, identity, true});
+             }
+-            catch (...) { return alarmUnsupported(cpu, "[IOP alarm diagnostic] registration allocation failed"); }
++            catch (...) { alarmRefused(cpu, kNoMemory, "registration allocation failed"); return ImportDisposition::Handled; }
+             cpu.gpr[2] = 0u;
+             return ImportDisposition::Handled;
+         }
+@@ -1046,16 +1081,17 @@ namespace ps2x::iop::detail
+                 {
+                     auto it = pendingGuestCallbacks.begin();
+                     while (it != pendingGuestCallbacks.end() && it->first <= cutoff &&
+-                           (it->second.identity > watermark || it->second.delivering)) ++it;
++                           it->second.identity > watermark) ++it;
+                     if (it == pendingGuestCallbacks.end() || it->first > cutoff) break;
+                     const ScheduledGuestCallback callback = it->second;
+-                    if (callback.alarm) it->second.delivering = true;
+-                    else pendingGuestCallbacks.erase(it);
+-                    // Do not retain an iterator across guest execution.
++                    const uint64_t dueCycle = it->first;
++                    // Do not retain an iterator across guest execution. An alarm
++                    // leaves the queue before it runs (see above).
++                    pendingGuestCallbacks.erase(it);
+                     if (!callback.alarm)
+                     {
+                         if (callback.function) (void)callFunction(callback.function, callback.argument,
+-                            0u, 0u, 0u, callback.gp, 100000u);
++                            0u, 0u, 0u, callback.gp, kCallbackInstructionBudget);
+                         continue;
+                     }
+                     struct ExecutionGuard
+@@ -1065,27 +1101,39 @@ namespace ps2x::iop::detail
+                         ~ExecutionGuard() { slot = previous; }
+                     } executionGuard{executingAlarm, executingAlarm};
+                     executingAlarm = &callback;
+-                    uint32_t result = 0u;
+-                    const auto status = executeGuestFunctionWithStackArgumentsChecked(callback.function,
+-                        callback.argument, 0u, 0u, 0u, callback.gp, {}, 100000u, result);
+-                    if (status != IopGuestCallStatus::Completed)
+-                    { markResetRequired(__LINE__); break; }
+-                    auto live = pendingGuestCallbacks.end();
+-                    for (auto scan = pendingGuestCallbacks.begin(); scan != pendingGuestCallbacks.end(); ++scan)
+-                        if (scan->second.identity == callback.identity) { live = scan; break; }
+-                    if (live == pendingGuestCallbacks.end()) continue; // Cancelled/replaced/retired.
+-                    if (result != 0u)
++                    bool returned = false;
++                    const uint32_t result = callFunction(callback.function, callback.argument, 0u, 0u, 0u,
++                        callback.gp, kCallbackInstructionBudget, &returned);
++                    if (resetRequired) break;
++                    if (!returned)
+                     {
+-                        markResetRequired(__LINE__);
+-                        log(LogLevel::Error, "[IOP alarm diagnostic] repeat semantics unsupported");
+-                        break;
++                        // Abandoned (budget, fault, tried to block): the alarm is
++                        // dropped, but only this alarm.
++                        noteAbandonedAlarm(callback);
++                        continue;
+                     }
+-                    pendingGuestCallbacks.erase(live);
++                    if (result == 0u) continue; // one-shot, already removed
++                    // Periodic: next target = previous target + max(result, min_wait).
++                    const uint64_t period = std::max<uint64_t>(result, kAlarmMinWaitCycles);
++                    if (period > UINT64_MAX - dueCycle) continue;
++                    ScheduledGuestCallback again = callback;
++                    again.identity = reserveCallbackIdentity();
++                    pendingGuestCallbacks.emplace(dueCycle + period, again);
+                 }
+             }
+             catch (...) { markResetRequired(__LINE__); }
+         }
+ 
++        void noteAbandonedAlarm(const ScheduledGuestCallback &callback)
++        {
++            if (!abandonedCallbacks.insert(callback.function).second || abandonedCallbacks.size() > 64u)
++                return;
++            std::ostringstream out;
++            out << "[IOP] alarm callback 0x" << std::hex << callback.function
++                << " did not return (budget, fault or blocking call); the alarm is dropped";
++            log(LogLevel::Warning, out.str());
++        }
++
+         bool runCyclesCore(uint64_t cycles, bool checked) noexcept
+         {
+             if (syncingSpu) { markResetRequired(__LINE__); return false; }
+@@ -1379,7 +1427,9 @@ namespace ps2x::iop::detail
+         bool rpcAbort = false;
+         const char *rpcFailReason = nullptr;
+         bool callStackExhaustionLogged = false;
++        std::set<uint32_t> abandonedCallbacks;
+         bool cannotWaitLogged = false;
++        bool alarmRefusalLogged = false;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+@@ -1554,10 +1604,7 @@ namespace ps2x::iop::detail
+ #ifdef PS2X_IOP_TEST_BOUNDARIES
+ #include "../../tests/iop_device_callback_boundaries.inc"
+ #include "../../tests/iop_rpc_wait_boundaries.inc"
+-#endif
+-#ifdef GA2_ALARM25_TEST
+-#include "../../tests/iop_allocator27_boundaries.inc"
+-#include "../../tests/iop_alarm25_boundaries.inc"
++#include "../../tests/iop_alarm_boundaries.inc"
+ #endif
+ 
+ #ifdef GA2_SPU31_TEST
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 24e34fc..a8c224a 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -53,9 +53,12 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+ 
+     private:
+-        // Defined only in the boundary-test translation unit; no runtime API.
++#if defined(PS2X_IOP_TEST_BOUNDARIES) || defined(GA2_SPU31_TEST)
++        // Boundary tests (defined only in the test translation units; no runtime API).
+         friend bool testIopDeviceCallbackBoundaries();
+         friend bool testIopRpcWaitBoundaries();
++        friend bool testIopAlarmBoundaries();
++#endif
+ #ifdef GA2_SPU31_TEST
+         friend void ga2_spu31_boundary_checks();
+ #endif
+diff --git a/ps2xIOP/src/emulator/iop_emulator_const.h b/ps2xIOP/src/emulator/iop_emulator_const.h
+index d317e0d..326fe5b 100644
+--- a/ps2xIOP/src/emulator/iop_emulator_const.h
++++ b/ps2xIOP/src/emulator/iop_emulator_const.h
+@@ -14,4 +14,9 @@ constexpr uint32_t kDefaultSlice = 256u;
+ constexpr uint64_t kMaxIopLeadCycles = 65536u;
+ constexpr uint32_t kMaxCallInstructions = 2'000'000u;
+ constexpr uint32_t kModuleLoadBase = 0x00010000u;
+-constexpr uint32_t kStackGuardBytes = 64u;
+\ No newline at end of file
++constexpr uint32_t kStackGuardBytes = 64u;// Interrupt/timer/CDVD/alarm callbacks run to completion on the IOP. A callback
++// that does not return within this many instructions is abandoned (and logged);
++// it is far above any legitimate handler and only bounds a hung one.
++constexpr uint32_t kCallbackInstructionBudget = 1'000'000u;
++// The kernel's shortest alarm (thbase min_wait = USec2SysClock(2000)).
++constexpr uint64_t kAlarmMinWaitCycles = kIopClockHz * 2000ull / 1'000'000ull;
+diff --git a/ps2xIOP/tests/iop_alarm25_boundaries.inc b/ps2xIOP/tests/iop_alarm25_boundaries.inc
+deleted file mode 100644
+index 4ff7abe..0000000
+--- a/ps2xIOP/tests/iop_alarm25_boundaries.inc
++++ /dev/null
+@@ -1,170 +0,0 @@
+-#include "iop_compat_test_support.h"
+-#include <cstdlib>
+-namespace ps2x::iop::detail {
+-bool testIopRpcWaitBoundaries() {
+- using State=IopEmulator::Impl;
+- const auto require=[](bool b,const char *s){if(!b)throw std::runtime_error(s);};
+- constexpr uint32_t CLOCK=0x13000, MARK=0x13100, NEXT=0x13104;
+- const auto prepare=[&](State &s){
+-  require(s.memory.zeroRam(0x10000,0x5000),"RAM seed");
+-  const auto words=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
+-  words(0x12000,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1200C,"thbase",7),"thbase");
+-  for(uint32_t n=0;n<=41;n++)words(0x12014+n*8,{0x03E00008,0x24000000|n});
+-  words(0x12200,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1220C,"thsemap",8),"thsemap");
+-  for(uint32_t n=0;n<=10;n++)words(0x12214+n*8,{0x03E00008,0x24000000|n});
+-  words(0x12400,{0x41E00000,0,0x101});require(s.memory.writeRam(0x1240C,"sysmem",7),"sysmem");
+-  for(uint32_t n=0;n<=15;n++)words(0x12414+n*8,{0x03E00008,0x24000000|n});
+-  // Real callback increments the opaque common argument and returns0.
+-  words(0x11000,{0x8C880000,0,0x25080001,0xAC880000,0x03E00008,0x00001021});
+-  s.memory.write32(CLOCK,1000);s.memory.write32(CLOCK+4,0);
+- };
+- const auto driver=[&](State &s,uint32_t ordinal,uint32_t function=0x11000,uint32_t clock=CLOCK,uint32_t argument=MARK,uint32_t gp=0){
+-  std::vector<uint32_t> w={0x27BDFFE8,0xAFBF0010};
+-  const auto li=[&](unsigned r,uint32_t a){w.push_back(0x3C000000|(r<<16)|(a>>16));w.push_back(0x34000000|(r<<21)|(r<<16)|(a&65535));};
+-  li(4,ordinal<=36?clock:function);li(5,ordinal<=36?function:argument);li(6,argument);
+-  w.insert(w.end(),{0x0C000000|((0x12014+ordinal*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0});
+-  uint32_t a=0x11200;for(auto v:w){s.memory.write32(a,v);a+=4;}
+-  uint32_t result=0;auto status=s.executeGuestFunctionWithStackArgumentsChecked(0x11200,0,0,0,0,gp,{},100000,result);
+-  return std::pair{status,result};
+- };
+- // Exercise actual MIPS imports and then a new callback, not only a host result.
+- for (uint32_t ordinal : {37u,38u}) {
+-   iop_test::Host h;State s(h);prepare(s);
+-   auto [st,v]=driver(s,ordinal);
+-   require(st==IopGuestCallStatus::Completed&&v==uint32_t(-105)&&!s.resetRequired,"missing cancel faulted IOP");
+-   driver(s,35);s.runCycles(1100);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==1,"not-found cancel stopped later callback");
+-   auto [st2,v2]=driver(s,ordinal);
+-   require(st2==IopGuestCallStatus::Completed&&v2==uint32_t(-105)&&!s.resetRequired,"expired cancel faulted IOP");
+-   driver(s,35);s.runCycles(1100);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==2,"expired cancel prevented new alarm");
+-   std::cout<<"PASS missing/expired MIPS cancellation and continued delivery ordinal="<<ordinal<<"\n";
+- }
+- for (uint32_t ordinal : {37u,38u}) {
+-   iop_test::Host h;State s(h);prepare(s);driver(s,35);
+-   auto [st,v]=driver(s,ordinal,0x11000,CLOCK,NEXT);
+-   require(st==IopGuestCallStatus::Completed&&v==uint32_t(-105)&&!s.resetRequired&&s.pendingGuestCallbacks.size()==1,"wrong common cancelled live pair");
+-   s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==1,"unrelated pair delivery lost");
+-   std::cout<<"PASS missing common preserves other alarm ordinal="<<ordinal<<"\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);driver(s,35);
+-   auto [st,v]=driver(s,37);auto [st2,v2]=driver(s,37);
+-   require(st==IopGuestCallStatus::Completed&&v==0&&st2==IopGuestCallStatus::Completed&&v2==uint32_t(-105)&&!s.resetRequired,"repeated cancellation faulted IOP");
+-   s.runCycles(2000);require(s.memory.read32(MARK)==0&&s.pendingGuestCallbacks.empty(),"already cancelled callback fired");
+-   std::cout<<"PASS repeated MIPS cancellation returns not-found\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);
+-   const uint32_t words[]={0x27BDFFE8,0xAFBF0010,0x3C040001,0x34841000,0x3C050001,0x34A53100,
+-     0x0C000000|((0x12014+37*8)>>2),0,0x0C000000|((0x12014+37*8)>>2),0,
+-     0x3C080001,0xAD023104,0x24090001,0xAD093100,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021};
+-   uint32_t a=0x11000;for(auto w:words){s.memory.write32(a,w);a+=4;}
+-   driver(s,35);s.runCycles(1100);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==1&&s.memory.read32(NEXT)==uint32_t(-105)&&s.pendingGuestCallbacks.empty(),"self double cancel did not finish guest callback");
+-   std::cout<<"PASS MIPS callback continues after second self cancellation\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);auto [st,v]=driver(s,35);require(st==IopGuestCallStatus::Completed&&v==0,"MIPS SetAlarm rejected");
+-   s.runCycles(50);require(s.memory.read32(MARK)==0,"alarm fired early");s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==1,"one-shot not delivered");s.runCycles(1100);require(s.memory.read32(MARK)==1,"one-shot repeated");std::cout<<"PASS real MIPS one-shot timing\n"; }
+- { iop_test::Host h;State s(h);prepare(s);driver(s,36);auto [st,v]=driver(s,38);require(st==IopGuestCallStatus::Completed&&v==0,"cancel failed");s.runCycles(2000);require(!s.resetRequired&&s.memory.read32(MARK)==0,"cancelled callback fired");std::cout<<"PASS MIPS interrupt aliases cancel\n"; }
+- { iop_test::Host h;State s(h);prepare(s);driver(s,35);s.retireAlarms(0x11000,4);s.runCycles(2000);require(!s.resetRequired&&s.memory.read32(MARK)==0,"retired callback fired");std::cout<<"PASS executable retirement boundary\n"; }
+- { iop_test::Host h;State s(h);prepare(s);
+-   const uint32_t code=s.memory.allocate(0x100,16);require(code!=0,"code allocation");
+-   std::array<uint8_t,24> body{};require(s.memory.readRam(0x11000,body.data(),body.size())&&s.memory.writeRam(code,body.data(),body.size()),"allocated callback copy");driver(s,35,code);
+-   require(s.memory.freeAllocation(code),"real code free");s.runCycles(2000);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==0,"composed retirement did not revoke alarm");std::cout<<"PASS real backing free through composed observer\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);
+-   const uint32_t clock=s.memory.allocate(0x100,16);require(clock!=0,"clock allocation");s.memory.write32(clock,1000);s.memory.write32(clock+4,0);driver(s,35,0x11000,clock);
+-   require(s.memory.freeAllocation(clock),"clock free");s.runCycles(2000);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==1,"copied clock treated as live dependency");std::cout<<"PASS copied clock retirement\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);
+-   // A cancels B after both are staged overdue. The batch must retain B's authority.
+-   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
+-   put(0x11100,{0x8C880000,0,0x25080001,0xAC880000,0x03E00008,0x00001021});
+-   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x3C040001,0x34841100,0x3C050001,0x34A53100,
+-       0x0C000000|((0x12014+37*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
+-   driver(s,35,0x11000,CLOCK,NEXT);driver(s,35,0x11100,CLOCK,MARK);
+-   s.totalCycles+=2000;s.servicePendingGuestCallbacks();
+-   require(!s.resetRequired&&s.memory.read32(MARK)==0&&s.pendingGuestCallbacks.empty(),"cancelled due-batch callback executed");std::cout<<"PASS real MIPS cancellation within staged due batch\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);
+-   // The callback cancels itself and registers the identical function/common again.
+-   // Its old completion must not erase or resurrect the new registration.
+-   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
+-   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x8C880000,0,0x25080001,0xAC880000,
+-     0x3C040001,0x34841000,0x3C050001,0x34A53100,0x0C000000|((0x12014+37*8)>>2),0,
+-     0x3C040001,0x34843000,0x3C050001,0x34A51000,0x3C060001,0x34C63100,
+-     0x0C000000|((0x12014+35*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
+-   driver(s,35);s.totalCycles+=2000;s.servicePendingGuestCallbacks();
+-   require(!s.resetRequired&&s.memory.read32(MARK)==1&&s.pendingGuestCallbacks.size()==1,"self replacement erased by old completion");
+-   s.runCycles(1100);require(!s.resetRequired&&s.memory.read32(MARK)==2&&s.pendingGuestCallbacks.size()==1,"self replacement failed next delivery");
+-   std::cout<<"PASS real MIPS self-cancel and same-pair replacement\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);
+-   iop_test::Irx image(0x10000,0x5000);
+-   require(s.memory.readRam(0x10000,image.bytes.data()+0x100,0x5000),"module image copy");
+-   image.words(0,{0x03E00008,0x00001021});
+-   const auto loaded=s.loadImage("authored-alarm.irx",image.bytes,nullptr,0);
+-   require(loaded.moduleId>0&&loaded.startResult==0,"actual module startup");driver(s,35);
+-   int32_t result=-1;require(s.stopModule(loaded.moduleId,&result)&&result==0,"actual module stop");s.runCycles(2000);
+-   require(!s.resetRequired&&s.memory.read32(MARK)==0,"stopped module callback fired");std::cout<<"PASS actual authored module stop\n";
+- }
+- { iop_test::Host h;State s(h);prepare(s);driver(s,35);s.reset();s.runCycles(2000);require(!s.resetRequired&&s.pendingGuestCallbacks.empty(),"reset preserved work");std::cout<<"PASS cold reset\n"; }
+- { iop_test::Host h;State s(h);prepare(s);driver(s,35,0xC0011000);require(s.resetRequired&&s.pendingGuestCallbacks.empty(),"bad raw alias admitted");std::cout<<"PASS raw alias guard\n"; }
+- { iop_test::Host h;State s(h);prepare(s);s.memory.write32(0x11014,0x24020001);driver(s,35);s.runCycles(2000);require(s.resetRequired,"unverified repeat silently accepted");std::cout<<"PASS nonzero callback stop\n"; }
+- { iop_test::Host h;State s(h);prepare(s);s.memory.write32(0x11000,0x08004400);s.memory.write32(0x11004,0);driver(s,35);s.runCycles(2000);require(s.resetRequired,"nonreturning callback accepted");std::cout<<"PASS nonreturning callback stop\n"; }
+- { iop_test::Host h;State s(h);prepare(s);
+-   // Allocate a real zero-count semaphore, then a MIPS callback signals it.
+-   s.memory.write32(0x13300,0);s.memory.write32(0x13304,0);s.memory.write32(0x13308,0);s.memory.write32(0x1330C,1);
+-   IopCpuState c{};c.gpr[4]=0x13300;require(s.kernel.dispatchSemaphoreImport(4,c),"semaphore creation");const uint32_t id=c.gpr[2];
+-   const auto put=[&](uint32_t a,std::initializer_list<uint32_t> v){for(auto w:v){s.memory.write32(a,w);a+=4;}};
+-   put(0x11000,{0x27BDFFE8,0xAFBF0010,0x24040000|id,0x0C000000|((0x12214+7*8)>>2),0,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
+-   // Checked RPC performs SetAlarm then the original WaitSemaphore import.
+-   put(0x11400,{0x27BDFFE8,0xAFBF0010,0x3C040001,0x34843000,0x3C050001,0x34A51000,0x00003021,
+-      0x0C000000|((0x12014+35*8)>>2),0,0x24040000|id,0x0C000000|((0x12214+8*8)>>2),0,
+-      0x3C080001,0x34090001,0xAD093104,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
+-   uint32_t result=99;auto st=s.executeRpcFunctionChecked(0x11400,0,0,0,0,0,100000,result);
+-   require(st==IopGuestCallStatus::Completed&&!s.resetRequired&&result==0&&s.memory.read32(NEXT)==1,"real held RPC did not resume");
+-   std::cout<<"PASS real held MIPS RPC alarm/semaphore continuation\n";
+-   // Suppress only SetAlarm's JAL in this authored driver: the real empty wait must fail.
+-   s.memory.write32(0x1141C,0);s.memory.write32(NEXT,0);result=99;
+-   st=s.executeRpcFunctionChecked(0x11400,0,0,0,0,0,100000,result);
+-   require(st==IopGuestCallStatus::ResetRequired&&s.resetRequired&&s.memory.read32(NEXT)==0,"missing-alarm control unexpectedly resumed");
+-   std::cout<<"PASS missing-alarm real RPC control\n";
+- }
+- // Real guest FreeSysMemory is the retirement stimulus, not a test hook.
+- const char *selection=std::getenv("GA2_ALARM_RETIRE_MODE");
+- const int selectedMode=selection?std::atoi(selection):-1;
+- for (int mode=0;mode<5;mode++) {
+-   if(selection&&selectedMode!=mode)continue;
+-   iop_test::Host h;State s(h);prepare(s);
+-   const uint32_t backing=s.memory.allocate(0x100,16);require(backing!=0,"active retirement allocation");
+-   const uint32_t function=(mode==3||mode==4)?0x11000:backing;
+-   std::vector<uint32_t> w={0x27BDFFE8,0xAFBF0010};
+-   const auto li=[&](unsigned r,uint32_t a){w.push_back(0x3C000000|(r<<16)|(a>>16));w.push_back(0x34000000|(r<<21)|(r<<16)|(a&65535));};
+-   if(mode==1||mode==2) {
+-     li(4,function);li(5,MARK);w.insert(w.end(),{0x0C000000|((0x12014+37*8)>>2),0});
+-   }
+-   if(mode==2) {
+-     li(4,CLOCK);li(5,function);li(6,MARK);w.insert(w.end(),{0x0C000000|((0x12014+35*8)>>2),0});
+-   }
+-   li(4,backing);w.insert(w.end(),{0x0C000000|((0x12414+5*8)>>2),0});
+-   li(8,MARK);w.insert(w.end(),{0x24090001,0xAD090000,0x8FBF0010,0,0x27BD0018,0x03E00008,0x00001021});
+-   uint32_t a=function;for(auto v:w){s.memory.write32(a,v);a+=4;}
+-   driver(s,35,function,CLOCK,MARK,mode==3?backing:0);
+-   s.runCycles(2000);
+-   require(!s.memory.ownsRamRange(backing,4),"guest FreeSysMemory did not retire backing");
+-   std::cout<<"OBSERVE guest retirement mode="<<mode<<" post-free-marker="<<s.memory.read32(MARK)<<" reset="<<s.resetRequired<<" pending="<<s.pendingGuestCallbacks.size()<<"\n";
+-   if(mode<4) {
+-     require(s.resetRequired&&s.memory.read32(MARK)==0,"retired alarm executed post-free instructions");
+-     require(s.pendingGuestCallbacks.empty(),"retired replacement registration survived");
+-   } else require(!s.resetRequired&&s.memory.read32(MARK)==1,"unrelated retirement stopped live callback");
+-#ifndef GA2_ALARM26_COMPARE25
+-   require(s.executingAlarm==nullptr,"execution witness escaped checked-call scope");
+-#endif
+-   require(!s.servicingGuestCallbacks,"callback service scope remained active");
+-   std::cout<<"PASS real guest retirement mode="<<mode<<" post-free-marker="<<s.memory.read32(MARK)<<" reset="<<s.resetRequired<<"\n";
+- }
+- return testAllocator27Boundaries<State>();
+-}
+-}
+diff --git a/ps2xIOP/tests/iop_alarm_boundaries.inc b/ps2xIOP/tests/iop_alarm_boundaries.inc
+new file mode 100644
+index 0000000..04b474a
+--- /dev/null
++++ b/ps2xIOP/tests/iop_alarm_boundaries.inc
+@@ -0,0 +1,159 @@
++// Included by the existing private emulator boundary-test target only.
++//
++// Alarms follow thbase (ps2sdk-study thbase.c / thcommon.c timer_handler):
++// duplicate pair = KE_FOUND_HANDLER, short delays are raised to min_wait, the
++// alarm leaves the queue before its callback runs, a non-zero return
++// reschedules, and no request or callback outcome shuts the IOP down.
++#include "iop_compat_test_support.h"
++#include <cstdlib>
++namespace ps2x::iop::detail
++{
++    bool testIopAlarmBoundaries()
++    {
++        using State = IopEmulator::Impl;
++        const auto require = [](bool b, const char *s) { if (!b) throw std::runtime_error(s); };
++        constexpr uint32_t CLOCK = 0x13000, MARK = 0x13100, NEXT = 0x13104, SECOND = 0x13108;
++        constexpr uint64_t MINWAIT = kAlarmMinWaitCycles;
++        const auto words = [](State &s, uint32_t a, std::initializer_list<uint32_t> v) { for (auto w : v) { s.memory.write32(a, w); a += 4; } };
++        const auto jal = [](uint32_t t) { return 0x0C000000u | (t >> 2); };
++        const auto prepare = [&](State &s, uint32_t delay = 1000)
++        {
++            require(s.memory.zeroRam(0x10000, 0x5000), "RAM seed");
++            words(s, 0x12000, {0x41E00000, 0, 0x101}); require(s.memory.writeRam(0x1200C, "thbase", 7), "thbase");
++            for (uint32_t n = 0; n <= 41; n++) words(s, 0x12014 + n * 8, {0x03E00008, 0x24000000 | n});
++            words(s, 0x12400, {0x41E00000, 0, 0x101}); require(s.memory.writeRam(0x1240C, "sysmem", 7), "sysmem");
++            for (uint32_t n = 0; n <= 15; n++) words(s, 0x12414 + n * 8, {0x03E00008, 0x24000000 | n});
++            // Callback 0x11000: ++*(int*)a0; return 0.
++            words(s, 0x11000, {0x8C880000, 0, 0x25080001, 0xAC880000, 0x03E00008, 0x00001021});
++            s.memory.write32(CLOCK, delay); s.memory.write32(CLOCK + 4, 0);
++        };
++        // Real MIPS calls into thbase: SetAlarm(35)/iSetAlarm(36)/CancelAlarm(37)/iCancelAlarm(38).
++        const auto driver = [&](State &s, uint32_t ordinal, uint32_t function = 0x11000, uint32_t clock = CLOCK, uint32_t argument = MARK)
++        {
++            std::vector<uint32_t> w = {0x27BDFFE8, 0xAFBF0010};
++            const auto li = [&](unsigned r, uint32_t a) { w.push_back(0x3C000000 | (r << 16) | (a >> 16)); w.push_back(0x34000000 | (r << 21) | (r << 16) | (a & 65535)); };
++            li(4, ordinal <= 36 ? clock : function); li(5, ordinal <= 36 ? function : argument); li(6, argument);
++            w.insert(w.end(), {jal(0x12014 + ordinal * 8), 0, 0x8FBF0010, 0, 0x27BD0018, 0x03E00008, 0});
++            uint32_t a = 0x11200; for (auto v : w) { s.memory.write32(a, v); a += 4; }
++            uint32_t result = 0;
++            const auto status = s.executeGuestFunctionWithStackArgumentsChecked(0x11200, 0, 0, 0, 0, 0, {}, 100000, result);
++            require(status == IopGuestCallStatus::Completed, "alarm driver did not complete");
++            return int32_t(result);
++        };
++        try
++        {
++            // One-shot: raised to min_wait, not early, delivered once.
++            { iop_test::Host h; State s(h); prepare(s);
++              require(driver(s, 35) == 0, "SetAlarm rejected");
++              s.runCycles(MINWAIT - 100); require(s.memory.read32(MARK) == 0, "alarm fired before min_wait (delay 1000 ticks)");
++              s.runCycles(300); require(!s.resetRequired && s.memory.read32(MARK) == 1, "one-shot not delivered at min_wait");
++              s.runCycles(3 * MINWAIT); require(s.memory.read32(MARK) == 1 && s.pendingGuestCallbacks.empty(), "one-shot repeated"); }
++            // A delay of zero is not an error (raised to min_wait), a long one is honoured.
++            { iop_test::Host h; State s(h); prepare(s, 0);
++              require(driver(s, 36) == 0, "zero delay was refused");
++              s.runCycles(MINWAIT + 100); require(!s.resetRequired && s.memory.read32(MARK) == 1, "zero-delay alarm not delivered");
++              s.memory.write32(CLOCK, uint32_t(5 * MINWAIT)); require(driver(s, 35) == 0, "long alarm");
++              s.runCycles(4 * MINWAIT); require(s.memory.read32(MARK) == 1, "long alarm fired early");
++              s.runCycles(2 * MINWAIT); require(s.memory.read32(MARK) == 2, "long alarm not delivered"); }
++            // Duplicate pair: KE_FOUND_HANDLER, still exactly one delivery.
++            { iop_test::Host h; State s(h); prepare(s);
++              require(driver(s, 35) == 0 && driver(s, 35) == -104 && driver(s, 36) == -104 && !s.resetRequired, "duplicate registration");
++              require(driver(s, 35, 0x11000, CLOCK, NEXT) == 0, "a different argument is a different alarm");
++              s.runCycles(2 * MINWAIT); require(!s.resetRequired && s.memory.read32(MARK) == 1 && s.memory.read32(NEXT) == 1, "duplicate delivered twice or lost"); }
++            // Cancel: missing / expired / repeated => KE_NOTFOUND_HANDLER, later alarms unaffected.
++            for (uint32_t ordinal : {37u, 38u})
++            { iop_test::Host h; State s(h); prepare(s);
++              require(driver(s, ordinal) == -105 && !s.resetRequired, "missing cancel");
++              require(driver(s, 35) == 0 && driver(s, ordinal) == 0 && driver(s, ordinal) == -105 && !s.resetRequired, "cancel then cancel again");
++              s.runCycles(2 * MINWAIT); require(s.memory.read32(MARK) == 0 && s.pendingGuestCallbacks.empty(), "cancelled alarm fired");
++              require(driver(s, 35) == 0, "register after cancel"); s.runCycles(2 * MINWAIT);
++              require(driver(s, ordinal) == -105 && s.memory.read32(MARK) == 1, "expired cancel"); }
++            // Too many alarms and bad pointers are error results.
++            { iop_test::Host h; State s(h); prepare(s);
++              int accepted = 0; int32_t last = 0;
++              for (uint32_t n = 0; n < 70; n++) { last = driver(s, 35, 0x11000, CLOCK, 0x13200 + n * 4); if (last == 0) ++accepted; }
++              require(accepted == 64 && last == -400 && !s.resetRequired, "alarm table limit must be an error, not a shutdown");
++              require(driver(s, 35, 0x11002) == -402 && !s.resetRequired, "unaligned callback");
++              require(driver(s, 35, 0x11000, 0x13003) == -1 && !s.resetRequired, "unaligned clock");
++              require(driver(s, 35, 0x11000, 0x00300000) == -1 && !s.resetRequired, "clock outside RAM");
++              s.runCycles(2 * MINWAIT); require(!s.resetRequired, "pending alarms after refusals"); }
++            // A callback cancelling itself sees KE_NOTFOUND_HANDLER and can re-arm itself.
++            { iop_test::Host h; State s(h); prepare(s);
++              words(s, 0x11000, {0x27BDFFE8, 0xAFBF0010, 0x8C880000, 0, 0x25080001, 0xAC880000,        // ++*a0
++                  0x3C040001, 0x34841000, 0x3C050001, 0x34A53100, jal(0x12014 + 37 * 8), 0,             // CancelAlarm(self)
++                  0x3C080001, 0xAD024104, 0x8FBF0010, 0, 0x27BD0018, 0x03E00008, 0x00001021});          // store v0; return 0
++              require(driver(s, 35) == 0, "register self-cancelling alarm");
++              s.runCycles(2 * MINWAIT);
++              require(!s.resetRequired && s.memory.read32(MARK) == 1 && int32_t(s.memory.read32(0x14104)) == -105,
++                      "self cancel from the callback must be KE_NOTFOUND_HANDLER"); }
++            { iop_test::Host h; State s(h); prepare(s);
++              // The callback re-arms itself (same pair) from inside the callback.
++              words(s, 0x11000, {0x27BDFFE8, 0xAFBF0010, 0x8C880000, 0, 0x25080001, 0xAC880000,
++                  0x3C040001, 0x34843000, 0x3C050001, 0x34A51000, 0x3C060001, 0x34C63100, jal(0x12014 + 36 * 8), 0,
++                  0x3C080001, 0xAD024104, 0x8FBF0010, 0, 0x27BD0018, 0x03E00008, 0x00001021});
++              require(driver(s, 35) == 0, "register re-arming alarm");
++              s.runCycles(MINWAIT + 5000);
++              require(!s.resetRequired && s.memory.read32(MARK) == 1 && s.memory.read32(0x14104) == 0u && s.pendingGuestCallbacks.size() == 1,
++                      "a callback must be able to re-arm itself");
++              s.runCycles(MINWAIT + 5000); require(s.memory.read32(MARK) == 2, "the re-armed alarm did not fire"); }
++            // Non-zero return: reschedules after the previous target (+ max(ret, min_wait)).
++            { iop_test::Host h; State s(h); prepare(s);
++              const uint32_t period = uint32_t(2 * MINWAIT);
++              // callback: ++*a0; return (*a0 < 3) ? period : 0
++              words(s, 0x11000, {0x8C880000, 0, 0x25080001, 0xAC880000,
++                                 0x29090003,                      // slti t1,t0,3
++                                 0x11200004,                      // beq t1,zero,+4 (-> return 0)
++                                 0x3C020000 | (period >> 16),     // lui v0,hi
++                                 0x34420000 | (period & 0xFFFF),  // ori v0,v0,lo
++                                 0x03E00008, 0});
++              words(s, 0x11028, {0x03E00008, 0x00001021}); // branch target: return 0
++              require(driver(s, 35) == 0, "register periodic alarm");
++              s.runCycles(MINWAIT + 100); require(s.memory.read32(MARK) == 1 && s.pendingGuestCallbacks.size() == 1, "first period");
++              s.runCycles(period); require(s.memory.read32(MARK) == 2, "second period");
++              s.runCycles(period); require(s.memory.read32(MARK) == 3 && s.pendingGuestCallbacks.empty(), "third period ends the alarm");
++              s.runCycles(4 * period); require(!s.resetRequired && s.memory.read32(MARK) == 3, "periodic alarm kept firing"); }
++            // A callback that never returns is dropped (logged) without stopping the IOP or other alarms.
++            { iop_test::Host h; State s(h); prepare(s);
++              words(s, 0x11100, {0x08004440, 0});                       // j self
++              require(driver(s, 35, 0x11100) == 0 && driver(s, 35, 0x11000, CLOCK, SECOND) == 0, "register hung and healthy alarms");
++              s.runCycles(2 * MINWAIT);
++              s.runCycles(1000); // the hung callback consumed its whole budget of IOP time
++              require(!s.resetRequired && s.memory.read32(SECOND) == 1 && s.pendingGuestCallbacks.empty(),
++                      "a hung alarm callback shut the IOP down or blocked another alarm");
++              bool logged = false; for (const auto &line : h.logs) logged = logged || line.find("alarm callback") != std::string::npos;
++              require(logged, "the dropped alarm callback was not logged"); }
++            // The callback budget is no longer silent for interrupt-style callbacks either.
++            { iop_test::Host h; State s(h); prepare(s);
++              words(s, 0x11100, {0x08004440, 0});
++              s.pendingGuestCallbacks.emplace(10u, State::ScheduledGuestCallback{0x11100u, 0u, 0u});
++              s.runCycles(100);
++              bool logged = false; for (const auto &line : h.logs) logged = logged || line.find("abandoned") != std::string::npos;
++              require(!s.resetRequired && logged, "an abandoned callback must be logged"); }
++            // Retirement of an executable or the whole module removes its alarms.
++            { iop_test::Host h; State s(h); prepare(s);
++              require(driver(s, 35) == 0, "register"); s.retireAlarms(0x11000, 4); s.runCycles(2 * MINWAIT);
++              require(!s.resetRequired && s.memory.read32(MARK) == 0, "retired callback fired"); }
++            { iop_test::Host h; State s(h); prepare(s);
++              const uint32_t code = s.memory.allocate(0x100, 16); require(code != 0, "code allocation");
++              std::array<uint8_t, 24> body{};
++              require(s.memory.readRam(0x11000, body.data(), body.size()) && s.memory.writeRam(code, body.data(), body.size()), "callback copy");
++              require(driver(s, 35, code) == 0, "register");
++              require(s.memory.freeAllocation(code), "free code"); s.runCycles(2 * MINWAIT);
++              require(!s.resetRequired && s.memory.read32(MARK) == 0, "freed code still ran"); }
++            { iop_test::Host h; State s(h); prepare(s);
++              const uint32_t clock = s.memory.allocate(0x100, 16); require(clock != 0, "clock allocation");
++              s.memory.write32(clock, 1000); s.memory.write32(clock + 4, 0); require(driver(s, 35, 0x11000, clock) == 0, "register");
++              require(s.memory.freeAllocation(clock), "free clock"); s.runCycles(2 * MINWAIT);
++              require(!s.resetRequired && s.memory.read32(MARK) == 1, "the copied clock is not a live dependency"); }
++            { iop_test::Host h; State s(h); prepare(s); require(driver(s, 35) == 0, "register");
++              s.reset(); s.runCycles(2 * MINWAIT); require(!s.resetRequired && s.pendingGuestCallbacks.empty(), "reset kept alarms"); }
++            std::cout << "PASS alarm boundaries (thbase SetAlarm/CancelAlarm contract)\n";
++            return true;
++        }
++        catch (const std::exception &error)
++        {
++            std::cerr << "FAIL alarm boundaries: " << error.what() << '\n';
++            return false;
++        }
++    }
++}
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index f05257a..1f7aae3 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -19,6 +19,7 @@
+ 
+ namespace ps2x::iop::detail { bool testIopDeviceCallbackBoundaries(); }
+ namespace ps2x::iop::detail { bool testIopRpcWaitBoundaries(); }
++namespace ps2x::iop::detail { bool testIopAlarmBoundaries(); }
+ 
+ namespace
+ {
+@@ -602,6 +603,7 @@ int main()
+                    testDevctlIncompleteRequiresReset() &&
+                    testIopDeviceCallbackBoundaries() &&
+                    testIopRpcWaitBoundaries() &&
++                   testIopAlarmBoundaries() &&
+                    testDevctlRejectsInvalidCallsBeforeCallback() &&
+                    testDestructorRevokesHostHandle()
+                ? 0
+-- 
+2.55.0
+

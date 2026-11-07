@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "private_diagnostic_only": true,
+  "production_approved": false,
+  "native_binary_unchanged_from_private27": true,
+  "native_sha256": "f089a968b1b7a736ad67f56aa355fc71bd8b2f560f00c78cf87544839c2cacf8",
+  "accepted_public_source_patch_prefix": 23,
+  "accepted_public_native_patch_prefix": 22,
+  "allfive_public_native_binaries_unchanged": true,
+  "native_source_changed": false,
+  "review": {
+    "effective_model": "gpt-6-astra",
+    "effective_effort": "ultra",
+    "bounded_first_sample_and_continuation_accepted": true,
+    "sample_ram_pcm_voice_acceptance": false,
+    "full_port_acceptance": false,
+    "capture": "20261010-054512",
+    "native_sha256": "f089a968b1b7a736ad67f56aa355fc71bd8b2f560f00c78cf87544839c2cacf8",
+    "adopted_limits": [
+      "only first47296-byte chunk, not full96704 section or separate1492304 section",
+      "guest continuation arrival and registers, not enclosing SCREAM function return0",
+      "bounded stop, no natural game exit",
+      "input hold duration versus schedule not isolated",
+      "silent PCM, periodic ownership checks",
+      "no hardware timing/performance/allocator/alarm lifecycle fidelity accepted"
+    ]
+  },
+  "capture": {
+    "id": "20261010-054512",
+    "bounded_seconds": 296.145,
+    "natural_game_exit": false,
+    "native27_gate": "complete",
+    "native28_gate": "complete",
+    "observer_errors": 0,
+    "observer_caps": false,
+    "observer_pending": 0,
+    "owner_scope_end": "returned"
+  },
+  "first_sample": {
+    "requested_bytes": 47296,
+    "dma_bytes": 47296,
+    "owned_request": true,
+    "owned_dma": true,
+    "sha256": "9d67c7e8ce674eb690b563bbbcebc0d0402c695c4ff33262ba671629a57430f3",
+    "unique_full_owned_iso_match": true,
+    "iso_offset": 303389824,
+    "candidate_sample_section_bytes": 96704,
+    "whole_section_proved": false,
+    "spu_sample_ram_proved": false,
+    "pcm_proved": false
+  },
+  "completion": {
+    "dma_words_per_block": 16,
+    "dma_blocks": 739,
+    "irq": 36,
+    "delay_cycles": 23648,
+    "same_held_wait_cpu": true,
+    "original_guest_continuations": [
+      "SCREAM+8338",
+      "SCREAM+845C"
+    ],
+    "enclosing_scream_function_return_zero_proved": false
+  },
+  "audio": {
+    "sample_rate": 48000,
+    "channels": 2,
+    "frames": 14400543,
+    "nonzero_channel_samples": 0,
+    "owned_stream_checks": 288,
+    "wav_sha256": "ec07c2147096efae3a9f3b8adf1260e105a6697a01b739fd38dee40239722d14"
+  },
+  "checks": {
+    "authored_validator_cases": 25,
+    "relocation_checks": 3,
+    "authored_GDB_callback_admission_check": "passed"
+  },
+  "excluded_captures": {
+    "20261010-052733": "startup module identity failure; invalid",
+    "20261010-053150": "Python callback admission failure; invalid",
+    "20261010-053723": "title menu; enclosing metadata checkpoint incomplete; native28 invalid"
+  },
+  "next": "trace complete initial sample section and real key-on, then Astra senior review of missing hardware data/PCM production while preserving working execution and completion semantics",
+  "goal_status": "active"
+}

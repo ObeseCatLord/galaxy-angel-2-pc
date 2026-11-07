@@ -1,0 +1,890 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 2bc7469..026cf1a 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -335,6 +335,10 @@ public:
+     void assignInvocationStack(GuestInvocation &invocation);
+     void validateInvocationStackDeclaration(uint32_t address, uint32_t bytes) const;
+     [[nodiscard]] bool retireInvocationStacksForColdLoad();
++    // Trusted HLE profile allocation; configure only with the executor stopped.
++    // This is a new native-owned range, not a claim about original BIOS memory.
++    void configureInvocationStackArena(uint32_t begin, uint32_t end);
++    void validateInvocationStackArenaClaim(uint32_t address, uint32_t bytes) const;
+ 
+     int addIrqHandler(bool dmac,
+                       uint32_t cause,
+@@ -468,6 +472,8 @@ private:
+     uint32_t m_gsVSyncCallbackGp = 0;
+     uint32_t m_gsVSyncCallbackSp = 0;
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
++    uint32_t m_invocationStackArenaBegin = 0u;
++    uint32_t m_invocationStackArenaEnd = 0u;
+     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+ 
+     mutable std::mutex m_snapshotMutex;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 80f69fb..327e56f 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -90,7 +90,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_invocationStackTops.clear();
+     {
+         std::lock_guard lock(m_runtime.m_asyncCallbackStackMutex);
+-        m_runtime.m_asyncCallbackStackTop = PS2_RAM_SIZE;
++        m_runtime.m_asyncCallbackStackTop = m_invocationStackArenaEnd != 0u
++            ? m_invocationStackArenaEnd : PS2_RAM_SIZE;
+     }
+     m_rdram = rdram;
+     m_readyQueues = {};
+@@ -1220,9 +1221,99 @@ bool EeScheduler::retireInvocationStacksForColdLoad()
+     if (isRunning() || m_guestExecuting.load(std::memory_order_acquire)) return false;
+     discardInvocations();
+     m_invocationStackTops.clear();
++    m_invocationStackArenaBegin = m_invocationStackArenaEnd = 0u;
++    {
++        std::lock_guard lock(m_runtime.m_asyncCallbackStackMutex);
++        m_runtime.m_asyncCallbackStackFloor = std::min(
++            std::max(0x01F00000u, m_runtime.m_guestHeapSuggestedBase), PS2_RAM_SIZE);
++        m_runtime.m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    }
+     return true;
+ }
+ 
++void EeScheduler::validateInvocationStackArenaClaim(uint32_t address, uint32_t bytes) const
++{
++    if (m_invocationStackArenaEnd == 0u || bytes == 0u) return;
++    uint32_t begin = 0u;
++    bool scratch = false;
++    // Installation pointers use the native memory resolver's final RAM mirror.
++    if (ps2ResolveGuestPointer(address, begin, scratch) && !scratch &&
++        bytes <= PS2_RAM_SIZE && begin <= PS2_RAM_SIZE - bytes &&
++        begin < m_invocationStackArenaEnd &&
++        m_invocationStackArenaBegin < uint64_t(begin) + bytes)
++        throw std::runtime_error("EE memory claim overlaps native callback stack arena");
++}
++
++void EeScheduler::configureInvocationStackArena(uint32_t begin, uint32_t end)
++{
++    if (isRunning() || m_guestExecuting.load(std::memory_order_acquire))
++        throw std::logic_error("EE callback arena configuration requires quiescence");
++    if (begin == 0u || begin >= end || end > PS2_RAM_SIZE ||
++        ((begin | end) & 0xFu) != 0u || end - begin < 0x4000u)
++        throw std::runtime_error("EE callback arena extent is invalid");
++    if (!m_invocationStackTops.empty() || !m_pendingInvocations.empty())
++        throw std::logic_error("EE callback arena configuration has outstanding reservations");
++    const auto overlaps = [begin, end](uint64_t first, uint64_t last)
++    { return first < last && begin < last && first < end; };
++    if (overlaps(m_runtime.guestHeapBase(), m_runtime.guestHeapLimit()))
++        throw std::runtime_error("EE callback arena overlaps guest heap entitlement");
++    // Existing native SDK packet/server/TLS/boot-mode pools are fixed claims.
++    if (overlaps(0x01F00000u, 0x01F31000u))
++        throw std::runtime_error("EE callback arena overlaps native SDK storage");
++    for (const auto &[id, owner] : m_threads)
++    {
++        if (!owner.invocations.empty())
++            throw std::logic_error("EE callback arena configuration has live invocations");
++        if (id <= 0 || (owner.stack == 0u && owner.stackSize == 0u) ||
++            (owner.stack == 0u && owner.status == EeThreadStatus::Dormant)) continue;
++        uint32_t base = 0u;
++        bool scratch = false;
++        if (owner.stackSize == 0u ||
++            !resolveEeGuestRange(owner.stack, owner.stackSize, base, scratch) || scratch ||
++            overlaps(base, uint64_t(base) + owner.stackSize))
++            throw std::runtime_error("EE callback arena conflicts with a declared thread stack");
++    }
++    for (const auto &module : m_runtime.m_loadedModules)
++    {
++        if (!module.active || module.size == 0u) continue;
++        uint32_t base = 0u;
++        bool scratch = false;
++        scratch = ps2IsScratchpadAddress(module.baseAddress);
++        base = m_runtime.memory().translateAddress(module.baseAddress);
++        const size_t capacity = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++        if (module.size > capacity || base > capacity - module.size)
++            throw std::runtime_error("EE callback arena cannot validate a loaded module");
++        if (!scratch && overlaps(base, uint64_t(base) + module.size))
++            throw std::runtime_error("EE callback arena overlaps a loaded module");
++    }
++    {
++        std::lock_guard lock(m_runtime.m_eeKernelStateMutex);
++        for (uint32_t address : m_runtime.m_eeSyscallMirrorAddresses)
++            if (overlaps(address, uint64_t(address) + 4u))
++                throw std::runtime_error("EE callback arena overlaps kernel ABI storage");
++        // Probe words exist even before the first kernel-state initialization.
++        if (overlaps(0x2F0u, 0x2F4u) || overlaps(0x2F8u, 0x2FCu))
++            throw std::runtime_error("EE callback arena overlaps kernel ABI probes");
++        for (const auto &[number, handler] : m_runtime.m_eeSyscallOverrides)
++        {
++            const int64_t address = 0x11F80ll + int64_t(int32_t(number)) * 4;
++            if (address >= 0 && address + 4 <= 0x80000 &&
++                overlaps(address, address + 4))
++                throw std::runtime_error("EE callback arena overlaps a kernel ABI mirror");
++            uint32_t physical = 0u;
++            bool scratch = false;
++            if (ps2ResolveGuestPointer(handler, physical, scratch) && !scratch &&
++                overlaps(physical, uint64_t(physical) + 4u))
++                throw std::runtime_error("EE callback arena overlaps an installed syscall handler");
++        }
++    }
++    std::lock_guard lock(m_runtime.m_asyncCallbackStackMutex);
++    m_invocationStackArenaBegin = begin;
++    m_invocationStackArenaEnd = end;
++    m_runtime.m_asyncCallbackStackFloor = begin;
++    m_runtime.m_asyncCallbackStackTop = end;
++}
++
+ void EeScheduler::validateInvocationStackDeclaration(uint32_t address, uint32_t bytes) const
+ {
+     if (isRunning()) assertExecutor();
+@@ -1231,6 +1322,7 @@ void EeScheduler::validateInvocationStackDeclaration(uint32_t address, uint32_t
+     bool scratch = false;
+     if (!resolveEeGuestRange(address, bytes, begin, scratch) || scratch)
+         throw std::runtime_error("EE stack or heap declaration is not a bounded RAM range");
++    validateInvocationStackArenaClaim(address, bytes);
+     const uint64_t end = uint64_t(begin) + bytes;
+     const auto validate = [begin, end](const GuestInvocation &invocation)
+     {
+@@ -1270,6 +1362,9 @@ void EeScheduler::validateIsolatedInvocationStack(uint32_t stackTop) const
+     if (end < 0x4000u || end > PS2_RAM_SIZE)
+         throw std::runtime_error("EE callback stack reservation is invalid");
+     const uint64_t begin = end - 0x4000u;
++    if (m_invocationStackArenaEnd != 0u &&
++        (begin < m_invocationStackArenaBegin || end > m_invocationStackArenaEnd))
++        throw std::runtime_error("EE callback reservation is outside the configured arena");
+     const auto overlaps = [begin, end](uint64_t first, uint64_t last)
+     { return first < last && begin < last && first < end; };
+     if (overlaps(m_runtime.guestHeapBase(), m_runtime.guestHeapLimit()))
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Loader.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Loader.h
+index db46c5d..ec27315 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Loader.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/Loader.h
+@@ -300,6 +300,31 @@ namespace
+             return false;
+         }
+ 
++        // Preflight ownership for every segment before installing the first one.
++        // Use this loader's actual address translation, including RAM mirrors.
++        if (runtime)
++        {
++            for (uint32_t i = 0; i < header.phnum; ++i)
++            {
++                Elf32ProgramHeader ph{};
++                const uint64_t offset = uint64_t(header.phoff) + uint64_t(i) * header.phentsize;
++                if (!readFileBlockAt(file, offset, &ph, sizeof(ph)))
++                { errorOut = "failed to read ELF program headers"; return false; }
++                if (ph.type != kElfPtLoad || ph.memsz == 0u) continue;
++                try
++                {
++                    const bool scratch = ph.vaddr >= PS2_SCRATCHPAD_BASE &&
++                        ph.vaddr < PS2_SCRATCHPAD_BASE + PS2_SCRATCHPAD_SIZE;
++                    const uint32_t physical = runtime->memory().translateAddress(ph.vaddr);
++                    if (uint64_t(physical) + ph.memsz > (scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE))
++                    { errorOut = "ELF segment out of range"; return false; }
++                    if (!scratch)
++                        runtime->eeScheduler().validateInvocationStackArenaClaim(physical, ph.memsz);
++                }
++                catch (const std::exception &e) { errorOut = e.what(); return false; }
++            }
++        }
++
+         bool loadedAny = false;
+         const bool loadAll = sectionName.empty() || toLowerAscii(sectionName) == "all";
+         static uint32_t secFilterLogCount = 0;
+@@ -362,6 +387,11 @@ namespace
+                     errorOut = "ELF RDRAM segment out of range";
+                     return false;
+                 }
++                if (runtime)
++                {
++                    try { runtime->eeScheduler().validateInvocationStackArenaClaim(physAddr, ph.memsz); }
++                    catch (const std::exception &e) { errorOut = e.what(); return false; }
++                }
+ 
+                 uint8_t *dest = rdram + physAddr;
+                 if (ph.filesz > 0u)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b641f88..ca6cde3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2349,6 +2349,10 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
+     const int64_t address = static_cast<int64_t>(kTableBase) + offset;
+ 
+     std::lock_guard lock(m_eeKernelStateMutex);
++    // Validate competing installations before changing either the host map or RAM.
++    if (address >= 0 && address + 4 <= kMirrorLimit)
++        m_eeScheduler->validateInvocationStackArenaClaim(static_cast<uint32_t>(address), 4u);
++    if (handler != 0u) m_eeScheduler->validateInvocationStackArenaClaim(handler, 4u);
+     if (handler == 0u)
+     {
+         m_eeSyscallOverrides.erase(syscallNumber);
+@@ -2385,6 +2389,18 @@ void PS2Runtime::initializeEeKernelState(uint8_t *rdram)
+     constexpr uint32_t kProbeBase = 0x000002F0u;
+ 
+     std::lock_guard lock(m_eeKernelStateMutex);
++    // Preflight the complete clear/replay batch before any guest or host mutation.
++    for (const uint32_t address : m_eeSyscallMirrorAddresses)
++        m_eeScheduler->validateInvocationStackArenaClaim(address, 4u);
++    m_eeScheduler->validateInvocationStackArenaClaim(kProbeBase, 4u);
++    m_eeScheduler->validateInvocationStackArenaClaim(kProbeBase + 8u, 4u);
++    for (const auto &[syscallNumber, handler] : m_eeSyscallOverrides)
++    {
++        const int64_t address = int64_t(kTableBase) + int64_t(int32_t(syscallNumber)) * 4;
++        if (address >= 0 && address + 4 <= kMirrorLimit)
++            m_eeScheduler->validateInvocationStackArenaClaim(static_cast<uint32_t>(address), 4u);
++        if (handler != 0u) m_eeScheduler->validateInvocationStackArenaClaim(handler, 4u);
++    }
+     for (const uint32_t address : m_eeSyscallMirrorAddresses)
+     {
+         const uint32_t zero = 0u;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 8c25eb1..8b5b29d 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_kernel_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_invocation_stack_tests.cpp
++    src/ps2_idle_irq_stack_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 11438b6..35729aa 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -14,6 +14,7 @@ void register_ps2_disc_mount_tests();
+ void register_ps2_runtime_kernel_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_invocation_stack_tests();
++void register_ps2_idle_irq_stack_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+@@ -41,6 +42,7 @@ int main()
+     register_ps2_runtime_kernel_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_invocation_stack_tests();
++    register_ps2_idle_irq_stack_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+diff --git a/ps2xTest/src/ps2_idle_irq_stack_tests.cpp b/ps2xTest/src/ps2_idle_irq_stack_tests.cpp
+new file mode 100644
+index 0000000..e74c7c3
+--- /dev/null
++++ b/ps2xTest/src/ps2_idle_irq_stack_tests.cpp
+@@ -0,0 +1,614 @@
++#include "MiniTest.h"
++#include "Kernel/Syscalls/System.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
++
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string_view>
++
++namespace
++{
++    constexpr uint32_t kParentEntry = 0x0017A000u;
++    constexpr uint32_t kParentResume = 0x0017A010u;
++    constexpr uint32_t kIrqHandler = 0x0017A020u;
++    constexpr uint32_t kIrqResume = 0x0017A030u;
++    constexpr uint32_t kChildEntry = 0x0017A040u;
++    constexpr uint32_t kArenaDriver = 0x0017A050u;
++    constexpr uint32_t kArenaOuter = 0x0017A060u;
++    constexpr uint32_t kArenaNested = 0x0017A070u;
++    constexpr uint32_t kArenaOuterResume = 0x0017A080u;
++    constexpr uint32_t kArenaNestedResume = 0x0017A090u;
++    constexpr uint32_t kArenaWake = 0x0017A0A0u;
++
++    constexpr uint32_t kMainStackBase = 0x01FE0000u;
++    constexpr uint32_t kMainStackSize = 0x00020000u;
++    constexpr uint32_t kMainStackLimit = kMainStackBase + kMainStackSize;
++    constexpr uint32_t kLiveParentSp = 0x01FFF990u;
++    constexpr uint32_t kHeapBase = 0x00839930u;
++    constexpr uint32_t kParentCanaryAddress = 0x01FFFFD8u;
++    constexpr uint32_t kParentMarkerAddress = kLiveParentSp + 0x10u;
++    constexpr uint32_t kParentGp = 0x00223A58u;
++    constexpr uint32_t kIrqGp = 0x004EE3F0u;
++    constexpr uint32_t kParentS0 = 0x0020A3CCu;
++    constexpr uint32_t kChildStack = 0x00828000u;
++    constexpr uint32_t kChildStackSize = 0x00008000u;
++    constexpr uint32_t kInvocationReservationSize = 0x00004000u;
++    constexpr uint32_t kInvocationArenaBegin = 0x00060000u;
++    constexpr uint32_t kInvocationArenaEnd = 0x00070000u;
++    constexpr uint32_t kStoreOffset = 0x18u;
++    constexpr uint64_t kParentCanary = 0x9D5B4A31E6C27F08ull;
++    constexpr uint64_t kIrqPoison = 0x4952515F53544143ull;
++    constexpr uint32_t kParentMarker = 0x50415245u;
++
++    constexpr uint32_t kCallbackSpAddress = 0x00019000u;
++    constexpr uint32_t kBorrowerIdAddress = 0x00019004u;
++    constexpr uint32_t kSemaphoreIdAddress = 0x00019008u;
++    constexpr uint32_t kChildIdAddress = 0x0001900Cu;
++    constexpr uint32_t kHandlerGpAddress = 0x00019010u;
++    constexpr uint32_t kHandlerRunsAddress = 0x00019014u;
++    constexpr uint32_t kChildRunsAddress = 0x00019018u;
++    constexpr uint32_t kParentResumeRunsAddress = 0x0001901Cu;
++    constexpr uint32_t kCallbackDoneAddress = 0x00019020u;
++    constexpr uint32_t kCallbackPoisonIntactAddress = 0x00019024u;
++    constexpr uint32_t kChildPoisonIntactAddress = 0x00019028u;
++    constexpr uint32_t kBorrowedParentResumedAddress = 0x0001902Cu;
++    constexpr uint32_t kParentContextIntactAddress = 0x00019030u;
++    constexpr uint32_t kParentFinalAddress = 0x00019034u;
++    constexpr uint32_t kObservedParentSpAddress = 0x00019038u;
++    constexpr uint32_t kArenaState = 0x00019100u;
++    constexpr uint64_t kArenaOuterPoison = 0x4F555445525F4652ull;
++    constexpr uint64_t kArenaNestedPoison = 0x4E45535445445F46ull;
++
++    struct TestEnv
++    {
++        TestEnv() : ram(PS2_RAM_SIZE, 0u) {}
++
++        std::vector<uint8_t> ram;
++        PS2Runtime runtime;
++    };
++
++    void setReg(R5900Context &ctx, int reg, uint32_t value)
++    {
++        SET_GPR_U32(&ctx, reg, value);
++    }
++
++    uint32_t getReg(const R5900Context &ctx, int reg)
++    {
++        return ::getRegU32(&ctx, reg);
++    }
++
++    void writeU32(uint8_t *ram, uint32_t address, uint32_t value)
++    {
++        std::memcpy(ram + address, &value, sizeof(value));
++    }
++
++    uint32_t readU32(const uint8_t *ram, uint32_t address)
++    {
++        uint32_t value = 0u;
++        std::memcpy(&value, ram + address, sizeof(value));
++        return value;
++    }
++
++    void writeU64(uint8_t *ram, uint32_t address, uint64_t value)
++    {
++        std::memcpy(ram + address, &value, sizeof(value));
++    }
++
++    uint64_t readU64(const uint8_t *ram, uint32_t address)
++    {
++        uint64_t value = 0u;
++        std::memcpy(&value, ram + address, sizeof(value));
++        return value;
++    }
++
++    bool inside(uint32_t address, uint32_t first, uint32_t last)
++    {
++        return address >= first && address <= last;
++    }
++
++    uint32_t arenaSlot(uint32_t offset, uint32_t id) { return kArenaState + offset + (id - 1u) * 4u; }
++    bool arenaSpan(uint32_t sp)
++    {
++        const uint64_t end = uint64_t(sp) + 0x10u;
++        return end >= kInvocationReservationSize && end <= kInvocationArenaEnd &&
++               end - kInvocationReservationSize >= kInvocationArenaBegin;
++    }
++    bool disjointSpans(uint32_t left, uint32_t right)
++    {
++        const uint64_t leftEnd = uint64_t(left) + 0x10u, rightEnd = uint64_t(right) + 0x10u;
++        return leftEnd <= rightEnd - kInvocationReservationSize || rightEnd <= leftEnd - kInvocationReservationSize;
++    }
++    bool rejectsArenaClaim(EeScheduler &scheduler, uint32_t address, uint32_t bytes)
++    {
++        try { scheduler.validateInvocationStackArenaClaim(address, bytes); }
++        catch (const std::runtime_error &) { return true; }
++        return false;
++    }
++
++    struct TempElf
++    {
++        std::filesystem::path directory, path;
++        TempElf(uint32_t first, uint32_t second, uint32_t secondSize = 4u)
++        {
++            directory = std::filesystem::temp_directory_path() /
++                ("ps2-arena-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++            if (!std::filesystem::create_directory(directory)) throw std::runtime_error("temporary ELF directory collision");
++            path = directory / "fixture.elf";
++            std::vector<uint8_t> data(124u, 0u);
++            auto u16 = [&data](size_t at, uint16_t value) { std::memcpy(data.data() + at, &value, 2u); };
++            auto u32 = [&data](size_t at, uint32_t value) { std::memcpy(data.data() + at, &value, 4u); };
++            u32(0, 0x464C457Fu); data[4] = 1u; data[5] = 1u; data[6] = 1u;
++            u16(16, 2u); u16(18, 8u); u32(20, 1u); u32(24, first);
++            u32(28, 52u); u16(40, 52u); u16(42, 32u); u16(44, 2u);
++            for (uint32_t i = 0; i < 2u; ++i)
++            {
++                const size_t at = 52u + i * 32u;
++                u32(at, 1u); u32(at + 4u, 116u + i * 4u);
++                u32(at + 8u, i == 0u ? first : second);
++                u32(at + 16u, 4u); u32(at + 20u, i == 0u ? 4u : secondSize);
++                u32(at + 24u, 6u); u32(at + 28u, 16u);
++            }
++            u32(116u, 0x12345678u); u32(120u, 0x87654321u);
++            std::ofstream file(path, std::ios::binary);
++            file.write(reinterpret_cast<const char *>(data.data()), data.size());
++            if (!file) throw std::runtime_error("temporary ELF write failed");
++        }
++        ~TempElf() { std::error_code error; std::filesystem::remove_all(directory, error); }
++    };
++
++    void parentEntry(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setReg(*ctx, 4, kParentGp);
++        setReg(*ctx, 5, kMainStackBase);
++        setReg(*ctx, 6, kMainStackSize);
++        ps2_syscalls::SetupThread(ram, ctx, runtime);
++
++        setReg(*ctx, 4, kHeapBase);
++        setReg(*ctx, 5, kMainStackBase - kHeapBase);
++        ps2_syscalls::SetupHeap(ram, ctx, runtime);
++
++        setReg(*ctx, 29, kLiveParentSp);
++        setReg(*ctx, 28, kParentGp);
++        setReg(*ctx, 16, kParentS0);
++        writeU32(ram, kObservedParentSpAddress, getReg(*ctx, 29));
++        writeU64(ram, kParentCanaryAddress, kParentCanary);
++
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const int semaphore = scheduler.createSemaphore(0, 1, 0u, 0u);
++        writeU32(ram, kSemaphoreIdAddress, static_cast<uint32_t>(semaphore));
++        scheduler.addIrqHandler(false, 2u, kIrqHandler, true, 0xCAFEu, kIrqGp, 0u);
++        scheduler.dispatchIrq(false, 2u);
++
++        ctx->pc = kParentResume;
++        scheduler.waitSemaphore(semaphore);
++    }
++
++    void irqHandler(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const uint32_t sp = getReg(*ctx, 29);
++        writeU32(ram, kCallbackSpAddress, sp);
++        writeU32(ram, kBorrowerIdAddress, static_cast<uint32_t>(scheduler.currentThreadId()));
++        writeU32(ram, kHandlerGpAddress, getReg(*ctx, 28));
++        writeU32(ram, kHandlerRunsAddress, readU32(ram, kHandlerRunsAddress) + 1u);
++        writeU64(ram, sp - kStoreOffset, kIrqPoison);
++
++        scheduler.signalSemaphore(static_cast<int>(readU32(ram, kSemaphoreIdAddress)), true);
++
++        EeThreadCreateParams child{};
++        child.entry = kChildEntry;
++        child.stack = kChildStack;
++        child.stackSize = kChildStackSize;
++        child.priority = 10;
++        const int childId = scheduler.createThread(child);
++        writeU32(ram, kChildIdAddress, static_cast<uint32_t>(childId));
++        scheduler.startThread(childId, 0u, *ctx, true);
++
++        ctx->pc = kIrqResume;
++        scheduler.sleepCurrent();
++    }
++
++    void parentResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeU32(ram, kParentResumeRunsAddress, readU32(ram, kParentResumeRunsAddress) + 1u);
++        if (readU32(ram, kCallbackDoneAddress) == 0u)
++        {
++            writeU32(ram, kParentMarkerAddress, kParentMarker);
++            ctx->pc = kParentResume;
++            runtime->eeScheduler().sleepCurrent();
++        }
++
++        const bool contextIntact = getReg(*ctx, 28) == kParentGp && getReg(*ctx, 16) == kParentS0;
++        writeU32(ram, kParentContextIntactAddress, contextIntact ? 1u : 0u);
++        writeU32(ram, kParentFinalAddress, 1u);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void childEntry(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const uint32_t callbackSp = readU32(ram, kCallbackSpAddress);
++        const uint64_t poison = readU64(ram, callbackSp - kStoreOffset);
++        const bool callbackBorrowedFromParent = inside(callbackSp, kMainStackBase, kMainStackLimit);
++        const bool parentRanBeforeCompletion = readU32(ram, kParentResumeRunsAddress) != 0u;
++
++        writeU32(ram, kChildRunsAddress, readU32(ram, kChildRunsAddress) + 1u);
++        writeU32(ram, kChildPoisonIntactAddress, poison == kIrqPoison ? 1u : 0u);
++        writeU32(ram, kBorrowedParentResumedAddress,
++                 callbackBorrowedFromParent && parentRanBeforeCompletion ? 1u : 0u);
++        scheduler.wakeupThread(static_cast<int>(readU32(ram, kBorrowerIdAddress)), false);
++        ctx->pc = 0u;
++    }
++
++    void irqResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t sp = getReg(*ctx, 29);
++        writeU32(ram, kCallbackPoisonIntactAddress,
++                 readU64(ram, sp - kStoreOffset) == kIrqPoison ? 1u : 0u);
++        setReg(*ctx, 28, 0xDEADC0DEu);
++        setReg(*ctx, 16, 0xBAD0BEEFu);
++        writeU32(ram, kCallbackDoneAddress, 1u);
++
++        const GuestThread *parent = runtime->eeScheduler().thread(EeScheduler::kMainThreadId);
++        if (parent && parent->status == EeThreadStatus::Waiting && parent->wait.reason == EeWaitReason::Sleep)
++        {
++            runtime->eeScheduler().wakeupThread(EeScheduler::kMainThreadId, false);
++        }
++        ctx->pc = 0u;
++    }
++
++    void arenaDriver(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        std::memset(ram + kArenaState, 0, 0x34u);
++        const uint32_t owners = getReg(*ctx, 4);
++        for (uint32_t id = 1u; id <= owners; ++id)
++        {
++            GuestInvocation invocation{};
++            invocation.context.pc = kArenaOuter;
++            setReg(invocation.context, 4, id);
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
++        if (owners == 2u)
++        {
++            ctx->pc = kArenaWake;
++            runtime->eeScheduler().sleepCurrent();
++        }
++        ctx->pc = 0u;
++    }
++
++    void arenaOuter(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t id = getReg(*ctx, 4), sp = getReg(*ctx, 29);
++        writeU32(ram, arenaSlot(0u, id), sp);
++        writeU32(ram, arenaSlot(0x10u, id), static_cast<uint32_t>(runtime->eeScheduler().currentThreadId()));
++        writeU64(ram, sp - kStoreOffset, kArenaOuterPoison);
++        GuestInvocation nested{};
++        nested.context = *ctx;
++        nested.context.pc = kArenaNested;
++        setReg(nested.context, 29, 0u);
++        setReg(nested.context, 31, 0u);
++        ctx->pc = kArenaOuterResume;
++        runtime->eeScheduler().invokeCurrent(std::move(nested));
++    }
++
++    void arenaNested(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t id = getReg(*ctx, 4), sp = getReg(*ctx, 29);
++        writeU32(ram, arenaSlot(8u, id), sp);
++        writeU64(ram, sp - kStoreOffset, kArenaNestedPoison);
++        if (id == 2u)
++            runtime->eeScheduler().wakeupThread(EeScheduler::kMainThreadId, true);
++        ctx->pc = kArenaNestedResume;
++        runtime->eeScheduler().sleepCurrent();
++    }
++
++    void arenaNestedResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *)
++    {
++        const uint32_t id = getReg(*ctx, 4);
++        writeU32(ram, arenaSlot(0x28u, id), readU64(ram, getReg(*ctx, 29) - kStoreOffset) == kArenaNestedPoison ? 1u : 0u);
++        ctx->pc = 0u;
++    }
++
++    void arenaOuterResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t id = getReg(*ctx, 4);
++        writeU32(ram, arenaSlot(0x20u, id), readU64(ram, getReg(*ctx, 29) - kStoreOffset) == kArenaOuterPoison ? 1u : 0u);
++        if (readU32(ram, kArenaState + 0x30u) + 1u == 2u) runtime->requestStop();
++        writeU32(ram, kArenaState + 0x30u, readU32(ram, kArenaState + 0x30u) + 1u);
++        ctx->pc = 0u;
++    }
++
++    void arenaWake(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        for (uint32_t id = 1u; id <= 2u; ++id)
++            runtime->eeScheduler().wakeupThread(static_cast<int>(readU32(ram, arenaSlot(0x10u, id))), false);
++        ctx->pc = 0u;
++    }
++}
++
++void register_ps2_idle_irq_stack_tests()
++{
++    MiniTest::Case("PS2IdleIrqStack", [](TestCase &tc)
++    {
++        tc.Run("idle IRQ frame survives wake, unrelated child, and callback return", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kParentEntry, parentEntry);
++            env.runtime.registerFunction(kParentResume, parentResume);
++            env.runtime.registerFunction(kIrqHandler, irqHandler);
++            env.runtime.registerFunction(kIrqResume, irqResume);
++            env.runtime.registerFunction(kChildEntry, childEntry);
++
++            R5900Context main{};
++            main.pc = kParentEntry;
++            setReg(main, 28, kParentGp);
++            setReg(main, 29, kLiveParentSp);
++            env.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            env.runtime.eeScheduler().run();
++
++            const uint32_t callbackSp = readU32(env.ram.data(), kCallbackSpAddress);
++            const uint64_t frameFirst = callbackSp >= kStoreOffset
++                                            ? static_cast<uint64_t>(callbackSp - kStoreOffset)
++                                            : ~uint64_t{0};
++            const uint64_t frameLast = frameFirst + sizeof(kIrqPoison);
++            const uint64_t reservationEnd = static_cast<uint64_t>(callbackSp) + 0x10u;
++            const uint64_t reservationBegin = reservationEnd >= kInvocationReservationSize
++                                                  ? reservationEnd - kInvocationReservationSize
++                                                  : ~uint64_t{0};
++            const bool frameBelowParent = frameLast <= kLiveParentSp;
++            const bool frameOutsideHeap = frameLast <= kHeapBase || frameFirst >= kMainStackBase;
++            const bool inDeclaredMainStack = callbackSp >= kMainStackBase && callbackSp <= kMainStackLimit;
++            const bool inDisjointArena = frameLast <= kHeapBase || frameFirst >= kMainStackLimit;
++            const bool reservationInRam = reservationBegin <= reservationEnd && reservationEnd <= PS2_RAM_SIZE;
++            const bool reservationOutsideHeap = reservationEnd <= kHeapBase || reservationBegin >= kMainStackBase;
++            const bool reservationInDeclaredMainStack = reservationBegin >= kMainStackBase &&
++                                                        reservationEnd <= kMainStackLimit;
++            const bool reservationDisjointFromDeclaredMainStack = reservationEnd <= kMainStackBase ||
++                                                                   reservationBegin >= kMainStackLimit;
++            const bool reservationDisjointFromChildStack = reservationEnd <= kChildStack ||
++                                                            reservationBegin >= kChildStack + kChildStackSize;
++            const bool reservationBelowParentFrame = reservationEnd <= kLiveParentSp;
++
++            t.Equals(env.runtime.guestHeapBase(), kHeapBase, "SetupHeap must retain the requested heap base");
++            t.Equals(env.runtime.guestHeapLimit(), kMainStackBase, "SetupThread must bound the configured heap");
++            t.Equals(readU32(env.ram.data(), kObservedParentSpAddress), kLiveParentSp,
++                     "the fixture must restore its live parent SP after thread and heap setup");
++            t.Equals(readU32(env.ram.data(), kHandlerRunsAddress), 1u, "the queued idle IRQ must execute once");
++            t.Equals(readU32(env.ram.data(), kHandlerGpAddress), kIrqGp,
++                     "the IRQ frame must receive its explicit registered GP");
++            t.IsTrue(static_cast<int32_t>(readU32(env.ram.data(), kBorrowerIdAddress)) < 0,
++                     "an idle IRQ must execute through its negative invocation owner");
++            t.IsTrue(readU32(env.ram.data(), kChildIdAddress) > 0u,
++                     "the IRQ must create an unrelated positive child thread");
++            t.Equals(readU32(env.ram.data(), kChildRunsAddress), 1u,
++                     "the unrelated child must run while the IRQ callback is blocked");
++            t.Equals(readU32(env.ram.data(), kChildPoisonIntactAddress), 1u,
++                     "the child must observe the IRQ guest frame poison intact");
++            t.Equals(readU32(env.ram.data(), kCallbackPoisonIntactAddress), 1u,
++                     "the resumed IRQ callback must retain its original guest frame poison");
++            t.Equals(readU32(env.ram.data(), kBorrowedParentResumedAddress), 0u,
++                     "a callback borrowing the declared parent stack must gate parent resumption until it returns");
++            t.Equals(readU32(env.ram.data(), kCallbackDoneAddress), 1u,
++                     "the blocked IRQ callback must resume after the child wakeup");
++            t.Equals(readU32(env.ram.data(), kParentFinalAddress), 1u,
++                     "the parent must reach its final continuation after callback completion");
++            t.Equals(readU32(env.ram.data(), kParentContextIntactAddress), 1u,
++                     "IRQ-local GP and s0 clobbers must not alter the parent continuation");
++            t.Equals(readU64(env.ram.data(), kParentCanaryAddress), kParentCanary,
++                     "IRQ activity must preserve the parent frame canary above its live SP");
++            t.IsTrue(callbackSp >= kStoreOffset && frameBelowParent && frameOutsideHeap,
++                     "the IRQ guest frame write at SP-0x18 must remain below the parent frame and outside the heap");
++            t.IsTrue(inDeclaredMainStack || inDisjointArena,
++                     "the IRQ stack must be bounded by the declared main stack or a disjoint owned arena");
++            t.IsTrue(reservationInRam && reservationOutsideHeap && reservationBelowParentFrame &&
++                         reservationDisjointFromChildStack &&
++                         (reservationInDeclaredMainStack || reservationDisjointFromDeclaredMainStack),
++                     "the complete 16 KiB IRQ reservation must be below the parent frame and bounded outside the heap and child stack by either declared or owned storage");
++        });
++
++        tc.Run("configured arena holds two blocked owners and nested frames, then rewinds on reset", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kArenaDriver, arenaDriver);
++            env.runtime.registerFunction(kArenaOuter, arenaOuter);
++            env.runtime.registerFunction(kArenaNested, arenaNested);
++            env.runtime.registerFunction(kArenaOuterResume, arenaOuterResume);
++            env.runtime.registerFunction(kArenaNestedResume, arenaNestedResume);
++            env.runtime.registerFunction(kArenaWake, arenaWake);
++            env.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            R5900Context main{};
++            main.pc = kArenaDriver;
++            setReg(main, 4, 2u);
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            env.runtime.eeScheduler().run();
++            uint32_t first[4] = {readU32(env.ram.data(), arenaSlot(0u, 1u)), readU32(env.ram.data(), arenaSlot(8u, 1u)),
++                                 readU32(env.ram.data(), arenaSlot(0u, 2u)), readU32(env.ram.data(), arenaSlot(8u, 2u))};
++            for (uint32_t sp : first) t.IsTrue(arenaSpan(sp), "each live outer or nested callback frame must occupy the configured arena");
++            for (size_t i = 0; i < 4u; ++i) for (size_t j = i + 1u; j < 4u; ++j)
++                t.IsTrue(disjointSpans(first[i], first[j]), "simultaneous owner and nested frames must not overlap");
++            for (uint32_t id = 1u; id <= 2u; ++id)
++            {
++                t.IsTrue(static_cast<int32_t>(readU32(env.ram.data(), arenaSlot(0x10u, id))) < 0, "queued owner must be an isolated invocation thread");
++                t.Equals(readU32(env.ram.data(), arenaSlot(0x20u, id)), 1u, "outer poison must survive its nested callback");
++                t.Equals(readU32(env.ram.data(), arenaSlot(0x28u, id)), 1u, "nested poison must survive its blocked wakeup");
++            }
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            env.runtime.eeScheduler().run();
++            t.Equals(readU32(env.ram.data(), arenaSlot(0u, 1u)), first[0], "reset must rewind the configured arena before the first owner frame");
++        });
++
++        tc.Run("configured arena claims persist through reset, reject aliases, and clear on cold retirement", [](TestCase &t)
++        {
++            TestEnv env;
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            R5900Context main{};
++            scheduler.reset(env.ram.data(), main);
++            for (uint32_t address : {kInvocationArenaBegin, kInvocationArenaEnd - 4u,
++                                     0x20000000u + kInvocationArenaBegin, 0x80000000u + kInvocationArenaEnd - 4u})
++                t.IsTrue(rejectsArenaClaim(scheduler, address, 4u), "physical and cached arena aliases must reject overlapping claims");
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaBegin - 4u, 4u), "claim ending at the arena boundary must remain valid");
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaEnd, 4u), "claim starting at the arena boundary must remain valid");
++            int cancelled = 0;
++            GuestInvocation pending{};
++            pending.onCancel = [&cancelled] { ++cancelled; };
++            scheduler.queueInvocation(std::move(pending));
++            t.IsTrue(scheduler.retireInvocationStacksForColdLoad(), "cold retirement must cancel pending work while quiescent");
++            t.Equals(cancelled, 1, "cold retirement must cancel a pending invocation exactly once");
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaBegin, 4u), "cold retirement must release the persistent arena claim");
++        });
++
++        tc.Run("configured arena reports exhaustion after four simultaneous reservations", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kArenaDriver, arenaDriver);
++            env.runtime.registerFunction(kArenaOuter, arenaOuter);
++            env.runtime.registerFunction(kArenaNested, arenaNested);
++            env.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            R5900Context main{};
++            main.pc = kArenaDriver;
++            setReg(main, 4, 3u);
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            bool exhausted = false;
++            try { env.runtime.eeScheduler().run(); }
++            catch (const std::runtime_error &error) { exhausted = std::string_view(error.what()) == "EE invocation stack space exhausted"; }
++            t.IsTrue(exhausted, "a fifth live callback reservation must exhaust the four-frame arena");
++        });
++
++        tc.Run("arena rejects mirror registration and removal before map or memory mutation", [](TestCase &t)
++        {
++            TestEnv env;
++            auto &scheduler = env.runtime.eeScheduler();
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            constexpr uint32_t index = (kInvocationArenaBegin - 0x11F80u) / 4u;
++            writeU32(env.ram.data(), kInvocationArenaBegin, 0xAABBCCDDu);
++            for (uint32_t handler : {0x00123400u, 0u})
++            {
++                bool rejected = false;
++                try { env.runtime.setEeSyscallOverride(env.ram.data(), index, handler); }
++                catch (const std::runtime_error &) { rejected = true; }
++                uint32_t found = 0u;
++                t.IsTrue(rejected, "registration and zero-handler removal must reject competing mirror storage");
++                t.IsFalse(env.runtime.findEeSyscallOverride(index, found), "rejection must preserve the host map");
++                t.Equals(readU32(env.ram.data(), kInvocationArenaBegin), 0xAABBCCDDu, "rejection must preserve arena bytes");
++            }
++            constexpr uint32_t validMirror = 0x11F80u + 0x90u * 4u;
++            env.runtime.setEeSyscallOverride(env.ram.data(), 0x90u, 0x00123400u);
++            for (uint32_t alias : {0x02060000u, 0x30060000u, 0x80060000u, 0xA0060000u})
++            {
++                bool rejected = false;
++                try { env.runtime.setEeSyscallOverride(env.ram.data(), 0x90u, alias); }
++                catch (const std::runtime_error &) { rejected = true; }
++                t.IsTrue(rejected, "installed handler aliases must not claim native stack storage");
++                uint32_t found = 0u;
++                t.IsTrue(env.runtime.findEeSyscallOverride(0x90u, found), "rejection must retain the valid registration");
++                t.Equals(found, 0x00123400u, "rejection must preserve the host handler");
++                t.Equals(readU32(env.ram.data(), validMirror), 0x00123400u, "rejection must preserve the valid mirror");
++            }
++            ps2_syscalls::initializeGuestKernelState(env.ram.data(), &env.runtime);
++            ps2_syscalls::initializeGuestKernelState(env.ram.data(), &env.runtime);
++            t.Equals(readU32(env.ram.data(), kInvocationArenaBegin), 0xAABBCCDDu, "clear and replay must preserve the owned arena");
++            t.Equals(readU32(env.ram.data(), validMirror), 0x00123400u, "clear and replay must restore the valid handler mirror");
++            TestEnv existing;
++            existing.runtime.setEeSyscallOverride(existing.ram.data(), index, 0x00123400u);
++            bool rejected = false;
++            try { existing.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "activation must reject an existing syscall mirror");
++        });
++
++        tc.Run("permanent arena rejects future heap and stack claims before metadata mutation", [](TestCase &t)
++        {
++            TestEnv env;
++            auto &scheduler = env.runtime.eeScheduler();
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            R5900Context main{};
++            scheduler.reset(env.ram.data(), main);
++            scheduler.bindMainContextForSyscall(main, env.ram.data());
++            scheduler.setupCurrentThread(kMainStackBase, kMainStackSize, kParentGp);
++            const uint32_t oldHeap = env.runtime.guestHeapBase();
++            bool rejected = false;
++            try { env.runtime.configureGuestHeap(kInvocationArenaBegin, kInvocationArenaEnd); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "unused arena ownership must reject a competing heap entitlement");
++            t.Equals(env.runtime.guestHeapBase(), oldHeap, "heap rejection must preserve metadata");
++            rejected = false;
++            try { scheduler.setupCurrentThread(0x80060000u, 0x4000u, 0u); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "unused arena ownership must reject a competing main stack");
++            t.Equals(scheduler.thread(1)->stack, kMainStackBase, "stack rejection must preserve metadata");
++            EeThreadCreateParams params{}; params.entry = kChildEntry; params.priority = 10;
++            params.stack = 0xA0060000u; params.stackSize = 0x1000u;
++            rejected = false;
++            try { scheduler.createThread(params); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "future child stacks must reject arena aliases");
++            params.stack = kChildStack;
++            t.Equals(scheduler.createThread(params), 2, "rejected declaration must not consume an ID");
++            TestEnv handlerClaim;
++            handlerClaim.runtime.setEeSyscallOverride(handlerClaim.ram.data(), 0x90u, 0x30060000u);
++            rejected = false;
++            try { handlerClaim.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "activation must reject an existing handler alias");
++        });
++
++        tc.Run("helper loader preflights later arena collisions and preserves scratch alias behavior", [](TestCase &t)
++        {
++            struct PathsGuard { PS2Runtime::IoPaths old = PS2Runtime::getIoPaths(); ~PathsGuard() { PS2Runtime::setIoPaths(old); } } pathsGuard;
++            for (bool enabled : {false, true})
++            {
++                TestEnv env;
++                if (enabled) env.runtime.eeScheduler().configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++                TempElf elf(0x00100000u, 0x30060000u);
++                PS2Runtime::configureIoPathsFromElf(elf.path.string());
++                const char path[] = "host0:fixture.elf";
++                std::memcpy(env.ram.data() + 0x19200u, path, sizeof(path));
++                writeU32(env.ram.data(), 0x00100000u, 0xDEADBEEFu);
++                writeU32(env.ram.data(), kInvocationArenaBegin, 0xAABBCCDDu);
++                R5900Context ctx{}; setReg(ctx, 4, 0x19200u); setReg(ctx, 5, 0x19300u);
++                ps2_syscalls::sceSifLoadElf(env.ram.data(), &ctx, &env.runtime);
++                t.Equals(getReg(ctx, 2), enabled ? 0xFFFFFFFFu : 0u, "arena activation alone decides whether the competing installation is rejected");
++                t.Equals(readU32(env.ram.data(), 0x00100000u), enabled ? 0xDEADBEEFu : 0x12345678u,
++                         "a later conflicting segment must reject before the first payload is installed");
++                t.Equals(readU32(env.ram.data(), kInvocationArenaBegin), enabled ? 0xAABBCCDDu : 0x87654321u, "mirror translation must match installation");
++                TempElf scratchAlias(0x00100000u, 0xF0000000u, 0x5000u);
++                PS2Runtime::configureIoPathsFromElf(scratchAlias.path.string());
++                ps2_syscalls::sceSifLoadElf(env.ram.data(), &ctx, &env.runtime);
++                t.Equals(getReg(ctx, 2), 0u, "noncanonical scratch alias must preserve the existing RDRAM installation branch");
++                t.Equals(readU32(env.ram.data(), 0u), 0x87654321u, "preflight and installation must classify the alias identically");
++            }
++        });
++
++        tc.Run("real unmatched ELF cold load retires arena while early failed load retains it", [](TestCase &t)
++        {
++            struct PathsGuard { PS2Runtime::IoPaths old = PS2Runtime::getIoPaths(); ~PathsGuard() { PS2Runtime::setIoPaths(old); } } pathsGuard;
++            TestEnv env;
++            t.IsTrue(env.runtime.memory().initialize(), "real loader needs actual runtime memory backing");
++            auto &scheduler = env.runtime.eeScheduler();
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            TempElf valid(0x00100000u, 0x00110000u);
++            t.IsFalse(env.runtime.loadELF((valid.directory / "missing.elf").string()), "early open failure must fail");
++            t.IsTrue(rejectsArenaClaim(scheduler, kInvocationArenaBegin, 4u), "early failure must retain the existing profile");
++            t.IsTrue(env.runtime.loadELF(valid.path.string()), "minimal unmatched executable must actually load");
++            t.Equals(readU32(env.runtime.memory().getRDRAM(), 0x00100000u), 0x12345678u, "actual runtime backing must contain the loaded payload");
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaBegin, 4u), "unmatched cold load must release scoped arena ownership");
++            scheduler.reset(env.ram.data(), R5900Context{});
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaBegin, 4u), "startup reset must not reactivate the old profile");
++            scheduler.configureInvocationStackArena(kInvocationArenaBegin, kInvocationArenaEnd);
++            TempElf invalid(0x00100000u, PS2_RAM_SIZE - 2u);
++            t.IsFalse(env.runtime.loadELF(invalid.path.string()), "late out-of-range segment must fail");
++            t.IsFalse(rejectsArenaClaim(scheduler, kInvocationArenaBegin, 4u), "failure after retirement must leave arena cleared");
++        });
++    });
++}

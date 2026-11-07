@@ -1,0 +1,123 @@
+From 77f5e7954ee783f43451c4a49cc151e310702ce5 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:26:27 -0500
+Subject: [PATCH] ga2: VU1 stores at issue, vector flagless FMAC normalization
+
+- SQ/SQI/SQD/ISW/ISWR write VU memory at issue instead of through a
+  one-cycle store ring: every pair ends by advancing a cycle, which
+  committed the store before PATH1 read its next qword, and no other lower
+  instruction can issue in between, so this is observationally identical
+  and keeps the pipeline-commit slow path idle.
+- Non-product-sum FMAC results with dead flags use the four-lane operand
+  rule (denormal -> signed zero, Inf/NaN -> signed max) instead of the
+  per-lane scalar path.
+
+Replay: --reference and interpreter-vs-capture digests 0 mismatches on
+eigou-2/zettai/mugen-1; generated ~10.3 -> 9.7 ns/VU cycle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1_exec.inl |  9 ++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      | 50 +++++---------------
+ 2 files changed, 21 insertions(+), 38 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+index 8551aa2..4d6e44a 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+@@ -252,6 +252,15 @@ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(f
+         }
+         return;
+     }
++    if (!productSum && !flagsNeeded)
++    {
++        // Without flags the per-lane rule below is normalizeResult's value
++        // part, which is the operand rule: denormal -> signed zero, Inf/NaN ->
++        // signed FLT_MAX. Lanes outside dest are discarded by the caller.
++        ga2_vu1::normalizeOperands4(result, result);
++        laneFlags[0] = laneFlags[1] = laneFlags[2] = laneFlags[3] = 0u;
++        return;
++    }
+ #endif
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index ee8fd36..6651ecd 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -189,19 +189,20 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+ 
+ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+ {
+-    // Stores all commit one cycle after issue (at most one per cycle), so the
+-    // ring releases them in issue order.
+-    if (m_storeCount == kMaxPendingStores)
+-    {
+-        reportReservedInstruction(false, 0xFFFFFFFCu);
++    // A store becomes visible one cycle after issue. Every pair ends by
++    // advancing one cycle, which commits it before PATH1 reads its next
++    // qword, and no other lower instruction can issue in between; so writing
++    // at issue is observationally identical and keeps the commit path idle.
++    if (!m_activeVuData || address + 16u > m_activeVuDataSize)
+         return;
++    uint32_t merged[4]{};
++    std::memcpy(merged, m_activeVuData + address, sizeof(merged));
++    for (uint32_t component = 0; component < 4u; ++component)
++    {
++        if ((laneMask & laneForComponent(component)) != 0u)
++            merged[component] = words[component];
+     }
+-    PendingStore &store = m_storePipeline[(m_storeHead + m_storeCount++) & (kMaxPendingStores - 1u)];
+-    store.valid = true;
+-    store.readyCycle = m_cycle + 1u; noteReady(store.readyCycle);
+-    store.address = address;
+-    store.laneMask = laneMask;
+-    std::copy(words, words + 4, store.words.begin());
++    std::memcpy(m_activeVuData + address, merged, sizeof(merged));
+ }
+ 
+ void VU1Interpreter::commitReadyPipelinesSlow()
+@@ -257,30 +258,6 @@ void VU1Interpreter::commitReadyPipelinesSlow()
+         }
+     }
+ 
+-    while (m_storeCount != 0u)
+-    {
+-        PendingStore &store = m_storePipeline[m_storeHead];
+-        if (store.readyCycle > m_cycle)
+-        {
+-            next = std::min(next, store.readyCycle);
+-            break;
+-        }
+-        if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+-        {
+-            uint32_t oldWords[4]{};
+-            std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                if ((store.laneMask & laneForComponent(component)) != 0u)
+-                    oldWords[component] = store.words[component];
+-            }
+-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+-        }
+-        store = {};
+-        m_storeHead = (m_storeHead + 1u) & (kMaxPendingStores - 1u);
+-        --m_storeCount;
+-    }
+-
+     m_nextCommitCycle = next;
+ }
+ 
+@@ -409,9 +386,6 @@ bool VU1Interpreter::pipelinesPending() const
+     for (const FlagPipelineEntry &entry : m_flagPipeline)
+         if (entry.valid)
+             return true;
+-    for (const PendingStore &store : m_storePipeline)
+-        if (store.valid)
+-            return true;
+     if (m_regWriteReady > m_cycle)
+         return true;
+     return false;
+-- 
+2.55.0
+

@@ -1,0 +1,20 @@
+{
+  "bounded_stock_reference_accepted": true,
+  "full_native_gameplay_accepted": false,
+  "scene_timing_parity_accepted": false,
+  "speech_music_identity_accepted": false,
+  "reviewer": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "ultra",
+    "effective_verified": true
+  },
+  "private_artifacts": "research/native-audio32-reference",
+  "stock_capture": "captures/reference-zettai/20261010-102648",
+  "recording_sha256": "4862cc31b4b6ab603c93c15a71307736663ff63f8db9a92b3052bdcc98b9ad0d",
+  "capture_identity_manifest_sha256": "87de6b369e1d4ab183b03a5a66882ebf1685ce0571082c2004de241e51088083",
+  "disposition_sha256": "afb7452e8b5e0436e93c2cddeb0b6473c8f2bb99fcc0d946bd322223d64e7d49",
+  "native_profile_sha256": "c42e2ba800205dbd8d29efa41df32615794691d5fee04b2033d6890787162512",
+  "source_baseline": "23",
+  "allfive_native_baseline": "22",
+  "full_goal_complete": false
+}

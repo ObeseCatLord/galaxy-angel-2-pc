@@ -1,0 +1,26 @@
+{
+  "checkpointed_producer_pcm_prefix_accepted": true,
+  "logical_stereo_frames": 3648057,
+  "prefix_bytes": 14592228,
+  "excluded_tail_bytes": 102300,
+  "submission_calls": 1673207,
+  "failed_submission_calls": 0,
+  "displayed_narration_progression_accepted": true,
+  "individual_input_consumption_accepted": false,
+  "audible_voice_accepted": false,
+  "normal_runtime_speed_accepted": false,
+  "matched_scene_timing_accepted": false,
+  "movie_completion_accepted": false,
+  "shipping_change_applied": false,
+  "full_goal_complete": false,
+  "reviewer": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "ultra",
+    "effective_verified": true
+  },
+  "review_sha256": "835a8a108acbbdfd94e982f45a0ad6204b8451686fdc6fb0dbf32d8dac02d260",
+  "disposition_sha256": "33098335d445d9799d371bc93702b58d6a3b46a38bb351607ef28320f13c5d67",
+  "private_artifacts": "research/native-pcm37",
+  "public_source_baseline": 23,
+  "allfive_public_native_baseline": 22
+}

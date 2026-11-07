@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "disc_id": "eigou-1",
+  "elf_sha256": "37544fc408902b35e5248343afeb3b7c88ea6a24132c483ed4dc6be927996ce7",
+  "elf_crc32": "73dec964",
+  "entry": "00100008",
+  "bindings": [
+    {
+      "name": "sceSifInitRpc",
+      "address": "0029b428",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "runtime_status": "bound-bootstrap-unverified",
+      "generation_strategy": "runtime-alias"
+    },
+    {
+      "name": "sceSifBindRpc",
+      "address": "0029bbd0",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "runtime_status": "bound-bootstrap-unverified",
+      "generation_strategy": "runtime-alias"
+    },
+    {
+      "name": "sceSifCallRpc",
+      "address": "0029bdb0",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "runtime_status": "bound-bootstrap-unverified",
+      "generation_strategy": "runtime-alias"
+    },
+    {
+      "name": "sceSifCheckStatRpc",
+      "address": "0029bfb0",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "runtime_status": "bound-bootstrap-unverified",
+      "generation_strategy": "runtime-alias"
+    },
+    {
+      "name": "sceCdInit",
+      "address": "00272ff8",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "runtime_status": "bound-bootstrap-unverified",
+      "generation_strategy": "runtime-alias"
+    },
+    {
+      "name": "scePadInit",
+      "address": "002709c8",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x243564"
+      ],
+      "runtime_status": "generated-entry-verified-startup-state-inferred-not-entry-sampled",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadPortOpen",
+      "address": "00270e20",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x243460"
+      ],
+      "runtime_status": "generated-entry-verified-open-state-observed-not-entry-sampled",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadPortClose",
+      "address": "00271008",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x243500"
+      ],
+      "runtime_status": "generated-entry-verified-close-unobserved",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadRead",
+      "address": "00271270",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x2429e8"
+      ],
+      "runtime_status": "real-backend-neutral-held-release-and-buffer-boundaries-verified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadGetState",
+      "address": "002712e8",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x242eac"
+      ],
+      "runtime_status": "sampled-command-states-and-returns-verified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadGetReqState",
+      "address": "00271450",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x24307c",
+        "0x24314c",
+        "0x243224"
+      ],
+      "runtime_status": "six-sampled-complete-request-returns-verified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadInfoAct",
+      "address": "002714e0",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x2430f4"
+      ],
+      "runtime_status": "generated-entry-verified-actuator-description-unverified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadInfoMode",
+      "address": "00271710",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x242ff4",
+        "0x24301c",
+        "0x2432ac"
+      ],
+      "runtime_status": "supported-table4/7-count2-currentID7-verified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadSetMainMode",
+      "address": "00271848",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x24303c"
+      ],
+      "runtime_status": "both-virtual-ports-analog-selection-return1-verified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadSetActDirect",
+      "address": "00271900",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x242cdc",
+        "0x242dcc"
+      ],
+      "runtime_status": "generated-entry-verified-two-tail-routes-unexercised",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadSetActAlign",
+      "address": "002719c8",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x242c10"
+      ],
+      "runtime_status": "original-tail-entry-return1-verified-actuator-effects-unverified",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadInfoPressMode",
+      "address": "00271c00",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x2431a4"
+      ],
+      "runtime_status": "generated-entry-verified-pressure-negotiation-inferred-not-entry-sampled",
+      "generation_strategy": "runtime-stub"
+    },
+    {
+      "name": "scePadEnterPressMode",
+      "address": "00271c80",
+      "evidence": "signature-matched-to-zettai-binding (immediates and jump targets masked, unique)",
+      "original_calls": [
+        "0x2431bc"
+      ],
+      "runtime_status": "generated-entry-verified-pressure-enabled-state-observed-not-entry-sampled",
+      "generation_strategy": "runtime-stub"
+    }
+  ],
+  "source": "tools/ga2.py generated runtime stubs; native/compat/zettai_sif.cpp existing five runtime aliases",
+  "limits": [
+    "CLI import/launch verifies SHA-256; runtime descriptor uses filename, entry and CRC32",
+    "Thirteen generated entry wrappers and eighteen recorded external direct edges are verified, including all three direct-J tails; surviving original interior SDK paths and indirect-call closure remain unverified",
+    "SifCallRpc argument-pack choice remains to be observed when an actual call is reached",
+    "No native scene/audio/battle/save verified",
+    "GetDmaStr remains original: its optional128-byte copy and selected DMA pointer are not implemented by the host helper",
+    "Virtual ports share the existing host backend; disconnected-port/multitap/actuator/haptics fidelity unverified",
+    "Controller SDK bindings do not bypass original normalization, dialog or memory-card behavior"
+  ],
+  "verification": "controller-sdk-verification.json"
+}

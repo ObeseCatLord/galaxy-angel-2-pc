@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch_prefix": 13,
+  "source": {
+    "descriptor": "002cf7c0",
+    "callback_slot": "74",
+    "missing_entry": "0023ed20",
+    "jalr": "00237ae8",
+    "guest_return": "00237af0",
+    "switch_table": "002ec930",
+    "selector_count": 35,
+    "native_selector": 19,
+    "native_case": "0023ed88",
+    "classification": 4,
+    "shared_continuation": "0023ed9c",
+    "guest_epilogue": "0023ef2c",
+    "mode0_return_word_count": 12,
+    "emitted_words_verified": 142,
+    "omitted_zero_delay_words_verified": [
+      "0x23ed64"
+    ],
+    "body_hashes": {
+      "entry_23ed20_0x23ed9c.cpp": "cf50eea0dd26c1472d27e219ba9af9131bc6f06e7b4a44a99da86f92b791f9a8",
+      "entry_0023ed9c_0x23ed9c.cpp": "c346989a7c230d1a69f427adead830e585004e0588f28f006110775f717aa6af",
+      "entry_0023ede0_0x23ede0.cpp": "efccb144b37a2ee894a1a90fad32ef3582adcc8a6ad3aa3a8e449b314fd98f38",
+      "entry_0023ee1c_0x23ee1c.cpp": "bdbf938531717364a9780c515c9ba79fc695546c086b3986430a02dfb36c3dd0",
+      "entry_0023eeb0_0x23eeb0.cpp": "5fdf3516d40b43bc094a64d7faf925cb21a3e048b852326461950b1f2bfc861b",
+      "entry_0023ef18_0x23ef18.cpp": "fc6b38f0a9a62a82c54d168ac76e6a36c7b21565b6f0df7f05d7f0a7a706961b",
+      "entry_0023ef2c_0x23ef2c.cpp": "9d8b96ff543f351a10e0c49f7b4ed40270d7805d665cb9bd24a6f341da8d96ff",
+      "FUN_002318f8_0x2318f8.cpp": "9bde83bda06fa7552ec5981b27a52404027641c638d5c8f7924d12ff733c7c2a"
+    },
+    "header_registry_entries": 1,
+    "original_descriptor_callbacks_registered": true
+  },
+  "generation": {
+    "method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+    "entry_hints_total": 24,
+    "config_sha256": "cd191ab08b9fcd279c4e45a567a1d6ab80e3340153633dbcc2daa219a731f5c5",
+    "config_artifact": "private analysis/zettai/recomp.toml",
+    "entry_profile_artifact": "configs/recomp-entry-points.json",
+    "entry_profile_sha256": "f5a4be97e15b847b304030e6025daa19f999c8a5e958584c00cd9aeb69e1f83d",
+    "changed_files": [
+      {
+        "file": "entry_23ed20_0x23ed9c.cpp",
+        "old_sha256": null,
+        "new_sha256": "cf50eea0dd26c1472d27e219ba9af9131bc6f06e7b4a44a99da86f92b791f9a8"
+      },
+      {
+        "file": "ps2_recompiled_functions.h",
+        "old_sha256": "4c6379bf1cfa6846a4317148776eeae15b3a0b25896eed806b90fbeb24623064",
+        "new_sha256": "7c881645eced99405191fc8e81ccd7b256a7f5ecadffc8a8e40a30fdc39f0db7"
+      },
+      {
+        "file": "register_functions.cpp",
+        "old_sha256": "21cabed2ad965b74f730910c5ff7e5066abb59dd06c55bf652f921d51b46ee9f",
+        "new_sha256": "ec8b40169cc1ec597a0f728b97a02c049df543751ec9a3631ef8d6acf25713c0"
+      }
+    ],
+    "obsolete_files": []
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "status": "Astra Ultra accepted source, corrected observer and bounded native selector19/mode0 proof; independently verified original table, packet, raw128saved registers and rendered memory-card boot text; other selectors/modes/gameplay unverified",
+    "document": "docs/reviews/resource-initializer-entry.md",
+    "observer_sha256": "7f931fc1e180646c995eca1644c8ba56bbca55e5a71e50d820fb54cc67037bb1"
+  },
+  "tests": {
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "runtime": "production unchanged from475 runtime tests/9 IOP suites"
+  },
+  "native": {
+    "build": "native target rebuild completed successfully",
+    "resource_return_verified": true,
+    "boot_text_visually_observed": true,
+    "scene_verified": false,
+    "audio_verified": false,
+    "binary_sha256": "8f4522f55a717ca276e817015378a6f12873aa4510de752a3deb8b0a62a100ea",
+    "binary_size": 364393280,
+    "focused_capture": "20261009-052130",
+    "resolved_hooks": 5,
+    "probe_errors": 0,
+    "entry_samples": 1,
+    "return_samples": 1,
+    "sample_id": 1,
+    "selector": 19,
+    "mode": 0,
+    "classification": 4,
+    "descriptor_mode": 2,
+    "helper_word": 72,
+    "packet_words": 12,
+    "result": 12,
+    "return_pc": "0x237af0",
+    "all35_live_table_entries_match_original": true,
+    "full128_s0_s4_gp_sp_ra_unchanged": true,
+    "twelve_neighbor_words_unchanged": true,
+    "packet_matches_original_stores": true,
+    "pending_samples": 0,
+    "ordinary_capture": "20261009-052131",
+    "ordinary_last_frame": "25.2s black background with Japanese PS2 memory-card checking/do-not-remove text; visually inspected",
+    "native_unobserved": "other selectors, invalid path, nonzero A2, descriptor mode5; functional memory-card check, title/gameplay/audio",
+    "next_missing_target": "00113c78",
+    "next_missing_source": "001148b4",
+    "debugger_exit_code": 0,
+    "natural_exit_code": null,
+    "bounded_stop": true
+  }
+}

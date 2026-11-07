@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch": "0010-deci2-console-callbacks.patch",
+  "runtime_patch_sha256": "96662d4b6714573baf485f15dd903fb485aab961331be021b7b674aecd84dca6",
+  "native_captures": [
+    "captures/native-zettai/20261008-233210/capture.json",
+    "captures/native-zettai/20261008-234700/capture.json"
+  ],
+  "native_verified": [
+    "original TTY0210 Open/ReqSend/Poll",
+    "original WRITE3 sends63 and91 bytes through checked ExSend",
+    "original DONE4 observes remaining zero and clears original busy state",
+    "native AXL texture and sound initialization reached",
+    "existing-generator entry00222608 executed and returned"
+  ],
+  "host_tests": {
+    "runtime_passed": 460,
+    "runtime_failed": 0,
+    "iop_suites_passed": 9,
+    "tooling_passed": 15
+  },
+  "generation": {
+    "profile": "recomp-entry-points.json",
+    "config_sha256": "8752ba113e1b451145bc8e5558b3481aa45dd812770d2f91dcae42ec6b24dace",
+    "entry": "0x00222608",
+    "actual_generator_run": true,
+    "changed_files": 3,
+    "obsolete_files": 0,
+    "hand_edited_generated_code": false
+  },
+  "patch_reproduction": {
+    "patches": 10,
+    "source_files": 58,
+    "primary_prefix": 10
+  },
+  "native_scene_passed": false,
+  "visual_result": "magenta framebuffer",
+  "next_missing_target": {
+    "source": "0x0022f944",
+    "target": "0x00222f98"
+  },
+  "limits": [
+    "local EE-to-host TTY only; no incoming debugger transport",
+    "bounded host errors do not establish original void Poll failure-path liveness",
+    "other four native boots not re-observed with this patch",
+    "full IOP firmware and original receiving EE SIF handler unverified",
+    "native title/story/audio/battle/save/disc transitions remain unpassed"
+  ],
+  "review": "Astra gpt-6-astra Ultra; production and exact-ELF adapter accepted, final pending-replacement ordering coverage accepted"
+}

@@ -1,0 +1,346 @@
+From c4ffff6c0ec4f510ba6d44e4d69eca44ad98cdca Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 11:20:35 -0500
+Subject: [PATCH] recomp: EE MMI halfword multiplies, 128-bit HI/LO transfers,
+ exchanges
+
+PMULTH/PMADDH/PMSUBH summed all eight products into one 64-bit value;
+the EE keeps each product in its own word of LO/HI (128 bits: lo/hi plus
+lo1/hi1) and returns {LO.w0, HI.w0, LO.w2, HI.w2} in rd. The games use
+PMULTH for squared distances (Zettai 0x139958, Eigou 1 0x13a630).
+PMFHL/PMTHL ignored the upper halves and had the wrong word order.
+PEXEH, PEXCH, PEXEW and PROT3W used the wrong shuffles, PADDUH/PSUBUH
+did not saturate, and PSLLH/PSRLH/PSRAH used all five bits of sa.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/lib/mmi_translation_helpers.cpp       |  56 ++-------
+ ps2xRecomp/src/lib/mmi_translator.cpp         |  12 +-
+ ps2xRuntime/include/ps2_runtime_macros.h      | 110 ++++++++++++++++--
+ ps2xTest/src/ps2_vu_tests.cpp                 |  31 +++++
+ 4 files changed, 150 insertions(+), 59 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index a2bcb77..cc88cd5 100644
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -105,9 +105,9 @@ namespace ps2recomp
+         case MMI1_PEXTUW:
+             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PADDUH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_add_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_adds_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PSUBUH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_sub_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_subs_epu16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PEXTUH:
+             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXTUH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+         case MMI1_PADDUB:
+@@ -228,15 +228,11 @@ namespace ps2recomp
+         switch (subfunc)
+         {
+         case PMFHL_LW:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LW(ctx->hi, ctx->lo));", inst.rd);
+         case PMFHL_UW:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_UW(ctx->hi, ctx->lo));", inst.rd);
+         case PMFHL_SLW:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SLW(ctx->hi, ctx->lo));", inst.rd);
+         case PMFHL_LH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
+         case PMFHL_SH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
++            return fmt::format("SET_GPR_VEC(ctx, {}, ps2_pmfhl(ctx, {}));", inst.rd, static_cast<int>(subfunc));
+         default:
+             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
+         }
+@@ -249,7 +245,7 @@ namespace ps2recomp
+         switch (subfunc)
+         {
+         case PMFHL_LW:
+-            return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->lo = _mm_extract_epi32(val, 0); ctx->hi = _mm_extract_epi32(val, 1); }}", inst.rs);
++            return fmt::format("ps2_pmthl_lw(ctx, GPR_VEC(ctx, {}));", inst.rs);
+         default:
+             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMTHL instruction: function 0x{:X}", subfunc));
+         }
+@@ -384,16 +380,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePMADDH(const Instruction &inst)
+     {
+-        // Parallel multiply add halfword -> results to HI/LO and rd
+-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n" // Packed multiply and add adjacent pairs
+-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
+-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
+-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
+-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
+-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
+-                           "   acc += (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
+-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, acc); }}",
++        return fmt::format("{{ const __m128i r = ps2_pmulth(ctx, GPR_VEC(ctx, {}), GPR_VEC(ctx, {}), 1); SET_GPR_VEC(ctx, {}, r); }}",
+                            inst.rs, inst.rt, inst.rd);
+     }
+ 
+@@ -420,15 +407,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePMSUBH(const Instruction &inst)
+     {
+-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
+-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
+-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
+-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
+-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
+-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
+-                           "   acc -= (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
+-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, acc); }}",
++        return fmt::format("{{ const __m128i r = ps2_pmulth(ctx, GPR_VEC(ctx, {}), GPR_VEC(ctx, {}), -1); SET_GPR_VEC(ctx, {}, r); }}",
+                            inst.rs, inst.rt, inst.rd);
+     }
+ 
+@@ -454,9 +433,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
+     {
+-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+-                           inst.rd, inst.rt);
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEH(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
+     }
+ 
+ 
+@@ -471,15 +448,8 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
+     {
+-        // Parallel multiply halfword, results sum to HI/LO and rd
+-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
+-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
+-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
+-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
+-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
+-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
+-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, result); }}",
++        // Eight 16x16 products into LO/HI words; rd = {LO.w0, HI.w0, LO.w2, HI.w2}.
++        return fmt::format("{{ const __m128i r = ps2_pmulth(ctx, GPR_VEC(ctx, {}), GPR_VEC(ctx, {}), 0); SET_GPR_VEC(ctx, {}, r); }}",
+                            inst.rs, inst.rt, inst.rd);
+     }
+ 
+@@ -520,9 +490,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
+     {
+-        // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
+-                           inst.rd, inst.rt);
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PROT3W(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
+     }
+ 
+ 
+@@ -560,9 +528,7 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
+     {
+-        // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+-                           inst.rd, inst.rt);
++        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXCH(GPR_VEC(ctx, {})));", inst.rd, inst.rt);
+     }
+ 
+ 
+diff --git a/ps2xRecomp/src/lib/mmi_translator.cpp b/ps2xRecomp/src/lib/mmi_translator.cpp
+index d8b3cbc..24512a9 100644
+--- a/ps2xRecomp/src/lib/mmi_translator.cpp
++++ b/ps2xRecomp/src/lib/mmi_translator.cpp
+@@ -107,12 +107,12 @@ namespace ps2recomp
+                 "SET_GPR_U64(ctx, {}, out); "
+                 "}}",
+                 rs, rd);
+-        case MMI_PSLLH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_slli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+-        case MMI_PSRLH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+-        case MMI_PSRAH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srai_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
++        case MMI_PSLLH: // the EE uses the low 4 bits of sa for halfwords
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_slli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa & 0xF);
++        case MMI_PSRLH: // the EE uses the low 4 bits of sa for halfwords
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srli_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa & 0xF);
++        case MMI_PSRAH: // the EE uses the low 4 bits of sa for halfwords
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_srai_epi16(GPR_VEC(ctx, {}), {}));", rd, rt, sa & 0xF);
+         case MMI_PSLLW:
+             return fmt::format("SET_GPR_VEC(ctx, {}, _mm_slli_epi32(GPR_VEC(ctx, {}), {}));", rd, rt, sa);
+         case MMI_PSRLW:
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 895032e..fdcd355 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -597,11 +597,6 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+     return _mm_set1_epi64x(static_cast<long long>(value));
+ }
+ 
+-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
+-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
+-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
+-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
+-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+ 
+ // FPU (COP1) operations
+ #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
+@@ -750,9 +745,108 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
+ }
+ #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
+ #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
+-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
+-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
+-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
++// PEXEH: exchange halfwords 0<->2 in each doubleword; PEXCH: 1<->2.
++#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
++#define PS2_PEXCH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
++// PEXEW: words 0<->2; PROT3W: words 0,1,2 rotate (w0=w1, w1=w2, w2=w0), w3 kept.
++#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
++#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
++
++// The EE's LO and HI are 128 bits: ctx->lo/hi hold bits 0-63 (pipeline 0),
++// ctx->lo1/hi1 bits 64-127 (pipeline 1, MULT1/DIV1).
++static inline __m128i ps2_lo128(const R5900Context *ctx) { return _mm_set_epi64x((long long)ctx->lo1, (long long)ctx->lo); }
++static inline __m128i ps2_hi128(const R5900Context *ctx) { return _mm_set_epi64x((long long)ctx->hi1, (long long)ctx->hi); }
++static inline void ps2_set_lo128(R5900Context *ctx, __m128i v)
++{
++    ctx->lo = (uint64_t)_mm_cvtsi128_si64(v);
++    ctx->lo1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v));
++}
++static inline void ps2_set_hi128(R5900Context *ctx, __m128i v)
++{
++    ctx->hi = (uint64_t)_mm_cvtsi128_si64(v);
++    ctx->hi1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v));
++}
++
++// PMULTH/PMADDH/PMSUBH: eight signed 16x16 products p0..p7.  LO = {p0, p1,
++// p4, p5} and HI = {p2, p3, p6, p7} (set, added or subtracted per word);
++// rd = {LO.w0, HI.w0, LO.w2, HI.w2}.  mode: 0 set, 1 add, -1 subtract.
++static inline __m128i ps2_pmulth(R5900Context *ctx, __m128i rs, __m128i rt, int mode)
++{
++    const __m128i lo16 = _mm_mullo_epi16(rs, rt), hi16 = _mm_mulhi_epi16(rs, rt);
++    const __m128i p0123 = _mm_unpacklo_epi16(lo16, hi16), p4567 = _mm_unpackhi_epi16(lo16, hi16);
++    __m128i lo = _mm_unpacklo_epi64(p0123, p4567); // p0 p1 p4 p5
++    __m128i hi = _mm_unpackhi_epi64(p0123, p4567); // p2 p3 p6 p7
++    if (mode > 0)
++    {
++        lo = _mm_add_epi32(ps2_lo128(ctx), lo);
++        hi = _mm_add_epi32(ps2_hi128(ctx), hi);
++    }
++    else if (mode < 0)
++    {
++        lo = _mm_sub_epi32(ps2_lo128(ctx), lo);
++        hi = _mm_sub_epi32(ps2_hi128(ctx), hi);
++    }
++    ps2_set_lo128(ctx, lo);
++    ps2_set_hi128(ctx, hi);
++    // {lo.w0, hi.w0, lo.w2, hi.w2}
++    return _mm_unpacklo_epi32(_mm_shuffle_epi32(lo, _MM_SHUFFLE(3, 1, 2, 0)), _mm_shuffle_epi32(hi, _MM_SHUFFLE(3, 1, 2, 0)));
++}
++
++// PMFHL: LW {LO.w0, HI.w0, LO.w2, HI.w2}; UW {LO.w1, HI.w1, LO.w3, HI.w3};
++// SLW: each doubleword HI.w:LO.w (w = 0, 2) saturated to 32 bits, sign-extended;
++// LH {LO.h0, LO.h2, HI.h0, HI.h2, LO.h4, LO.h6, HI.h4, HI.h6};
++// SH: the eight words LO.w0 LO.w1 HI.w0 HI.w1 LO.w2 LO.w3 HI.w2 HI.w3
++// saturated to halfwords.
++static inline __m128i ps2_pmfhl(const R5900Context *ctx, int fmt)
++{
++    const __m128i lo = ps2_lo128(ctx), hi = ps2_hi128(ctx);
++    switch (fmt)
++    {
++    case 0: // LW
++        return _mm_unpacklo_epi32(_mm_shuffle_epi32(lo, _MM_SHUFFLE(3, 1, 2, 0)), _mm_shuffle_epi32(hi, _MM_SHUFFLE(3, 1, 2, 0)));
++    case 1: // UW
++        return _mm_unpacklo_epi32(_mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 0, 3, 1)), _mm_shuffle_epi32(hi, _MM_SHUFFLE(2, 0, 3, 1)));
++    case 2: // SLW
++    {
++        int64_t out[2];
++        for (int i = 0; i < 2; ++i)
++        {
++            const uint32_t l = (uint32_t)(i ? (ctx->lo1 & 0xFFFFFFFFu) : (ctx->lo & 0xFFFFFFFFu));
++            const uint32_t h = (uint32_t)(i ? (ctx->hi1 & 0xFFFFFFFFu) : (ctx->hi & 0xFFFFFFFFu));
++            const int64_t v = (int64_t)(((uint64_t)h << 32) | l);
++            out[i] = v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : v;
++        }
++        return _mm_set_epi64x(out[1], out[0]);
++    }
++    case 3: // LH
++    {
++        alignas(16) uint16_t l[8], h[8], out[8];
++        _mm_store_si128((__m128i *)l, lo);
++        _mm_store_si128((__m128i *)h, hi);
++        const uint16_t picked[8] = {l[0], l[2], h[0], h[2], l[4], l[6], h[4], h[6]};
++        std::memcpy(out, picked, sizeof(out));
++        return _mm_load_si128((const __m128i *)out);
++    }
++    default: // SH
++    {
++        const __m128i first = _mm_unpacklo_epi64(lo, hi);  // LO.w0 LO.w1 HI.w0 HI.w1
++        const __m128i second = _mm_unpackhi_epi64(lo, hi); // LO.w2 LO.w3 HI.w2 HI.w3
++        return _mm_packs_epi32(first, second);
++    }
++    }
++}
++
++// PMTHL.LW: LO.w0 = rs.w0, HI.w0 = rs.w1, LO.w2 = rs.w2, HI.w2 = rs.w3.
++static inline void ps2_pmthl_lw(R5900Context *ctx, __m128i rs)
++{
++    alignas(16) uint32_t w[4], lo[4], hi[4];
++    _mm_store_si128((__m128i *)w, rs);
++    _mm_store_si128((__m128i *)lo, ps2_lo128(ctx));
++    _mm_store_si128((__m128i *)hi, ps2_hi128(ctx));
++    lo[0] = w[0]; hi[0] = w[1]; lo[2] = w[2]; hi[2] = w[3];
++    ps2_set_lo128(ctx, _mm_load_si128((const __m128i *)lo));
++    ps2_set_hi128(ctx, _mm_load_si128((const __m128i *)hi));
++}
+ 
+ // Additional VU0 operations
+ #define PS2_VSQRT(x) sqrtf(x)
+diff --git a/ps2xTest/src/ps2_vu_tests.cpp b/ps2xTest/src/ps2_vu_tests.cpp
+index d4bf0ec..218b41f 100644
+--- a/ps2xTest/src/ps2_vu_tests.cpp
++++ b/ps2xTest/src/ps2_vu_tests.cpp
+@@ -98,6 +98,37 @@ void register_ps2_vu_tests()
+             t.IsTrue(ps2_fpu_div_s(fcr31, 3.0f, 2.0f) == 1.5f, "ordinary division");
+         });
+ 
++        tc.Run("EE MMI halfword multiply, HI/LO transfers and exchanges follow the EE layout", [](TestCase &t)
++        {
++            R5900Context ctx{};
++            const __m128i rs = _mm_setr_epi16(1, -2, 3, 4, 5, 6, 7, -8), rt = _mm_setr_epi16(10, 20, 30, 40, 50, 60, 70, 80);
++            const __m128i rd = ps2_pmulth(&ctx, rs, rt, 0);
++            alignas(16) int32_t w[4];
++            _mm_store_si128((__m128i *)w, rd);
++            t.IsTrue(w[0] == 10 && w[1] == 90 && w[2] == 250 && w[3] == 490, "PMULTH rd = {p0, p2, p4, p6}");
++            t.IsTrue(ctx.lo == ((uint64_t)(uint32_t)-40 << 32 | 10u) && ctx.hi == (160ull << 32 | 90u), "LO/HI words 0-1");
++            t.IsTrue(ctx.lo1 == (360ull << 32 | 250u) && ctx.hi1 == ((uint64_t)(uint32_t)-640 << 32 | 490u), "LO/HI words 2-3");
++            ps2_pmulth(&ctx, rs, rt, 1);
++            t.IsTrue((uint32_t)ctx.lo == 20u && (uint32_t)ctx.hi1 == 980u, "PMADDH adds per word");
++            _mm_store_si128((__m128i *)w, ps2_pmfhl(&ctx, 0));
++            t.IsTrue(w[0] == 20 && w[1] == 180 && w[2] == 500 && w[3] == 980, "PMFHL.LW");
++            _mm_store_si128((__m128i *)w, ps2_pmfhl(&ctx, 1));
++            t.IsTrue(w[0] == -80 && w[1] == 320 && w[2] == 720 && w[3] == -1280, "PMFHL.UW");
++            ps2_pmthl_lw(&ctx, _mm_setr_epi32(1, 2, 3, 4));
++            _mm_store_si128((__m128i *)w, ps2_pmfhl(&ctx, 0));
++            t.IsTrue(w[0] == 1 && w[1] == 2 && w[2] == 3 && w[3] == 4, "PMTHL.LW then PMFHL.LW round-trips");
++            alignas(16) int16_t h[8];
++            const __m128i x = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7);
++            _mm_store_si128((__m128i *)h, PS2_PEXEH(x));
++            t.IsTrue(h[0] == 2 && h[1] == 1 && h[2] == 0 && h[3] == 3 && h[4] == 6 && h[6] == 4, "PEXEH swaps halfwords 0 and 2");
++            _mm_store_si128((__m128i *)h, PS2_PEXCH(x));
++            t.IsTrue(h[0] == 0 && h[1] == 2 && h[2] == 1 && h[3] == 3 && h[5] == 6 && h[6] == 5, "PEXCH swaps halfwords 1 and 2");
++            _mm_store_si128((__m128i *)w, PS2_PEXEW(_mm_setr_epi32(0, 1, 2, 3)));
++            t.IsTrue(w[0] == 2 && w[1] == 1 && w[2] == 0 && w[3] == 3, "PEXEW swaps words 0 and 2");
++            _mm_store_si128((__m128i *)w, PS2_PROT3W(_mm_setr_epi32(0, 1, 2, 3)));
++            t.IsTrue(w[0] == 1 && w[1] == 2 && w[2] == 0 && w[3] == 3, "PROT3W rotates words 0-2");
++        });
++
+         tc.Run("MulVector_componentwise", [](TestCase &t)
+         {
+             VuEnv env;
+-- 
+2.55.0
+

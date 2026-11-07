@@ -1,0 +1,53 @@
+From 811ca97328725ebfd00f837680c450dbc740b66e Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:20:47 -0500
+Subject: [PATCH] buttons: <button>_wide.png icons for pill-shaped prompt spots
+ (aspect >= 1.5), used when the style has one
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 471babb..d733c2d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -85,8 +85,24 @@ namespace ga2_texpacks
+             }
+         }
+ 
+-        const ::Image *icon(const std::string &button)
++        const ::Image *icon(const std::string &button, bool wide = false)
+         {
++            // Wide spots (pills, 'Menu' keys) use <button>_wide.png when the style has one.
++            if (wide)
++            {
++                const std::string wideKey = g_style + "/" + button + "_wide";
++                auto it = g_icons.find(wideKey);
++                if (it == g_icons.end())
++                {
++                    ::Image image = LoadImage(
++                        (std::filesystem::path(g_buttonDir) / g_style / (button + "_wide.png")).string().c_str());
++                    if (image.data)
++                        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                    it = g_icons.emplace(wideKey, image).first;
++                }
++                if (it->second.data)
++                    return &it->second;
++            }
+             const std::string key = g_style + "/" + button;
+             auto it = g_icons.find(key);
+             if (it == g_icons.end())
+@@ -114,7 +130,7 @@ namespace ga2_texpacks
+             bool drew = false;
+             for (const IconSpot &spot : spots)
+             {
+-                const ::Image *art = icon(spot.button);
++                const ::Image *art = icon(spot.button, spot.w * 10 >= spot.h * 15);
+                 if (!art)
+                     continue;
+                 // Cover the PS2 icon with the colour around it, then draw ours.
+-- 
+2.55.0
+

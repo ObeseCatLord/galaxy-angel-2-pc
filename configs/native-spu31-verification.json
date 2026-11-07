@@ -1,0 +1,22 @@
+{
+  "status": "accepted-bounded-IOP-device-host-component",
+  "review_model": "gpt-6-astra",
+  "review_effort": "ultra",
+  "effective_routing_independently_verified": true,
+  "production_source_units_rebuilt": 71,
+  "current_headers": 100,
+  "fresh_runtime_test_units": 27,
+  "runtime_tests_passed": 561,
+  "iop_suites_passed": 12,
+  "sample_ram_proof": "authored-both-core-DMA-roundtrip",
+  "pcm_proof": "authored-ADPCM-through-actual-IOP-and-typed-host",
+  "ordinary_dma_deadline": "preserved-provisional",
+  "auto_dma_supported": false,
+  "identity_exhaustion_restores_counter": false,
+  "native_game_sample_ram_accepted": false,
+  "native_game_audio_accepted": false,
+  "reference_parity_accepted": false,
+  "production_approved": false,
+  "gameplay_or_feature_gate_passed": false,
+  "public_baseline": "source23/allfive-native22"
+}

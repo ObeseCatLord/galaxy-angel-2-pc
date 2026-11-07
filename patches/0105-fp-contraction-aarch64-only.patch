@@ -1,0 +1,33 @@
+From 91f304345cfd4bf47019ce1b0127d13bfbaad144 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 11:17:01 -0500
+Subject: [PATCH] build: FP contraction flag only where the target can fuse
+ (aarch64)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 2555693..adf3ea9 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -543,9 +543,11 @@ endif()
+ 
+ # The VU1 interpreter and the generated VU1 programs are bit-exact only when
+ # the compiler never fuses a multiply and an add (no FP contraction): x86-64
+-# without -mfma cannot, aarch64 can. PUBLIC, so the generated programs built by
+-# consumers of ps2_runtime use the same setting as the interpreter.
+-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++# without -mfma cannot (so the flag is left out there: adding it would rebuild
++# every generated program for nothing), aarch64 can. PUBLIC, so the generated
++# programs built by consumers of ps2_runtime use the same setting as the
++# interpreter.
++if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+     target_compile_options(ps2_runtime PUBLIC -ffp-contract=off)
+ endif()
+ 
+-- 
+2.55.0
+

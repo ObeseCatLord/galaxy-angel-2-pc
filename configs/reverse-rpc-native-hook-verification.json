@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "source_status": "astra-reviewed-patch22-runtime-hooks-and-SIF-single-settlement-game-transport-pending",
+  "accepted_runtime_patch_prefix": 22,
+  "production_transport_integrated": false,
+  "native_binaries_use_hooks": false,
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "disposition": "docs/reviews/reverse-rpc-native-hooks.md"
+  },
+  "candidate_sources": {
+    "ps2_runtime.h": "4ad49ba63219895db066634d1a0880478b8dc5e2e4cf6179446a7857a0d466d2",
+    "ps2_runtime.cpp": "a80eeaf2b9d0b0a31ed055f0618657868bfadc5bea65e8b49b79c1e9f335b7d7",
+    "ps2_iop_host.h": "e771bc69d34ff27bdadc80de8b122d3b067068d08d9575ba2a6441428223a3b2",
+    "ps2_iop_host.cpp": "53c9016357be54002cd08796630f6bc501a43410da67f2915d75a72b3a65dae8",
+    "ee_scheduler.h": "2ff2f8b5f48f80c5f5fea50afc430b733440d30624b7bfb5361aa4f090114955",
+    "EeScheduler.cpp": "ce46de151b7213230925d3a60e708e6cfe82b7e546b276e4f07b43d1e9dcd8b6"
+  },
+  "runtime_owned_component": {
+    "fixture_sha256": "42d451422c537f6ac1c1241d2ee584dbf36f2d72786cf2d09c00ed4703a617a0",
+    "binary_sha256": "a793069526d83fe77d029d149893278643b1aea71e694675858054bae571501e",
+    "build_exit": 0,
+    "run_exit": 0,
+    "negative_controls": {
+      "wrong-parent-restore": 1,
+      "skip-epilogue": 1
+    },
+    "calls": 2,
+    "reply_bytes_per_call": 64,
+    "MIPS_continuations": 2,
+    "manual_IOP_pumps": false,
+    "second_IOP_engine": false,
+    "EE_idle_charges_per_dispatch": 64,
+    "synthetic_idle_priority": 40,
+    "original_service_priority": 20,
+    "stopped_EE_cycles": 992,
+    "forced_original_cache_resumes": 2,
+    "asserted_VBlank_ticks": 2
+  },
+  "lifecycle_component": {
+    "fixture_sha256": "d36ef7886e4979165e94fab72739b5ff7d03bd0972f1a82437f642e2bbf2e9b3",
+    "binary_sha256": "6e9057ffc7ad01c0ace71063e16f57b9441e9e99c391d675454ed844fb979cf3",
+    "build_exit": 0,
+    "run_exit": 0,
+    "actual_original_ELF_reload": true,
+    "throwing_cancellation_teardown": true,
+    "stopped_callback_reentry": true,
+    "old_capture_reentry": true,
+    "sanitizer_claim": false
+  },
+  "limits": [
+    "exclusive quiescence and native controller ownership contract required",
+    "lifecycle and clock proofs separate; observer-acquisition/configuration rollback untested",
+    "SIF source and15 public tests accepted; native controller/transport integration pending",
+    "combined transport cancellation/failure/provider reuse pending",
+    "original STREAM999/0 and packet conventions pending",
+    "IRQ/timer handlers and stock timing parity pending",
+    "PCM/voices/audio/gameplay pending"
+  ],
+  "patch_file": "patches/0022-native-ee-rpc-hooks.patch",
+  "patch_sha256": "08f3cc9922dcf753e9110ba1da179b17d5d2dd707b4538bd9c6e6ab1d5da3745",
+  "reproduced_affected_files": 81,
+  "idempotent_primary_prefix": 22,
+  "reviewed_source_sha256": {
+    "ps2xRuntime/include/ps2_runtime.h": "4ad49ba63219895db066634d1a0880478b8dc5e2e4cf6179446a7857a0d466d2",
+    "ps2xRuntime/src/lib/ps2_iop_host.cpp": "53c9016357be54002cd08796630f6bc501a43410da67f2915d75a72b3a65dae8",
+    "ps2xRuntime/src/lib/ps2_iop_host.h": "e771bc69d34ff27bdadc80de8b122d3b067068d08d9575ba2a6441428223a3b2",
+    "ps2xRuntime/src/lib/ps2_runtime.cpp": "a80eeaf2b9d0b0a31ed055f0618657868bfadc5bea65e8b49b79c1e9f335b7d7",
+    "ps2xRuntime/src/lib/Kernel/EeScheduler.cpp": "ce46de151b7213230925d3a60e708e6cfe82b7e546b276e4f07b43d1e9dcd8b6",
+    "ps2xRuntime/include/runtime/ee_scheduler.h": "2ff2f8b5f48f80c5f5fea50afc430b733440d30624b7bfb5361aa4f090114955",
+    "ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp": "0c5716a31a39d02d3d2f2128f1aab3380a26b3a0d0531dcdec5aa830fc7c51d7",
+    "ps2xRuntime/src/lib/Kernel/Stubs/SIF.h": "da7773987bfea44b632c6a8699d42001dea714c4e808bd7af9b49d522aa3dec2",
+    "ps2xTest/CMakeLists.txt": "f3e94bfa2ec75c78a51ba51afa089a93b820bf993f781d223066a892f6e2394f",
+    "ps2xTest/src/main.cpp": "9d93d66c88af8af46c24f6591af42fc3bf7012fdb28fca6b1ef67cbf940312cb",
+    "ps2xTest/src/native_ee_rpc_hooks_tests22.cpp": "d5c26f5a912923cec82f45d95dea1330f408191b864fee0fd83f1d6e2a7c1407",
+    "ps2xTest/src/sif_command_hooks_tests22.cpp": "d162f9d8f190a5c40fb9eb0422facf3de5e44c55445d5368a583e9369ee51d55"
+  },
+  "tests": {
+    "runtime_passed": 558,
+    "runtime_failed": 0,
+    "IOP_suites_passed": 11,
+    "tooling_passed": 27,
+    "scope": "exact-byte private copied accepted source22 plus15 public tests"
+  },
+  "SIF_interface_installed": true,
+  "native_builds": {
+    "last_completed_prefix": 22,
+    "targets": 5,
+    "build_exit": 0,
+    "game_transport_integrated": false
+  }
+}

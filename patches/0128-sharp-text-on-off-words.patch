@@ -1,0 +1,48 @@
+From 2d246429e34dddeb24e6b3330447cc9ace7c4f08 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:24:47 -0500
+Subject: [PATCH] sharp text: GA2_SHARP_TEXT also takes on/off (and true/false,
+ yes/no)
+
+"on" parsed as 0 and silently turned the feature off; an unknown word now
+means auto.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index 094ccdd..274e18c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -23,6 +23,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cctype>
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+@@ -92,7 +93,17 @@ namespace ga2_hitext
+             const char *v = std::getenv("GA2_SHARP_TEXT");
+             if (!v || !*v || std::string(v) == "auto")
+                 return 2;
+-            return std::atoi(v) != 0 ? 1 : 0;
++            // 1/0 as the settings store them; the words too (an unknown word is not taken for "off").
++            std::string s(v);
++            for (char &c : s)
++                c = char(std::tolower(static_cast<unsigned char>(c)));
++            if (s == "on" || s == "true" || s == "yes")
++                return 1;
++            if (s == "off" || s == "false" || s == "no")
++                return 0;
++            if (s.find_first_not_of("0123456789") == std::string::npos)
++                return std::atoi(v) != 0 ? 1 : 0;
++            return 2;
+         }
+ 
+         // ---- the vector font ---------------------------------------------------
+-- 
+2.56.0
+

@@ -1,0 +1,1884 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 7c79eb9..00911fc 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -94,6 +94,13 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_rpc_wait_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_rpc_wait_tests COMMAND ps2_iop_rpc_wait_tests)
+ 
++    # Direct bridge/kernel scope. EE ingress/queue/Exec remains an integration
++    # responsibility of the host/runtime test family.
++    add_executable(ps2_iop_reverse_rpc_tests tests/iop_reverse_rpc_tests.cpp)
++    target_link_libraries(ps2_iop_reverse_rpc_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_reverse_rpc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_reverse_rpc_tests COMMAND ps2_iop_reverse_rpc_tests)
++
+ endif()
+ 
+ install(TARGETS ps2_iop
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index d545640..f3783f0 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -5,6 +5,8 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -19,6 +21,41 @@ namespace ps2x::iop
+         uint32_t serverAddress = 0;
+         uint32_t bufferAddress = 0;
+     };
++
++    // Value-only admission payload for the observed asynchronous sifcmd Call16
++    // shape. Addresses in the IOP fields are canonical IOP RAM addresses; the
++    // EE server/buffer addresses retain the SDK values supplied by Bind15.
++    struct ReverseRpcRequest
++    {
++        uint64_t nonce = 0;
++        uint32_t clientAddress = 0;
++        uint32_t receiveAddress = 0;
++        uint32_t serverAddress = 0;
++        uint32_t bufferAddress = 0;
++        uint32_t function = 0;
++        uint32_t mode = 0;
++        std::array<uint8_t, 40> send{};
++    };
++
++    // The host invokes this only on its serialized guest executor. A successful
++    // completion is result == 0 with exactly 64 reply bytes. The IOP bridge
++    // rejects other successful-looking completions and never assumes this
++    // callback is safe to invoke from another thread.
++    using ReverseRpcCompletion = std::function<void(int32_t result, std::span<const uint8_t> reply)>;
++
++    // Hosts must check isCurrent immediately before any payload, enqueue, or
++    // callee side effect, then use complete to deliver a staged result. Both
++    // callables are serialized on the guest executor.
++    struct ReverseRpcCompletionEndpoint
++    {
++    // The host must call this immediately before an observable payload,
++    // enqueue, or callee side effect. It is true after the exact owned wait is
++    // installed, including while submitReverseRpc is still deciding admission.
++    // A false result requires complete with a negative result if the host still
++    // owns an outstanding endpoint; it must not abandon the guest waiter.
++    std::function<bool()> isCurrent;
++        ReverseRpcCompletion complete;
++    };
+     enum class HostPathKind : uint32_t
+     {
+         ElfDirectory = 0,
+@@ -165,5 +202,13 @@ namespace ps2x::iop
+         virtual bool writeSifRegister(SifRegister, uint32_t) { return false; }
+         virtual void resetIopSifRegisters() {}
+         virtual GuestRpcBinding lookupGuestRpcBinding(uint32_t) { return {}; }
++
++        // Hosts own EE reservations and transport. Returning false leaves the
++        // IOP caller with an explicit negative completion and preserves reply
++        // memory. The default intentionally keeps reverse Call16 unsupported.
++        virtual bool submitReverseRpc(const ReverseRpcRequest &, ReverseRpcCompletionEndpoint)
++        {
++            return false;
++        }
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index cdbf6f7..eaf5255 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -28,6 +28,7 @@ namespace ps2x::iop::detail
+ 
+     void IopMemory::reset()
+     {
++        notifyRamRetired(0u, RamSize);
+         std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
+@@ -368,6 +369,7 @@ namespace ps2x::iop::detail
+                                         { return candidate.address == address; });
+         if (block == m_allocations.end())
+             return false;
++        notifyRamRetired(block->address, block->size);
+         std::fill(m_owned.begin() + block->address,
+                   m_owned.begin() + block->address + block->size,
+                   uint8_t{0});
+@@ -375,6 +377,39 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
++    bool IopMemory::setRamRetirementObserver(const void *owner,
++                                             std::function<void(uint32_t, uint32_t)> observer)
++    {
++        if (owner == nullptr || !observer || (m_ramRetirementOwner != nullptr && m_ramRetirementOwner != owner))
++            return false;
++        m_ramRetirementObserver = std::move(observer);
++        m_ramRetirementOwner = owner;
++        return true;
++    }
++
++    void IopMemory::clearRamRetirementObserver(const void *owner) noexcept
++    {
++        if (owner != nullptr && m_ramRetirementOwner == owner)
++        {
++            m_ramRetirementObserver = {};
++            m_ramRetirementOwner = nullptr;
++        }
++    }
++
++    void IopMemory::notifyRamRetired(uint32_t address, uint32_t size) noexcept
++    {
++        if (!m_ramRetirementObserver)
++            return;
++        try
++        {
++            m_ramRetirementObserver(address, size);
++        }
++        catch (...)
++        {
++            // Retirement cannot change allocator/reset success semantics.
++        }
++    }
++
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+         return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 1c3faef..bf59bbe 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -61,6 +61,13 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t maxFreeMemory() const;
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+ 
++        // One serialized guest-executor owner may observe backing retirement.
++        // A successful free/reset notifies before RAM ownership or allocation
++        // state changes. The owner token is compared only and never dereferenced.
++        [[nodiscard]] bool setRamRetirementObserver(const void *owner,
++                                                     std::function<void(uint32_t, uint32_t)> observer);
++        void clearRamRetirementObserver(const void *owner) noexcept;
++
+         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
+         [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
+         [[nodiscard]] uint32_t interruptControl() const noexcept { return m_interruptControl; }
+@@ -82,12 +89,15 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
++        void notifyRamRetired(uint32_t address, uint32_t size) noexcept;
+ 
+         std::vector<uint8_t> m_ram;
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
+         std::vector<Allocation> m_allocations;
++        const void *m_ramRetirementOwner = nullptr;
++        std::function<void(uint32_t, uint32_t)> m_ramRetirementObserver;
+         uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cb2dacc..f79b413 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -9,18 +9,208 @@
+ #include <array>
+ #include <cstring>
+ #include <limits>
++#include <stdexcept>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+-    IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+-        : m_host(host), m_memory(memory), m_kernel(kernel)
++    namespace
+     {
++        constexpr int32_t kReverseRpcFailure = -5;
++        constexpr uint32_t kClientBytes = 40u;
++        constexpr uint32_t kSendBytes = 40u;
++        constexpr uint32_t kReplyBytes = 64u;
++
++        [[nodiscard]] bool addWithinUint32(uint32_t address, uint32_t size) noexcept
++        {
++            return size <= std::numeric_limits<uint32_t>::max() - address;
++        }
++    }
++
++    struct IopRpcBridge::ReverseRpcEndpoint
++    {
++        IopKernel::RpcWaitOwner owner;
++        uint64_t nonce = 0u;
++        std::array<uint32_t, kClientBytes / sizeof(uint32_t)> clientWords{};
++        std::array<uint8_t, kReplyBytes> stagedReply{};
++        uint32_t clientAddress = 0u;
++        uint32_t receiveAddress = 0u;
++        int32_t stagedResult = kReverseRpcFailure;
++        size_t stagedReplySize = 0u;
++        bool submissionOpen = true;
++        bool accepted = false;
++        bool completionStaged = false;
++    };
++
++    // This lease is only accessed by the serialized guest executor contract of
++    // IopHost::submitReverseRpc. Callbacks retain no bridge, CPU, frame, or
++    // thread-container pointer; reset/destruction expires their weak lease.
++    struct IopRpcBridge::ReverseRpcLease
++    {
++        IopMemory *memory = nullptr;
++        IopKernel *kernel = nullptr;
++        std::unordered_map<uint32_t, std::shared_ptr<ReverseRpcEndpoint>> endpoints;
++    };
++
++    IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel)
++        : m_host(host), m_memory(memory), m_kernel(kernel),
++          m_reverseLease(std::make_shared<ReverseRpcLease>(ReverseRpcLease{&memory, &kernel}))
++    {
++        const std::weak_ptr<ReverseRpcLease> weakLease = m_reverseLease;
++        std::function<void(uint32_t, uint32_t)> retirement = [weakLease](uint32_t base, uint32_t size) noexcept
++        {
++            IopRpcBridge::revokeRetiredEndpoints(weakLease, base, size);
++        };
++        if (!m_memory.setRamRetirementObserver(this, std::move(retirement)))
++            throw std::runtime_error("IOP RAM retirement observer already has a live owner");
++    }
++
++    IopRpcBridge::~IopRpcBridge()
++    {
++        while (!m_reverseLease->endpoints.empty())
++            revokeReverseEndpoint(m_reverseLease, m_reverseLease->endpoints.begin()->first);
++        m_memory.clearRamRetirementObserver(this);
++        m_reverseLease.reset();
++    }
++
++    uint32_t IopRpcBridge::canonicalAddress(uint32_t address) noexcept
++    {
++        return IopMemory::physicalAddress(address);
++    }
++
++    bool IopRpcBridge::rangesOverlap(uint32_t firstAddress, uint32_t firstSize,
++                                     uint32_t secondAddress, uint32_t secondSize) noexcept
++    {
++        return firstSize != 0u && secondSize != 0u &&
++               firstAddress < secondAddress + secondSize && secondAddress < firstAddress + firstSize;
++    }
++
++    bool IopRpcBridge::clientIdentityMatches(const ReverseRpcLease &lease,
++                                             const ReverseRpcEndpoint &endpoint) noexcept
++    {
++        std::array<uint32_t, kClientBytes / sizeof(uint32_t)> words{};
++        return lease.memory != nullptr &&
++               lease.memory->ownsRamRange(endpoint.clientAddress, kClientBytes) &&
++               lease.memory->ownsRamRange(endpoint.receiveAddress, kReplyBytes) &&
++               lease.memory->readRam(endpoint.clientAddress, words.data(), sizeof(words)) &&
++               words == endpoint.clientWords;
++    }
++
++    bool IopRpcBridge::reverseEndpointCurrent(const std::weak_ptr<ReverseRpcLease> &weakLease,
++                                               const std::shared_ptr<ReverseRpcEndpoint> &endpoint) noexcept
++    {
++        const std::shared_ptr<ReverseRpcLease> lease = weakLease.lock();
++        if (!lease || lease->kernel == nullptr || !lease->kernel->isRpcWaitCurrent(endpoint->owner) ||
++            !clientIdentityMatches(*lease, *endpoint))
++            return false;
++        const auto installed = lease->endpoints.find(endpoint->clientAddress);
++        return installed != lease->endpoints.end() && installed->second == endpoint;
++    }
++
++    void IopRpcBridge::revokeReverseEndpoint(const std::shared_ptr<ReverseRpcLease> &lease,
++                                             uint32_t canonicalClient) noexcept
++    {
++        const auto found = lease->endpoints.find(canonicalClient);
++        if (found == lease->endpoints.end())
++            return;
++        const std::shared_ptr<ReverseRpcEndpoint> endpoint = found->second;
++        lease->endpoints.erase(found);
++        if (lease->kernel != nullptr && lease->kernel->isRpcWaitCurrent(endpoint->owner))
++            (void)lease->kernel->completeRpcWait(endpoint->owner, kReverseRpcFailure);
++    }
++
++    void IopRpcBridge::revokeRetiredEndpoints(const std::weak_ptr<ReverseRpcLease> &weakLease,
++                                              uint32_t base, uint32_t size) noexcept
++    {
++        const std::shared_ptr<ReverseRpcLease> lease = weakLease.lock();
++        if (!lease || size == 0u || base > IopMemory::RamSize || size > IopMemory::RamSize - base)
++            return;
++        for (auto endpoint = lease->endpoints.begin(); endpoint != lease->endpoints.end();)
++        {
++            const std::shared_ptr<ReverseRpcEndpoint> value = endpoint->second;
++            if (!rangesOverlap(value->clientAddress, kClientBytes, base, size) &&
++                !rangesOverlap(value->receiveAddress, kReplyBytes, base, size))
++            {
++                ++endpoint;
++                continue;
++            }
++            endpoint = lease->endpoints.erase(endpoint);
++            if (lease->kernel != nullptr && lease->kernel->isRpcWaitCurrent(value->owner))
++                (void)lease->kernel->completeRpcWait(value->owner, kReverseRpcFailure);
++        }
++    }
++
++    void IopRpcBridge::completeReverseEndpoint(const std::weak_ptr<ReverseRpcLease> &weakLease,
++                                               const std::shared_ptr<ReverseRpcEndpoint> &endpoint,
++                                               int32_t result, std::span<const uint8_t> reply) noexcept
++    {
++        const std::shared_ptr<ReverseRpcLease> lease = weakLease.lock();
++        if (!lease || lease->memory == nullptr || lease->kernel == nullptr)
++            return;
++
++        // A host is allowed to invoke its callback inline. Retain only a value
++        // copy until submitReverseRpc confirms admission, so a later rejection
++        // or exception cannot leave a success reply behind.
++        if (endpoint->submissionOpen)
++        {
++            if (!endpoint->completionStaged)
++            {
++                endpoint->stagedResult = result;
++                endpoint->stagedReplySize = reply.size();
++                if (reply.size() == kReplyBytes && reply.data() != nullptr)
++                    std::memcpy(endpoint->stagedReply.data(), reply.data(), endpoint->stagedReply.size());
++                endpoint->completionStaged = true;
++            }
++            return;
++        }
++        if (!endpoint->accepted)
++            return;
++
++        // A host failure may wake the still-owned worker, but it cannot alter
++        // reply memory. Successful-looking results require the exact observed
++        // reply footprint and a current unmodified client identity.
++        if (result != 0 || reply.size() != kReplyBytes || reply.data() == nullptr)
++        {
++            if (lease->kernel->isRpcWaitCurrent(endpoint->owner))
++                (void)lease->kernel->completeRpcWait(endpoint->owner, kReverseRpcFailure);
++            return;
++        }
++
++        std::array<uint8_t, kReplyBytes> stagedReply{};
++        std::memcpy(stagedReply.data(), reply.data(), stagedReply.size());
++        if (!reverseEndpointCurrent(weakLease, endpoint))
++        {
++            if (lease->kernel->isRpcWaitCurrent(endpoint->owner))
++                (void)lease->kernel->completeRpcWait(endpoint->owner, kReverseRpcFailure);
++            return;
++        }
++
++        // Serialized delivery means this is the final validity check before the
++        // single IOP-RAM commit. A stale owner never receives a reply write.
++        if (!reverseEndpointCurrent(weakLease, endpoint) ||
++            !lease->memory->writeRam(endpoint->receiveAddress, stagedReply.data(), stagedReply.size()))
++        {
++            if (lease->kernel->isRpcWaitCurrent(endpoint->owner))
++                (void)lease->kernel->completeRpcWait(endpoint->owner, kReverseRpcFailure);
++            return;
++        }
++        (void)lease->kernel->completeRpcWait(endpoint->owner, 0);
+     }
+ 
+     void IopRpcBridge::reset()
+     {
++        auto nextLease = std::make_shared<ReverseRpcLease>(ReverseRpcLease{&m_memory, &m_kernel});
++        const std::weak_ptr<ReverseRpcLease> weakNextLease = nextLease;
++        std::function<void(uint32_t, uint32_t)> retirement = [weakNextLease](uint32_t base, uint32_t size) noexcept
++        {
++            IopRpcBridge::revokeRetiredEndpoints(weakNextLease, base, size);
++        };
++        if (!m_memory.setRamRetirementObserver(this, std::move(retirement)))
++            return;
+         m_servers.clear();
++        while (!m_reverseLease->endpoints.empty())
++            revokeReverseEndpoint(m_reverseLease, m_reverseLease->endpoints.begin()->first);
++        m_reverseLease = std::move(nextLease);
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+     }
+@@ -192,6 +382,11 @@ namespace ps2x::iop::detail
+             std::array<uint32_t, 10> words{};
+             if (!m_memory.readRam(client, words.data(), sizeof(words)))
+             { setV0(uint32_t(-2)); return true; }
++            const uint32_t canonicalClient = canonicalAddress(client);
++            // A successful same-address rebind invalidates an outstanding Call16
++            // endpoint before changing the client identity. Rejected binds leave
++            // another worker's endpoint untouched.
++            revokeReverseEndpoint(m_reverseLease, canonicalClient);
+             words[0] = 0u; // completed packet; no synthetic packet allocation
+             words[2] = 0xFFFFFFFFu; // no live semaphore allocation
+             words[4] = 0u; // command
+@@ -203,9 +398,148 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         }
+-        case 16: // Reverse execution/completion is not implemented by binding.
+-            setV0(uint32_t(-48));
++        case 16: // Observed asynchronous reverse execution/completion.
++        {
++            const uint32_t client = cpu.gpr[4];
++            const uint32_t function = cpu.gpr[5];
++            const uint32_t mode = cpu.gpr[6];
++            const uint32_t send = cpu.gpr[7];
++            const uint32_t stack = cpu.gpr[29];
++            constexpr uint32_t kStackArgumentsOffset = 16u;
++            constexpr uint32_t kStackArgumentBytes = 20u;
++            std::array<uint32_t, 5> stackArguments{};
++            const uint32_t canonicalStack = canonicalAddress(stack);
++            constexpr uint32_t kRequiredStackSpan = kStackArgumentsOffset + kStackArgumentBytes;
++            if (client == 0u || send == 0u || (client & 3u) != 0u || (send & 3u) != 0u ||
++                (stack & 3u) != 0u || canonicalStack > IopMemory::RamSize ||
++                kRequiredStackSpan > IopMemory::RamSize - canonicalStack ||
++                !m_memory.ownsRamRange(client, kClientBytes) ||
++                !m_memory.ownsRamRange(send, kSendBytes) ||
++                !m_memory.ownsRamRange(canonicalStack, kRequiredStackSpan) ||
++                !m_memory.readRam(canonicalStack + kStackArgumentsOffset, stackArguments.data(), sizeof(stackArguments)))
++            {
++                setV0(uint32_t(-2));
++                return true;
++            }
++
++            const uint32_t sendSize = stackArguments[0];
++            const uint32_t receive = stackArguments[1];
++            const uint32_t receiveSize = stackArguments[2];
++            const uint32_t endFunction = stackArguments[3];
++            const uint32_t endParameter = stackArguments[4];
++            const uint32_t canonicalClient = canonicalAddress(client);
++            const uint32_t canonicalSend = canonicalAddress(send);
++            const uint32_t canonicalReceive = canonicalAddress(receive);
++            if (receive == 0u || (receive & 3u) != 0u || function != 0u || mode != 0u ||
++                sendSize != kSendBytes || receiveSize != kReplyBytes || endFunction != 0u || endParameter != 0u ||
++                !m_memory.ownsRamRange(receive, kReplyBytes) ||
++                rangesOverlap(canonicalClient, kClientBytes, canonicalSend, kSendBytes) ||
++                rangesOverlap(canonicalClient, kClientBytes, canonicalReceive, kReplyBytes) ||
++                rangesOverlap(canonicalSend, kSendBytes, canonicalReceive, kReplyBytes))
++            {
++                setV0(uint32_t(-2));
++                return true;
++            }
++
++            std::array<uint32_t, kClientBytes / sizeof(uint32_t)> clientWords{};
++            std::array<uint8_t, kSendBytes> stagedSend{};
++            if (!m_memory.readRam(canonicalClient, clientWords.data(), sizeof(clientWords)) ||
++                !m_memory.readRam(canonicalSend, stagedSend.data(), stagedSend.size()) ||
++                clientWords[5] == 0u || clientWords[9] == 0u || m_nextReverseRpcNonce == 0u)
++            {
++                setV0(uint32_t(kReverseRpcFailure));
++                return true;
++            }
++
++            const auto existing = m_reverseLease->endpoints.find(canonicalClient);
++            if (existing != m_reverseLease->endpoints.end())
++            {
++                if (m_kernel.isRpcWaitCurrent(existing->second->owner))
++                {
++                    setV0(uint32_t(kReverseRpcFailure));
++                    return true;
++                }
++                m_reverseLease->endpoints.erase(existing);
++            }
++
++            const uint64_t nonce = m_nextReverseRpcNonce++;
++            std::shared_ptr<ReverseRpcEndpoint> endpoint;
++            ReverseRpcRequest request;
++            ReverseRpcCompletionEndpoint completionEndpoint;
++            const std::weak_ptr<ReverseRpcLease> weakLease = m_reverseLease;
++            bool endpointInserted = false;
++            try
++            {
++                endpoint = std::make_shared<ReverseRpcEndpoint>();
++                endpoint->nonce = nonce;
++                endpoint->clientWords = clientWords;
++                endpoint->clientAddress = canonicalClient;
++                endpoint->receiveAddress = canonicalReceive;
++                request.nonce = nonce;
++                request.clientAddress = canonicalClient;
++                request.receiveAddress = canonicalReceive;
++                request.serverAddress = clientWords[9];
++                request.bufferAddress = clientWords[5];
++                request.function = function;
++                request.mode = mode;
++                request.send = stagedSend;
++                completionEndpoint.isCurrent = [weakLease, endpoint]
++                {
++                    return IopRpcBridge::reverseEndpointCurrent(weakLease, endpoint);
++                };
++                completionEndpoint.complete = [weakLease, endpoint](int32_t completionResult, std::span<const uint8_t> reply)
++                {
++                    IopRpcBridge::completeReverseEndpoint(weakLease, endpoint, completionResult, reply);
++                };
++                endpointInserted = m_reverseLease->endpoints.emplace(canonicalClient, endpoint).second;
++            }
++            catch (...)
++            {
++                setV0(uint32_t(kReverseRpcFailure));
++                return true;
++            }
++            if (!endpointInserted)
++            {
++                setV0(uint32_t(kReverseRpcFailure));
++                return true;
++            }
++
++            const auto owner = m_kernel.beginRpcWait(cpu, nonce);
++            if (!owner)
++            {
++                m_reverseLease->endpoints.erase(canonicalClient);
++                setV0(uint32_t(kReverseRpcFailure));
++                return true;
++            }
++            endpoint->owner = *owner;
++            bool accepted = false;
++            try
++            {
++                accepted = m_host.submitReverseRpc(request, completionEndpoint);
++            }
++            catch (...)
++            {
++                accepted = false;
++            }
++            endpoint->submissionOpen = false;
++            if (!accepted)
++            {
++                revokeReverseEndpoint(m_reverseLease, canonicalClient);
++            }
++            else
++            {
++                endpoint->accepted = true;
++                if (endpoint->completionStaged)
++                {
++                    const std::span<const uint8_t> stagedReply = endpoint->stagedReplySize == kReplyBytes
++                        ? std::span<const uint8_t>(endpoint->stagedReply.data(), endpoint->stagedReply.size())
++                        : std::span<const uint8_t>{};
++                    completeReverseEndpoint(weakLease, endpoint, endpoint->stagedResult,
++                                            stagedReply);
++                }
++            }
+             return true;
++        }
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
+@@ -437,6 +771,14 @@ namespace ps2x::iop::detail
+ 
+     void IopRpcBridge::removeServersInRange(uint32_t base, uint32_t size)
+     {
++        if (size != 0u && addWithinUint32(base, size))
++        {
++            const uint32_t canonicalBase = canonicalAddress(base);
++            if (canonicalBase <= IopMemory::RamSize && size <= IopMemory::RamSize - canonicalBase)
++            {
++                revokeRetiredEndpoints(m_reverseLease, canonicalBase, size);
++            }
++        }
+         for (auto server = m_servers.begin(); server != m_servers.end();)
+         {
+             const uint32_t function = IopMemory::physicalAddress(server->second.function);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index 5e1ce37..7900e19 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -4,6 +4,8 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <array>
++#include <memory>
+ #include <span>
+ #include <unordered_map>
+ 
+@@ -75,7 +77,12 @@ namespace ps2x::iop::detail
+     class IopRpcBridge
+     {
+     public:
+-        IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
++        IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel);
++        ~IopRpcBridge();
++        IopRpcBridge(const IopRpcBridge &) = delete;
++        IopRpcBridge &operator=(const IopRpcBridge &) = delete;
++        IopRpcBridge(IopRpcBridge &&) = delete;
++        IopRpcBridge &operator=(IopRpcBridge &&) = delete;
+ 
+         void reset();
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+@@ -88,6 +95,24 @@ namespace ps2x::iop::detail
+         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+ 
+     private:
++        struct ReverseRpcEndpoint;
++        struct ReverseRpcLease;
++
++        [[nodiscard]] static uint32_t canonicalAddress(uint32_t address) noexcept;
++        [[nodiscard]] static bool rangesOverlap(uint32_t firstAddress, uint32_t firstSize,
++                                                uint32_t secondAddress, uint32_t secondSize) noexcept;
++        [[nodiscard]] static bool clientIdentityMatches(const ReverseRpcLease &lease,
++                                                        const ReverseRpcEndpoint &endpoint) noexcept;
++        [[nodiscard]] static bool reverseEndpointCurrent(const std::weak_ptr<ReverseRpcLease> &lease,
++                                                         const std::shared_ptr<ReverseRpcEndpoint> &endpoint) noexcept;
++        static void revokeReverseEndpoint(const std::shared_ptr<ReverseRpcLease> &lease,
++                                          uint32_t canonicalClient) noexcept;
++        static void revokeRetiredEndpoints(const std::weak_ptr<ReverseRpcLease> &lease,
++                                           uint32_t base, uint32_t size) noexcept;
++        static void completeReverseEndpoint(const std::weak_ptr<ReverseRpcLease> &lease,
++                                            const std::shared_ptr<ReverseRpcEndpoint> &endpoint,
++                                            int32_t result, std::span<const uint8_t> reply) noexcept;
++
+         struct RpcServer
+         {
+             uint32_t sid = 0;
+@@ -104,6 +129,8 @@ namespace ps2x::iop::detail
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
++        std::shared_ptr<ReverseRpcLease> m_reverseLease;
++        uint64_t m_nextReverseRpcNonce = 1u;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+     };
+diff --git a/ps2xIOP/tests/iop_reverse_rpc_tests.cpp b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+new file mode 100644
+index 0000000..db0ec60
+--- /dev/null
++++ b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+@@ -0,0 +1,1229 @@
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/services/iop_rpc.h"
++#include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/iop_subsystem.h"
++
++#include <array>
++#include <cstring>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++
++    constexpr uint32_t kDescriptor = 0x1000u;
++    constexpr uint32_t kEntry = 0x4000u;
++    constexpr uint32_t kStack = 0x8000u;
++    constexpr uint32_t kClient = 0x10000u;
++    constexpr uint32_t kSend = 0x10100u;
++    constexpr uint32_t kReply = 0x10200u;
++    constexpr uint32_t kServer = 0x01800000u;
++    constexpr uint32_t kBuffer = 0x01800100u;
++    constexpr int32_t kFailure = -5;
++
++    void require(bool condition, std::string_view message)
++    {
++        if (!condition)
++            throw std::runtime_error(std::string(message));
++    }
++
++    class Host final : public IopHost
++    {
++    public:
++        Host() : guest(0x20000u, 0u) {}
++
++        bool readGuest(uint32_t address, void *destination, size_t size) const override
++        {
++            if ((size != 0u && destination == nullptr) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(destination, guest.data() + address, size);
++            return true;
++        }
++        bool writeGuest(uint32_t address, const void *source, size_t size) override
++        {
++            if ((size != 0u && source == nullptr) || address > guest.size() || size > guest.size() - address)
++                return false;
++            if (size != 0u)
++                std::memcpy(guest.data() + address, source, size);
++            return true;
++        }
++        bool zeroGuest(uint32_t address, size_t size) override
++        {
++            if (address > guest.size() || size > guest.size() - address)
++                return false;
++            std::memset(guest.data() + address, 0, size);
++            return true;
++        }
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override
++        {
++            normalized = address;
++            return address < guest.size();
++        }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 0u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind) const override { return {}; }
++        std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
++        uint64_t openHostFile(std::string_view) override { return 0u; }
++        bool hostFileSize(uint64_t, uint64_t &) const override { return false; }
++        bool readHostFile(uint64_t, uint64_t, void *, size_t, size_t &) override { return false; }
++        void closeHostFile(uint64_t) override {}
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
++        void log(LogLevel, std::string_view) override {}
++
++        GuestRpcBinding lookupGuestRpcBinding(uint32_t) override { return binding; }
++
++        bool submitReverseRpc(const ReverseRpcRequest &request, ReverseRpcCompletionEndpoint endpointValue) override
++        {
++            lastRequest = request;
++            endpoint = std::move(endpointValue);
++            if (checkGuardDuringSubmit)
++            {
++                guardDuringSubmit = endpoint.isCurrent && endpoint.isCurrent();
++                if (guardDuringSubmit)
++                    ++guardedSideEffects;
++                else
++                    endpoint.complete(kFailure, {});
++            }
++            if (duringSubmit)
++                duringSubmit();
++            ++submissions;
++            if (completeInline)
++            {
++                endpoint.complete(inlineResult, std::span<const uint8_t>(inlineReply.data(), inlineReplySize));
++                if (duplicateInline)
++                    endpoint.complete(inlineResult, std::span<const uint8_t>(inlineReply.data(), inlineReplySize));
++            }
++            if (throwOnSubmit)
++                throw std::runtime_error("host submit exception");
++            return accept;
++        }
++
++        void complete(int32_t result, std::span<const uint8_t> reply = {})
++        {
++            require(static_cast<bool>(endpoint.complete), "host has no deferred completion");
++            endpoint.complete(result, reply);
++        }
++
++        GuestRpcBinding binding{};
++        std::vector<uint8_t> guest;
++        ReverseRpcRequest lastRequest{};
++        ReverseRpcCompletionEndpoint endpoint;
++        uint32_t submissions = 0u;
++        bool accept = true;
++        bool throwOnSubmit = false;
++        bool completeInline = false;
++        bool duplicateInline = false;
++        int32_t inlineResult = 0;
++        std::array<uint8_t, 64> inlineReply{};
++        size_t inlineReplySize = inlineReply.size();
++        bool checkGuardDuringSubmit = false;
++        bool guardDuringSubmit = false;
++        uint32_t guardedSideEffects = 0u;
++        std::function<void()> duringSubmit;
++    };
++
++    struct Fixture
++    {
++        IopMemory memory;
++        IopKernel kernel{memory};
++        Host host;
++        IopRpcBridge bridge{host, memory, kernel};
++        IopCpuState control{};
++
++        int createThread(uint32_t entry = kEntry)
++        {
++            memory.write32(kDescriptor + 0u, 0u);
++            memory.write32(kDescriptor + 4u, 0u);
++            memory.write32(kDescriptor + 8u, entry);
++            memory.write32(kDescriptor + 12u, 0x400u);
++            memory.write32(kDescriptor + 16u, 10u);
++            control = {};
++            control.gpr[4] = kDescriptor;
++            require(kernel.dispatchThreadImport(4u, control, 0u), "CreateThread was not handled");
++            require(static_cast<int32_t>(control.gpr[2]) > 0, "CreateThread failed");
++            return static_cast<int>(control.gpr[2]);
++        }
++
++        void startThread(int id)
++        {
++            control = {};
++            control.gpr[4] = static_cast<uint32_t>(id);
++            require(kernel.dispatchThreadImport(7u, control, 0u), "StartThread was not handled");
++            require(control.gpr[2] == 0u, "StartThread failed");
++        }
++
++        IopThread &runThread()
++        {
++            IopThread *thread = kernel.beginNextReady(0u);
++            require(thread != nullptr && thread->state == IopThreadState::Running, "worker did not run");
++            return *thread;
++        }
++
++        void endSlice(IopThread &thread)
++        {
++            kernel.endTimeslice(thread, 0xFFFFFFFFu);
++            require(!kernel.hasCurrentThread(), "timeslice owner remained current");
++        }
++
++        void prepare(uint32_t client = kClient, uint32_t send = kSend, uint32_t reply = kReply,
++                     uint32_t function = 0u, uint32_t sendSize = 40u, uint32_t receiveSize = 64u,
++                     uint32_t mode = 0u, uint32_t endFunction = 0u, uint32_t endParameter = 0u)
++        {
++            std::array<uint32_t, 10> clientWords{};
++            clientWords[5] = kBuffer;
++            clientWords[9] = kServer;
++            std::array<uint8_t, 40> sendBytes{};
++            std::array<uint8_t, 64> replyBytes{};
++            for (uint32_t index = 0u; index < sendBytes.size(); ++index)
++                sendBytes[index] = static_cast<uint8_t>(0x20u + index);
++            replyBytes.fill(0xA5u);
++            std::array<uint8_t, 36> stackBytes{};
++            const std::array<uint32_t, 5> stackArgs{sendSize, reply, receiveSize, endFunction, endParameter};
++            std::memcpy(stackBytes.data() + 16u, stackArgs.data(), sizeof(stackArgs));
++            require(memory.writeRam(client, clientWords.data(), sizeof(clientWords)), "client setup failed");
++            require(memory.writeRam(send, sendBytes.data(), sendBytes.size()), "send setup failed");
++            require(memory.writeRam(reply, replyBytes.data(), replyBytes.size()), "reply setup failed");
++            require(memory.writeRam(kStack, stackBytes.data(), stackBytes.size()), "stack setup failed");
++            (void)function;
++        }
++
++        bool call16(IopCpuState &cpu, uint32_t client = kClient, uint32_t function = 0u,
++                    uint32_t mode = 0u, uint32_t send = kSend)
++        {
++            cpu.gpr[4] = client;
++            cpu.gpr[5] = function;
++            cpu.gpr[6] = mode;
++            cpu.gpr[7] = send;
++            cpu.gpr[29] = kStack;
++            return bridge.dispatchSifCmdImport(16u, cpu);
++        }
++
++        std::array<uint8_t, 64> reply() const
++        {
++            std::array<uint8_t, 64> value{};
++            require(memory.readRam(kReply, value.data(), value.size()), "reply read failed");
++            return value;
++        }
++    };
++
++    std::array<uint8_t, 64> patternedReply(uint8_t seed = 0x60u)
++    {
++        std::array<uint8_t, 64> value{};
++        for (uint32_t index = 0u; index < value.size(); ++index)
++            value[index] = static_cast<uint8_t>(seed + index);
++        return value;
++    }
++
++    class MipsCall16Irx
++    {
++    public:
++        static constexpr uint32_t kBase = 0x10000u;
++        static constexpr uint32_t kDescriptor = kBase + 0x300u;
++        static constexpr uint32_t kClient = kBase + 0x340u;
++        static constexpr uint32_t kSend = kBase + 0x370u;
++        static constexpr uint32_t kReply = kBase + 0x3A0u;
++        static constexpr uint32_t kFirstResult = kBase + 0x3E0u;
++        static constexpr uint32_t kSecondResult = kBase + 0x3E4u;
++        static constexpr uint32_t kContinuationCount = kBase + 0x3E8u;
++
++        MipsCall16Irx() : bytes(0x100u + 0x500u, 0u)
++        {
++            put32(0u, 0x464C457Fu);
++            bytes[4] = bytes[5] = bytes[6] = 1u;
++            put16(16u, 2u);
++            put16(18u, 8u);
++            put32(20u, 1u);
++            put32(24u, kBase);
++            put32(28u, 52u);
++            put16(40u, 52u);
++            put16(42u, 32u);
++            put16(44u, 1u);
++            put32(52u, 1u);
++            put32(56u, 0x100u);
++            put32(60u, kBase);
++            put32(64u, kBase);
++            put32(68u, 0x500u);
++            put32(72u, 0x500u);
++            put32(76u, 7u);
++            put32(80u, 4u);
++
++            constexpr uint32_t thbaseTable = 0x80u;
++            constexpr uint32_t sifcmdTable = 0xC0u;
++            constexpr uint32_t createThreadStub = kBase + thbaseTable + 20u;
++            constexpr uint32_t startThreadStub = createThreadStub + 8u;
++            constexpr uint32_t call16Stub = kBase + sifcmdTable + 20u;
++            words(0u, {
++                0x27BDFFE0u, 0xAFBF001Cu,
++                0x3C040001u, 0x34840300u,
++                0x0C000000u | ((createThreadStub >> 2u) & 0x03FFFFFFu), 0u,
++                0x00402021u,
++                0x0C000000u | ((startThreadStub >> 2u) & 0x03FFFFFFu), 0u,
++                0x8FBF001Cu, 0x00001021u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            words(thbaseTable, {
++                0x41E00000u, 0u, 0x00000101u, 0x61626874u, 0x00006573u,
++                0x03E00008u, 0x24000004u,
++                0x03E00008u, 0x24000006u,
++                0u, 0u,
++            });
++            words(sifcmdTable, {
++                0x41E00000u, 0u, 0x00000101u, 0x63666973u, 0x0000646Du,
++                0x03E00008u, 0x24000010u, 0u, 0u,
++            });
++
++            // The worker makes two Call16 imports without resetting. Each
++            // post-import store is an observable caller continuation witness.
++            words(0x180u, {
++                0x27BDFFD0u, 0xAFBF002Cu,
++                // a0=client, a1=function0, a2=mode0, a3=send.
++                // stack+16..32 = sendSize, receive, receiveSize, end_fn, end_param.
++                0x3C040001u, 0x34840340u, 0x00002821u, 0x00003021u, 0x3C070001u, 0x34E70370u,
++                0x24080028u, 0xAFA80010u, 0x3C080001u, 0x350803A0u, 0xAFA80014u,
++                0x24080040u, 0xAFA80018u, 0xAFA0001Cu, 0xAFA00020u,
++                0x0C000000u | ((call16Stub >> 2u) & 0x03FFFFFFu), 0u,
++                0x3C080001u, 0x350803E0u, 0xAD020000u, 0x8D090008u, 0x25290001u, 0xAD090008u,
++                0x3C040001u, 0x34840340u, 0x00002821u, 0x00003021u, 0x3C070001u, 0x34E70370u,
++                0x24080028u, 0xAFA80010u, 0x3C080001u, 0x350803A0u, 0xAFA80014u,
++                0x24080040u, 0xAFA80018u, 0xAFA0001Cu, 0xAFA00020u,
++                0x0C000000u | ((call16Stub >> 2u) & 0x03FFFFFFu), 0u,
++                0x3C080001u, 0x350803E4u, 0xAD020000u, 0x8D090004u, 0x25290001u, 0xAD090004u,
++                0x8FBF002Cu, 0x27BD0030u, 0x03E00008u, 0u,
++            });
++
++            words(0x300u, {0u, 0u, kBase + 0x180u, 0x400u, 10u});
++            std::array<uint32_t, 10> client{};
++            client[5] = kBuffer;
++            client[9] = kServer;
++            for (uint32_t index = 0u; index < client.size(); ++index)
++                put32(0x100u + 0x340u + index * sizeof(uint32_t), client[index]);
++            for (uint32_t index = 0u; index < 40u; ++index)
++                bytes[0x100u + 0x370u + index] = static_cast<uint8_t>(0x80u + index);
++            std::fill_n(bytes.begin() + 0x100u + 0x3A0u, 64u, uint8_t{0xA5u});
++        }
++
++        void install(Host &host, uint32_t address = 0x1000u) const
++        {
++            require(host.writeGuest(address, bytes.data(), bytes.size()), "MIPS Call16 IRX does not fit");
++        }
++
++    private:
++        void put16(uint32_t offset, uint16_t value)
++        {
++            require(offset + 2u <= bytes.size(), "MIPS Call16 IRX write overflow");
++            bytes[offset] = static_cast<uint8_t>(value);
++            bytes[offset + 1u] = static_cast<uint8_t>(value >> 8u);
++        }
++        void put32(uint32_t offset, uint32_t value)
++        {
++            put16(offset, static_cast<uint16_t>(value));
++            put16(offset + 2u, static_cast<uint16_t>(value >> 16u));
++        }
++        void words(uint32_t offset, std::initializer_list<uint32_t> values)
++        {
++            for (const uint32_t value : values)
++            {
++                put32(0x100u + offset, value);
++                offset += sizeof(value);
++            }
++        }
++
++        std::vector<uint8_t> bytes;
++    };
++
++    void verifyMipsImportPipelineContinuation()
++    {
++        Host host;
++        MipsCall16Irx image;
++        image.install(host);
++        IopSubsystem iop(host);
++        const ModuleLoadResult loaded = iop.loadModuleBuffer(0x1000u);
++        require(loaded.handled && loaded.startResult == 0, "synthetic Call16 IRX did not create its worker");
++
++        iop.runEeCycles(8u * 20000u);
++        require(host.submissions == 1u, "MIPS worker did not reach deferred sifcmd Call16 import");
++        require(host.endpoint.isCurrent && host.endpoint.isCurrent(), "MIPS host endpoint was not current before first effect");
++        const auto first = patternedReply(0x11u);
++        host.complete(0, first);
++        require(!host.endpoint.isCurrent(), "first MIPS completion left its endpoint current");
++        std::array<uint8_t, 64> reply{};
++        require(iop.readMemory(MipsCall16Irx::kReply, reply.data(), reply.size()) && reply == first,
++                "first deferred MIPS reply was not committed to IOP RAM");
++
++        iop.runEeCycles(8u * 20000u);
++        require(host.submissions == 2u && host.lastRequest.nonce != 0u,
++                "MIPS worker did not resume once and issue the second Call16 without reset");
++        require(host.endpoint.isCurrent && host.endpoint.isCurrent(), "MIPS host endpoint was not current before second effect");
++        const auto second = patternedReply(0x51u);
++        host.complete(0, second);
++        iop.runEeCycles(8u * 20000u);
++
++        uint32_t firstResult = ~0u;
++        uint32_t secondResult = ~0u;
++        uint32_t continuations = 0u;
++        require(iop.readMemory(MipsCall16Irx::kFirstResult, &firstResult, sizeof(firstResult)) &&
++                    iop.readMemory(MipsCall16Irx::kSecondResult, &secondResult, sizeof(secondResult)) &&
++                    iop.readMemory(MipsCall16Irx::kContinuationCount, &continuations, sizeof(continuations)),
++                "MIPS caller result witnesses were unreadable");
++        if (firstResult != 0u || secondResult != 0u || continuations != 2u)
++            throw std::runtime_error("MIPS caller continuation witnesses were " + std::to_string(firstResult) + "," +
++                                     std::to_string(secondResult) + "," + std::to_string(continuations));
++        require(iop.readMemory(MipsCall16Irx::kReply, reply.data(), reply.size()) && reply == second,
++                "second deferred MIPS reply was not committed");
++    }
++
++    void verifyDeferredAndExactCompletion()
++    {
++        Fixture fixture;
++        fixture.prepare();
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        const uint32_t continuation = thread.cpu.pc;
++        const auto before = fixture.reply();
++        require(fixture.call16(thread.cpu), "Call16 was not handled");
++        require(thread.state == IopThreadState::RpcWait && thread.cpu.yielded, "Call16 did not start owned wait");
++        require(fixture.host.endpoint.isCurrent && fixture.host.endpoint.isCurrent(),
++                "deferred host endpoint was not current before delivery");
++        require(thread.cpu.pc == continuation, "Call16 changed continuation before completion");
++        require(fixture.host.submissions == 1u && fixture.host.lastRequest.clientAddress == kClient &&
++                    fixture.host.lastRequest.receiveAddress == kReply && fixture.host.lastRequest.serverAddress == kServer &&
++                    fixture.host.lastRequest.bufferAddress == kBuffer && fixture.host.lastRequest.function == 0u &&
++                    fixture.host.lastRequest.mode == 0u && fixture.host.lastRequest.send[0] == 0x20u,
++                "host did not receive immutable observed request values");
++        require(fixture.reply() == before, "admission changed reply memory");
++        const auto expected = patternedReply();
++        fixture.host.complete(0, expected);
++        require(thread.state == IopThreadState::Ready && thread.cpu.gpr[2] == 0u && fixture.reply() == expected,
++                "exact deferred completion did not commit reply and resume once");
++        require(!fixture.host.endpoint.isCurrent(), "completed endpoint remained current");
++        fixture.host.complete(0, expected);
++        require(fixture.reply() == expected && thread.cpu.gpr[2] == 0u, "duplicate completion changed result");
++    }
++
++    void verifyInvalidCompletionsPreserveReply()
++    {
++        for (const size_t replySize : {size_t{0u}, size_t{63u}, size_t{65u}})
++        {
++            Fixture fixture;
++            fixture.prepare();
++            const int id = fixture.createThread();
++            fixture.startThread(id);
++            IopThread &thread = fixture.runThread();
++            const auto before = fixture.reply();
++            require(fixture.call16(thread.cpu), "invalid-completion Call16 was not handled");
++            std::vector<uint8_t> malformed(replySize, 0xCCu);
++            fixture.host.complete(0, malformed);
++            require(thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == kFailure &&
++                        fixture.reply() == before, "malformed completion altered reply or did not fail");
++        }
++        Fixture fixture;
++        fixture.prepare();
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        const auto before = fixture.reply();
++        require(fixture.call16(thread.cpu), "negative-completion Call16 was not handled");
++        fixture.host.complete(-77, patternedReply());
++        require(thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == kFailure &&
++                    fixture.reply() == before, "negative completion altered reply");
++    }
++
++    void verifyAdmissionRejections()
++    {
++        struct InvalidCall
++        {
++            uint32_t function;
++            uint32_t sendSize;
++            uint32_t receiveSize;
++            uint32_t mode;
++            uint32_t callback;
++            uint32_t parameter;
++        };
++        for (const InvalidCall invalid : {
++                 InvalidCall{1u, 40u, 64u, 0u, 0u, 0u}, InvalidCall{0u, 39u, 64u, 0u, 0u, 0u},
++                 InvalidCall{0u, 40u, 63u, 0u, 0u, 0u}, InvalidCall{0u, 40u, 64u, 1u, 0u, 0u},
++                 InvalidCall{0u, 40u, 64u, 0u, 1u, 0u}, InvalidCall{0u, 40u, 64u, 0u, 0u, 1u}})
++        {
++            Fixture fixture;
++            fixture.prepare(kClient, kSend, kReply, invalid.function, invalid.sendSize, invalid.receiveSize,
++                            invalid.mode, invalid.callback);
++            const std::array<uint32_t, 5> args{invalid.sendSize, kReply, invalid.receiveSize, invalid.callback, invalid.parameter};
++            require(fixture.memory.writeRam(kStack + 16u, args.data(), sizeof(args)), "invalid stack write failed");
++            const int id = fixture.createThread();
++            fixture.startThread(id);
++            IopThread &thread = fixture.runThread();
++            const auto before = fixture.reply();
++            require(fixture.call16(thread.cpu, kClient, invalid.function, invalid.mode, kSend), "invalid Call16 unhandled");
++            require(fixture.host.submissions == 0u && thread.state == IopThreadState::Running &&
++                        static_cast<int32_t>(thread.cpu.gpr[2]) == -2 && fixture.reply() == before,
++                    "unsupported footprint reached host or mutated reply");
++        }
++
++        Fixture overlap;
++        overlap.prepare(kClient, kClient + 4u);
++        const int overlapId = overlap.createThread();
++        overlap.startThread(overlapId);
++        IopThread &overlapThread = overlap.runThread();
++        const auto beforeOverlap = overlap.reply();
++        require(overlap.call16(overlapThread.cpu, kClient, 0u, 0u, kClient + 4u), "overlap Call16 unhandled");
++        require(overlap.host.submissions == 0u && static_cast<int32_t>(overlapThread.cpu.gpr[2]) == -2 &&
++                    overlap.reply() == beforeOverlap, "overlap reached host");
++
++        Fixture badStack;
++        badStack.prepare();
++        const int stackId = badStack.createThread();
++        badStack.startThread(stackId);
++        IopThread &stackThread = badStack.runThread();
++        stackThread.cpu.gpr[29] = 0x001FFFF0u;
++        stackThread.cpu.gpr[4] = kClient;
++        stackThread.cpu.gpr[5] = 0u;
++        stackThread.cpu.gpr[6] = 0u;
++        stackThread.cpu.gpr[7] = kSend;
++        require(badStack.bridge.dispatchSifCmdImport(16u, stackThread.cpu), "bad-stack Call16 unhandled");
++        require(badStack.host.submissions == 0u && static_cast<int32_t>(stackThread.cpu.gpr[2]) == -2,
++                "bad stack reached host");
++
++        const auto rejectStack = [](uint32_t stack, std::string_view message)
++        {
++            Fixture fixture;
++            fixture.prepare();
++            // Seed the exact location decoded by the pre-span implementation:
++            // physical(stack + 16). Its arguments and all other backing are
++            // valid, so rejection is attributable to this stack base/span.
++            const std::array<uint32_t, 5> args{40u, kReply, 64u, 0u, 0u};
++            const uint32_t oldArgumentAddress = IopMemory::physicalAddress(stack + 16u);
++            require(fixture.memory.writeRam(oldArgumentAddress, args.data(), sizeof(args)),
++                    "legacy stack-argument seed failed");
++            const int id = fixture.createThread();
++            fixture.startThread(id);
++            IopThread &thread = fixture.runThread();
++            const auto before = fixture.reply();
++            thread.cpu.gpr[4] = kClient;
++            thread.cpu.gpr[5] = 0u;
++            thread.cpu.gpr[6] = 0u;
++            thread.cpu.gpr[7] = kSend;
++            thread.cpu.gpr[29] = stack;
++            require(fixture.bridge.dispatchSifCmdImport(16u, thread.cpu), "stack Call16 unhandled");
++            require(fixture.host.submissions == 0u && thread.state == IopThreadState::Running && !thread.cpu.yielded &&
++                        static_cast<int32_t>(thread.cpu.gpr[2]) == -2 && fixture.reply() == before, message);
++        };
++        rejectStack(kStack + 2u, "misaligned stack reached host");
++        rejectStack(0x1FFFFFF0u, "alias-boundary stack normalized into RAM zero");
++        rejectStack(0x9FFFFFF0u, "wrapped KSEG stack normalized into RAM zero");
++
++        Fixture truncated;
++        truncated.prepare();
++        constexpr uint32_t kShortStack = kStack + 0x100u;
++        const std::array<uint32_t, 5> truncatedArgs{40u, kReply, 64u, 0u, 0u};
++        require(truncated.memory.writeRam(kShortStack + 16u, truncatedArgs.data(), sizeof(truncatedArgs)),
++                "truncated stack seed failed");
++        const int truncatedId = truncated.createThread();
++        truncated.startThread(truncatedId);
++        IopThread &truncatedThread = truncated.runThread();
++        const auto truncatedBefore = truncated.reply();
++        truncatedThread.cpu.gpr[4] = kClient;
++        truncatedThread.cpu.gpr[5] = 0u;
++        truncatedThread.cpu.gpr[6] = 0u;
++        truncatedThread.cpu.gpr[7] = kSend;
++        truncatedThread.cpu.gpr[29] = kShortStack;
++        require(truncated.bridge.dispatchSifCmdImport(16u, truncatedThread.cpu), "truncated stack Call16 unhandled");
++        require(truncated.host.submissions == 0u && truncatedThread.state == IopThreadState::Running &&
++                    !truncatedThread.cpu.yielded && static_cast<int32_t>(truncatedThread.cpu.gpr[2]) == -2 &&
++                    truncated.reply() == truncatedBefore,
++                "partial stack arguments reached host");
++
++        Fixture aliases;
++        aliases.prepare();
++        const std::array<uint32_t, 5> aliasArgs{40u, kReply | 0x80000000u, 64u, 0u, 0u};
++        require(aliases.memory.writeRam(kStack + 16u, aliasArgs.data(), sizeof(aliasArgs)), "alias stack setup failed");
++        const int aliasId = aliases.createThread();
++        aliases.startThread(aliasId);
++        IopThread &aliasThread = aliases.runThread();
++        aliasThread.cpu.gpr[29] = kStack | 0x80000000u;
++        aliasThread.cpu.gpr[4] = kClient | 0x80000000u;
++        aliasThread.cpu.gpr[5] = 0u;
++        aliasThread.cpu.gpr[6] = 0u;
++        aliasThread.cpu.gpr[7] = kSend | 0x80000000u;
++        require(aliases.bridge.dispatchSifCmdImport(16u, aliasThread.cpu),
++                "canonical KSEG Call16 unhandled");
++        require(aliases.host.submissions == 1u && aliases.host.endpoint.isCurrent && aliases.host.endpoint.isCurrent(),
++                "canonical KSEG aliases were rejected");
++        aliases.host.complete(0, patternedReply());
++    }
++
++    void verifyAdmissionGuard()
++    {
++        Fixture deferred;
++        deferred.prepare();
++        deferred.host.checkGuardDuringSubmit = true;
++        const int deferredId = deferred.createThread();
++        deferred.startThread(deferredId);
++        IopThread &deferredThread = deferred.runThread();
++        const auto deferredBefore = deferred.reply();
++        require(deferred.call16(deferredThread.cpu), "guarded deferred Call16 unhandled");
++        require(deferred.host.guardDuringSubmit && deferred.host.guardedSideEffects == 1u &&
++                    deferredThread.state == IopThreadState::RpcWait && deferred.reply() == deferredBefore,
++                "admission guard was unavailable before deferred host side effect");
++        deferred.host.complete(0, patternedReply());
++        require(deferredThread.state == IopThreadState::Ready && deferredThread.cpu.gpr[2] == 0u,
++                "guarded deferred completion did not settle");
++
++        for (const bool throws : {false, true})
++        {
++            Fixture rejected;
++            rejected.prepare();
++            rejected.host.checkGuardDuringSubmit = true;
++            rejected.host.completeInline = true;
++            rejected.host.inlineReply = patternedReply();
++            rejected.host.accept = false;
++            rejected.host.throwOnSubmit = throws;
++            const int id = rejected.createThread();
++            rejected.startThread(id);
++            IopThread &thread = rejected.runThread();
++            const auto before = rejected.reply();
++            require(rejected.call16(thread.cpu), "guarded rejection Call16 unhandled");
++            require(rejected.host.guardDuringSubmit && rejected.host.guardedSideEffects == 1u &&
++                        thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == kFailure &&
++                        rejected.reply() == before && rejected.host.endpoint.isCurrent && !rejected.host.endpoint.isCurrent(),
++                    "rejected guarded submission left authority or reply state");
++        }
++
++        Fixture inlineAccepted;
++        inlineAccepted.prepare();
++        inlineAccepted.host.checkGuardDuringSubmit = true;
++        inlineAccepted.host.completeInline = true;
++        inlineAccepted.host.inlineReply = patternedReply(0x39u);
++        const int inlineId = inlineAccepted.createThread();
++        inlineAccepted.startThread(inlineId);
++        IopThread &inlineThread = inlineAccepted.runThread();
++        require(inlineAccepted.call16(inlineThread.cpu), "guarded inline Call16 unhandled");
++        require(inlineAccepted.host.guardDuringSubmit && inlineAccepted.host.guardedSideEffects == 1u &&
++                    inlineThread.state == IopThreadState::Ready && inlineThread.cpu.gpr[2] == 0u &&
++                    inlineAccepted.reply() == inlineAccepted.host.inlineReply,
++                "inline guarded completion did not stage until acceptance");
++
++        Fixture malformedInline;
++        malformedInline.prepare();
++        malformedInline.host.checkGuardDuringSubmit = true;
++        malformedInline.host.completeInline = true;
++        malformedInline.host.inlineReplySize = 63u;
++        const int malformedId = malformedInline.createThread();
++        malformedInline.startThread(malformedId);
++        IopThread &malformedThread = malformedInline.runThread();
++        const auto malformedBefore = malformedInline.reply();
++        require(malformedInline.call16(malformedThread.cpu), "malformed inline Call16 unhandled");
++        require(malformedInline.host.guardDuringSubmit && malformedThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(malformedThread.cpu.gpr[2]) == kFailure &&
++                    malformedInline.reply() == malformedBefore,
++                "malformed inline completion committed a reply");
++
++        Fixture duplicateInline;
++        duplicateInline.prepare();
++        duplicateInline.host.checkGuardDuringSubmit = true;
++        duplicateInline.host.completeInline = true;
++        duplicateInline.host.duplicateInline = true;
++        duplicateInline.host.inlineReply = patternedReply(0x91u);
++        const int duplicateId = duplicateInline.createThread();
++        duplicateInline.startThread(duplicateId);
++        IopThread &duplicateThread = duplicateInline.runThread();
++        require(duplicateInline.call16(duplicateThread.cpu), "duplicate inline Call16 unhandled");
++        require(duplicateInline.host.guardDuringSubmit && duplicateThread.state == IopThreadState::Ready &&
++                    duplicateThread.cpu.gpr[2] == 0u && duplicateInline.reply() == duplicateInline.host.inlineReply,
++                "duplicate inline completion was not exactly once");
++    }
++
++    void verifyHostFailureAndDetachedCpu()
++    {
++        for (const bool throws : {false, true})
++        {
++            Fixture fixture;
++            fixture.prepare();
++            fixture.host.accept = false;
++            fixture.host.throwOnSubmit = throws;
++            const int id = fixture.createThread();
++            fixture.startThread(id);
++            IopThread &thread = fixture.runThread();
++            const auto before = fixture.reply();
++            require(fixture.call16(thread.cpu), "host-failure Call16 unhandled");
++            require(thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == kFailure &&
++                        fixture.reply() == before, "host failure did not complete negative without reply");
++        }
++
++        Fixture rejectedInline;
++        rejectedInline.prepare();
++        rejectedInline.host.accept = false;
++        rejectedInline.host.completeInline = true;
++        rejectedInline.host.inlineReply = patternedReply();
++        const int rejectedInlineId = rejectedInline.createThread();
++        rejectedInline.startThread(rejectedInlineId);
++        IopThread &rejectedInlineThread = rejectedInline.runThread();
++        const auto rejectedInlineBefore = rejectedInline.reply();
++        require(rejectedInline.call16(rejectedInlineThread.cpu), "inline-reject Call16 unhandled");
++        require(rejectedInlineThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(rejectedInlineThread.cpu.gpr[2]) == kFailure &&
++                    rejectedInline.reply() == rejectedInlineBefore,
++                "rejected inline completion wrote a reply");
++
++        Fixture acceptedInline;
++        acceptedInline.prepare();
++        acceptedInline.host.completeInline = true;
++        acceptedInline.host.inlineReply = patternedReply(0x42u);
++        const int acceptedInlineId = acceptedInline.createThread();
++        acceptedInline.startThread(acceptedInlineId);
++        IopThread &acceptedInlineThread = acceptedInline.runThread();
++        require(acceptedInline.call16(acceptedInlineThread.cpu), "inline-accept Call16 unhandled");
++        require(acceptedInlineThread.state == IopThreadState::Ready && acceptedInlineThread.cpu.gpr[2] == 0u &&
++                    acceptedInline.reply() == acceptedInline.host.inlineReply,
++                "accepted inline completion was not delivered after admission");
++
++        Fixture fixture;
++        fixture.prepare();
++        IopCpuState detached{};
++        const auto before = fixture.reply();
++        require(fixture.call16(detached), "detached CPU Call16 unhandled");
++        require(fixture.host.submissions == 0u && static_cast<int32_t>(detached.gpr[2]) == kFailure && fixture.reply() == before,
++                "detached CPU acquired an owned wait");
++    }
++
++    void verifyAliasAndConcurrentClientOwnership()
++    {
++        Fixture fixture;
++        fixture.prepare();
++        const int firstId = fixture.createThread();
++        const int secondId = fixture.createThread();
++        fixture.startThread(firstId);
++        IopThread &first = fixture.runThread();
++        require(fixture.call16(first.cpu), "first Call16 failed");
++        fixture.endSlice(first);
++        fixture.startThread(secondId);
++        IopThread &second = fixture.runThread();
++        require(fixture.call16(second.cpu, kClient | 0x80000000u), "aliased Call16 unhandled");
++        require(fixture.host.submissions == 1u && second.state == IopThreadState::Running &&
++                    static_cast<int32_t>(second.cpu.gpr[2]) == kFailure,
++                "same canonical client admitted concurrent alias worker");
++        const auto before = fixture.reply();
++        fixture.host.complete(0, patternedReply());
++        require(first.state == IopThreadState::Ready && fixture.reply() != before, "first owner did not complete after alias rejection");
++    }
++
++    void verifyRebindAndIdentityRevocation()
++    {
++        Fixture fixture;
++        fixture.prepare();
++        fixture.host.binding = {0, 0x01800200u, 0x01800300u};
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        const auto before = fixture.reply();
++        require(fixture.call16(thread.cpu), "rebind Call16 failed");
++        const ReverseRpcCompletionEndpoint oldEndpoint = fixture.host.endpoint;
++        std::array<uint32_t, 10> oldClientWords{};
++        require(fixture.memory.readRam(kClient, oldClientWords.data(), sizeof(oldClientWords)), "client snapshot read failed");
++        IopCpuState binder{};
++        binder.gpr[4] = kClient;
++        binder.gpr[5] = 0x1234u;
++        binder.gpr[6] = 0u;
++        require(fixture.bridge.dispatchSifCmdImport(15u, binder) && binder.gpr[2] == 0u,
++                "successful Bind15 failed");
++        require(thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == kFailure,
++                "successful Bind15 did not revoke pending Call16");
++        require(fixture.memory.writeRam(kClient, oldClientWords.data(), sizeof(oldClientWords)), "client snapshot restore failed");
++        require(oldEndpoint.isCurrent && !oldEndpoint.isCurrent(),
++                "same snapshot rebind revived a revoked endpoint");
++        fixture.host.complete(0, patternedReply());
++        require(fixture.reply() == before, "late completion after Bind15 changed reply");
++
++        Fixture negative;
++        negative.prepare();
++        negative.host.binding.result = -77;
++        const int negativeId = negative.createThread();
++        negative.startThread(negativeId);
++        IopThread &negativeThread = negative.runThread();
++        require(negative.call16(negativeThread.cpu), "negative-bind Call16 failed");
++        IopCpuState badBinder{};
++        badBinder.gpr[4] = kClient;
++        badBinder.gpr[5] = 0x9999u;
++        require(negative.bridge.dispatchSifCmdImport(15u, badBinder) && static_cast<int32_t>(badBinder.gpr[2]) == -77,
++                "negative Bind15 did not report binding error");
++        require(negativeThread.state == IopThreadState::RpcWait, "negative Bind15 revoked another worker");
++
++        Fixture changed;
++        changed.prepare();
++        const int changedId = changed.createThread();
++        changed.startThread(changedId);
++        IopThread &changedThread = changed.runThread();
++        const auto changedBefore = changed.reply();
++        require(changed.call16(changedThread.cpu), "identity Call16 failed");
++        require(changed.host.endpoint.isCurrent && changed.host.endpoint.isCurrent(), "identity endpoint was not current initially");
++        changed.memory.write32(kClient + 4u, 0xDEADBEEFu);
++        require(!changed.host.endpoint.isCurrent(), "changed client identity remained host-current");
++        changed.host.complete(0, patternedReply());
++        require(changedThread.state == IopThreadState::Ready && static_cast<int32_t>(changedThread.cpu.gpr[2]) == kFailure &&
++                    changed.reply() == changedBefore, "changed client identity accepted reply");
++    }
++
++    void verifyBackingRetirement()
++    {
++        const auto allocateCallBacking = [](Fixture &fixture, uint32_t &client, uint32_t &send, uint32_t &reply)
++        {
++            client = fixture.memory.allocate(40u, 16u);
++            send = fixture.memory.allocate(40u, 16u);
++            reply = fixture.memory.allocate(64u, 16u);
++            require(client != 0u && send != 0u && reply != 0u, "reverse RPC backing allocation failed");
++            fixture.prepare(client, send, reply);
++        };
++
++        Fixture clientFree;
++        uint32_t client = 0u, send = 0u, reply = 0u;
++        allocateCallBacking(clientFree, client, send, reply);
++        const int clientId = clientFree.createThread();
++        clientFree.startThread(clientId);
++        IopThread &clientThread = clientFree.runThread();
++        require(clientFree.call16(clientThread.cpu, client, 0u, 0u, send), "allocated-client Call16 failed");
++        const ReverseRpcCompletionEndpoint staleClient = clientFree.host.endpoint;
++        require(clientFree.memory.freeAllocation(client), "allocated client free failed");
++        require(clientThread.state == IopThreadState::Ready && static_cast<int32_t>(clientThread.cpu.gpr[2]) == kFailure &&
++                    staleClient.isCurrent && !staleClient.isCurrent() && !clientFree.memory.ownsRamRange(client, 40u),
++                "client backing retirement retained authority");
++        const uint32_t reused = clientFree.memory.allocate(40u, 16u, client);
++        require(reused == client, "fixed client backing did not reuse its original address");
++        clientFree.prepare(client, send, reply);
++        std::array<uint8_t, 40> reusedClientBefore{};
++        require(clientFree.memory.readRam(client, reusedClientBefore.data(), reusedClientBefore.size()),
++                "reused client bytes unreadable");
++        std::array<uint8_t, 64> clientReuseReplyBefore{};
++        const bool clientReuseReplyOwnedBefore = clientFree.memory.ownsRamRange(reply, 64u);
++        require(clientFree.memory.readRam(reply, clientReuseReplyBefore.data(), clientReuseReplyBefore.size()) &&
++                    clientReuseReplyOwnedBefore,
++                "client-reuse reply destination unreadable or unowned");
++        staleClient.complete(0, patternedReply());
++        std::array<uint8_t, 40> reusedClientAfter{};
++        std::array<uint8_t, 64> clientReuseReplyAfter{};
++        require(!staleClient.isCurrent() && clientFree.memory.readRam(client, reusedClientAfter.data(), reusedClientAfter.size()) &&
++                    reusedClientAfter == reusedClientBefore && clientFree.memory.ownsRamRange(client, 40u) &&
++                    clientFree.memory.readRam(reply, clientReuseReplyAfter.data(), clientReuseReplyAfter.size()) &&
++                    clientReuseReplyAfter == clientReuseReplyBefore &&
++                    clientFree.memory.ownsRamRange(reply, 64u) == clientReuseReplyOwnedBefore &&
++                    static_cast<int32_t>(clientThread.cpu.gpr[2]) == kFailure,
++                "identical reused client backing accepted a stale success");
++
++        Fixture receiveFree;
++        allocateCallBacking(receiveFree, client, send, reply);
++        const int receiveId = receiveFree.createThread();
++        receiveFree.startThread(receiveId);
++        IopThread &receiveThread = receiveFree.runThread();
++        require(receiveFree.call16(receiveThread.cpu, client, 0u, 0u, send), "allocated-receive Call16 failed");
++        std::array<uint8_t, 64> receiveBefore{};
++        require(receiveFree.memory.readRam(reply, receiveBefore.data(), receiveBefore.size()), "receive canary read failed");
++        require(receiveFree.memory.freeAllocation(reply), "allocated receive free failed");
++        const ReverseRpcCompletionEndpoint staleReceive = receiveFree.host.endpoint;
++        const uint32_t reusedReceive = receiveFree.memory.allocate(64u, 16u, reply);
++        require(reusedReceive == reply && receiveFree.memory.writeRam(reply, receiveBefore.data(), receiveBefore.size()),
++                "fixed receive backing did not reuse identical bytes");
++        staleReceive.complete(0, patternedReply());
++        std::array<uint8_t, 64> receiveAfter{};
++        require(receiveFree.memory.readRam(reply, receiveAfter.data(), receiveAfter.size()) && receiveAfter == receiveBefore &&
++                    !staleReceive.isCurrent() && receiveFree.memory.ownsRamRange(reply, 64u) &&
++                    receiveThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(receiveThread.cpu.gpr[2]) == kFailure,
++                "identical reused receive backing accepted a stale success");
++
++        Fixture range;
++        allocateCallBacking(range, client, send, reply);
++        const int rangeId = range.createThread();
++        range.startThread(rangeId);
++        IopThread &rangeThread = range.runThread();
++        require(range.call16(rangeThread.cpu, client, 0u, 0u, send), "range Call16 failed");
++        range.bridge.removeServersInRange(reply, 64u);
++        require(rangeThread.state == IopThreadState::Ready && static_cast<int32_t>(rangeThread.cpu.gpr[2]) == kFailure,
++                "receive-only module retirement retained endpoint");
++
++        Fixture unrelated;
++        allocateCallBacking(unrelated, client, send, reply);
++        const uint32_t other = unrelated.memory.allocate(16u, 16u);
++        const int unrelatedId = unrelated.createThread();
++        unrelated.startThread(unrelatedId);
++        IopThread &unrelatedThread = unrelated.runThread();
++        require(unrelated.call16(unrelatedThread.cpu, client, 0u, 0u, send), "unrelated-free Call16 failed");
++        require(unrelated.memory.freeAllocation(other) && unrelated.host.endpoint.isCurrent && unrelated.host.endpoint.isCurrent(),
++                "unrelated backing free revoked endpoint");
++        require(unrelated.memory.freeAllocation(send) && unrelated.host.endpoint.isCurrent && unrelated.host.endpoint.isCurrent(),
++                "staged-send backing free revoked endpoint");
++        unrelated.host.complete(0, patternedReply());
++        std::array<uint8_t, 64> unrelatedReply{};
++        require(unrelated.memory.readRam(reply, unrelatedReply.data(), unrelatedReply.size()) &&
++                    unrelatedReply == patternedReply() && unrelatedThread.cpu.gpr[2] == 0u,
++                "unrelated or staged-send retirement blocked completion");
++
++        Fixture failedFree;
++        allocateCallBacking(failedFree, client, send, reply);
++        const int failedId = failedFree.createThread();
++        failedFree.startThread(failedId);
++        IopThread &failedThread = failedFree.runThread();
++        require(failedFree.call16(failedThread.cpu, client, 0u, 0u, send), "failed-free Call16 failed");
++        require(!failedFree.memory.freeAllocation(client + 4u) && failedFree.host.endpoint.isCurrent &&
++                    failedFree.host.endpoint.isCurrent() && failedThread.state == IopThreadState::RpcWait,
++                "failed free notified or revoked an endpoint");
++        failedFree.host.complete(-1, {});
++
++        Fixture suspended;
++        allocateCallBacking(suspended, client, send, reply);
++        const int suspendedId = suspended.createThread();
++        suspended.startThread(suspendedId);
++        IopThread &suspendedThread = suspended.runThread();
++        require(suspended.call16(suspendedThread.cpu, client, 0u, 0u, send), "retired suspended Call16 failed");
++        suspended.endSlice(suspendedThread);
++        suspended.control = {};
++        suspended.control.gpr[4] = static_cast<uint32_t>(suspendedId);
++        require(suspended.kernel.dispatchThreadImport(29u, suspended.control, 0u), "retired SuspendThread failed");
++        require(suspended.memory.freeAllocation(reply) && suspendedThread.state == IopThreadState::Suspended,
++                "retirement woke suspended worker early");
++        suspended.control = {};
++        suspended.control.gpr[4] = static_cast<uint32_t>(suspendedId);
++        require(suspended.kernel.dispatchThreadImport(31u, suspended.control, 0u) &&
++                    suspendedThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(suspendedThread.cpu.gpr[2]) == kFailure,
++                "suspended retirement did not preserve negative result for resume");
++
++        Fixture reset;
++        allocateCallBacking(reset, client, send, reply);
++        const int resetId = reset.createThread();
++        reset.startThread(resetId);
++        IopThread &resetThread = reset.runThread();
++        require(reset.call16(resetThread.cpu, client, 0u, 0u, send), "memory-reset Call16 failed");
++        const ReverseRpcCompletionEndpoint resetEndpoint = reset.host.endpoint;
++        reset.memory.reset();
++        require(resetThread.state == IopThreadState::Ready && static_cast<int32_t>(resetThread.cpu.gpr[2]) == kFailure &&
++                    resetEndpoint.isCurrent && !resetEndpoint.isCurrent(),
++                "direct memory reset did not revoke pending endpoint");
++        allocateCallBacking(reset, client, send, reply);
++        IopThread &afterResetThread = reset.runThread();
++        require(reset.call16(afterResetThread.cpu, client, 0u, 0u, send), "post-reset Call16 failed");
++        require(reset.memory.freeAllocation(reply) && afterResetThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(afterResetThread.cpu.gpr[2]) == kFailure,
++                "retirement observer did not survive direct memory reset");
++
++        Fixture duringAdmission;
++        allocateCallBacking(duringAdmission, client, send, reply);
++        duringAdmission.host.checkGuardDuringSubmit = true;
++        bool retiredDuringAdmission = false;
++        duringAdmission.host.duringSubmit = [&]
++        {
++            retiredDuringAdmission = duringAdmission.memory.freeAllocation(reply);
++        };
++        const int admissionId = duringAdmission.createThread();
++        duringAdmission.startThread(admissionId);
++        IopThread &admissionThread = duringAdmission.runThread();
++        std::array<uint8_t, 64> admissionBefore{};
++        require(duringAdmission.memory.readRam(reply, admissionBefore.data(), admissionBefore.size()), "admission canary read failed");
++        require(duringAdmission.call16(admissionThread.cpu, client, 0u, 0u, send), "retiring admission Call16 failed");
++        duringAdmission.host.complete(0, patternedReply());
++        std::array<uint8_t, 64> admissionAfter{};
++        require(retiredDuringAdmission && duringAdmission.host.guardDuringSubmit &&
++                    admissionThread.state == IopThreadState::Ready &&
++                    static_cast<int32_t>(admissionThread.cpu.gpr[2]) == kFailure &&
++                    duringAdmission.memory.readRam(reply, admissionAfter.data(), admissionAfter.size()) &&
++                    admissionAfter == admissionBefore && !duringAdmission.memory.ownsRamRange(reply, 64u),
++                "retirement during admission left a writable endpoint");
++    }
++
++    void verifyRetirementRegistration()
++    {
++        Host host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        auto first = std::make_unique<IopRpcBridge>(host, memory, kernel);
++        bool rejectedSecondOwner = false;
++        try
++        {
++            IopRpcBridge second{host, memory, kernel};
++        }
++        catch (const std::runtime_error &)
++        {
++            rejectedSecondOwner = true;
++        }
++        require(rejectedSecondOwner, "memory accepted a second live reverse-RPC retirement owner");
++        first.reset();
++        IopRpcBridge successor{host, memory, kernel};
++        (void)successor;
++    }
++
++    void verifyKernelStackRetirement()
++    {
++        const auto run = [](bool cleanupDead)
++        {
++            Fixture fixture;
++            const uint32_t victimEntry = cleanupDead ? kEntry + 0x100u : kEntry + 0x200u;
++            const int victimId = fixture.createThread(victimEntry);
++            const auto victimStack = fixture.memory.allocationContaining(IopMemory::HeapBase);
++            require(victimStack && victimStack->size >= 0x200u, "victim stack allocation missing");
++            const uint32_t retiredClient = victimStack->address + 0x40u;
++            const uint32_t retiredReply = victimStack->address + 0x100u;
++
++            if (cleanupDead)
++            {
++                fixture.startThread(victimId);
++                IopThread &victim = fixture.runThread();
++                fixture.endSlice(victim);
++                fixture.kernel.terminateThreadsInRange(victimEntry, 4u);
++            }
++
++            fixture.prepare(retiredClient, kSend, retiredReply);
++            const int affectedId = fixture.createThread();
++            const int neighborId = fixture.createThread();
++            fixture.startThread(affectedId);
++            IopThread &affected = fixture.runThread();
++            require(fixture.call16(affected.cpu, retiredClient, 0u, 0u, kSend),
++                    "stack-backed Call16 failed");
++            require(fixture.host.submissions == 1u && affected.state == IopThreadState::RpcWait,
++                    "stack-backed Call16 did not install its wait");
++            const ReverseRpcCompletionEndpoint affectedEndpoint = fixture.host.endpoint;
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "stack-backed endpoint was not current immediately after admission");
++            std::array<uint8_t, 40> clientBefore{};
++            std::array<uint8_t, 64> replyBefore{};
++            require(fixture.memory.readRam(retiredClient, clientBefore.data(), clientBefore.size()) &&
++                        fixture.memory.readRam(retiredReply, replyBefore.data(), replyBefore.size()),
++                    "stack-backed canary read failed");
++
++            fixture.prepare();
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "neighbor setup changed stack-backed endpoint identity");
++            fixture.startThread(neighborId);
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "starting neighbor changed stack-backed endpoint identity");
++            IopThread &neighbor = fixture.runThread();
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "scheduling neighbor changed stack-backed endpoint identity");
++            require(fixture.call16(neighbor.cpu), "neighbor Call16 failed");
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "neighbor Call16 changed stack-backed endpoint identity");
++            const ReverseRpcCompletionEndpoint neighborEndpoint = fixture.host.endpoint;
++            require(affectedEndpoint.isCurrent && affectedEndpoint.isCurrent(),
++                    "stack-backed endpoint was not current before retirement");
++            require(neighborEndpoint.isCurrent && neighborEndpoint.isCurrent(),
++                    "neighbor endpoint was not current before retirement");
++
++            if (cleanupDead)
++                fixture.kernel.cleanupDeadThreads();
++            else
++            {
++                fixture.control = {};
++                fixture.control.gpr[4] = static_cast<uint32_t>(victimId);
++                require(fixture.kernel.dispatchThreadImport(5u, fixture.control, 0u), "DeleteThread was not handled");
++                require(fixture.control.gpr[2] == 0u, "DeleteThread failed");
++            }
++
++            require(!fixture.memory.ownsRamRange(retiredClient, 40u) &&
++                        !fixture.memory.ownsRamRange(retiredReply, 64u),
++                    "victim stack backing was not retired");
++            require(affected.state == IopThreadState::Ready,
++                    "stack retirement did not wake the affected wait");
++            require(static_cast<int32_t>(affected.cpu.gpr[2]) == kFailure,
++                    "stack retirement supplied the wrong affected result");
++            require(neighbor.state == IopThreadState::RpcWait && neighborEndpoint.isCurrent && neighborEndpoint.isCurrent(),
++                    "stack retirement revoked the non-overlapping neighbor");
++            require(affectedEndpoint.isCurrent && !affectedEndpoint.isCurrent(),
++                    "stack retirement retained affected endpoint authority");
++            require(fixture.kernel.threadCount() == 2u,
++                    "stack retirement corrupted kernel iteration state");
++            affectedEndpoint.complete(0, patternedReply());
++            std::array<uint8_t, 40> clientAfter{};
++            std::array<uint8_t, 64> replyAfter{};
++            require(fixture.memory.readRam(retiredClient, clientAfter.data(), clientAfter.size()) &&
++                        fixture.memory.readRam(retiredReply, replyAfter.data(), replyAfter.size()) &&
++                        clientAfter == clientBefore && replyAfter == replyBefore &&
++                        !fixture.memory.ownsRamRange(retiredClient, 40u) &&
++                        !fixture.memory.ownsRamRange(retiredReply, 64u),
++                    "late stack-backed completion restored retired ownership or bytes");
++            neighborEndpoint.complete(0, patternedReply());
++            require(neighbor.state == IopThreadState::Ready && neighbor.cpu.gpr[2] == 0u,
++                    "non-overlapping neighbor did not survive stack retirement");
++        };
++
++        run(false);
++        run(true);
++    }
++
++    void verifyLifecycleAndSuspension()
++    {
++        Fixture directReset;
++        directReset.prepare();
++        const int directResetId = directReset.createThread();
++        directReset.startThread(directResetId);
++        IopThread &directResetThread = directReset.runThread();
++        const auto directResetBefore = directReset.reply();
++        require(directReset.call16(directResetThread.cpu), "direct-reset Call16 failed");
++        const ReverseRpcCompletionEndpoint directResetEndpoint = directReset.host.endpoint;
++        directReset.bridge.reset();
++        require(directResetThread.state == IopThreadState::Ready && static_cast<int32_t>(directResetThread.cpu.gpr[2]) == kFailure &&
++                    directReset.reply() == directResetBefore && directResetEndpoint.isCurrent && !directResetEndpoint.isCurrent(),
++                "direct bridge reset orphaned an owned worker or retained endpoint validity");
++
++        Fixture reset;
++        reset.prepare();
++        const int resetId = reset.createThread();
++        reset.startThread(resetId);
++        IopThread &resetThread = reset.runThread();
++        const auto resetBefore = reset.reply();
++        require(reset.call16(resetThread.cpu), "reset Call16 failed");
++        reset.endSlice(resetThread);
++        reset.kernel.reset();
++        reset.bridge.reset();
++        reset.host.complete(0, patternedReply());
++        require(reset.reply() == resetBefore, "late reset completion changed reply");
++
++        Fixture restart;
++        restart.prepare();
++        const int restartId = restart.createThread();
++        restart.startThread(restartId);
++        IopThread &restartThread = restart.runThread();
++        const auto restartBefore = restart.reply();
++        require(restart.call16(restartThread.cpu), "restart Call16 failed");
++        restart.endSlice(restartThread);
++        restart.startThread(restartId);
++        restart.host.complete(0, patternedReply());
++        require(restart.reply() == restartBefore, "restart retained late endpoint");
++
++        Fixture deleted;
++        deleted.prepare();
++        const int deleteId = deleted.createThread();
++        deleted.startThread(deleteId);
++        IopThread &deleteThread = deleted.runThread();
++        const auto deleteBefore = deleted.reply();
++        require(deleted.call16(deleteThread.cpu), "delete Call16 failed");
++        deleted.endSlice(deleteThread);
++        deleted.control = {};
++        deleted.control.gpr[4] = static_cast<uint32_t>(deleteId);
++        require(deleted.kernel.dispatchThreadImport(5u, deleted.control, 0u), "DeleteThread failed");
++        deleted.host.complete(0, patternedReply());
++        require(deleted.reply() == deleteBefore, "deleted worker accepted late completion");
++
++        Fixture unloaded;
++        unloaded.prepare();
++        const int unloadId = unloaded.createThread();
++        unloaded.startThread(unloadId);
++        IopThread &unloadThread = unloaded.runThread();
++        const auto unloadBefore = unloaded.reply();
++        require(unloaded.call16(unloadThread.cpu), "unload Call16 failed");
++        unloaded.endSlice(unloadThread);
++        unloaded.kernel.terminateThreadsInRange(kEntry, 4u);
++        unloaded.kernel.cleanupDeadThreads();
++        unloaded.bridge.removeServersInRange(kEntry, 4u);
++        unloaded.host.complete(0, patternedReply());
++        require(unloaded.reply() == unloadBefore, "unload accepted late completion");
++
++        Fixture suspended;
++        suspended.prepare();
++        const int suspendedId = suspended.createThread();
++        suspended.startThread(suspendedId);
++        IopThread &suspendedThread = suspended.runThread();
++        require(suspended.call16(suspendedThread.cpu), "suspended Call16 failed");
++        suspended.endSlice(suspendedThread);
++        suspended.control = {};
++        suspended.control.gpr[4] = static_cast<uint32_t>(suspendedId);
++        require(suspended.kernel.dispatchThreadImport(29u, suspended.control, 0u), "SuspendThread failed");
++        const auto expected = patternedReply();
++        suspended.host.complete(0, expected);
++        require(suspendedThread.state == IopThreadState::Suspended && suspended.reply() == expected,
++                "suspended completion did not retain result");
++        suspended.control = {};
++        suspended.control.gpr[4] = static_cast<uint32_t>(suspendedId);
++        require(suspended.kernel.dispatchThreadImport(25u, suspended.control, 0u), "unrelated WakeupThread failed");
++        require(suspendedThread.state == IopThreadState::Suspended, "unrelated wake resumed completed suspended RPC");
++        suspended.control = {};
++        suspended.control.gpr[4] = static_cast<uint32_t>(suspendedId);
++        require(suspended.kernel.dispatchThreadImport(31u, suspended.control, 0u), "ResumeThread failed");
++        require(suspendedThread.state == IopThreadState::Ready && suspendedThread.cpu.gpr[2] == 0u,
++                "resume did not consume suspended completion");
++    }
++
++    void verifyDestructionLease()
++    {
++        Host host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        std::array<uint32_t, 10> client{};
++        client[5] = kBuffer;
++        client[9] = kServer;
++        const auto send = patternedReply();
++        const std::array<uint32_t, 5> args{40u, kReply, 64u, 0u, 0u};
++        std::array<uint8_t, 36> stackBytes{};
++        std::memcpy(stackBytes.data() + 16u, args.data(), sizeof(args));
++        require(memory.writeRam(kClient, client.data(), sizeof(client)) && memory.writeRam(kSend, send.data(), 40u) &&
++                    memory.writeRam(kReply, send.data(), 64u) && memory.writeRam(kStack, stackBytes.data(), stackBytes.size()),
++                "destruction setup failed");
++        memory.write32(kDescriptor + 8u, kEntry);
++        memory.write32(kDescriptor + 12u, 0x400u);
++        memory.write32(kDescriptor + 16u, 10u);
++        IopCpuState control{};
++        control.gpr[4] = kDescriptor;
++        require(kernel.dispatchThreadImport(4u, control, 0u), "destruction CreateThread failed");
++        const int id = static_cast<int>(control.gpr[2]);
++        control = {};
++        control.gpr[4] = static_cast<uint32_t>(id);
++        require(kernel.dispatchThreadImport(7u, control, 0u), "destruction StartThread failed");
++        IopThread *thread = kernel.beginNextReady(0u);
++        require(thread != nullptr, "destruction worker did not run");
++        const auto before = [&]
++        {
++            std::array<uint8_t, 64> bytes{};
++            require(memory.readRam(kReply, bytes.data(), bytes.size()), "destruction reply read failed");
++            return bytes;
++        }();
++        {
++            IopRpcBridge bridge{host, memory, kernel};
++            thread->cpu.gpr[4] = kClient;
++            thread->cpu.gpr[5] = 0u;
++            thread->cpu.gpr[6] = 0u;
++            thread->cpu.gpr[7] = kSend;
++            thread->cpu.gpr[29] = kStack;
++            require(bridge.dispatchSifCmdImport(16u, thread->cpu), "destruction Call16 failed");
++        }
++        host.complete(0, patternedReply());
++        std::array<uint8_t, 64> after{};
++        require(memory.readRam(kReply, after.data(), after.size()) && after == before &&
++                    thread->state == IopThreadState::Ready && static_cast<int32_t>(thread->cpu.gpr[2]) == kFailure &&
++                    host.endpoint.isCurrent && !host.endpoint.isCurrent(),
++                "destroyed bridge callback retained memory or orphaned its wait");
++    }
++}
++
++int main()
++{
++    try
++    {
++        verifyMipsImportPipelineContinuation();
++        verifyDeferredAndExactCompletion();
++        verifyInvalidCompletionsPreserveReply();
++        verifyAdmissionRejections();
++        verifyAdmissionGuard();
++        verifyHostFailureAndDetachedCpu();
++        verifyAliasAndConcurrentClientOwnership();
++        verifyRebindAndIdentityRevocation();
++        verifyBackingRetirement();
++        verifyRetirementRegistration();
++        verifyKernelStackRetirement();
++        verifyLifecycleAndSuspension();
++        verifyDestructionLease();
++    }
++    catch (const std::exception &error)
++    {
++        std::cerr << "FAIL: " << error.what() << '\n';
++        return 1;
++    }
++    return 0;
++}
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index d01a1bf..6b57b5a 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -510,7 +510,8 @@ void register_ps2_sif_rpc_tests()
+                   std::array<uint32_t, 4>{0u, 0u, 15u, uint32_t(-2)},
+                   std::array<uint32_t, 4>{0x10201u, 0u, 15u, uint32_t(-2)},
+                   std::array<uint32_t, 4>{0x104F0u, 0u, 15u, uint32_t(-2)},
+-                  std::array<uint32_t, 4>{0x10200u, 0u, 16u, uint32_t(-48)}})
++                  // Bind-shaped arguments are malformed for Call16.
++                  std::array<uint32_t, 4>{0x10200u, 0u, 16u, uint32_t(-2)}})
+             {
+                 observed = nativeBind(env, client, mode, kNativeSid, static_cast<uint16_t>(ordinal));
+                 t.Equals(observed.result, static_cast<int32_t>(error), "unsupported/invalid operation fails explicitly");

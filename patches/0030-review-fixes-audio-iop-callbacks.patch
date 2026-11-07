@@ -1,0 +1,504 @@
+From 52d9f2910b1b5a9a544880a11c4124deb44f8f64 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:23:05 -0500
+Subject: [PATCH 30/31] ga2: review fixes (best-effort PCM, SPU IRQ9 delivery,
+ logged IOP disable, 10s RPC budget, isolated callback stack fallback) and
+ GA2_PERF speed meter
+
+---
+ ps2xIOP/src/emulator/iop_emulator.cpp      | 97 ++++++++++++++--------
+ ps2xIOP/src/emulator/services/iop_rpc.cpp  |  2 +-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 37 ++++++++-
+ ps2xRuntime/src/lib/ps2_audio.cpp          |  5 +-
+ ps2xRuntime/src/lib/ps2_pcm_queue.h        | 19 ++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  1 +
+ 6 files changed, 118 insertions(+), 43 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index a7ba1ae..297fd31 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -144,7 +144,7 @@ namespace ps2x::iop::detail
+         void reset()
+         {
+             if (syncingSpu || (spu && (callDepth || activeCpu || servicingDmaInterrupts || servicingGuestCallbacks)))
+-            { resetRequired = true; throw std::runtime_error("IOP SPU reset requires quiescent execution"); }
++            { markResetRequired(__LINE__); throw std::runtime_error("IOP SPU reset requires quiescent execution"); }
+             // Retire the sole completion owner before freeing its borrowed chip.
+             pendingDmaInterrupts.clear();
+             if (spu)
+@@ -155,7 +155,7 @@ namespace ps2x::iop::detail
+                 struct Guard { bool &flag; ~Guard() { flag = false; } } guard{syncingSpu};
+                 try {
+                     if (!host.resetSpuPcm()) throw std::runtime_error("SPU PCM reset failed");
+-                } catch (...) { resetRequired = true; throw; }
++                } catch (...) { markResetRequired(__LINE__); throw; }
+                 spu.reset();
+                 bindSpuBus();
+             }
+@@ -238,20 +238,23 @@ namespace ps2x::iop::detail
+                         totalCycles + dma->delayCycles, identity, dma->core};
+                 }
+             }
+-            catch (...) { resetRequired = true; throw; }
++            catch (...) { markResetRequired(__LINE__); throw; }
+         }
+ 
++        bool pcmRejectionLogged = false;
++        bool pendingSpuIrq = false;
++
+         void bindSpuBus()
+         {
+             memory.setSpuAccess(spu.get(), [this] { synchronizeSpu(true); },
+-                [this] { resetRequired = true; });
++                [this] { markResetRequired(__LINE__); });
+         }
+ 
+         void synchronizeSpu(bool access = false)
+         {
+             if (!access && !spu) return;
+             if (resetRequired || syncingSpu)
+-            { resetRequired = true; throw std::runtime_error("SPU access outside quiescent IOP execution"); }
++            { markResetRequired(__LINE__); throw std::runtime_error("SPU access outside quiescent IOP execution"); }
+             syncingSpu = true;
+             struct Guard { bool &flag; ~Guard() { flag = false; } } guard{syncingSpu};
+             try
+@@ -267,14 +270,19 @@ namespace ps2x::iop::detail
+                         interleaved.reserve(frames.size() * 2u);
+                         for (const auto &frame : frames)
+                         { interleaved.push_back(frame.left); interleaved.push_back(frame.right); }
+-                        if (!host.submitSpuPcm(interleaved, 48000u))
+-                            throw std::runtime_error("SPU PCM submission rejected by host");
++                        // Host output is best effort; it must never stop emulation.
++                        if (!host.submitSpuPcm(interleaved, 48000u) && !pcmRejectionLogged)
++                        {
++                            pcmRejectionLogged = true;
++                            log(LogLevel::Warning, "[IOP SPU] host rejected PCM; continuing without output");
++                        }
+                         if (resetRequired) throw std::runtime_error("SPU PCM callback faulted IOP");
+                     });
+                     // SPU address IRQ9 is distinct from DMA IRQ36/40. Raise only
+                     // existing hardware pending state; never execute guest in DSP.
+                     spu->setSpuAddressIrq([this](uint8_t) {
+                         memory.setInterruptStatus(memory.interruptStatus() | (1u << 9u));
++                        pendingSpuIrq = true; // delivered at the next quiescent service point
+                     });
+                 }
+                 if (access || totalCycles - spu->lastIopCycle() >= ga2::spu::kIopCyclesPerSample)
+@@ -282,7 +290,7 @@ namespace ps2x::iop::detail
+             }
+             catch (...)
+             {
+-                resetRequired = true;
++                markResetRequired(__LINE__);
+                 try { log(LogLevel::Error, "[IOP SPU] device/PCM failure; reset required"); } catch (...) {}
+                 throw;
+             }
+@@ -291,7 +299,7 @@ namespace ps2x::iop::detail
+         void advanceIopTime(uint64_t cycles)
+         {
+             if (cycles > UINT64_MAX - totalCycles)
+-            { resetRequired = true; throw std::runtime_error("IOP clock overflow"); }
++            { markResetRequired(__LINE__); throw std::runtime_error("IOP clock overflow"); }
+             totalCycles += cycles;
+             synchronizeSpu();
+         }
+@@ -397,7 +405,7 @@ namespace ps2x::iop::detail
+                 {
+                     if (kernel.hasCurrentThread() || servicingDmaInterrupts || servicingGuestCallbacks)
+                     {
+-                        resetRequired = true;
++                        markResetRequired(__LINE__);
+                         cpu.executionFault = true;
+                         setV0(uint32_t(-5));
+                         return ImportDisposition::Handled;
+@@ -405,7 +413,7 @@ namespace ps2x::iop::detail
+                     const int id = static_cast<int>(a0);
+                     if (kernel.hasSemaphoreWaiter(id))
+                     {
+-                        resetRequired = true;
++                        markResetRequired(__LINE__);
+                         cpu.executionFault = true;
+                         setV0(uint32_t(-5));
+                         return ImportDisposition::Handled;
+@@ -415,7 +423,7 @@ namespace ps2x::iop::detail
+                         return ImportDisposition::Handled;
+                     IopKernel::DetachedSemaphoreWait wait{id};
+                     if (!kernel.attachDetachedSemaphoreWait(wait))
+-                        resetRequired = true;
++                        markResetRequired(__LINE__);
+                     struct WaitGuard
+                     {
+                         IopKernel &kernel;
+@@ -428,7 +436,7 @@ namespace ps2x::iop::detail
+                         if (wait.cancelled || kernel.hasSemaphoreWaiter(id) || rpcBudgetExhausted() ||
+                             !runCyclesCore(kDefaultSlice, true))
+                         {
+-                            resetRequired = true;
++                            markResetRequired(__LINE__);
+                             break;
+                         }
+                     }
+@@ -449,7 +457,7 @@ namespace ps2x::iop::detail
+                     // Immediate/invalid waits retain their kernel result.
+                     if (kernel.hasPendingDetachedSemaphoreWait(static_cast<int>(a0)))
+                     {
+-                        resetRequired = true;
++                        markResetRequired(__LINE__);
+                         cpu.executionFault = true;
+                         setV0(uint32_t(-5));
+                     }
+@@ -458,7 +466,7 @@ namespace ps2x::iop::detail
+                         (void)kernel.dispatchSemaphoreImport(9u, cpu);
+                         if (int32_t(cpu.gpr[2]) == -419)
+                         {
+-                            resetRequired = true;
++                            markResetRequired(__LINE__);
+                             cpu.executionFault = true;
+                             setV0(uint32_t(-5));
+                         }
+@@ -589,7 +597,7 @@ namespace ps2x::iop::detail
+ 
+         bool step(CpuState &cpu)
+         {
+-            if (syncingSpu) resetRequired = true;
++            if (syncingSpu) markResetRequired(__LINE__);
+             if (resetRequired) { cpu.stopped = true; cpu.executionFault = true; return false; }
+             if (cpu.stopped)
+                 return false;
+@@ -655,15 +663,15 @@ namespace ps2x::iop::detail
+                 }
+                 if (rpcWaitCpu && rpcBudgetExhausted())
+                 {
+-                    resetRequired = true;
++                    markResetRequired(__LINE__);
+                     break;
+                 }
+                 if (!step(cpu))
+                     break;
+                 if (rpcWaitCpu && (cpu.missingImport || cpu.executionFault))
+-                    resetRequired = true;
++                    markResetRequired(__LINE__);
+                 if (resetRequired) break;
+-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
++                if (!servicingDmaInterrupts && (!pendingDmaInterrupts.empty() || pendingSpuIrq))
+                     servicePendingDmaInterrupts();
+                 if (resetRequired) break;
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -743,7 +751,7 @@ namespace ps2x::iop::detail
+             }
+             runCpu(cpu, budget);
+             const bool completed = !resetRequired && cpu.pc == kCallReturnSentinel && !cpu.yielded && !cpu.missingImport && !cpu.executionFault;
+-            if (rpcWaitCpu && !completed) resetRequired = true;
++            if (rpcWaitCpu && !completed) markResetRequired(__LINE__);
+             if (returned) *returned = completed;
+             return cpu.gpr[2];
+         }
+@@ -763,12 +771,12 @@ namespace ps2x::iop::detail
+             { result = uint32_t(-5); return IopGuestCallStatus::Rejected; }
+             bool returned = false, started = false;
+             try { result = callFunction(address, a0, a1, a2, a3, gp, budget, &returned, {}, &started, true); }
+-            catch (...) { result = uint32_t(-5); if (started) resetRequired = true; }
++            catch (...) { result = uint32_t(-5); if (started) markResetRequired(__LINE__); }
+             if (resetRequired) { result = uint32_t(-5); return IopGuestCallStatus::ResetRequired; }
+             if (returned) return IopGuestCallStatus::Completed;
+             result = uint32_t(-5);
+             if (!started) return IopGuestCallStatus::Rejected;
+-            resetRequired = true;
++            markResetRequired(__LINE__);
+             return IopGuestCallStatus::ResetRequired;
+         }
+ 
+@@ -797,7 +805,7 @@ namespace ps2x::iop::detail
+             if (resetRequired) return IopGuestCallStatus::ResetRequired;
+             if (returned) return IopGuestCallStatus::Completed;
+             if (!started) return IopGuestCallStatus::Rejected;
+-            resetRequired = true;
++            markResetRequired(__LINE__);
+             log(LogLevel::Error, "[IOP] synchronous device callback incomplete; reset required before guest execution");
+             return IopGuestCallStatus::ResetRequired;
+         }
+@@ -830,6 +838,16 @@ namespace ps2x::iop::detail
+         // Not that good to use exception handling for control flow but will do for now
+         void servicePendingDmaInterrupts()
+         {
++            if (pendingSpuIrq && !resetRequired && !servicingDmaInterrupts && !syncingSpu)
++            {
++                // SPU2 address IRQ (I_STAT bit 9). intrman acknowledges the
++                // status bit before calling the registered handler.
++                pendingSpuIrq = false;
++                memory.setInterruptStatus(memory.interruptStatus() & ~(1u << 9u));
++                servicingDmaInterrupts = true;
++                struct SpuGuard { bool &flag; ~SpuGuard() { flag = false; } } spuGuard{servicingDmaInterrupts};
++                (void)intrman.dispatchInterrupt(9, *this);
++            }
+             if (resetRequired || servicingDmaInterrupts || pendingDmaInterrupts.empty())
+                 return;
+ 
+@@ -845,7 +863,7 @@ namespace ps2x::iop::detail
+                 if (dma.deadline <= totalCycles)
+                 {
+                     if (count == completed.size())
+-                    { resetRequired = true; throw std::runtime_error("SPU completion owner exceeds two channels"); }
++                    { markResetRequired(__LINE__); throw std::runtime_error("SPU completion owner exceeds two channels"); }
+                     completed[count++] = {irq, dma.identity};
+                 }
+             }
+@@ -866,7 +884,7 @@ namespace ps2x::iop::detail
+                     if (settleDevice)
+                     {
+                         if (!spu || !spu->settleOrdinaryDma(core))
+-                        { resetRequired = true; throw std::runtime_error("SPU DMA settlement lost its device owner"); }
++                        { markResetRequired(__LINE__); throw std::runtime_error("SPU DMA settlement lost its device owner"); }
+                         memory.finishSpuDma(core);
+                     }
+                     pendingDmaInterrupts.erase(live);
+@@ -899,7 +917,7 @@ namespace ps2x::iop::detail
+             };
+             // Execution remains live after cancellation removes its registration.
+             // The stack witness outlives the checked call; never borrow a map node.
+-            if (executingAlarm && overlaps(*executingAlarm)) resetRequired = true;
++            if (executingAlarm && overlaps(*executingAlarm)) markResetRequired(__LINE__);
+             for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end();)
+                 if (it->second.alarm && overlaps(it->second)) it = pendingGuestCallbacks.erase(it);
+                 else ++it;
+@@ -907,7 +925,7 @@ namespace ps2x::iop::detail
+ 
+         ImportDisposition alarmUnsupported(CpuState &cpu, const char *reason) noexcept
+         {
+-            resetRequired = true;
++            markResetRequired(__LINE__);
+             cpu.gpr[2] = uint32_t(-5);
+             // Diagnostic scope only; never invent successful unsupported behavior.
+             try { log(LogLevel::Error, reason); } catch (...) {}
+@@ -998,36 +1016,36 @@ namespace ps2x::iop::detail
+                     const auto status = executeGuestFunctionWithStackArgumentsChecked(callback.function,
+                         callback.argument, 0u, 0u, 0u, callback.gp, {}, 100000u, result);
+                     if (status != IopGuestCallStatus::Completed)
+-                    { resetRequired = true; break; }
++                    { markResetRequired(__LINE__); break; }
+                     auto live = pendingGuestCallbacks.end();
+                     for (auto scan = pendingGuestCallbacks.begin(); scan != pendingGuestCallbacks.end(); ++scan)
+                         if (scan->second.identity == callback.identity) { live = scan; break; }
+                     if (live == pendingGuestCallbacks.end()) continue; // Cancelled/replaced/retired.
+                     if (result != 0u)
+                     {
+-                        resetRequired = true;
++                        markResetRequired(__LINE__);
+                         log(LogLevel::Error, "[IOP alarm diagnostic] repeat semantics unsupported");
+                         break;
+                     }
+                     pendingGuestCallbacks.erase(live);
+                 }
+             }
+-            catch (...) { resetRequired = true; }
++            catch (...) { markResetRequired(__LINE__); }
+         }
+ 
+         bool runCyclesCore(uint64_t cycles, bool checked) noexcept
+         {
+-            if (syncingSpu) { resetRequired = true; return false; }
++            if (syncingSpu) { markResetRequired(__LINE__); return false; }
+             if (resetRequired) return false;
+             try
+             {
+                 if (cycles > UINT64_MAX - totalCycles)
+-                { resetRequired = true; return false; }
++                { markResetRequired(__LINE__); return false; }
+                 const uint64_t target = checked && rpcWaitCpu
+                     ? std::min(totalCycles + cycles, rpcCycleDeadline) : totalCycles + cycles;
+                 while (totalCycles < target && !resetRequired)
+                 {
+-                    if (checked && rpcWaitCpu && rpcBudgetExhausted()) { resetRequired = true; break; }
++                    if (checked && rpcWaitCpu && rpcBudgetExhausted()) { markResetRequired(__LINE__); break; }
+                     servicePendingDmaInterrupts();
+                     if (resetRequired) break;
+                     servicePendingGuestCallbacks();
+@@ -1059,7 +1077,7 @@ namespace ps2x::iop::detail
+                         if (checked && (next->cpu.missingImport || next->cpu.executionFault ||
+                             (next->cpu.stopped && next->cpu.pc != kThreadReturnSentinel &&
+                              !(next->cpu.yielded && (next->state == IopThreadState::Dormant || next->state == IopThreadState::Dead)))))
+-                            resetRequired = true;
++                            markResetRequired(__LINE__);
+                     }
+                     if (totalCycles == before)
+                         advanceIopTime(1u);
+@@ -1068,7 +1086,7 @@ namespace ps2x::iop::detail
+             catch (...)
+             {
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
+-                if (checked || (spu && spu->faulted())) resetRequired = true;
++                if (checked || (spu && spu->faulted())) markResetRequired(__LINE__);
+             }
+             return !resetRequired;
+         }
+@@ -1299,6 +1317,15 @@ namespace ps2x::iop::detail
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
+         bool resetRequired = false;
++        // Every path that disables the IOP reports where it happened (once).
++        void markResetRequired(int line) noexcept
++        {
++            if (!resetRequired)
++            {
++                resetRequired = true;
++                try { log(LogLevel::Error, "[IOP] emulation disabled (reset required) at iop_emulator.cpp:" + std::to_string(line)); } catch (...) {}
++            }
++        }
+         GuestCallback secrMcCommandHandler;
+         GuestCallback secrMcDevIdHandler;
+         GuestCallback checkKelfPathCallback;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 367dd5b..4f76aea 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -737,7 +737,7 @@ namespace ps2x::iop::detail
+                                                                server.buffer,
+                                                                request.send.size,
+                                                                0u,
+-                                                               server.gp, 2000000u, returnPointer);
++                                                               server.gp, 400000000u, returnPointer); // ~10 s of IOP time
+         if (status != IopGuestCallStatus::Completed)
+         {
+             result.handled = true;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 25534bb..7b7591b 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -1584,6 +1586,7 @@ EeScheduler::InvocationStackChoice EeScheduler::selectInvocationStack()
+     constexpr uint32_t kCallShim = 0x20u;
+     // Attached callbacks execute while this owner's parent is paused. Borrow
+     // unused space below its live SP, not a registration-time SP or cached loan.
++    bool borrowedStackUnusable = false;
+     if (owner->id > 0 && (owner->stack != 0u || owner->stackSize != 0u))
+     {
+         uint32_t base = 0u, live = 0u;
+@@ -1596,13 +1599,19 @@ EeScheduler::InvocationStackChoice EeScheduler::selectInvocationStack()
+             live < base || uint64_t(live) + kCallShim > uint64_t(base) + owner->stackSize ||
+             uint64_t(live) < uint64_t(base) + kInvocationStackSize)
+         {
+-            throw std::runtime_error("EE callback has no valid owned stack headroom");
++            // Small or deep thread stacks cannot lend 16 KiB. On hardware the
++            // handler would run on the kernel stack, so use an isolated slot
++            // keyed by nesting depth (interrupt dispatch is serialized).
++            borrowedStackUnusable = true;
++        }
++        else
++        {
++            return {liveSp - kCallShim, 0u, 0u};
+         }
+-        return {liveSp - kCallShim, 0u, 0u};
+     }
+     const size_t depth = owner ? owner->invocations.size() : 0u;
+-    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(owner->id)) << 32u) |
+-                         static_cast<uint32_t>(depth);
++    const uint32_t keyOwner = borrowedStackUnusable ? 0xFFFFFFFFu : static_cast<uint32_t>(owner->id);
++    const uint64_t key = (static_cast<uint64_t>(keyOwner) << 32u) | static_cast<uint32_t>(depth);
+     const auto existing = m_invocationStackTops.find(key);
+     if (existing != m_invocationStackTops.end())
+     {
+@@ -2335,6 +2344,26 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        {
++            // Opt-in speed meter: guest vsyncs per host second (60 = full speed).
++            static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++            if (perf)
++            {
++                static auto last = std::chrono::steady_clock::now();
++                static uint64_t lastTick = 0;
++                const auto now = std::chrono::steady_clock::now();
++                const double seconds = std::chrono::duration<double>(now - last).count();
++                if (seconds >= 5.0)
++                {
++                    std::fprintf(stderr, "[ga2 perf] vsync=%llu rate=%.2f/s (%.0f%% speed)\n",
++                                 static_cast<unsigned long long>(m_vsyncTick),
++                                 static_cast<double>(m_vsyncTick - lastTick) / seconds,
++                                 100.0 * static_cast<double>(m_vsyncTick - lastTick) / seconds / 59.94);
++                    last = now;
++                    lastTick = m_vsyncTick;
++                }
++            }
++        }
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index ec8ddb7..41c864c 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -173,8 +173,9 @@ bool PS2AudioBackend::submitSpuPcm(std::span<const int16_t> samples, uint32_t sa
+     return false;
+ #else
+     std::lock_guard lock(m_mutex);
+-    if (!m_audioReady || sampleRate != 48000 || samples.size() % 2u ||
+-        samples.size() / 2u > SpuPcmQueue::CapacityFrames) return false;
++    if (sampleRate != 48000 || samples.size() % 2u) return false;
++    // Without an audio device the game must still run; discard the output.
++    if (!m_audioReady) return true;
+     if (samples.empty()) return true;
+     auto observe = [&](bool result) noexcept {
+         try { return privatePcmObservation().record(samples, result); }
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+index f3b8a80..d2daeea 100644
+--- a/ps2xRuntime/src/lib/ps2_pcm_queue.h
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -10,10 +10,24 @@ class SpuPcmQueue
+ {
+ public:
+     static constexpr size_t CapacityFrames = 96000;
++    // Host output latency is bounded: when the producer runs ahead of the
++    // audio device, the oldest queued frames are dropped instead of rejecting
++    // the new ones (a rejection used to fault the whole IOP).
++    static constexpr size_t TargetLatencyFrames = 7200; // 150 ms at 48 kHz
+     bool push(std::span<const int16_t> samples)
+     {
+-        if (samples.size() % 2u || samples.size() / 2u > CapacityFrames - m_count)
++        if (samples.size() % 2u)
+             return false;
++        if (samples.size() / 2u > CapacityFrames)
++            samples = samples.last(CapacityFrames * 2u);
++        const size_t incoming = samples.size() / 2u;
++        if (m_count + incoming > TargetLatencyFrames)
++        {
++            const size_t drop = std::min(m_count, m_count + incoming - TargetLatencyFrames);
++            m_head = (m_head + drop) % CapacityFrames;
++            m_count -= drop;
++            m_dropped += drop;
++        }
+         for (size_t i = 0; i < samples.size() / 2u; ++i)
+         {
+             const size_t p = ((m_head + m_count + i) % CapacityFrames) * 2u;
+@@ -34,7 +48,10 @@ public:
+         m_head = (m_head + frames) % CapacityFrames; m_count -= frames;
+     }
+     void clear() noexcept { m_head = m_count = 0; }
++    size_t queuedFrames() const noexcept { return m_count; }
++    uint64_t droppedFrames() const noexcept { return m_dropped; }
+ private:
+     std::array<int16_t, CapacityFrames * 2u> m_samples{};
+     size_t m_head = 0, m_count = 0;
++    uint64_t m_dropped = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b3f4d03..7f47559 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1642,6 +1642,7 @@ void PS2Runtime::drainIpuDeviceInterrupts(uint8_t *rdram, uint32_t vaddr)
+     const uint32_t phys = vaddr & 0x1FFFFFFFu;
+     if (!((phys >= 0x10002000u && phys < 0x10002100u) ||
+           (phys >= 0x10007000u && phys < 0x10007020u) ||
++          (phys >= 0x1000B000u && phys < 0x1000B100u) ||
+           (phys >= 0x1000B400u && phys < 0x1000B500u) ||
+           (phys & ~3u) == 0x1000E000u || (phys & ~3u) == 0x1000F590u))
+         return;
+-- 
+2.55.0
+

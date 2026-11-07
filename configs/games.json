@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "games": [
+    {"id": "zettai", "title": "Galaxy Angel II - Zettai Ryouiki no Tobira", "discs": ["zettai"]},
+    {"id": "mugen", "title": "Galaxy Angel II - Mugen Kairou no Kagi", "discs": ["mugen-1", "mugen-2"]},
+    {"id": "eigou", "title": "Galaxy Angel II - Eigou Kaiki no Toki", "discs": ["eigou-1", "eigou-2"]}
+  ]
+}

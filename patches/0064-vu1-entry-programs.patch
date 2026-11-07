@@ -1,0 +1,731 @@
+From e53da83f24ee66e22ca65b9bdd8e123fc002d716 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 05:19:39 -0500
+Subject: [PATCH] ga2: VU1 programs keyed by entry point and reachable code
+
+Games upload VU1 microprograms in changing combinations, so whole-image
+program keys kept missing in new scenes (Mugen tutorial battle, Zettai
+ship map) and those scenes fell back to the interpreter. ga2_vu1_gen now
+also emits one program per entry point, keyed by the entry pair and the
+contents of the pairs reachable from it (ps2_vu1_reach.h), analysed from
+those pairs alone. The runtime merges the programs that match an image into
+a per-image chunk table; a pc no program covers (a run entry, a JR target)
+is tried once as an entry, and GA2_VU1_DUMP records misses in
+<hash>.entries for the next vu1gen. Chunks are only entered with nothing
+pending. GA2_VU1JIT=entries checks entry programs alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h       |  14 ++
+ ps2xRuntime/include/runtime/ps2_vu1_reach.h | 118 +++++++++++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp     | 174 +++++++++++++++++--
+ ps2xTest/src/ga2_vu1_gen.cpp                | 176 +++++++++++++++++---
+ ps2xTest/src/ps2_vu1_tests.cpp              |  41 +++++
+ 5 files changed, 482 insertions(+), 41 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ps2_vu1_reach.h
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 7dc2313..7007935 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -4,6 +4,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ 
+ class GS;
+ class PS2Memory;
+@@ -161,6 +162,13 @@ public:
+     // elidesFlags: the program skips flag results its own code image never
+     // reads (ga2_vu1_gen); switching to another image afterwards is reported.
+     static void registerJitProgram(uint64_t codeHash, JitProgram program, bool elidesFlags = false);
++    // Programs for single entry points (used when no program matches the
++    // whole image), keyed by the entry pair and the code reachable from it
++    // (ps2_vu1_reach.h). chunks[pair] runs a chunk of the program from that
++    // pair (as a generated run() loop would); statusElided: valid only in
++    // images without status flag readers.
++    static void registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, bool elidesFlags,
++                                 bool statusElided);
+     bool lastRunEnded() const { return m_lastRunEnded; }
+     static DecodedInstructionPair decodeForCodegen(const uint8_t *vuCode, uint32_t pc);
+     // Codegen: whether this upper instruction queues MAC/status flag results.
+@@ -320,6 +328,12 @@ private:
+     bool m_jitElidesFlags = false;
+     bool m_elidedFlagsRan = false;
+     uint64_t m_jitHash = 0;
++    // Entry programs merged per code image (ps2_vu1_core.cpp).
++    struct JitEntryCache;
++    std::shared_ptr<JitEntryCache> m_jitEntryCache;
++    struct JitEntryTable;
++    JitEntryTable *m_jitEntryTable = nullptr;
++    static StepResult runJitEntries(VU1Interpreter &vu, const StepArgs &args);
+ 
+ public:
+     // Reference runs (ga2_vu1_replay --reference) use the interpreter only.
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_reach.h b/ps2xRuntime/include/runtime/ps2_vu1_reach.h
+new file mode 100644
+index 0000000..05eda0b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_vu1_reach.h
+@@ -0,0 +1,118 @@
++// The pairs a VU1 microprogram can reach from its entry point, and a key for
++// them. Games upload microprograms into code memory in changing combinations
++// (with stale code between them), so whole-image hashes keep missing; a
++// program keyed by its entry pair and the contents of the pairs it reaches is
++// found again in any image that holds the same code at the same place.
++// Shared by the runtime (lookup) and ga2_vu1_gen (generation), which must
++// agree exactly.
++#pragma once
++
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace ps2_vu1_reach
++{
++    inline uint32_t word(const uint8_t *code, uint32_t index, uint32_t half)
++    {
++        uint32_t w = 0;
++        std::memcpy(&w, code + index * 8u + half * 4u, 4);
++        return w;
++    }
++
++    // Lower-instruction branch kinds (I bit clear); 0x2A/0x2B are not branches.
++    inline bool isDirectBranch(uint32_t op)
++    {
++        return op == 0x20u || op == 0x21u || (op >= 0x28u && op <= 0x2Fu && op != 0x2Au && op != 0x2Bu);
++    }
++    inline bool isIndirectJump(uint32_t op) { return op == 0x24u || op == 0x25u; }
++
++    struct Program
++    {
++        std::vector<uint32_t> pairs; // ascending pair indices
++        uint64_t key = 0;
++    };
++
++    // Control flow by pairs, as in ga2_vu1_gen's flag analysis: a branch or
++    // jump acts after its delay slot and an E bit ends the program after the
++    // pair that follows it. BAL/JALR also continue after their delay slot
++    // (where a JR returns); JR targets are unknown and not followed (the
++    // runtime tries them as entries of their own). A run starting at the
++    // entry has nothing pending, so the entry also continues to the next pair.
++    inline Program reach(const uint8_t *code, uint32_t pairCount, uint32_t entry)
++    {
++        Program p;
++        if (pairCount == 0u || entry >= pairCount)
++            return p;
++        std::vector<uint8_t> seen(pairCount, 0u);
++        std::vector<uint32_t> work{entry};
++        while (!work.empty())
++        {
++            const uint32_t i = work.back();
++            work.pop_back();
++            if (i >= pairCount || seen[i])
++                continue;
++            seen[i] = 1u;
++            if (i == entry)
++                work.push_back(i + 1u);
++            if (i == 0u)
++            {
++                work.push_back(1u);
++                continue;
++            }
++            const uint32_t prevLower = word(code, i - 1u, 0), prevUpper = word(code, i - 1u, 1);
++            if ((prevUpper >> 30) & 1u) // i is the E bit's delay slot: the program ends after it
++                continue;
++            const uint32_t op = prevLower >> 25;
++            if ((prevUpper >> 31) == 0u && isDirectBranch(op))
++            {
++                int32_t imm = static_cast<int32_t>(prevLower & 0x7FFu);
++                if (imm & 0x400) imm -= 0x800;
++                work.push_back(static_cast<uint32_t>((static_cast<int64_t>(i) + imm + pairCount) % pairCount));
++                if (op != 0x20u) // conditional falls through; BAL returns here
++                    work.push_back(i + 1u);
++                continue;
++            }
++            if ((prevUpper >> 31) == 0u && isIndirectJump(op))
++            {
++                if (op == 0x25u) // JALR returns here
++                    work.push_back(i + 1u);
++                continue;
++            }
++            work.push_back(i + 1u);
++        }
++        // FNV-1a over the image size, the entry and each reached pair.
++        uint64_t h = 1469598103934665603ull;
++        auto mix = [&h](uint32_t v) {
++            for (int b = 0; b < 4; ++b)
++            {
++                h ^= (v >> (8 * b)) & 0xFFu;
++                h *= 1099511628211ull;
++            }
++        };
++        mix(pairCount);
++        mix(entry);
++        for (uint32_t i = 0; i < pairCount; ++i)
++            if (seen[i])
++            {
++                p.pairs.push_back(i);
++                mix(i);
++                mix(word(code, i, 0));
++                mix(word(code, i, 1));
++            }
++        p.key = h;
++        return p;
++    }
++
++    // Any FSAND/FSEQ/FSOR in the image: status flag results are observable.
++    inline bool readsStatus(const uint8_t *code, uint32_t pairCount)
++    {
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const uint32_t op = word(code, i, 0) >> 25;
++            if ((word(code, i, 1) >> 31) == 0u && (op == 0x14u || op == 0x16u || op == 0x17u))
++                return true;
++        }
++        return false;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 863c7f5..0b0b9ba 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_pgs.h"
+ #include "runtime/ps2_vu1.h"
++#include "runtime/ps2_vu1_reach.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+@@ -1033,8 +1034,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ // ---------------------------------------------------------------------------
+ // Generated VU1 programs (tools: ps2xTest/ga2_vu1_gen). A program is selected
+ // by a hash of the whole code image, so its constant decoded pairs are exactly
+-// what the interpreter would decode. GA2_VU1JIT=0 forces the interpreter;
+-// GA2_VU1_DUMP=<dir> writes code images that have no generated program.
++// what the interpreter would decode. Without one, entry programs that match
++// the image (entry pair plus the code reachable from it, ps2_vu1_reach.h) are
++// merged into a table for that image. GA2_VU1JIT=0 forces the interpreter;
++// GA2_VU1JIT=entries ignores whole-image programs (to check entry programs);
++// GA2_VU1_DUMP=<dir> writes code images that have no generated program and
++// the entries that missed.
+ namespace
+ {
+     struct RegisteredProgram
+@@ -1048,13 +1053,139 @@ namespace
+         static std::unordered_map<uint64_t, RegisteredProgram> registry;
+         return registry;
+     }
++
++    struct RegisteredEntry
++    {
++        const VU1Interpreter::JitProgram *chunks = nullptr;
++        uint32_t entryPair = 0;
++        bool elidesFlags = false;
++        bool statusElided = false;
++    };
++
++    // By reach key (which covers the entry pair too).
++    std::unordered_map<uint64_t, RegisteredEntry> &jitEntryRegistry()
++    {
++        static std::unordered_map<uint64_t, RegisteredEntry> registry;
++        return registry;
++    }
++
++    // Reports a code image (and entry pair, or -1 for the image) without a
++    // generated program once; GA2_VU1_DUMP also keeps the image and the
++    // entries that missed (<hash>.entries) for ga2_vu1_gen.
++    void reportJitMiss(const uint8_t *vuCode, uint32_t codeSize, uint64_t hash, int64_t entryPair)
++    {
++        static std::unordered_map<uint64_t, bool> reported;
++        const uint64_t id = hash ^ (static_cast<uint64_t>(entryPair + 1) * 0x9E3779B97F4A7C15ull);
++        if (reported[id])
++            return;
++        reported[id] = true;
++        if (entryPair < 0)
++            std::fprintf(stderr, "[vu1jit] no generated program for code image %016llx; interpreting\n",
++                         static_cast<unsigned long long>(hash));
++        else
++            std::fprintf(stderr, "[vu1jit] no generated program for entry %04llx of code image %016llx; interpreting\n",
++                         static_cast<unsigned long long>(entryPair), static_cast<unsigned long long>(hash));
++        const char *dir = std::getenv("GA2_VU1_DUMP");
++        if (!dir || !*dir)
++            return;
++        char name[64];
++        std::snprintf(name, sizeof(name), "/%016llx", static_cast<unsigned long long>(hash));
++        if (std::FILE *f = std::fopen((std::string(dir) + name + ".bin").c_str(), "wb"))
++        {
++            std::fwrite(vuCode, 1, codeSize, f);
++            std::fclose(f);
++        }
++        if (entryPair >= 0)
++            if (std::FILE *f = std::fopen((std::string(dir) + name + ".entries").c_str(), "a"))
++            {
++                std::fprintf(f, "%lld\n", static_cast<long long>(entryPair));
++                std::fclose(f);
++            }
++    }
+ }
+ 
++// The entry programs found in one code image so far: chunk per pair, and the
++// pairs already tried as entries. Everything here follows from the image's
++// contents, so a table is kept per image hash and reused when the game
++// uploads that image again.
++struct VU1Interpreter::JitEntryTable
++{
++    std::vector<JitProgram> chunks;
++    std::vector<uint8_t> tried;
++    bool readsStatus = false;
++    bool elidesFlags = false;
++};
++
++struct VU1Interpreter::JitEntryCache
++{
++    std::unordered_map<uint64_t, std::unique_ptr<JitEntryTable>> tables;
++};
++
+ void VU1Interpreter::registerJitProgram(uint64_t codeHash, JitProgram program, bool elidesFlags)
+ {
+     jitRegistry()[codeHash] = {program, elidesFlags};
+ }
+ 
++void VU1Interpreter::registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, bool elidesFlags,
++                                      bool statusElided)
++{
++    jitEntryRegistry()[reachKey] = {chunks, entryPair, elidesFlags, statusElided};
++}
++
++// Runs a microprogram from the merged entry-program table: chunks where a
++// matching program covers the pc, the interpreter elsewhere. A pc no program
++// covers yet (a run's entry, a JR target) is tried once as an entry.
++VU1Interpreter::StepResult VU1Interpreter::runJitEntries(VU1Interpreter &vu, const StepArgs &a)
++{
++    JitEntryTable &table = *vu.m_jitEntryTable;
++    const uint32_t pairs = static_cast<uint32_t>(table.chunks.size());
++    auto resolve = [&](uint32_t entry) {
++        const ps2_vu1_reach::Program reached = ps2_vu1_reach::reach(a.vuCode, pairs, entry);
++        table.tried[entry] = 1u;
++        for (uint32_t p : reached.pairs)
++            table.tried[p] = 1u;
++        const auto &registry = jitEntryRegistry();
++        const auto r = registry.find(reached.key);
++        if (r == registry.end() || r->second.entryPair != entry || (r->second.statusElided && table.readsStatus))
++        {
++            reportJitMiss(a.vuCode, a.codeSize, vu.m_jitHash, entry);
++            return;
++        }
++        // Each chunk carries its own program's analysis, and chunks are only
++        // entered with nothing pending, so programs can share a table.
++        for (uint32_t p : reached.pairs)
++            if (!table.chunks[p])
++                table.chunks[p] = r->second.chunks[p];
++        table.elidesFlags = table.elidesFlags || r->second.elidesFlags;
++    };
++
++    if (!vu.stepLoopHead(a))
++        return StepResult::Stop;
++    for (;;)
++    {
++        const uint32_t pc = vu.m_state.pc;
++        JitProgram chunk = nullptr;
++        // After an interpreted pair something may be pending that a chunk's
++        // entry facts rule out: interpret until it settles.
++        if ((pc & 7u) == 0u && (pc >> 3) < pairs && !vu.resumesInDelaySlot())
++        {
++            const uint32_t index = pc >> 3;
++            chunk = table.chunks[index];
++            if (!chunk && !table.tried[index])
++            {
++                resolve(index);
++                chunk = table.chunks[index];
++                vu.m_jitElidesFlags = table.elidesFlags;
++            }
++        }
++        const StepResult r = chunk ? chunk(vu, a) : vu.stepGeneric(a);
++        if (r != StepResult::Continue)
++            return r;
++        if (!chunk && !vu.stepLoopHead(a))
++            return StepResult::Stop;
++    }
++}
++
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeForCodegen(const uint8_t *vuCode, uint32_t pc)
+ {
+     static const VU1Interpreter decoder(Unit::VU1);
+@@ -1093,8 +1224,13 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+         return m_jitProgram;
+     m_jitMemory = memory;
+     m_jitGeneration = generation;
++    static const bool entriesOnly = [] {
++        const char *v = std::getenv("GA2_VU1JIT");
++        return v && std::strcmp(v, "entries") == 0;
++    }();
+     const uint64_t hash = digestBytes(vuCode, codeSize);
+-    const auto &registry = jitRegistry();
++    static const std::unordered_map<uint64_t, RegisteredProgram> none;
++    const auto &registry = entriesOnly ? none : jitRegistry();
+     const auto it = registry.find(hash);
+     m_jitProgram = it != registry.end() ? it->second.program : nullptr;
+     // Flag elision assumes a program's flags are only read by its own image.
+@@ -1110,22 +1246,28 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+     m_jitHash = hash;
+     m_jitElidesFlags = it != registry.end() && it->second.elidesFlags;
+ 
+-    static std::unordered_map<uint64_t, bool> reported;
+-    if (!m_jitProgram && !registry.empty() && !reported[hash])
++    if (!m_jitProgram && !jitEntryRegistry().empty())
+     {
+-        reported[hash] = true;
+-        std::fprintf(stderr, "[vu1jit] no generated program for code image %016llx; interpreting\n",
+-                     static_cast<unsigned long long>(hash));
+-        if (const char *dir = std::getenv("GA2_VU1_DUMP"); dir && *dir)
++        if (!m_jitEntryCache)
++            m_jitEntryCache = std::make_shared<JitEntryCache>();
++        auto &tables = m_jitEntryCache->tables;
++        if (tables.size() >= 256u)
++            tables.clear();
++        std::unique_ptr<JitEntryTable> &table = tables[hash];
++        if (!table)
+         {
+-            char name[64];
+-            std::snprintf(name, sizeof(name), "/%016llx.bin", static_cast<unsigned long long>(hash));
+-            if (std::FILE *f = std::fopen((std::string(dir) + name).c_str(), "wb"))
+-            {
+-                std::fwrite(vuCode, 1, codeSize, f);
+-                std::fclose(f);
+-            }
++            table = std::make_unique<JitEntryTable>();
++            table->chunks.assign(codeSize / 8u, nullptr);
++            table->tried.assign(codeSize / 8u, 0u);
++            table->readsStatus = ps2_vu1_reach::readsStatus(vuCode, codeSize / 8u);
+         }
++        m_jitEntryTable = table.get();
++        m_jitElidesFlags = table->elidesFlags;
++        m_jitProgram = &VU1Interpreter::runJitEntries;
++        return m_jitProgram;
+     }
++
++    if (!m_jitProgram && !registry.empty())
++        reportJitMiss(vuCode, codeSize, hash, -1);
+     return m_jitProgram;
+ }
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index a95293a..7c270a7 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -6,15 +6,19 @@
+ // each distinct image the tool writes vu1_<hash>_*.cpp: constexpr decoded
+ // pairs (decoded by the interpreter's own decoder) driving the shared
+ // VU1Interpreter::stepPair, which the compiler then specialises per pair.
+-// Pairs that the captured runs execute are compiled (all pairs for a raw
+-// image without runs); anything else falls back to the interpreter's step.
+-// The program registers itself under the image hash.
++// A captured image gets a program for the pairs its runs executed, registered
++// under the image hash. Every image also yields one program per entry point,
++// compiling the pairs reachable from it and registered under the key of
++// those pairs (runtime/ps2_vu1_reach.h). Anything else falls back to the
++// interpreter's step.
+ #include "ga2_vu1_capture.h"
++#include "runtime/ps2_vu1_reach.h"
+ 
+ #include <algorithm>
+ 
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <string>
+ #include <utility>
+ 
+@@ -48,7 +52,9 @@ namespace
+     // (so at least 4 cycles) before the reader; at a program end only the
+     // last result survives; indirect jumps lead anywhere, so they count as
+     // readers. Values are unaffected: only flag bookkeeping is skipped.
+-    std::vector<uint8_t> flagModes(const std::vector<uint8_t> &code)
++    // inSet (entry programs): only these pairs are known; leaving them counts
++    // as reaching any reader.
++    std::vector<uint8_t> flagModes(const std::vector<uint8_t> &code, const std::vector<uint8_t> *inSet = nullptr)
+     {
+         const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
+         auto word = [&](uint32_t index, uint32_t half) {
+@@ -106,6 +112,11 @@ namespace
+                     succ[slot].push_back(static_cast<int>((i + 2u) % pairs));
+             }
+         }
++        if (inSet)
++            for (uint32_t i = 0; i < pairs; ++i)
++                for (int &n : succ[i])
++                    if (n >= 0 && !(*inSet)[static_cast<uint32_t>(n)])
++                        n = kAnywhere;
+         // GA2_VU1GEN_ALLFLAGS=1: keep every flag result (a strict oracle build
+         // for digest-mode replay).
+         if (const char *all = std::getenv("GA2_VU1GEN_ALLFLAGS"); all && *all == '1')
+@@ -235,21 +246,29 @@ namespace
+         return static_cast<bool>(f);
+     }
+ 
+-    bool emit(const std::string &outdir, uint64_t hash, const std::vector<uint8_t> &code,
+-              const std::vector<uint64_t> &hits)
++    // What a generated program covers and how it registers.
++    struct Target
+     {
+-        char base[64];
+-        std::snprintf(base, sizeof(base), "vu1_%016llx", static_cast<unsigned long long>(hash));
++        std::string base;               // file and symbol prefix
++        std::vector<uint32_t> selected; // pairs compiled (ascending)
++        // Entry programs (see ps2_vu1_reach.h): only the selected pairs are
++        // known, so a pair whose predecessor is not one of them assumes
++        // anything may be pending, and the key registers the program.
++        bool entryProgram = false;
++        uint32_t entry = 0;
++        uint64_t key = 0;
++    };
++
++    bool emit(const std::string &outdir, uint64_t hash, const std::vector<uint8_t> &code, const Target &target)
++    {
++        const char *base = target.base.c_str();
+         const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
+         if (pairs == 0u || (pairs & (pairs - 1u)) != 0u)
+         {
+             std::fprintf(stderr, "%s: code image of %u pairs is not a power of two\n", base, pairs);
+             return false;
+         }
+-        std::vector<uint32_t> selected;
+-        for (uint32_t i = 0; i < pairs; ++i)
+-            if (hits.empty() || hits[i] != 0u)
+-                selected.push_back(i);
++        const std::vector<uint32_t> &selected = target.selected;
+ 
+         // Chunks of consecutive selected pairs; each chunk runs its own loop
+         // while execution stays inside it.
+@@ -261,8 +280,19 @@ namespace
+             chunks.back().push_back(index);
+         }
+ 
+-        const std::vector<uint8_t> modes = flagModes(code);
+-        const EntryFacts facts = entryFacts(code);
++        std::vector<uint8_t> inSet;
++        if (target.entryProgram)
++        {
++            inSet.assign(pairs, 0u);
++            for (uint32_t i : selected)
++                inSet[i] = 1u;
++        }
++        const std::vector<uint8_t> modes = flagModes(code, target.entryProgram ? &inSet : nullptr);
++        EntryFacts facts = entryFacts(code);
++        if (target.entryProgram)
++            for (uint32_t i : selected)
++                if (i == 0u || !std::binary_search(selected.begin(), selected.end(), i - 1u))
++                    facts.mayBranch[i] = facts.mayEnd[i] = facts.mayHalt[i] = true;
+         size_t macLive = 0, producers = 0;
+         for (uint32_t i = 0; i < pairs; ++i)
+             if (VU::upperProducesFmacFlags(static_cast<uint32_t>(code[i * 8u + 4u] | code[i * 8u + 5u] << 8 |
+@@ -285,8 +315,11 @@ namespace
+                     std::to_string(pairs) + "] = {\n";
+         for (uint32_t i = 0; i < pairs; ++i)
+             dispatch += chunkOf[i] < 0 ? "    nullptr,\n" : "    " + std::string(base) + "_chunk" + std::to_string(chunkOf[i]) + ",\n";
+-        dispatch += "};\n\n"
+-                    "// A chunk is entered with the loop head already done for its pc and\n"
++        dispatch += "};\n\n";
++        // An entry program registers its chunks; the runtime merges them
++        // with other programs found in the same image and runs the loop.
++        if (!target.entryProgram)
++            dispatch += "// A chunk is entered with the loop head already done for its pc and\n"
+                     "// returns Continue with the loop head done for a pc outside itself.\n"
+                     "VU::StepResult run(VU &vu, const VU::StepArgs &a)\n{\n"
+                     "    if (!vu.stepLoopHead(a))\n        return VU::StepResult::Stop;\n"
+@@ -298,15 +331,23 @@ namespace
+                     "        if (!vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n    }\n"
+                     "    for (;;)\n    {\n"
+                     "        const uint32_t pc = vu.state().pc;\n"
+-                    "        const Chunk chunk = (pc & 7u) == 0u ? kChunks[(pc >> 3) & " + std::to_string(pairs - 1) + "u] : nullptr;\n"
++                    "        // After an interpreted pair something may be pending that a\n"
++                    "        // chunk's entry facts rule out: interpret until it settles.\n"
++                    "        const Chunk chunk = (pc & 7u) == 0u && !vu.resumesInDelaySlot() ? kChunks[(pc >> 3) & " + std::to_string(pairs - 1) + "u] : nullptr;\n"
+                     "        const VU::StepResult r = chunk ? chunk(vu, a) : vu.stepGeneric(a);\n"
+                     "        if (r != VU::StepResult::Continue)\n            return r;\n"
+                     "        if (!chunk && !vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n"
+                     "    }\n}\n\n";
+-        char reg[192];
++        char reg[256];
+         const bool elides = std::any_of(modes.begin(), modes.end(), [](uint8_t m) { return m != VU::kFlagAll; });
+-        std::snprintf(reg, sizeof(reg), "struct Register\n{\n    Register() { VU::registerJitProgram(0x%016llxull, run, %s); }\n} registerProgram;\n}\n",
+-                      static_cast<unsigned long long>(hash), elides ? "true" : "false");
++        if (target.entryProgram)
++            std::snprintf(reg, sizeof(reg),
++                          "struct Register\n{\n    Register() { VU::registerJitEntry(%u, 0x%016llxull, kChunks, %s, %s); }\n} registerProgram;\n}\n",
++                          target.entry, static_cast<unsigned long long>(target.key), elides ? "true" : "false",
++                          !modes.empty() && (modes[0] & VU::kFlagStatus) ? "false" : "true");
++        else
++            std::snprintf(reg, sizeof(reg), "struct Register\n{\n    Register() { VU::registerJitProgram(0x%016llxull, run, %s); }\n} registerProgram;\n}\n",
++                          static_cast<unsigned long long>(hash), elides ? "true" : "false");
+         dispatch += reg;
+         if (!write(outdir + "/" + base + ".cpp", dispatch))
+             return false;
+@@ -385,14 +426,99 @@ int main(int argc, char **argv)
+                 h[i] += counts[i];
+         }
+     }
++    // Entry points recorded by the runtime next to a dumped image
++    // (<hash>.entries: one pair index per line).
++    std::unordered_map<uint64_t, std::vector<uint32_t>> recordedEntries;
++    for (int i = 2; i < argc; ++i)
++    {
++        std::string path = argv[i];
++        if (path.size() < 4 || path.compare(path.size() - 4, 4, ".bin") != 0)
++            continue;
++        const size_t slash = path.find_last_of("/\\");
++        const std::string stem = path.substr(slash == std::string::npos ? 0 : slash + 1, path.size() - 4 - (slash == std::string::npos ? 0 : slash + 1));
++        std::ifstream in(path.substr(0, path.size() - 4) + ".entries");
++        for (uint32_t entry = 0; in >> entry;)
++            recordedEntries[std::strtoull(stem.c_str(), nullptr, 16)].push_back(entry);
++    }
++
++    for (const auto &run : cap.runs)
++        recordedEntries[run.codeHash].push_back(run.startPC >> 3);
++
++    std::unordered_map<uint64_t, bool> emittedKeys;
++    size_t entryPrograms = 0, entryInstances = 0;
+     for (const auto &[hash, code] : cap.codes)
+     {
+         const auto it = hits.find(hash);
+-        std::vector<uint64_t> h = it != hits.end() ? it->second : std::vector<uint64_t>{};
+-        if (!h.empty())
+-            h.resize(code.size() / 8u);
+-        if (!emit(argv[1], hash, code, h))
+-            return 1;
++        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++        if (it != hits.end())
++        {
++            // Captured runs: one program for the image, compiling the pairs
++            // they executed.
++            Target t;
++            char base[64];
++            std::snprintf(base, sizeof(base), "vu1_%016llx", static_cast<unsigned long long>(hash));
++            t.base = base;
++            for (uint32_t i = 0; i < pairs; ++i)
++                if (i < it->second.size() && it->second[i] != 0u)
++                    t.selected.push_back(i);
++            if (!emit(argv[1], hash, code, t))
++                return 1;
++        }
++        // Every image also gives one program per entry point, keyed by the
++        // code it reaches, so other images holding the same program find it.
++        // Entries are where a program can start after another one's end (and
++        // pair 0), plus those captured runs started at or the runtime recorded.
++        std::vector<uint32_t> entries{0u};
++        for (uint32_t i = 0; i + 2u < pairs; ++i)
++            if ((ps2_vu1_reach::word(code.data(), i, 1) >> 30) & 1u)
++                entries.push_back(i + 2u);
++        if (const auto r = recordedEntries.find(hash); r != recordedEntries.end())
++            entries.insert(entries.end(), r->second.begin(), r->second.end());
++        std::sort(entries.begin(), entries.end());
++        entries.erase(std::unique(entries.begin(), entries.end()), entries.end());
++        // Pairs the captured runs executed that no entry reaches (JR
++        // targets): the first of each becomes an entry too.
++        if (it != hits.end())
++        {
++            std::vector<uint8_t> covered(pairs, 0u);
++            for (uint32_t entry : entries)
++                for (uint32_t i : ps2_vu1_reach::reach(code.data(), pairs, entry).pairs)
++                    covered[i] = 1u;
++            for (uint32_t i = 0; i < pairs && i < it->second.size(); ++i)
++                if (it->second[i] != 0u && !covered[i])
++                {
++                    entries.push_back(i);
++                    for (uint32_t k : ps2_vu1_reach::reach(code.data(), pairs, i).pairs)
++                        covered[k] = 1u;
++                }
++        }
++        for (uint32_t entry : entries)
++        {
++            ps2_vu1_reach::Program program = ps2_vu1_reach::reach(code.data(), pairs, entry);
++            if (program.pairs.empty())
++                continue;
++            ++entryInstances;
++            if (emittedKeys[program.key])
++                continue;
++            emittedKeys[program.key] = true;
++            ++entryPrograms;
++            // Generate from the reached pairs alone: everything else reads as
++            // zero (no branch, no E bit, no flag reader).
++            std::vector<uint8_t> masked(code.size(), 0u);
++            for (uint32_t i : program.pairs)
++                std::memcpy(masked.data() + i * 8u, code.data() + i * 8u, 8u);
++            Target t;
++            char base[64];
++            std::snprintf(base, sizeof(base), "vu1e_%04x_%016llx", entry, static_cast<unsigned long long>(program.key));
++            t.base = base;
++            t.selected = std::move(program.pairs);
++            t.entryProgram = true;
++            t.entry = entry;
++            t.key = program.key;
++            if (!emit(argv[1], hash, masked, t))
++                return 1;
++        }
+     }
++    std::printf("entry programs: %zu distinct of %zu entry points\n", entryPrograms, entryInstances);
+     return 0;
+ }
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index d0139cb..afe3d45 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_vu1.h"
++#include "runtime/ps2_vu1_reach.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -1696,6 +1697,46 @@ void register_ps2_vu1_tests()
+                      "the underflowing product should set sticky Z and U");
+         });
+ 
++        tc.Run("entry program keys cover exactly the code reachable from the entry", [](TestCase &t)
++        {
++            constexpr uint32_t kPairs = PS2_VU1_CODE_SIZE / 8u;
++            std::vector<uint8_t> code(PS2_VU1_CODE_SIZE, 0u);
++            constexpr uint32_t kUpperE = kVuUpperNop | (1u << 30);
++            // 10: IBNE +3 (to 14) / 11: delay slot / 12 / 13: E / 14: E delay slot / 15: E
++            writeVuInstructionPair(code.data(), 10u * 8u, makeVuIbne(1u, 2u, 3), kVuUpperNop);
++            writeVuInstructionPair(code.data(), 13u * 8u, 0u, kUpperE);
++            writeVuInstructionPair(code.data(), 15u * 8u, makeVuIaddiu(1u, 0u, 7), kUpperE);
++            // 100: JR (target unknown) / 101: delay slot
++            writeVuInstructionPair(code.data(), 100u * 8u, makeVuJr(1u), kVuUpperNop);
++            // 200: BAL to 205, returning to 202 / 202: E / 205: E
++            writeVuInstructionPair(code.data(), 200u * 8u, (0x21u << 25) | (15u << 16) | 4u, kVuUpperNop);
++            writeVuInstructionPair(code.data(), 202u * 8u, 0u, kUpperE);
++            writeVuInstructionPair(code.data(), 205u * 8u, 0u, kUpperE);
++
++            const auto a = ps2_vu1_reach::reach(code.data(), kPairs, 10u);
++            t.IsTrue(a.pairs == std::vector<uint32_t>({10u, 11u, 12u, 13u, 14u}),
++                     "a branch reaches its target and fall-through; the E delay slot ends the program");
++            t.IsTrue(ps2_vu1_reach::reach(code.data(), kPairs, 14u).pairs == std::vector<uint32_t>({14u, 15u, 16u}),
++                     "a run entered at an E delay slot continues past it");
++            const auto j = ps2_vu1_reach::reach(code.data(), kPairs, 100u);
++            t.IsTrue(j.pairs == std::vector<uint32_t>({100u, 101u}), "a JR target is not followed");
++            const auto b = ps2_vu1_reach::reach(code.data(), kPairs, 200u);
++            t.IsTrue(b.pairs == std::vector<uint32_t>({200u, 201u, 202u, 203u, 205u, 206u}),
++                     "BAL reaches its target and its return point");
++
++            std::vector<uint8_t> other = code;
++            writeVuInstructionPair(other.data(), 15u * 8u, makeVuIaddiu(2u, 0u, 9), kVuUpperNop);
++            writeVuInstructionPair(other.data(), 9u * 8u, makeVuIaddiu(3u, 0u, 1), kVuUpperNop);
++            t.Equals(ps2_vu1_reach::reach(other.data(), kPairs, 10u).key, a.key,
++                     "code the program cannot reach does not change its key");
++            writeVuInstructionPair(other.data(), 12u * 8u, makeVuIaddiu(3u, 0u, 1), kVuUpperNop);
++            t.IsTrue(ps2_vu1_reach::reach(other.data(), kPairs, 10u).key != a.key,
++                     "a change inside the program changes its key");
++            t.IsTrue(ps2_vu1_reach::reach(code.data(), kPairs, 11u).key != a.key,
++                     "the entry pair is part of the key");
++            t.IsFalse(ps2_vu1_reach::readsStatus(code.data(), kPairs), "no FSAND/FSEQ/FSOR in the image");
++        });
++
+         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
+         {
+             Vu1Fixture fx;
+-- 
+2.55.0
+

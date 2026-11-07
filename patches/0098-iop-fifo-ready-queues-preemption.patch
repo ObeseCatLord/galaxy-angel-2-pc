@@ -1,0 +1,853 @@
+From 20236deb874279b0db68a56d01a40094ea15b7ab Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:12:46 -0500
+Subject: [PATCH] iop: FIFO ready queues with priority preemption; kernel
+ semaphore results (H-IOP5, H-IOP14)
+
+Scheduler (H-IOP5): equal priorities used to run lowest-id-first with a
+re-pick after every slice, and a readied higher-priority thread waited for
+the 256-instruction slice to end.
+- every ready thread has a place in its priority's FIFO queue; a slice that
+  merely ends keeps the thread at the front (the IOP kernel does not time
+  slice), RotateThreadReadyQueue(prio) rotates the named queue, and
+  ChangeThreadPriority moves a ready thread to the back of its new queue
+- anything that readies a thread (StartThread, WakeupThread, ResumeThread,
+  SignalSema, SetEventFlag, DeleteSema/DeleteEventFlag, ReleaseWait, RPC
+  completion, expired DelayThread) preempts the running thread immediately
+  when it outranks it; the preempted thread keeps its place in its queue
+- DisableDispatchThread/EnableDispatchThread are honoured (preemption is
+  deferred and applied on enable); expired delays become ready in wake order
+- semaphore waiters are served by (priority, arrival) instead of thread id
+
+Kernel results (H-IOP14):
+- SignalSema returns KE_SEMA_OVF instead of silently saturating
+- DeleteSema releases waiters with KE_WAIT_DELETE (they used to wait forever)
+- WaitSema that would block outside a scheduled thread (callback, module
+  start routine, driver callback) returns KE_CAN_NOT_WAIT with v0 written and
+  one logged warning; it no longer parks the interrupted thread on the
+  callback's behalf or leaves v0 unwritten
+- a thread whose last instruction tail-calls a blocking import keeps its wait
+  instead of being retired at the return sentinel
+
+Tests: new ps2_iop_kernel_sched_tests (12 cases).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/CMakeLists.txt                   |   5 +
+ ps2xIOP/src/emulator/core/iop_kernel.cpp | 168 ++++++++--
+ ps2xIOP/src/emulator/core/iop_kernel.h   |  11 +
+ ps2xIOP/src/emulator/iop_emulator.cpp    |  16 +-
+ ps2xIOP/tests/iop_kernel_sched_tests.cpp | 378 +++++++++++++++++++++++
+ 5 files changed, 546 insertions(+), 32 deletions(-)
+ create mode 100644 ps2xIOP/tests/iop_kernel_sched_tests.cpp
+
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 76c3c47..d7b9a63 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -100,6 +100,11 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_rpc_wait_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_rpc_wait_tests COMMAND ps2_iop_rpc_wait_tests)
+ 
++    add_executable(ps2_iop_kernel_sched_tests tests/iop_kernel_sched_tests.cpp)
++    target_link_libraries(ps2_iop_kernel_sched_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_kernel_sched_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_kernel_sched_tests COMMAND ps2_iop_kernel_sched_tests)
++
+     # Direct bridge/kernel scope. EE ingress/queue/Exec remains an integration
+     # responsibility of the host/runtime test family.
+     add_executable(ps2_iop_reverse_rpc_tests tests/iop_reverse_rpc_tests.cpp)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 8db8fc8..434f9d0 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -11,6 +11,9 @@ namespace ps2x::iop::detail
+     {
+         constexpr int32_t kKeIllegalThid = -406;
+         constexpr int32_t kKeNotDormant = -414;
++        constexpr int32_t kKeCanNotWait = -417;
++        constexpr int32_t kKeSemaOvf = -420;
++        constexpr int32_t kKeWaitDelete = -425;
+     }
+ 
+     namespace
+@@ -58,6 +61,27 @@ namespace ps2x::iop::detail
+             m_threadList.push_back(&thread);
+     }
+ 
++    void IopKernel::makeReady(IopThread &thread)
++    {
++        thread.state = IopThreadState::Ready;
++        thread.readySerial = m_nextReadySerial++;
++        if (!m_dispatchDisabled && m_currentThread != nullptr && m_currentThread != &thread &&
++            thread.priority < m_currentThread->priority)
++            m_currentThread->cpu.yielded = true; // preempted; it keeps its place at the front of its queue
++    }
++
++    void IopKernel::requestPreemptionIfOutranked()
++    {
++        if (m_currentThread == nullptr || m_dispatchDisabled)
++            return;
++        for (const IopThread *thread : m_threadList)
++            if (thread->state == IopThreadState::Ready && thread->priority < m_currentThread->priority)
++            {
++                m_currentThread->cpu.yielded = true;
++                return;
++            }
++    }
++
+     void IopKernel::reset()
+     {
+         m_threads.clear();
+@@ -71,6 +95,8 @@ namespace ps2x::iop::detail
+         m_currentThread = nullptr;
+         m_detachedSemaphoreWait = nullptr;
+         m_nextWaitSerial = 1;
++        m_nextReadySerial = 1;
++        m_dispatchDisabled = false;
+     }
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+@@ -157,7 +183,7 @@ namespace ps2x::iop::detail
+             thread.cpu.gpr[28] = cpu.gpr[28];
+             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+             thread.cpu.gpr[31] = kThreadReturnSentinel;
+-            thread.state = IopThreadState::Ready;
++            makeReady(thread);
+             setV0(0);
+             return true;
+         }
+@@ -192,8 +218,13 @@ namespace ps2x::iop::detail
+             setV0(0);
+             return true;
+         }
+-        case 12:
+-        case 13:
++        case 12: // DisableDispatchThread
++            m_dispatchDisabled = true;
++            setV0(0);
++            return true;
++        case 13: // EnableDispatchThread
++            m_dispatchDisabled = false;
++            requestPreemptionIfOutranked();
+             setV0(0);
+             return true;
+         case 14:
+@@ -209,14 +240,41 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
++            if (it->second.state == IopThreadState::Ready)
++                it->second.readySerial = m_nextReadySerial++; // back of its new queue
++            requestPreemptionIfOutranked();
+             setV0(0);
+             return true;
+         }
+-        case 16:
++        case 16: // RotateThreadReadyQueue
+         case 17:
++        {
++            // a0 = priority (0 = the caller's). Rotating the caller's own queue
++            // sends the caller to the back; another queue's front goes to its back.
++            uint32_t priority = cpu.gpr[4];
++            if (priority == 0u && m_currentThread != nullptr)
++                priority = m_currentThread->priority;
+             setV0(0);
+-            cpu.yielded = true;
++            const bool ownThread = m_currentThread != nullptr && &m_currentThread->cpu == &cpu;
++            if (ownThread && m_currentThread->priority == priority)
++            {
++                m_currentThread->rotateRequested = true;
++                cpu.yielded = true;
++                return true;
++            }
++            // A private callback CPU that yields has not completed (its
++            // synchronous owner treats that as an incomplete call).
++            if (!ownThread)
++                cpu.yielded = true;
++            IopThread *front = nullptr;
++            for (IopThread *thread : m_threadList)
++                if (thread->state == IopThreadState::Ready && thread->priority == priority &&
++                    (front == nullptr || thread->readySerial < front->readySerial))
++                    front = thread;
++            if (front != nullptr)
++                front->readySerial = m_nextReadySerial++;
+             return true;
++        }
+         case 18:
+         case 19:
+         {
+@@ -232,7 +290,7 @@ namespace ps2x::iop::detail
+                 it->second.state == IopThreadState::Semaphore ||
+                 it->second.state == IopThreadState::EventFlag)
+             {
+-                it->second.state = IopThreadState::Ready;
++                makeReady(it->second);
+             }
+             setV0(0);
+             return true;
+@@ -273,7 +331,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             if (it->second.state == IopThreadState::Sleep)
+-                it->second.state = IopThreadState::Ready;
++                makeReady(it->second);
+             else
+                 ++it->second.wakeupCount;
+             setV0(0);
+@@ -328,7 +386,7 @@ namespace ps2x::iop::detail
+                     {
+                         it->second.cpu.gpr[2] = static_cast<uint32_t>(it->second.rpcWaitResult);
+                         invalidateRpcWait(it->second);
+-                        it->second.state = IopThreadState::Ready;
++                        makeReady(it->second);
+                     }
+                     else
+                     {
+@@ -337,7 +395,7 @@ namespace ps2x::iop::detail
+                 }
+                 else
+                 {
+-                    it->second.state = IopThreadState::Ready;
++                    makeReady(it->second);
+                 }
+             }
+             setV0(0);
+@@ -489,11 +547,28 @@ namespace ps2x::iop::detail
+             setV0(semaphore.id);
+             return true;
+         }
+-        case 5:
+-            if (hasDetachedSemaphoreWait(static_cast<int>(cpu.gpr[4])) && !m_detachedSemaphoreWait->acquired)
++        case 5: // DeleteSema
++        {
++            const int id = static_cast<int>(cpu.gpr[4]);
++            if (hasDetachedSemaphoreWait(id) && !m_detachedSemaphoreWait->acquired)
+                 m_detachedSemaphoreWait->cancelled = true;
+-            setV0(m_semaphores.erase(static_cast<int>(cpu.gpr[4])) != 0u ? 0 : -1);
++            if (m_semaphores.erase(id) == 0u)
++            {
++                setV0(-1);
++                return true;
++            }
++            // Every thread still waiting is released with KE_WAIT_DELETE.
++            for (auto &[threadId, thread] : m_threads)
++            {
++                if (thread.state != IopThreadState::Semaphore || thread.waitId != id)
++                    continue;
++                thread.cpu.gpr[2] = static_cast<uint32_t>(kKeWaitDelete);
++                thread.waitId = 0;
++                makeReady(thread);
++            }
++            setV0(0);
+             return true;
++        }
+         case 6:
+         case 7:
+         {
+@@ -504,6 +579,14 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            // A signal that finds a waiter hands its token over (the count
++            // does not change); otherwise the count may not exceed its maximum.
++            if (it->second.current >= it->second.maximum && !hasSemaphoreWaiter(id) &&
++                !(hasDetachedSemaphoreWait(id) && !m_detachedSemaphoreWait->acquired && !m_detachedSemaphoreWait->cancelled))
++            {
++                setV0(kKeSemaOvf);
++                return true;
++            }
+             if (it->second.current < it->second.maximum)
+                 ++it->second.current;
+             wakeOneSemaphore(id);
+@@ -527,7 +610,7 @@ namespace ps2x::iop::detail
+             }
+             else if (ordinal == 9)
+                 setV0(-419);
+-            else if (m_currentThread != nullptr)
++            else if (m_currentThread != nullptr && &m_currentThread->cpu == &cpu)
+             {
+                 m_currentThread->state = IopThreadState::Semaphore;
+                 m_currentThread->waitId = id;
+@@ -535,6 +618,15 @@ namespace ps2x::iop::detail
+                 cpu.yielded = true;
+                 setV0(0);
+             }
++            else
++            {
++                // Only a scheduled thread can block. An IRQ/alarm/timer
++                // callback, a module start routine or a driver callback runs on
++                // a private CPU: parking the interrupted thread on its behalf
++                // would lose that thread's progress.
++                ++m_cannotWaitCount;
++                setV0(kKeCanNotWait);
++            }
+             return true;
+         }
+         case 11:
+@@ -600,8 +692,8 @@ namespace ps2x::iop::detail
+         if (best != nullptr)
+         {
+             --semaphore->second.current;
+-            best->state = IopThreadState::Ready;
+             best->waitId = 0;
++            makeReady(*best);
+         }
+     }
+ 
+@@ -626,7 +718,7 @@ namespace ps2x::iop::detail
+             thread.cpu.gpr[2] = 0u;
+             if ((thread.waitMode & 0x10u) != 0u)
+                 event.bits = 0u;
+-            thread.state = IopThreadState::Ready;
++            makeReady(thread);
+             thread.waitId = 0;
+             thread.waitBits = 0;
+             thread.waitMode = 0;
+@@ -687,9 +779,9 @@ namespace ps2x::iop::detail
+             {
+                 if (thread.state == IopThreadState::EventFlag && thread.waitId == id)
+                 {
+-                    thread.state = IopThreadState::Ready;
+                     thread.waitId = 0;
+                     thread.cpu.gpr[2] = static_cast<uint32_t>(-1);
++                    makeReady(thread);
+                 }
+             }
+             setV0(0);
+@@ -850,22 +942,29 @@ namespace ps2x::iop::detail
+         }
+ 
+         invalidateRpcWait(thread);
+-        thread.state = IopThreadState::Ready;
++        makeReady(thread);
+         return true;
+     }
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        // One pass: wake expired delays and pick the highest-priority ready
+-        // thread (lowest priority value, then lowest id).
+-        IopThread *next = nullptr;
++        // Expired delays become ready in (wake time, id) order, behind the
++        // threads that are already queued. The next thread is the head of the
++        // best priority's FIFO queue: lowest (priority, readySerial).
++        std::vector<IopThread *> expired;
+         for (IopThread *thread : m_threadList)
+-        {
+             if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
+-                thread->state = IopThreadState::Ready;
+-            if (thread->state == IopThreadState::Ready && (next == nullptr || thread->priority < next->priority))
+-                next = thread; // id order: the first of equal priority wins
+-        }
++                expired.push_back(thread);
++        std::stable_sort(expired.begin(), expired.end(),
++                         [](const IopThread *a, const IopThread *b) { return a->wakeCycle < b->wakeCycle; });
++        for (IopThread *thread : expired)
++            makeReady(*thread);
++        IopThread *next = nullptr;
++        for (IopThread *thread : m_threadList)
++            if (thread->state == IopThreadState::Ready &&
++                (next == nullptr || thread->priority < next->priority ||
++                 (thread->priority == next->priority && thread->readySerial < next->readySerial)))
++                next = thread;
+         if (next == nullptr)
+             return nullptr;
+ 
+@@ -889,10 +988,21 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
+-        if (thread.state != IopThreadState::Dead && (thread.cpu.pc == returnSentinel || thread.cpu.stopped))
+-            thread.state = IopThreadState::Dormant;
+-        else if (thread.state == IopThreadState::Running)
+-            thread.state = IopThreadState::Ready;
++        // Only a thread that is still running can finish here. A thread that
++        // blocked in its last instruction (a tail-called WaitSema/SleepThread
++        // returns to the sentinel in the same step) keeps its wait state; it
++        // finishes when it is woken and resumes at the sentinel.
++        if (thread.state == IopThreadState::Running)
++        {
++            thread.state = (thread.cpu.pc == returnSentinel || thread.cpu.stopped) ? IopThreadState::Dormant
++                                                                                     : IopThreadState::Ready;
++            // A slice that merely ran out (or a preemption) keeps the thread at
++            // the front of its priority queue; only an explicit rotate sends it
++            // to the back.
++            if (thread.state == IopThreadState::Ready && thread.rotateRequested)
++                thread.readySerial = m_nextReadySerial++;
++        }
++        thread.rotateRequested = false;
+         m_currentThread = nullptr;
+         cleanupDeadThreads();
+     }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 8bc35b9..f498df5 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -41,6 +41,8 @@ namespace ps2x::iop::detail
+         uint64_t wakeCycle = 0;
+         int waitId = 0;
+         uint64_t waitSerial = 0; // arrival order among semaphore waiters
++        uint64_t readySerial = 0; // position in its priority's FIFO ready queue
++        bool rotateRequested = false; // RotateThreadReadyQueue: go to the back at the end of the slice
+         uint32_t waitBits = 0;
+         uint32_t waitMode = 0;
+         uint32_t waitResultAddress = 0;
+@@ -124,6 +126,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool ownsCurrentCpu(const IopCpuState &cpu) const noexcept
+         { return m_currentThread && &m_currentThread->cpu == &cpu; }
+         [[nodiscard]] bool hasSemaphoreWaiter(int id) const noexcept;
++        // WaitSema calls that could not block (callback/start-routine context).
++        [[nodiscard]] uint64_t cannotWaitCount() const noexcept { return m_cannotWaitCount; }
+ 
+     private:
+         struct Semaphore
+@@ -148,6 +152,10 @@ namespace ps2x::iop::detail
+         void invalidateRpcWait(IopThread &thread) noexcept;
+         [[nodiscard]] uint64_t nextRpcLifetimeGeneration() noexcept;
+         void wakeOneSemaphore(int id);
++        // Moves a thread to the back of its priority's ready queue and, when it
++        // outranks the running thread, makes that thread yield (preemption).
++        void makeReady(IopThread &thread);
++        void requestPreemptionIfOutranked();
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+         void wakeEventWaiters(EventFlag &event);
+ 
+@@ -163,6 +171,9 @@ namespace ps2x::iop::detail
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         uint64_t m_nextWaitSerial = 1;
++        uint64_t m_cannotWaitCount = 0;
++        uint64_t m_nextReadySerial = 1;
++        bool m_dispatchDisabled = false; // DisableDispatchThread: no preemption
+         uint64_t m_nextRpcLifetimeGeneration = 1;
+         int m_systemStatusEventFlag = 0;
+         IopThread *m_currentThread = nullptr;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index bee7f22..eb331cf 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -188,6 +188,7 @@ namespace ps2x::iop::detail
+             rpcAbort = false;
+             rpcFailReason = nullptr;
+             callStackExhaustionLogged = false;
++            cannotWaitLogged = false;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+@@ -422,9 +423,17 @@ namespace ps2x::iop::detail
+             {
+                 if (call.ordinal == 8u && rpcWaitCpu != nullptr && &cpu == rpcWaitCpu)
+                     return dispatchRpcSemaphoreWait(cpu);
+-                return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                const uint64_t cannotWait = kernel.cannotWaitCount();
++                const bool handled = kernel.dispatchSemaphoreImport(call.ordinal, cpu);
++                if (kernel.cannotWaitCount() != cannotWait && !cannotWaitLogged)
++                {
++                    cannotWaitLogged = true;
++                    std::ostringstream out;
++                    out << "[IOP] WaitSema would block outside a scheduled thread (callback or start routine); "
++                           "returning KE_CAN_NOT_WAIT, ra=0x" << std::hex << cpu.gpr[31];
++                    log(LogLevel::Warning, out.str());
++                }
++                return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
+             }
+             if (iequals(call.library, "thevent"))
+             {
+@@ -1370,6 +1379,7 @@ namespace ps2x::iop::detail
+         bool rpcAbort = false;
+         const char *rpcFailReason = nullptr;
+         bool callStackExhaustionLogged = false;
++        bool cannotWaitLogged = false;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+diff --git a/ps2xIOP/tests/iop_kernel_sched_tests.cpp b/ps2xIOP/tests/iop_kernel_sched_tests.cpp
+new file mode 100644
+index 0000000..16f0b32
+--- /dev/null
++++ b/ps2xIOP/tests/iop_kernel_sched_tests.cpp
+@@ -0,0 +1,378 @@
++// Kernel-level scheduling and semaphore contract: FIFO per priority, priority
++// preemption, rotate/priority changes, DisableDispatchThread and the kernel's
++// semaphore results (KE_SEMA_OVF, KE_WAIT_DELETE, KE_CAN_NOT_WAIT).
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/iop_emulator_const.h"
++
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++
++    constexpr int32_t kSemaZero = -419, kSemaOvf = -420, kWaitDelete = -425, kCanNotWait = -417;
++
++    void require(bool condition, std::string_view message)
++    {
++        if (!condition)
++            throw std::runtime_error(std::string(message));
++    }
++
++    struct Fixture
++    {
++        IopMemory memory;
++        IopKernel kernel{memory};
++        uint64_t cycle = 0;
++
++        int32_t thread(uint32_t priority)
++        {
++            memory.write32(0x1000u + 0u, 0u);
++            memory.write32(0x1000u + 4u, 0u);
++            memory.write32(0x1000u + 8u, 0x4000u);
++            memory.write32(0x1000u + 12u, 0x400u);
++            memory.write32(0x1000u + 16u, priority);
++            IopCpuState cpu{};
++            cpu.gpr[4] = 0x1000u;
++            require(kernel.dispatchThreadImport(4u, cpu, cycle), "CreateThread");
++            require(int32_t(cpu.gpr[2]) > 0, "CreateThread failed");
++            return int32_t(cpu.gpr[2]);
++        }
++        int32_t call(IopCpuState &cpu, uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u)
++        {
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            require(kernel.dispatchThreadImport(ordinal, cpu, cycle), "thread import not handled");
++            return int32_t(cpu.gpr[2]);
++        }
++        int32_t sema(IopCpuState &cpu, uint16_t ordinal, uint32_t a0)
++        {
++            cpu.gpr[4] = a0;
++            require(kernel.dispatchSemaphoreImport(ordinal, cpu), "semaphore import not handled");
++            return int32_t(cpu.gpr[2]);
++        }
++        int32_t start(int32_t id, IopCpuState &caller)
++        {
++            return call(caller, 6u, uint32_t(id), 0u);
++        }
++        int32_t makeSema(uint32_t attr, uint32_t initial, uint32_t maximum)
++        {
++            memory.write32(0x1100u + 0u, attr);
++            memory.write32(0x1100u + 4u, 0u);
++            memory.write32(0x1100u + 8u, initial);
++            memory.write32(0x1100u + 12u, maximum);
++            IopCpuState cpu{};
++            cpu.gpr[4] = 0x1100u;
++            require(kernel.dispatchSemaphoreImport(4u, cpu), "CreateSema");
++            return int32_t(cpu.gpr[2]);
++        }
++        // One scheduler slice: run the next thread, return its id (0 if idle).
++        IopThread *begin() { return kernel.beginNextReady(cycle); }
++        void end(IopThread &t) { kernel.endTimeslice(t, kThreadReturnSentinel); }
++        int32_t sliceOwner()
++        {
++            IopThread *t = begin();
++            if (!t) return 0;
++            const int32_t id = t->id;
++            end(*t);
++            return id;
++        }
++    };
++
++    void equalPriorityIsFifoAndNeverTimeslices()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t a = f.thread(10), b = f.thread(10), c = f.thread(10);
++        // Start in c, a, b order: that, not the thread id, is the queue order.
++        require(f.start(c, boot) == 0 && f.start(a, boot) == 0 && f.start(b, boot) == 0, "start");
++        require(f.sliceOwner() == c, "the first started thread must run first");
++        require(f.sliceOwner() == c, "a slice that merely ends must not rotate equal priorities");
++        // c yields explicitly: it goes to the back.
++        IopThread *t = f.begin();
++        require(t && t->id == c, "c is still at the front");
++        IopCpuState &cpu = t->cpu;
++        require(f.call(cpu, 16u, 0u) == 0 && cpu.yielded, "RotateThreadReadyQueue(0)");
++        f.end(*t);
++        require(f.sliceOwner() == a, "rotate must hand over to the next thread in FIFO order");
++        require(f.sliceOwner() == a, "a stays at the front until it yields or blocks");
++        (void)b;
++    }
++
++    void rotateOfAnotherQueueMovesItsFront()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t hi = f.thread(5), x = f.thread(20), y = f.thread(20);
++        require(f.start(x, boot) == 0 && f.start(y, boot) == 0 && f.start(hi, boot) == 0, "start");
++        IopThread *t = f.begin();
++        require(t && t->id == hi, "highest priority runs");
++        // The running thread rotates priority 20: x (front) goes behind y.
++        require(f.call(t->cpu, 16u, 20u) == 0 && !t->rotateRequested, "rotate of another priority");
++        t->state = IopThreadState::Sleep; // hi sleeps
++        f.end(*t);
++        require(f.sliceOwner() == y, "front of the rotated queue moved behind its peer");
++    }
++
++    void higherPriorityPreemptsAndPreemptedThreadKeepsItsPlace()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t low1 = f.thread(20), low2 = f.thread(20), high = f.thread(5);
++        require(f.start(low1, boot) == 0 && f.start(low2, boot) == 0, "start lows");
++        IopThread *running = f.begin();
++        require(running && running->id == low1, "low1 runs");
++        // low1 is mid-slice when an interrupt handler starts the higher thread.
++        IopCpuState handler{};
++        require(f.start(high, handler) == 0, "start high");
++        require(running->cpu.yielded, "starting a higher-priority thread must preempt the running one");
++        f.end(*running);
++        require(running->state == IopThreadState::Ready, "preempted thread stays ready");
++        IopThread *next = f.begin();
++        require(next && next->id == high, "the higher priority thread runs next");
++        next->state = IopThreadState::Sleep;
++        f.end(*next);
++        require(f.sliceOwner() == low1, "a preempted thread resumes before its equal-priority peer");
++    }
++
++    void wakeupsPreemptOnlyWhenOutranked()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t sleeperHi = f.thread(5), sleeperLo = f.thread(30), runner = f.thread(10);
++        require(f.start(sleeperHi, boot) == 0 && f.start(sleeperLo, boot) == 0, "start");
++        // Put both sleepers to sleep, then start the runner.
++        for (int i = 0; i < 2; ++i)
++        {
++            IopThread *t = f.begin();
++            require(t, "sleeper ready");
++            t->state = IopThreadState::Sleep;
++            f.end(*t);
++        }
++        require(f.start(runner, boot) == 0, "start runner");
++        IopThread *running = f.begin();
++        require(running && running->id == runner, "runner runs");
++        IopCpuState irq{};
++        require(f.call(irq, 26u, uint32_t(sleeperLo)) == 0 && !running->cpu.yielded,
++                "waking a lower priority thread must not preempt");
++        require(f.call(irq, 26u, uint32_t(sleeperHi)) == 0 && running->cpu.yielded,
++                "waking a higher priority thread must preempt");
++        f.end(*running);
++        require(f.sliceOwner() == sleeperHi, "the woken high priority thread runs first");
++    }
++
++    void semaphoreSignalPreempts()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t waiter = f.thread(5), runner = f.thread(10);
++        const int32_t sem = f.makeSema(0, 0, 1);
++        require(f.start(waiter, boot) == 0 && f.start(runner, boot) == 0, "start");
++        IopThread *w = f.begin();
++        require(w && w->id == waiter, "waiter runs first");
++        require(f.sema(w->cpu, 8u, uint32_t(sem)) == 0 && w->state == IopThreadState::Semaphore, "waiter blocks");
++        f.end(*w);
++        IopThread *r = f.begin();
++        require(r && r->id == runner, "runner runs");
++        require(f.sema(r->cpu, 6u, uint32_t(sem)) == 0, "signal");
++        require(r->cpu.yielded, "a signal that readies a higher-priority waiter must preempt the signaller");
++        f.end(*r);
++        require(f.sliceOwner() == waiter, "the waiter runs after the signal");
++    }
++
++    void disableDispatchDefersPreemption()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t low = f.thread(20), high = f.thread(5);
++        require(f.start(low, boot) == 0, "start low");
++        IopThread *running = f.begin();
++        require(running && running->id == low, "low runs");
++        require(f.call(running->cpu, 12u) == 0, "DisableDispatchThread");
++        require(f.start(high, running->cpu) == 0 && !running->cpu.yielded,
++                "no preemption while dispatch is disabled");
++        require(f.call(running->cpu, 13u) == 0 && running->cpu.yielded,
++                "EnableDispatchThread must apply the deferred preemption");
++        f.end(*running);
++        require(f.sliceOwner() == high, "the deferred higher priority thread runs");
++    }
++
++    void priorityChangeReordersAndPreempts()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t a = f.thread(10), b = f.thread(15);
++        require(f.start(a, boot) == 0 && f.start(b, boot) == 0, "start");
++        IopThread *running = f.begin();
++        require(running && running->id == a, "a runs");
++        // a lowers itself below b: it must yield to b.
++        require(f.call(running->cpu, 14u, 0u, 30u) == 0 && running->cpu.yielded, "ChangeThreadPriority(self, lower)");
++        f.end(*running);
++        require(f.sliceOwner() == b, "b outranks a after the change");
++    }
++
++    void expiredDelaysWakeInTimeOrder()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t a = f.thread(10), b = f.thread(10);
++        require(f.start(a, boot) == 0 && f.start(b, boot) == 0, "start");
++        // b delays 100us, a delays 300us; both expire before the next slice.
++        IopThread *t = f.begin();
++        require(t && t->id == a, "a first");
++        require(f.call(t->cpu, 33u, 300u) == 0 && t->state == IopThreadState::Delay, "a delays");
++        f.end(*t);
++        t = f.begin();
++        require(t && t->id == b, "b second");
++        require(f.call(t->cpu, 33u, 100u) == 0 && t->state == IopThreadState::Delay, "b delays");
++        f.end(*t);
++        require(f.begin() == nullptr, "everybody sleeps");
++        f.cycle += kIopClockHz; // one second later
++        require(f.sliceOwner() == b, "the shorter delay wakes (and runs) first");
++    }
++
++    void semaphoreSignalOverflowAndDelete()
++    {
++        Fixture f;
++        IopCpuState cpu{};
++        const int32_t sem = f.makeSema(0, 0, 2);
++        require(f.sema(cpu, 6u, uint32_t(sem)) == 0 && f.sema(cpu, 6u, uint32_t(sem)) == 0, "two signals");
++        require(f.sema(cpu, 6u, uint32_t(sem)) == kSemaOvf, "a third signal reports KE_SEMA_OVF");
++        require(f.sema(cpu, 9u, uint32_t(sem)) == 0 && f.sema(cpu, 9u, uint32_t(sem)) == 0 &&
++                    f.sema(cpu, 9u, uint32_t(sem)) == kSemaZero,
++                "the overflowing signal must not have raised the count");
++
++        // A waiter takes the token directly and a later signal still works.
++        IopCpuState boot{};
++        const int32_t t1 = f.thread(10);
++        require(f.start(t1, boot) == 0, "start");
++        IopThread *t = f.begin();
++        require(t && f.sema(t->cpu, 8u, uint32_t(sem)) == 0 && t->state == IopThreadState::Semaphore, "wait blocks");
++        f.end(*t);
++        require(f.sema(cpu, 7u, uint32_t(sem)) == 0, "iSignalSema hands the token over");
++        t = f.begin();
++        require(t && t->id == t1, "waiter is ready");
++        f.end(*t);
++
++        // DeleteSema releases waiters with KE_WAIT_DELETE.
++        const int32_t sem2 = f.makeSema(0, 0, 1);
++        t = f.begin();
++        require(t && f.sema(t->cpu, 8u, uint32_t(sem2)) == 0 && t->state == IopThreadState::Semaphore, "wait on sem2");
++        f.end(*t);
++        require(f.sema(cpu, 5u, uint32_t(sem2)) == 0, "DeleteSema");
++        t = f.begin();
++        require(t && int32_t(t->cpu.gpr[2]) == kWaitDelete, "the waiter must wake with KE_WAIT_DELETE");
++        f.end(*t);
++    }
++
++    void waitersWakeInArrivalOrderThenPriority()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t first = f.thread(20), second = f.thread(10);
++        const int32_t sem = f.makeSema(0, 0, 4);
++        require(f.start(first, boot) == 0 && f.start(second, boot) == 0, "start");
++        IopThread *t = f.begin(); // second (priority 10) runs first
++        require(t && t->id == second, "second runs");
++        require(f.sema(t->cpu, 8u, uint32_t(sem)) == 0, "second waits");
++        f.end(*t);
++        t = f.begin();
++        require(t && t->id == first, "first runs");
++        require(f.sema(t->cpu, 8u, uint32_t(sem)) == 0, "first waits");
++        f.end(*t);
++        IopCpuState cpu{};
++        require(f.sema(cpu, 6u, uint32_t(sem)) == 0, "signal");
++        require(f.sliceOwner() == second, "the better priority waiter gets the token");
++        // Equal priorities: arrival order.
++        Fixture g;
++        const int32_t p = g.thread(10), q = g.thread(10);
++        const int32_t sg = g.makeSema(0, 0, 4);
++        require(g.start(q, boot) == 0 && g.start(p, boot) == 0, "start");
++        t = g.begin();
++        const int32_t arrivedFirst = t->id;
++        require(g.sema(t->cpu, 8u, uint32_t(sg)) == 0, "first waits");
++        g.end(*t);
++        t = g.begin();
++        require(g.sema(t->cpu, 8u, uint32_t(sg)) == 0, "second waits");
++        g.end(*t);
++        require(g.sema(cpu, 6u, uint32_t(sg)) == 0 && g.sliceOwner() == arrivedFirst,
++                "equal priority waiters are served first come first served");
++    }
++
++    void waitOutsideAThreadCannotBlock()
++    {
++        Fixture f;
++        IopCpuState callback{};
++        const int32_t sem = f.makeSema(0, 1, 1);
++        require(f.sema(callback, 8u, uint32_t(sem)) == 0, "a token is still taken without a thread");
++        require(f.sema(callback, 8u, uint32_t(sem)) == kCanNotWait, "no token: KE_CAN_NOT_WAIT, v0 always written");
++        require(f.kernel.cannotWaitCount() == 1u, "the refusal is counted for diagnostics");
++        // Even with a thread running, a different CPU (an interrupt handler's
++        // private CPU) must not park the interrupted thread.
++        IopCpuState boot{};
++        const int32_t id = f.thread(10);
++        require(f.start(id, boot) == 0, "start");
++        IopThread *t = f.begin();
++        require(t, "thread runs");
++        callback.gpr[2] = 0xDEADu;
++        require(f.sema(callback, 8u, uint32_t(sem)) == kCanNotWait && t->state == IopThreadState::Running,
++                "a callback CPU must not block the interrupted thread");
++        f.end(*t);
++    }
++
++    void tailCalledBlockingImportKeepsItsWait()
++    {
++        Fixture f;
++        IopCpuState boot{};
++        const int32_t id = f.thread(10);
++        const int32_t sem = f.makeSema(0, 0, 1);
++        require(f.start(id, boot) == 0, "start");
++        IopThread *t = f.begin();
++        require(t, "thread runs");
++        // `j WaitSema` as the thread's last instruction: the import returns to
++        // the thread-return sentinel in the same step that blocks.
++        require(f.sema(t->cpu, 8u, uint32_t(sem)) == 0, "wait blocks");
++        t->cpu.pc = kThreadReturnSentinel;
++        f.end(*t);
++        require(t->state == IopThreadState::Semaphore, "a blocked thread must not become dormant at the sentinel");
++        IopCpuState cpu{};
++        require(f.sema(cpu, 6u, uint32_t(sem)) == 0, "signal");
++        t = f.begin();
++        require(t && t->id == id && t->cpu.pc == kThreadReturnSentinel, "woken thread resumes at the sentinel");
++        t->cpu.stopped = true; // runCpu: sentinel reached
++        f.end(*t);
++        require(t->state == IopThreadState::Dormant, "and finishes once it has been woken");
++    }
++}
++
++int main()
++{
++    struct Case { const char *name; void (*run)(); };
++    const Case cases[] = {
++        {"equal priority is FIFO and never time-sliced", equalPriorityIsFifoAndNeverTimeslices},
++        {"rotating another priority queue", rotateOfAnotherQueueMovesItsFront},
++        {"higher priority preempts, preempted keeps its place", higherPriorityPreemptsAndPreemptedThreadKeepsItsPlace},
++        {"wakeups preempt only when outranked", wakeupsPreemptOnlyWhenOutranked},
++        {"semaphore signal preempts", semaphoreSignalPreempts},
++        {"DisableDispatchThread defers preemption", disableDispatchDefersPreemption},
++        {"priority change reorders and preempts", priorityChangeReordersAndPreempts},
++        {"expired delays wake in time order", expiredDelaysWakeInTimeOrder},
++        {"semaphore overflow and delete results", semaphoreSignalOverflowAndDelete},
++        {"semaphore waiters: priority then arrival", waitersWakeInArrivalOrderThenPriority},
++        {"WaitSema outside a thread cannot block", waitOutsideAThreadCannotBlock},
++        {"tail-called blocking import keeps its wait", tailCalledBlockingImportKeepsItsWait},
++    };
++    size_t failures = 0;
++    for (const Case &c : cases)
++    {
++        try { c.run(); std::cout << "PASS " << c.name << '\n'; }
++        catch (const std::exception &error) { ++failures; std::cerr << "FAIL " << c.name << ": " << error.what() << '\n'; }
++    }
++    std::cout << sizeof(cases) / sizeof(cases[0]) - failures << '/' << sizeof(cases) / sizeof(cases[0]) << " cases passed\n";
++    return failures == 0 ? 0 : 1;
++}
+-- 
+2.55.0
+

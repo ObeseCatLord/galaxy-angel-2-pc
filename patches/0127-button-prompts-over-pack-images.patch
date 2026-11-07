@@ -1,0 +1,850 @@
+From 3fc9f85e03fe0340310f46f0a3a297b6be868b67 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 21:19:32 -0500
+Subject: [PATCH] button prompts: device icons over texture-pack images too,
+ drawn at the internal resolution
+
+A pack image replacing a texture of buttons/map.json kept its PlayStation
+icons. gs_buttonmatch.h finds the icons in the pack image with the original
+texture's icon pixels as templates (translations move them: tutorial and
+message-box pictures), only confident matches, never covering text;
+gs_buttonpack.h covers each with the colour around it and draws the style's
+icon. Icons (map spots, pack images, text placeholders) are composed at
+ga2_hitext::iconScale(): the sharp-text scale, at least 4x
+(GA2_ICON_SCALE overrides). Tests: ga2_buttonmatch_tests.cpp.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_hitext.h |   4 +
+ ps2xRuntime/src/lib/gs/gs_buttonmatch.h  | 306 +++++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_buttonpack.h   | 107 ++++++++
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp     |   9 +
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp   |  63 +++--
+ ps2xTest/CMakeLists.txt                  |   1 +
+ ps2xTest/src/ga2_buttonmatch_tests.cpp   | 196 +++++++++++++++
+ ps2xTest/src/main.cpp                    |   2 +
+ 8 files changed, 672 insertions(+), 16 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_buttonmatch.h
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_buttonpack.h
+ create mode 100644 ps2xTest/src/ga2_buttonmatch_tests.cpp
+
+diff --git a/ps2xRuntime/include/runtime/ga2_hitext.h b/ps2xRuntime/include/runtime/ga2_hitext.h
+index f2125eb..d463d82 100644
+--- a/ps2xRuntime/include/runtime/ga2_hitext.h
++++ b/ps2xRuntime/include/runtime/ga2_hitext.h
+@@ -27,6 +27,10 @@ namespace ga2_hitext
+     // Resolution of the replacement images relative to the game's own: 4 (96x96 glyphs) at 4x scan-out, 2 at 2x
+     // (and at native when forced on).
+     int renderScale();
++    // Resolution of the button-prompt icons (and the pack images they are drawn into) relative to the game's
++    // own: the sharp-text scale, never below 4 (the highest internal resolution, X16 super-sampling, is 4x linear).
++    // GA2_ICON_SCALE=1..8 overrides it.
++    int iconScale();
+ 
+     // ---- game side (game thread, cheap) --------------------------------------
+     // The game fetched the 24x24 4-bit bitmap (288 bytes, two pixels per byte, low nibble first) of the
+diff --git a/ps2xRuntime/src/lib/gs/gs_buttonmatch.h b/ps2xRuntime/src/lib/gs/gs_buttonmatch.h
+new file mode 100644
+index 0000000..3749d41
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_buttonmatch.h
+@@ -0,0 +1,306 @@
++// Finding the games' PS2 button icons inside a texture-pack image (gs_texpacks.cpp).
++//
++// The button map (native/buttons/map.json) lists icon rectangles in the ORIGINAL
++// texture. A language pack replaces the whole texture; for the options, load/save
++// and similar screens the artist kept the icon where it was, but in the tutorial and
++// message-box translations the text was laid out again and the icons moved. So the
++// original icon pixels (the decoded original at the mapped rectangle) are used as a
++// template and looked for in the pack image: only confident matches are accepted,
++// and nothing is touched when there is none (never cover text).
++//
++// Pure functions on RGBA words (R | G << 8 | B << 16 | A << 24, alpha 255 = opaque)
++// so the tests can drive them without Vulkan or raylib.
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++namespace ga2_buttonmatch
++{
++    struct Rgba
++    {
++        int w = 0, h = 0;
++        std::vector<uint32_t> px;
++    };
++
++    struct Rect
++    {
++        int x = 0, y = 0, w = 0, h = 0;
++    };
++
++    struct Match
++    {
++        Rect r;          // in pack pixels
++        float score = 0; // mean absolute difference per channel (0 = identical)
++        int spot = -1;   // index of the spot whose template matched
++    };
++
++    // Acceptance: a match is confident when its mean per-channel difference is below
++    // kAbsolute and well below what a flat patch of the template's mean colour would
++    // score (kRelative of the template's own contrast); templates with less contrast
++    // than kMinContrast say nothing and are never searched for.
++    constexpr float kAbsolute = 24.0f;
++    constexpr float kRelative = 0.30f;
++    constexpr float kMinContrast = 14.0f;
++    // A translator may have redrawn the icon (same button, same colours, slightly different art): the
++    // looser limits below then apply, but only to templates with a coloured symbol and only when the found
++    // symbol has the same colour (a cross is not taken for a circle).
++    constexpr float kLooseAbsolute = 40.0f;
++    constexpr float kLooseRelative = 0.60f;
++    constexpr float kHueTolerance = 28.0f; // degrees
++
++    inline int channel(uint32_t c, int i) { return int((c >> (8 * i)) & 255u); }
++
++    // Fully transparent pixels carry no colour.
++    inline uint32_t canonical(uint32_t c) { return (c >> 24) ? c : 0u; }
++
++    // Whether the point (x, y), relative to the rectangle's corner in the same units, is inside the
++    // stadium inscribed in a w x h rectangle (an ellipse for squares, a pill for wide rectangles),
++    // grown by `margin`.
++    inline bool inStadium(float x, float y, float w, float h, float margin)
++    {
++        const float r = std::min(w, h) * 0.5f + margin;
++        const float cy = h * 0.5f;
++        const float x0 = std::min(w, h) * 0.5f, x1 = w - x0;
++        const float cx = std::clamp(x, x0, x1);
++        const float dx = x - cx, dy = y - cy;
++        return dx * dx + dy * dy <= r * r;
++    }
++
++    struct Sample
++    {
++        int dx, dy;
++        int c[4];
++    };
++
++    struct Template
++    {
++        int w = 0, h = 0;
++        std::vector<Sample> samples; // the stadium's pixels, in a scattered order (early exits stay cheap)
++        float contrast = 0;          // mean absolute deviation from the mean colour
++        // The coloured symbol: hue (degrees) of the saturated pixels and their share of the stadium; hue < 0
++        // when the template has none (grey keycaps and pills), which then only ever match tightly.
++        float hue = -1, share = 0;
++    };
++
++    // Hue (degrees) of an RGB colour, and whether it is saturated and bright enough to carry one.
++    inline bool hueOf(int r, int g, int b, float &hue)
++    {
++        const int mx = std::max({r, g, b}), mn = std::min({r, g, b});
++        if (mx - mn < 60 || mx < 90)
++            return false;
++        const float d = float(mx - mn);
++        float h = mx == r ? float(g - b) / d : mx == g ? 2.0f + float(b - r) / d : 4.0f + float(r - g) / d;
++        h *= 60.0f;
++        hue = h < 0 ? h + 360.0f : h;
++        return true;
++    }
++
++    inline float hueDistance(float a, float b)
++    {
++        const float d = std::fabs(a - b);
++        return std::min(d, 360.0f - d);
++    }
++
++    // The mean hue and share of the saturated pixels of `samples` (pixels colour-weighted by vector mean).
++    template <class GetRgba>
++    inline void symbolColour(size_t n, GetRgba get, float &hue, float &share)
++    {
++        double sx = 0, sy = 0;
++        size_t count = 0;
++        for (size_t i = 0; i < n; ++i)
++        {
++            int c[4];
++            get(i, c);
++            float h;
++            if (c[3] > 128 && hueOf(c[0], c[1], c[2], h))
++            {
++                sx += std::cos(h * 0.0174533f);
++                sy += std::sin(h * 0.0174533f);
++                ++count;
++            }
++        }
++        share = n ? float(count) / float(n) : 0.0f;
++        hue = count ? float(std::atan2(sy, sx) / 0.0174533) : -1.0f;
++        if (hue < 0 && count)
++            hue += 360.0f;
++    }
++
++    // The original rectangle `spot`, resampled by (sx, sy) (bilinear) into the pack's pixel grid.
++    inline Template makeTemplate(const Rgba &orig, const Rect &spot, float sx, float sy)
++    {
++        Template t;
++        t.w = std::max(1, int(std::lround(spot.w * sx)));
++        t.h = std::max(1, int(std::lround(spot.h * sy)));
++        std::vector<Sample> all;
++        for (int y = 0; y < t.h; ++y)
++            for (int x = 0; x < t.w; ++x)
++            {
++                if (!inStadium(float(x) + 0.5f, float(y) + 0.5f, float(t.w), float(t.h), -0.5f))
++                    continue;
++                // Source position of the pixel centre inside the original rectangle.
++                const float fx = spot.x + (float(x) + 0.5f) / sx - 0.5f, fy = spot.y + (float(y) + 0.5f) / sy - 0.5f;
++                const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
++                const float ax = fx - float(x0), ay = fy - float(y0);
++                Sample s{x, y, {0, 0, 0, 0}};
++                for (int ch = 0; ch < 4; ++ch)
++                {
++                    float v = 0;
++                    for (int j = 0; j < 4; ++j)
++                    {
++                        const int px = std::clamp(x0 + (j & 1), 0, orig.w - 1), py = std::clamp(y0 + (j >> 1), 0, orig.h - 1);
++                        const float wgt = ((j & 1) ? ax : 1 - ax) * ((j >> 1) ? ay : 1 - ay);
++                        v += wgt * float(channel(canonical(orig.px[size_t(py) * size_t(orig.w) + size_t(px)]), ch));
++                    }
++                    s.c[ch] = int(std::lround(v));
++                }
++                all.push_back(s);
++            }
++        if (all.empty())
++            return t;
++        double mean[4] = {};
++        for (const Sample &s : all)
++            for (int ch = 0; ch < 4; ++ch)
++                mean[ch] += s.c[ch];
++        for (double &m : mean)
++            m /= double(all.size());
++        double dev = 0;
++        for (const Sample &s : all)
++            for (int ch = 0; ch < 4; ++ch)
++                dev += std::fabs(s.c[ch] - mean[ch]);
++        t.contrast = float(dev / (4.0 * double(all.size())));
++        symbolColour(all.size(), [&](size_t i, int *c) { for (int ch = 0; ch < 4; ++ch) c[ch] = all[i].c[ch]; }, t.hue, t.share);
++        // A fixed stride coprime to the count scatters the samples across the template.
++        const size_t n = all.size();
++        size_t stride = n / 2 + 1;
++        auto gcd = [](size_t a, size_t b) { while (b) { const size_t r = a % b; a = b; b = r; } return a; };
++        while (gcd(stride, n) != 1)
++            ++stride;
++        t.samples.reserve(n);
++        for (size_t i = 0, k = 0; i < n; ++i, k = (k + stride) % n)
++            t.samples.push_back(all[k]);
++        return t;
++    }
++
++    // Mean per-channel absolute difference of the template placed at (ox, oy); stops (returning a value
++    // above `limit`) as soon as it cannot get below it.
++    inline float scoreAt(const Rgba &img, const Template &t, int ox, int oy, float limit)
++    {
++        const long long cap = (long long)(limit * 4.0f * float(t.samples.size()));
++        long long sum = 0;
++        for (const Sample &s : t.samples)
++        {
++            const uint32_t c = canonical(img.px[size_t(oy + s.dy) * size_t(img.w) + size_t(ox + s.dx)]);
++            for (int ch = 0; ch < 4; ++ch)
++                sum += std::abs(channel(c, ch) - s.c[ch]);
++            if (sum > cap)
++                return limit + 1.0f;
++        }
++        return float(double(sum) / (4.0 * double(t.samples.size())));
++    }
++
++    // The places in `pack` that show one of the icons cut from `orig` at `spots` (original pixels);
++    // overlapping finds are reduced to the best one. Spots may repeat a button: each distinct place is
++    // reported once, tagged with the spot that matched it best.
++    inline std::vector<Match> findIcons(const Rgba &pack, const Rgba &orig, const std::vector<Rect> &spots)
++    {
++        std::vector<Match> candidates;
++        if (pack.w <= 0 || pack.h <= 0 || orig.w <= 0 || orig.h <= 0)
++            return candidates;
++        const float sx = float(pack.w) / float(orig.w), sy = float(pack.h) / float(orig.h);
++        for (size_t i = 0; i < spots.size(); ++i)
++        {
++            const Rect &sp = spots[i];
++            if (sp.w <= 0 || sp.h <= 0 || sp.x < 0 || sp.y < 0 || sp.x + sp.w > orig.w || sp.y + sp.h > orig.h)
++                continue;
++            const Template t = makeTemplate(orig, sp, sx, sy);
++            if (t.samples.empty() || t.contrast < kMinContrast || t.w > pack.w || t.h > pack.h)
++                continue;
++            const float tight = std::min(kAbsolute, kRelative * t.contrast);
++            const bool coloured = t.hue >= 0 && t.share >= 0.04f;
++            const float limit = coloured ? std::max(tight, std::min(kLooseAbsolute, kLooseRelative * t.contrast)) : tight;
++            for (int y = 0; y + t.h <= pack.h; ++y)
++                for (int x = 0; x + t.w <= pack.w; ++x)
++                {
++                    const float score = scoreAt(pack, t, x, y, limit);
++                    if (score > limit)
++                        continue;
++                    if (score > tight)
++                    {
++                        // Only a redrawn icon of the same colour is accepted this loosely.
++                        float hue, share;
++                        symbolColour(t.samples.size(), [&](size_t k, int *c) {
++                            const Sample &s = t.samples[k];
++                            const uint32_t px = canonical(pack.px[size_t(y + s.dy) * size_t(pack.w) + size_t(x + s.dx)]);
++                            for (int ch = 0; ch < 4; ++ch) c[ch] = channel(px, ch);
++                        }, hue, share);
++                        if (hue < 0 || hueDistance(hue, t.hue) > kHueTolerance || share < t.share * 0.4f || share > t.share * 2.5f)
++                            continue;
++                    }
++                    candidates.push_back({{x, y, t.w, t.h}, score, int(i)});
++                }
++        }
++        std::stable_sort(candidates.begin(), candidates.end(),
++                         [](const Match &a, const Match &b) { return a.score < b.score; });
++        std::vector<Match> kept;
++        for (const Match &m : candidates)
++        {
++            bool overlaps = false;
++            for (const Match &k : kept)
++            {
++                const int ix = std::max(0, std::min(m.r.x + m.r.w, k.r.x + k.r.w) - std::max(m.r.x, k.r.x));
++                const int iy = std::max(0, std::min(m.r.y + m.r.h, k.r.y + k.r.h) - std::max(m.r.y, k.r.y));
++                if (double(ix) * double(iy) > 0.2 * double(std::min(m.r.w * m.r.h, k.r.w * k.r.h)))
++                {
++                    overlaps = true;
++                    break;
++                }
++            }
++            if (!overlaps)
++                kept.push_back(m);
++        }
++        std::sort(kept.begin(), kept.end(), [](const Match &a, const Match &b) {
++            return a.r.y != b.r.y ? a.r.y < b.r.y : a.r.x < b.r.x;
++        });
++        return kept;
++    }
++
++    // The colour around a rectangle: the per-channel median of the one-pixel ring just outside it.
++    inline uint32_t ringColor(const Rgba &img, const Rect &r)
++    {
++        std::vector<int> ch[4];
++        for (int y = r.y - 1; y <= r.y + r.h; ++y)
++            for (int x = r.x - 1; x <= r.x + r.w; ++x)
++            {
++                const bool border = y == r.y - 1 || y == r.y + r.h || x == r.x - 1 || x == r.x + r.w;
++                if (!border || x < 0 || y < 0 || x >= img.w || y >= img.h)
++                    continue;
++                const uint32_t c = img.px[size_t(y) * size_t(img.w) + size_t(x)];
++                for (int i = 0; i < 4; ++i)
++                    ch[i].push_back(channel(c, i));
++            }
++        uint32_t out = 0;
++        for (int i = 0; i < 4; ++i)
++        {
++            if (ch[i].empty())
++                continue;
++            std::nth_element(ch[i].begin(), ch[i].begin() + ch[i].size() / 2, ch[i].end());
++            out |= uint32_t(ch[i][ch[i].size() / 2]) << (8 * i);
++        }
++        return out;
++    }
++
++    // Paint the stadium of the rectangle (x, y, w, h; in the image's own pixels, grown by `margin`) with
++    // `color`, leaving the rectangle's corners (the art around a round button) alone.
++    inline void coverStadium(uint32_t *px, int imgW, int imgH, const Rect &r, float margin, uint32_t color)
++    {
++        const int x0 = std::max(0, r.x - int(std::ceil(margin))), x1 = std::min(imgW, r.x + r.w + int(std::ceil(margin)));
++        const int y0 = std::max(0, r.y - int(std::ceil(margin))), y1 = std::min(imgH, r.y + r.h + int(std::ceil(margin)));
++        for (int y = y0; y < y1; ++y)
++            for (int x = x0; x < x1; ++x)
++                if (inStadium(float(x - r.x) + 0.5f, float(y - r.y) + 0.5f, float(r.w), float(r.h), margin))
++                    px[size_t(y) * size_t(imgW) + size_t(x)] = color;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_buttonpack.h b/ps2xRuntime/src/lib/gs/gs_buttonpack.h
+new file mode 100644
+index 0000000..8c200e9
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_buttonpack.h
+@@ -0,0 +1,107 @@
++// Button prompts over a texture-pack image (gs_texpacks.cpp): the pack's PNG with
++// the PS2 icons found in it (gs_buttonmatch.h) covered and the style's icons drawn
++// in their place. Needs raylib for the image work, nothing else, so the offline
++// check (tools/modding/check_pack_buttons.cpp) builds from it.
++#pragma once
++
++#include "gs_buttonmatch.h"
++
++#include "raylib.h"
++
++#include <algorithm>
++#include <cmath>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace ga2_buttonmatch
++{
++    struct IconSpot
++    {
++        std::string button;
++        int x = 0, y = 0, w = 0, h = 0; // in the original texture's pixels
++    };
++
++    // The style's icon for a button; `wide` asks for the keycap/pill variant when the style has one.
++    using IconLookup = std::function<const ::Image *(const std::string &button, bool wide)>;
++
++    // Wide spots (pills, 'Menu' keys) take the wide variant of the icon.
++    inline bool wideSpot(int w, int h) { return w * 10 >= h * 15; }
++
++    // The visible part of the icon fitted, keeping its shape, into the rectangle (output pixels).
++    inline void drawIconFitted(::Image &out, const ::Image &art, float x, float y, float w, float h)
++    {
++        const Rectangle src = GetImageAlphaBorder(art, 0.05f);
++        const float scale = std::min(w / src.width, h / src.height);
++        const float dw = src.width * scale, dh = src.height * scale;
++        ImageDraw(&out, art, src, Rectangle{x + (w - dw) * 0.5f, y + (h - dh) * 0.5f, dw, dh}, WHITE);
++    }
++
++    // `pack`: the pack image (RGBA8, alpha 255 = opaque). `orig`: the original texture's pixels as decoded from
++    // GS memory (alpha 0x80 = opaque), ow x oh, which the spots refer to. The result is the pack image, scaled
++    // up to at least `scale` times the original's size, with every confidently found PS2 icon replaced. False
++    // (and `out` empty) when no icon is found: the pack image should then be used as it is. `matchesOut`, when
++    // given, receives the icons found (pack pixels).
++    inline bool composePackButtons(const ::Image &pack, const std::vector<uint32_t> &orig, int ow, int oh,
++                                   const std::vector<IconSpot> &spots, int scale, const IconLookup &lookup, ::Image &out,
++                                   std::vector<Match> *matchesOut = nullptr)
++    {
++        out = ::Image{};
++        if (!pack.data || pack.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 || pack.width <= 0 || pack.height <= 0 ||
++            ow <= 0 || oh <= 0 || orig.size() < size_t(ow) * size_t(oh) || spots.empty())
++            return false;
++        Rgba packRgba;
++        packRgba.w = pack.width;
++        packRgba.h = pack.height;
++        packRgba.px.assign(static_cast<const uint32_t *>(pack.data), static_cast<const uint32_t *>(pack.data) + size_t(pack.width) * size_t(pack.height));
++        Rgba origRgba;
++        origRgba.w = ow;
++        origRgba.h = oh;
++        origRgba.px.resize(size_t(ow) * size_t(oh));
++        for (size_t i = 0; i < origRgba.px.size(); ++i)
++        {
++            const uint32_t c = orig[i];
++            origRgba.px[i] = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
++        }
++        std::vector<Rect> rects;
++        for (const IconSpot &s : spots)
++            rects.push_back({s.x, s.y, s.w, s.h});
++        const std::vector<Match> found = findIcons(packRgba, origRgba, rects);
++        if (matchesOut)
++            *matchesOut = found;
++        if (found.empty())
++            return false;
++        // The colours around the icons, from the untouched pack image.
++        std::vector<uint32_t> fills;
++        for (const Match &m : found)
++            fills.push_back(ringColor(packRgba, m.r));
++
++        const int outW = std::max(pack.width, ow * scale), outH = std::max(pack.height, oh * scale);
++        out = ImageCopy(pack);
++        if (outW != pack.width || outH != pack.height)
++            ImageResize(&out, outW, outH);
++        const float fx = float(outW) / float(pack.width), fy = float(outH) / float(pack.height);
++        bool drew = false;
++        for (size_t i = 0; i < found.size(); ++i)
++        {
++            const IconSpot &spot = spots[size_t(found[i].spot)];
++            const ::Image *art = lookup(spot.button, wideSpot(spot.w, spot.h));
++            if (!art)
++                continue;
++            const Rect &r = found[i].r;
++            const Rect o{int(std::floor(r.x * fx)), int(std::floor(r.y * fy)),
++                         int(std::ceil((r.x + r.w) * fx)) - int(std::floor(r.x * fx)),
++                         int(std::ceil((r.y + r.h) * fy)) - int(std::floor(r.y * fy))};
++            // The PS2 icon's anti-aliased edge reaches one pack pixel past the matched disc.
++            coverStadium(static_cast<uint32_t *>(out.data), out.width, out.height, o, std::max(fx, fy), fills[i]);
++            drawIconFitted(out, *art, float(o.x), float(o.y), float(o.w), float(o.h));
++            drew = true;
++        }
++        if (!drew)
++        {
++            UnloadImage(out);
++            out = ::Image{};
++        }
++        return drew;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index 1befc81..094ccdd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -517,6 +517,15 @@ namespace ga2_hitext
+         return k;
+     }
+ 
++    int iconScale()
++    {
++        static const int k = [] {
++            const int forced = envInt("GA2_ICON_SCALE", 0);
++            return forced >= 1 ? std::min(forced, 8) : std::max(4, renderScale());
++        }();
++        return k;
++    }
++
+     uint64_t glyphHash(const uint8_t *bitmap)
+     {
+         std::vector<uint32_t> px(size_t(kCell) * kCell);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index feac48d..d9a55a7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -23,6 +23,7 @@ namespace ga2_text_icons
+ 
+ #if defined(PS2X_HAVE_PGS)
+ 
++#include "gs_buttonpack.h"
+ #include "gs_texregion.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/gs_clut_snapshot.h"
+@@ -65,15 +66,14 @@ namespace ga2_texpacks
+         // as it runs, so every image handed out stays alive here (this also
+         // keeps PNGs from being decoded twice).
+         std::unordered_map<std::string, ImageHandle> g_images;
++        // Pack images (per device, file and style) in which no PS2 icon was found: used as they are.
++        std::unordered_set<std::string> g_packIconless;
+ 
+         // Button prompts (native/buttons): textures known to hold PS2 button
+         // icons get the port's own icons for the player's input device drawn
+-        // over them, at 4x resolution.
+-        struct IconSpot
+-        {
+-            std::string button;
+-            int x = 0, y = 0, w = 0, h = 0;
+-        };
++        // over them, at the icon scale (at least 4x). A pack image replacing
++        // such a texture gets them too, wherever its PS2 icons are (gs_buttonmatch.h).
++        using ga2_buttonmatch::IconSpot;
+         std::string g_style = "playstation"; // in use: g_fixed when the player chose one, else the detected device's
+         std::string g_detected = "playstation";
+         std::string g_fixed;                 // empty: follow the input device
+@@ -137,12 +137,12 @@ namespace ga2_texpacks
+             return it->second.data ? &it->second : nullptr;
+         }
+ 
+-        // The texture at 4x with the device's icons over the PS2 ones; RGBA
+-        // with alpha 255 = opaque.
++        // The texture at the icon scale (4x or the internal resolution, ga2_hitext::iconScale) with the
++        // device's icons over the PS2 ones; RGBA with alpha 255 = opaque.
+         bool composeButtons(const std::vector<uint32_t> &px, uint32_t w, uint32_t h, const std::vector<IconSpot> &spots,
+                             ::Image &out)
+         {
+-            constexpr int k = 4;
++            const int k = ga2_hitext::iconScale();
+             std::vector<uint32_t> base(px);
+             for (uint32_t &c : base)
+                 c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
+@@ -152,7 +152,7 @@ namespace ga2_texpacks
+             bool drew = false;
+             for (const IconSpot &spot : spots)
+             {
+-                const ::Image *art = icon(spot.button, spot.w * 10 >= spot.h * 15);
++                const ::Image *art = icon(spot.button, ga2_buttonmatch::wideSpot(spot.w, spot.h));
+                 if (!art)
+                     continue;
+                 // Cover the PS2 icon with the colour around it, then draw ours.
+@@ -173,11 +173,8 @@ namespace ga2_texpacks
+                                      : Color{0, 0, 0, 0};
+                 ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, fill);
+                 // The icon's visible part, fitted into the spot keeping its shape.
+-                const Rectangle src = GetImageAlphaBorder(*art, 0.05f);
+-                const float scale = std::min(spot.w * k / src.width, spot.h * k / src.height);
+-                const float dw = src.width * scale, dh = src.height * scale;
+-                const Rectangle dst{spot.x * k + (spot.w * k - dw) * 0.5f, spot.y * k + (spot.h * k - dh) * 0.5f, dw, dh};
+-                ImageDraw(&out, *art, src, dst, WHITE);
++                ga2_buttonmatch::drawIconFitted(out, *art, float(spot.x * k), float(spot.y * k), float(spot.w * k),
++                                                float(spot.h * k));
+                 drew = true;
+             }
+             return drew;
+@@ -211,7 +208,7 @@ namespace ga2_texpacks
+         // opaque; false when the style has no icon for the button.
+         bool composeTextIcon(const ga2_text_icons::Glyph &glyph, ::Image &out)
+         {
+-            constexpr int cell = 24 * 4;
++            const int cell = 24 * ga2_hitext::iconScale();
+             const ::Image *art = icon(glyph.button, glyph.parts > 1);
+             if (!art)
+                 return false;
+@@ -689,6 +686,40 @@ namespace ga2_texpacks
+                     g_images.emplace(key, handle);
+                     return handle;
+                 }
++                // A pack image replacing a texture the button map lists: the PS2 icons in it (wherever the
++                // translation put them; found by the original's icon pixels) give way to the style's.
++                const auto packSpots = buttons ? g_buttonMap.find(hash) : g_buttonMap.end();
++                if (packSpots != g_buttonMap.end())
++                {
++                    const std::string key = deviceKey(device) + "pack:" + it->second + "/" + g_style;
++                    if (const auto cached = g_images.find(key); cached != g_images.end())
++                        return cached->second;
++                    if (!g_packIconless.count(key))
++                    {
++                        ::Image packImage = LoadImage(it->second.c_str());
++                        if (packImage.data)
++                        {
++                            ImageFormat(&packImage, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                            ::Image composed{};
++                            const uint64_t c0 = nowNs();
++                            const bool done = ga2_buttonmatch::composePackButtons(
++                                packImage, pixels(), int(w), int(h), packSpots->second, ga2_hitext::iconScale(),
++                                [](const std::string &button, bool wide) { return icon(button, wide); }, composed);
++                            std::fprintf(stderr, "[texpacks] pack %s (%s): %s (%.1f ms)\n", name, g_style.c_str(),
++                                         done ? "PS2 icons replaced" : "no PS2 icon found, image kept as is",
++                                         double(nowNs() - c0) / 1e6);
++                            UnloadImage(packImage);
++                            if (done)
++                            {
++                                ImageHandle handle = upload(device, composed);
++                                UnloadImage(composed);
++                                g_images.emplace(key, handle);
++                                return handle;
++                            }
++                        }
++                        g_packIconless.insert(key);
++                    }
++                }
+                 const std::string fileKey = deviceKey(device) + it->second;
+                 if (const auto cached = g_images.find(fileKey); cached != g_images.end())
+                     return cached->second;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 95a6a3d..73ddce1 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_library(ps2_test_lib STATIC
+     src/ga2_settings_tests.cpp
+     src/ga2_text_icons_tests.cpp
+     src/ga2_hitext_tests.cpp
++    src/ga2_buttonmatch_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+diff --git a/ps2xTest/src/ga2_buttonmatch_tests.cpp b/ps2xTest/src/ga2_buttonmatch_tests.cpp
+new file mode 100644
+index 0000000..b1263a2
+--- /dev/null
++++ b/ps2xTest/src/ga2_buttonmatch_tests.cpp
+@@ -0,0 +1,196 @@
++#include "MiniTest.h"
++#include "gs/gs_buttonmatch.h"
++
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++namespace
++{
++    using namespace ga2_buttonmatch;
++
++    uint32_t rgba(int r, int g, int b, int a = 255) { return uint32_t(r) | uint32_t(g) << 8 | uint32_t(b) << 16 | uint32_t(a) << 24; }
++
++    Rgba blank(int w, int h, uint32_t c)
++    {
++        Rgba img;
++        img.w = w;
++        img.h = h;
++        img.px.assign(size_t(w) * size_t(h), c);
++        return img;
++    }
++
++    // A PS2-style button: dark disc with a coloured symbol (kind 0: ring, 1: cross, 2: bar).
++    void drawButton(Rgba &img, int x0, int y0, int size, int kind)
++    {
++        const float c = size * 0.5f;
++        for (int y = 0; y < size; ++y)
++            for (int x = 0; x < size; ++x)
++            {
++                const float dx = x + 0.5f - c, dy = y + 0.5f - c;
++                if (dx * dx + dy * dy > c * c)
++                    continue;
++                uint32_t col = rgba(28, 30, 44);
++                const float r2 = dx * dx + dy * dy;
++                if (kind == 0 && r2 < (c * 0.6f) * (c * 0.6f) && r2 > (c * 0.3f) * (c * 0.3f))
++                    col = rgba(230, 70, 60);
++                if (kind == 1 && (std::abs(dx - dy) < 1.2f || std::abs(dx + dy) < 1.2f) && r2 < (c * 0.7f) * (c * 0.7f))
++                    col = rgba(70, 110, 240);
++                if (kind == 2 && std::abs(dy) < c * 0.15f && std::abs(dx) < c * 0.6f)
++                    col = rgba(240, 240, 240);
++                img.px[size_t(y0 + y) * size_t(img.w) + size_t(x0 + x)] = col;
++            }
++    }
++
++    // Stripes standing in for text.
++    void drawText(Rgba &img, int x0, int y0, int w, int h)
++    {
++        for (int y = y0; y < y0 + h; ++y)
++            for (int x = x0; x < x0 + w; ++x)
++                if (((x / 2) + (y / 3)) % 3 == 0)
++                    img.px[size_t(y) * size_t(img.w) + size_t(x)] = rgba(250, 250, 250);
++    }
++
++    Rgba scaled(const Rgba &src, int k)
++    {
++        Rgba out = blank(src.w * k, src.h * k, 0);
++        for (int y = 0; y < out.h; ++y)
++            for (int x = 0; x < out.w; ++x)
++                out.px[size_t(y) * size_t(out.w) + size_t(x)] = src.px[size_t(y / k) * size_t(src.w) + size_t(x / k)];
++        return out;
++    }
++}
++
++void register_ga2_buttonmatch_tests()
++{
++    MiniTest::Case("GA2ButtonMatch", [](TestCase &tc) {
++        const uint32_t bg = rgba(190, 170, 120);
++
++        tc.Run("an icon that kept its place is found there", [](TestCase &t) {
++            Rgba orig = blank(96, 64, rgba(190, 170, 120));
++            drawButton(orig, 10, 12, 20, 0);
++            Rgba pack = orig;
++            const auto found = findIcons(pack, orig, {{10, 12, 20, 20}});
++            t.Equals(found.size(), size_t(1), "one match");
++            if (found.size() == 1)
++            {
++                t.Equals(found[0].r.x, 10, "x");
++                t.Equals(found[0].r.y, 12, "y");
++                t.IsTrue(found[0].score < 0.5f, "identical pixels");
++            }
++        });
++
++        tc.Run("a moved icon is found, one per occurrence, and the old place is left alone", [](TestCase &t) {
++            Rgba orig = blank(160, 64, rgba(190, 170, 120));
++            drawButton(orig, 4, 4, 20, 1);
++            Rgba pack = blank(160, 64, rgba(190, 170, 120));
++            drawText(pack, 4, 4, 30, 20); // the English text where the icon was
++            drawButton(pack, 60, 30, 20, 1);
++            drawButton(pack, 120, 10, 20, 1);
++            const auto found = findIcons(pack, orig, {{4, 4, 20, 20}});
++            t.Equals(found.size(), size_t(2), "both occurrences");
++            if (found.size() == 2)
++            {
++                t.Equals(found[0].r.x, 120, "first (top) one");
++                t.Equals(found[0].r.y, 10, "its row");
++                t.Equals(found[1].r.x, 60, "second");
++                t.Equals(found[1].r.y, 30, "its row");
++            }
++        });
++
++        tc.Run("a pack without the icon matches nothing (text is never covered)", [](TestCase &t) {
++            Rgba orig = blank(96, 64, rgba(190, 170, 120));
++            drawButton(orig, 10, 12, 20, 0);
++            Rgba pack = blank(96, 64, rgba(190, 170, 120));
++            drawText(pack, 0, 0, 96, 64);
++            t.IsTrue(findIcons(pack, orig, {{10, 12, 20, 20}}).empty(), "nothing found");
++            // Another button's icon is not mistaken for this one.
++            Rgba other = blank(96, 64, rgba(190, 170, 120));
++            drawButton(other, 40, 20, 20, 1);
++            t.IsTrue(findIcons(other, orig, {{10, 12, 20, 20}}).empty(), "cross is not a circle");
++        });
++
++        tc.Run("each match carries the spot that matched it", [](TestCase &t) {
++            Rgba orig = blank(96, 64, rgba(190, 170, 120));
++            drawButton(orig, 4, 4, 20, 0);
++            drawButton(orig, 40, 4, 20, 1);
++            Rgba pack = blank(96, 64, rgba(190, 170, 120));
++            drawButton(pack, 30, 30, 20, 1);
++            drawButton(pack, 60, 30, 20, 0);
++            const auto found = findIcons(pack, orig, {{4, 4, 20, 20}, {40, 4, 20, 20}});
++            t.Equals(found.size(), size_t(2), "two matches");
++            if (found.size() == 2)
++            {
++                t.Equals(found[0].spot, 1, "cross at x=30");
++                t.Equals(found[1].spot, 0, "circle at x=60");
++            }
++        });
++
++        tc.Run("a pack at twice the resolution is searched at its own scale", [](TestCase &t) {
++            Rgba orig = blank(96, 64, rgba(190, 170, 120));
++            drawButton(orig, 8, 8, 20, 0);
++            Rgba small = blank(96, 64, rgba(190, 170, 120));
++            drawButton(small, 50, 30, 20, 0);
++            const Rgba pack = scaled(small, 2);
++            const auto found = findIcons(pack, orig, {{8, 8, 20, 20}});
++            t.Equals(found.size(), size_t(1), "one match");
++            if (found.size() == 1)
++            {
++                t.Equals(found[0].r.x, 100, "x in pack pixels");
++                t.Equals(found[0].r.y, 60, "y in pack pixels");
++                t.Equals(found[0].r.w, 40, "width in pack pixels");
++            }
++        });
++
++        tc.Run("a template without contrast is never searched for", [](TestCase &t) {
++            const Rgba orig = blank(64, 64, rgba(100, 100, 100));
++            const Rgba pack = blank(64, 64, rgba(100, 100, 100));
++            t.IsTrue(findIcons(pack, orig, {{10, 10, 16, 16}}).empty(), "flat");
++            t.IsTrue(findIcons(pack, orig, {{60, 60, 16, 16}}).empty(), "outside the original");
++        });
++
++        tc.Run("pills (wide spots) are matched too", [](TestCase &t) {
++            Rgba orig = blank(120, 40, rgba(190, 170, 120));
++            for (int y = 0; y < 14; ++y)
++                for (int x = 0; x < 40; ++x)
++                {
++                    const float dx = std::max(0.0f, std::abs(x + 0.5f - 20.0f) - 13.0f), dy = y + 0.5f - 7.0f;
++                    if (dx * dx + dy * dy <= 49.0f)
++                        orig.px[size_t(y + 5) * 120 + size_t(x + 6)] = (x > 10 && x < 30 && y > 3 && y < 10 && (x / 3) % 2 == 0) ? rgba(240, 240, 240) : rgba(90, 90, 100);
++                }
++            Rgba pack = blank(120, 40, rgba(190, 170, 120));
++            for (int y = 0; y < 14; ++y)
++                for (int x = 0; x < 40; ++x)
++                    pack.px[size_t(y + 20) * 120 + size_t(x + 70)] = orig.px[size_t(y + 5) * 120 + size_t(x + 6)];
++            const auto found = findIcons(pack, orig, {{6, 5, 40, 14}});
++            t.Equals(found.size(), size_t(1), "found");
++            if (found.size() == 1)
++            {
++                t.Equals(found[0].r.x, 70, "x");
++                t.Equals(found[0].r.y, 20, "y");
++            }
++        });
++
++        tc.Run("the ring colour is the median around the rectangle", [bg](TestCase &t) {
++            Rgba img = blank(20, 20, bg);
++            img.px[size_t(4) * 20 + 7] = rgba(255, 255, 255); // text pixel on the ring
++            t.Equals(ringColor(img, {8, 8, 4, 4}), bg, "median ignores a stray pixel");
++            img.px[size_t(8) * 20 + 7] = rgba(0, 0, 0);
++            t.Equals(ringColor(img, {8, 8, 4, 4}), bg, "also one dark pixel");
++        });
++
++        tc.Run("covering fills the disc but leaves the rectangle's corners", [bg](TestCase &t) {
++            Rgba img = blank(40, 40, bg);
++            drawButton(img, 10, 10, 20, 0);
++            coverStadium(img.px.data(), img.w, img.h, {10, 10, 20, 20}, 1.0f, bg);
++            bool clean = true;
++            for (const uint32_t c : img.px)
++                clean = clean && c == bg;
++            t.IsTrue(clean, "no icon pixel is left");
++            Rgba corner = blank(40, 40, rgba(1, 2, 3));
++            coverStadium(corner.px.data(), corner.w, corner.h, {10, 10, 20, 20}, 1.0f, bg);
++            t.Equals(corner.px[size_t(10) * 40 + 10], rgba(1, 2, 3), "corner untouched");
++            t.Equals(corner.px[size_t(20) * 40 + 20], bg, "centre covered");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index a59ec48..500a7ac 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -11,6 +11,7 @@ void register_ga2_vr_input_tests();
+ void register_ga2_settings_tests();
+ void register_ga2_text_icons_tests();
+ void register_ga2_hitext_tests();
++void register_ga2_buttonmatch_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+@@ -50,6 +51,7 @@ int main()
+     register_ga2_settings_tests();
+     register_ga2_text_icons_tests();
+     register_ga2_hitext_tests();
++    register_ga2_buttonmatch_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+-- 
+2.56.0
+

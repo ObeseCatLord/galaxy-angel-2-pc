@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "status": "source-tests-approved-native-positive-bind-observed; gameplay-open",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "patch_file": "0018-native-ee-sdk-rpc-binding.patch",
+  "patch_sha256": "501f0a77174f3860f36c4b399a61925acca3223eac4680c8ba2825a3790d497b",
+  "reviewer": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "scope": "production source/tests approved after3findings; completed152827 positivebind/RPC evidence independently verified"
+  },
+  "checks": {
+    "runtime_passed": 494,
+    "runtime_failed": 0,
+    "iop_suites_passed": 9,
+    "tooling_passed": 27,
+    "patch_prefix": 18,
+    "reproduced_source_files": 73,
+    "live_idempotence_prefix": 18,
+    "all_five_native_builds": "passed terminalexit0",
+    "binary_identities": "native-verification.json"
+  },
+  "adapter": {
+    "authority": "live originalEE SDKqueue root; no HLEmerge/cache/registry publication",
+    "zettai_root_address": "0x00832428",
+    "supported": "completed mode0 binding only",
+    "reverse_calls": "explicit unsupported -48; no fabricated completion"
+  },
+  "capture": {
+    "path": "captures/native-zettai/20261009-152827",
+    "bounded_seconds": 55.997,
+    "diagnostic_exe_sha256": "b044772d4c204337af3dd6e5d07e7f779cdc7fd2e89d22f8e975c54507709119",
+    "event_sha256": "b0345b470672c04015d82973b44867a7c41ffb09b549a44fd0b75d83ecc96f19",
+    "observer_sha256": "c948d372c9e7325ae19cf497d5afe856e3c7e21238d3f290db64ca57337d0e95",
+    "errors": [],
+    "caps": {},
+    "pending_finishes": 0,
+    "bind_pairs": 1,
+    "server_address": "0x007EDE08",
+    "buffer_address": "0x007EDEC0",
+    "completed_STREAM_rpc_pairs": 19,
+    "reverse_call_pairs": 2,
+    "reverse_request": {
+      "function": 0,
+      "mode": 0,
+      "send_size": 40,
+      "receive_size": 64,
+      "end_function": 0,
+      "end_parameter": 0
+    },
+    "acceptance": "individual completed positive binding/RPC returns only; no voice/fullbank/battle/save/performance proof"
+  },
+  "excluded_captures": {
+    "20261009-152345": "premature debugger stop from observerNameError pluswronglibrary identityerror",
+    "20261009-152515": "sessionrestart killed process; no terminalcapture/audio-record; excludecompleteness/negative/audio claims",
+    "20261009-153459": "observer-source indentation error; no semantic acceptance"
+  },
+  "native_builds": {
+    "eigou-1": "rebuilt prefix18; gameplayunverified",
+    "eigou-2": "rebuilt prefix18; gameplayunverified",
+    "mugen-1": "rebuilt prefix18; gameplayunverified",
+    "mugen-2": "rebuilt prefix18; gameplayunverified",
+    "zettai": "rebuilt prefix18; gameplayunverified"
+  },
+  "remaining": [
+    "actual IOP->EE RPC execution, reply and scheduler ownership",
+    "original soundbank/chunk transfer and PCM",
+    "fulltrilogy gameplay/desktop/language/mod/unifiedISOpackage gates"
+  ],
+  "reverse_request_capture": {
+    "path": "captures/native-zettai/20261009-153615",
+    "bounded_seconds": 35.853,
+    "event_sha256": "22c3110775913701aa2640e9a0b1e14eb17d774a4f77f3a71ecca0a43bac6c20",
+    "observer_sha256": "f67822d22c28dac10a991d6f4e71284ef98366bffd7b33f948e3c49b61de6449",
+    "pairs": 2,
+    "errors": [],
+    "caps": {},
+    "pending_finishes": 0,
+    "IOP_owner_thread": 17,
+    "EE_server_thread": 3,
+    "EE_server_status": "Waiting/Sleep",
+    "native_reply_packet_base": 0,
+    "native_reply_packet_count": 0,
+    "send_reply_client_before_after_equal": true,
+    "review_scope": "AstraUltra independently verified terminal capture/hash/originalinstruction evidence; sourcepayload/ownership observations only"
+  },
+  "next_architecture_review": "reverse-rpc-design.md"
+}

@@ -1,0 +1,171 @@
+From dc8579483ca47d423bf78108380c3b6e204fcddb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:35:36 -0500
+Subject: [PATCH] ga2: acknowledged interrupt causes do not fire on re-enable
+
+0047 latched DMAC/INTC causes that complete while masked and delivered
+them on EnableDmac/EnableIntc. Hardware only interrupts if the D_STAT /
+I_STAT bit is still set; the guest clears it by writing one. Zettai's
+movie CSC handler acknowledges fromIPU (D_STAT = 8) and re-enables, so
+the stale latch re-ran the handler at the next picture's start, issued
+the last CSC chunk first and rotated every decoded picture by 177
+macroblocks (stale band at the top, wrapped strip on the right).
+Guest W1C writes to D_STAT/I_STAT (and the native GIF chain kick's D_STAT
+write) now clear the latch.
+
+SPR DMA failures throw IpuUnsupportedOperation so they reach the host as
+device-compatibility failures instead of becoming guest address errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h   |  3 ++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp   |  6 +++
+ ps2xRuntime/src/lib/ps2_memory.cpp           |  4 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  6 +++
+ ps2xTest/src/ps2_runtime_interrupt_tests.cpp | 53 ++++++++++++++++++++
+ 5 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index b0b4c91..86ef180 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -385,6 +385,9 @@ public:
+     int removeIrqHandler(bool dmac, uint32_t cause, int id);
+     int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
+     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
++    // The guest cleared these D_STAT/I_STAT bits (write-one-to-clear): a cause
++    // latched while masked no longer fires when its handler is re-enabled.
++    void acknowledgeIrqCauses(bool dmac, uint32_t mask);
+     void dispatchIrq(bool dmac, uint32_t cause);
+     // A DMAC completion whose interrupt the device delays (VIF1 downloads).
+     // Dropped at its deadline if an immediate completion of the same cause
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 335c33a..53f8be1 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1745,6 +1745,12 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+     return KE_OK;
+ }
+ 
++void EeScheduler::acknowledgeIrqCauses(bool dmac, uint32_t mask)
++{
++    assertExecutor();
++    (dmac ? m_pendingDmacMask : m_pendingIntcMask) &= ~mask;
++}
++
+ void EeScheduler::postDelayedDmac(uint32_t cause, uint64_t cycles)
+ {
+     assertExecutor();
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 96b754e..d3a55cd 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1839,7 +1839,9 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+         char message[160];
+         std::snprintf(message, sizeof(message), "SPR %s DMA mode %u: %s (chcr=%08x madr=%08x tadr=%08x)",
+                       fromScratchpad ? "from" : "to", mode, why, chcr, savedMadr, savedTadr);
+-        throw std::runtime_error(message);
++        // The runtime turns other exceptions from MMIO into guest address
++        // errors; this one reaches the host as a device-compatibility failure.
++        throw IpuUnsupportedOperation(message);
+     };
+ 
+     auto copyQwords = [&](uint32_t mainAddress, uint32_t qwords) -> bool
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fb51a7a..ceceb81 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2486,6 +2486,11 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+     try
+     {
+         m_memory.write32(vaddr, value);
++        // D_STAT/I_STAT low bits are write-one-to-clear acknowledgements.
++        if ((vaddr & 0x1FFFFFFFu) == 0x1000E010u)
++            eeScheduler().acknowledgeIrqCauses(true, value & 0x3FFu);
++        else if ((vaddr & 0x1FFFFFFFu) == 0x1000F000u)
++            eeScheduler().acknowledgeIrqCauses(false, value & 0x7FFFu);
+         drainIpuDeviceInterrupts(rdram, vaddr);
+         drainCompletedDmacHandlers(rdram);
+     }
+@@ -2553,6 +2558,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+     m_memory.writeIORegister(D_PCR, dPcrValue);
+     ps2TraceGuestWrite(rdram, D_STAT, 4u, dStatValue, 0u, "WRITE32", ctx);
+     m_memory.writeIORegister(D_STAT, dStatValue);
++    eeScheduler().acknowledgeIrqCauses(true, dStatValue & 0x3FFu);
+     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
+     m_memory.writeIORegister(GIF_TADR, tadr);
+     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 8a9b629..c3b9c66 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -329,6 +329,21 @@ namespace
+         scheduler.waitVSync(scheduler.currentVSyncTick() + 1u);
+     }
+ 
++    bool g_latchAcknowledged = false;
++
++    void latchedDmacMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        scheduler.addIrqHandler(true, 3u, kDelayedDmacHandlerPc, true, 0u, 0u, 0u);
++        scheduler.setIrqCauseEnabled(true, 3u, false); // DisableDmac(3)
++        scheduler.dispatchIrq(true, 3u); // completes while masked: latched
++        if (g_latchAcknowledged)
++            scheduler.acknowledgeIrqCauses(true, 1u << 3u); // guest wrote D_STAT = 8
++        scheduler.setIrqCauseEnabled(true, 3u, true);
++        ctx->pc = kDelayedDmacResumePc;
++        scheduler.waitVSync(scheduler.currentVSyncTick());
++    }
++
+     void delayedDmacResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         g_delayedDmacDone.store(true, std::memory_order_release);
+@@ -778,6 +793,44 @@ void register_ps2_runtime_interrupt_tests()
+             }
+         });
+ 
++        tc.Run("a masked DMAC cause the guest acknowledged does not fire on enable", [](TestCase &t)
++        {
++            for (const bool acknowledged : {false, true})
++            {
++                TestEnv env;
++                t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++                env.runtime.registerFunction(kDelayedDmacMainPc, latchedDmacMain);
++                env.runtime.registerFunction(kDelayedDmacResumePc, delayedDmacResume);
++                env.runtime.registerFunction(kDelayedDmacHandlerPc, delayedDmacHandler);
++                g_delayedDmacCalls = 0;
++                g_latchAcknowledged = acknowledged;
++                g_delayedDmacDone.store(false, std::memory_order_release);
++                R5900Context mainContext{};
++                mainContext.pc = kDelayedDmacMainPc;
++                std::thread gameThread([&]()
++                {
++                    try
++                    {
++                        env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                        env.runtime.eeScheduler().run();
++                    }
++                    catch (...)
++                    {
++                    }
++                });
++                const bool done = waitUntil([]() { return g_delayedDmacDone.load(std::memory_order_acquire); },
++                                            std::chrono::milliseconds(500));
++                if (!done)
++                    env.runtime.requestStop();
++                gameThread.join();
++                t.IsTrue(done, "guest must resume after a vsync");
++                t.Equals(g_delayedDmacCalls, acknowledged ? 0 : 1,
++                         acknowledged ? "an acknowledged latch is dropped (D_STAT CIS cleared)"
++                                      : "an unacknowledged latch fires on EnableDmac");
++                cleanupRuntime(env);
++            }
++        });
++
+         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.55.0
+

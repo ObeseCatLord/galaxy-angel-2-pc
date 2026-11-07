@@ -1,0 +1,53 @@
+From 276ed8bbc3bef05ae998108d27621e0ce2a45f68 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:32:42 -0500
+Subject: [PATCH] Hacks: replacements_cover_rect (host images cover the cached
+ region)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 12 +++++++++++-
+ gs/gs_interface.hpp |  4 ++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index e691a32..93e6d2c 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1792,7 +1792,17 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 
+ 		info.info.bias.x = -float(desc.rect.x) * info.info.sizes.z;
+ 		info.info.bias.y = -float(desc.rect.y) * info.info.sizes.w;
+-		if (renderer.is_replaced_image(&*image))
++		if (renderer.is_replaced_image(&*image) && hacks.replacements_cover_rect)
++		{   // Host image = exactly the cached region (desc.rect) at any resolution: normalise by the region's size in PS2
++			// texels, with its crop offset, as for a decoded cache entry.
++			info.info.sizes.z = 1.0f / float(desc.rect.width);
++			info.info.sizes.w = 1.0f / float(desc.rect.height);
++			if (uint32_t(desc.clamp.desc.WMS) == CLAMPBits::CLAMP) info.info.region.z = float(desc.rect.width) - 1.0f;
++			if (uint32_t(desc.clamp.desc.WMT) == CLAMPBits::CLAMP) info.info.region.w = float(desc.rect.height) - 1.0f;
++			info.info.bias.x = -float(desc.rect.x) * info.info.sizes.z;
++			info.info.bias.y = -float(desc.rect.y) * info.info.sizes.w;
++		}
++		else if (renderer.is_replaced_image(&*image))
+ 		{   // [texreplace] host image = the whole PS2 texture at any resolution: normalise by the PS2 size, no crop offset,
+ 			// clamp region in PS2 texels
+ 			info.info.sizes.z = 1.0f / float(width);
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index ba94e98..76ed6e1 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -220,6 +220,10 @@ struct Hacks
+ 	// buffers then show their colour steps instead of the checkerboard).
+ 	bool disable_dither = false;
+ 
++	// Replacement images cover exactly the cached region (TextureDescriptor::rect) instead of the whole PS2 texture.
++	// Textures are often declared larger than their art, so the region is what a host can identify stably.
++	bool replacements_cover_rect = false;
++
+ 	// [texreplace] BT3-Recomp: sample every texture bilinearly regardless of TEX1 MMAG/MMIN (smooths 1x art at high
+ 	// scanout resolutions, the same knob as the host GL renderer's force_bilinear).
+ 	bool force_bilinear = false;
+-- 
+2.55.0
+

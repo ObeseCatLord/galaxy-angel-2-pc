@@ -1,0 +1,428 @@
+From afeafc7c48644d4d9d97f9e8f0923d2219659923 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 03:13:18 -0500
+Subject: [PATCH] ga2: mouse on dialogue buttons, system menu, choices, yes/no
+ prompts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Menus recognised from the presented picture (shared by all three games):
+- dialogue box Auto / Back / Menu buttons press Triangle / Square / Select;
+- the system menu (ロード / セーブ / オプション / ゲームをやめる) and
+  yes/no prompts (はい / いいえ) follow the pointer: the item whose centre
+  row is red is the cursor, Up/Down (Left/Right for yes/no) move it;
+- story choices (thought bubble, white dot = selected row) likewise.
+A left press belongs to what it landed on until release, so a button that
+changes look when pressed no longer turns the rest of the press into Circle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_mouse.cpp       |  38 +++-
+ ps2xRuntime/src/lib/ps2_mouse.h         |   5 +
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp | 251 +++++++++++++++++++++---
+ ps2xRuntime/src/lib/ps2_runtime.cpp     |   2 +
+ 4 files changed, 268 insertions(+), 28 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 797d1a0..2f7bbb3 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -31,7 +31,7 @@ namespace ps2_mouse
+         std::array<Button, 14> g_buttons{};
+         double g_lastMove = -10.0;
+         uint16_t g_held = 0;
+-        bool g_overPad = false, g_clickedGame = false;
++        bool g_overPad = false, g_clickedGame = false, g_pressOwned = false;
+         int g_wheelNotches = 0, g_wheelPhase = 0;
+         uint16_t g_wheelDirection = 0;
+ 
+@@ -128,7 +128,14 @@ namespace ps2_mouse
+         // confirm; elsewhere the left button is Circle.
+         const uint16_t menu = ps2_mouse_menus::update();
+         g_held |= menu;
+-        if (!pad && overGame && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !ps2_mouse_menus::ownsClick())
++        // A press belongs to what it landed on until release: one that opened
++        // a menu through an on-screen button must not turn into Circle when
++        // the button's look changes under the still-held mouse.
++        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++            g_pressOwned = pad != nullptr || ps2_mouse_menus::ownsClick();
++        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++            g_pressOwned = false;
++        if (!pad && overGame && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !g_pressOwned && !ps2_mouse_menus::ownsClick())
+             g_held |= kCircle;
+         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+             g_held |= kCross;
+@@ -206,6 +213,33 @@ namespace ps2_mouse
+         }
+     }
+ 
++    namespace
++    {
++        const uint8_t *g_frame = nullptr;
++        uint32_t g_frameWidth = 0, g_frameHeight = 0;
++    }
++
++    void setFrame(const uint8_t *rgba, uint32_t width, uint32_t height)
++    {
++        g_frame = rgba;
++        g_frameWidth = width;
++        g_frameHeight = height;
++    }
++
++    bool pixel(int x, int y, uint8_t rgb[3])
++    {
++        if (!g_frame || g_frameWidth == 0 || g_frameHeight == 0)
++            return false;
++        // The presented picture may be supersampled (2x/4x): scale from 640x448.
++        const uint32_t fx = static_cast<uint32_t>(x) * g_frameWidth / static_cast<uint32_t>(g_sourceWidth);
++        const uint32_t fy = static_cast<uint32_t>(y) * g_frameHeight / static_cast<uint32_t>(g_sourceHeight);
++        if (x < 0 || y < 0 || fx >= g_frameWidth || fy >= g_frameHeight)
++            return false;
++        const uint8_t *p = g_frame + (size_t(fy) * g_frameWidth + fx) * 4u;
++        rgb[0] = p[0]; rgb[1] = p[1]; rgb[2] = p[2];
++        return true;
++    }
++
+     uint16_t heldButtons() { return g_held; }
+     bool clickedGame() { return g_clickedGame; }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.h b/ps2xRuntime/src/lib/ps2_mouse.h
+index 4324f29..db41591 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.h
++++ b/ps2xRuntime/src/lib/ps2_mouse.h
+@@ -27,4 +27,9 @@ namespace ps2_mouse
+     bool pointer(float &x, float &y);
+     // Left button went down this frame over the game image (not on the pad).
+     bool clickedGame();
++
++    // The picture being presented (RGBA, top-down; valid until the next one).
++    void setFrame(const uint8_t *rgba, uint32_t width, uint32_t height);
++    // Its pixel at PS2 frame coordinates (640x448 scale); false without one.
++    bool pixel(int x, int y, uint8_t rgb[3]);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index 9de90ae..ba258d3 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_mouse.h"
+ #include "ps2_host_backend.h"
+ 
++#include <cstdlib>
+ #include <cstring>
+ #include <string>
+ #include <vector>
+@@ -57,6 +58,157 @@ namespace ps2_mouse_menus
+             return table;
+         }
+ 
++        // On-screen buttons recognised from the picture itself: when every
++        // probe pixel matches, clicking a spot presses its pad button.
++        struct Probe
++        {
++            int x, y;
++            uint8_t r, g, b;
++        };
++        struct Spot
++        {
++            Item rect;
++            uint16_t button;
++        };
++        struct VisualDef
++        {
++            std::vector<Probe> probes;
++            std::vector<Spot> spots;
++        };
++
++        constexpr uint16_t kTriangle = 0x1000u, kSquare = 0x8000u, kSelect = 0x0001u;
++
++        const std::vector<VisualDef> &visuals()
++        {
++            static const std::vector<VisualDef> table = {
++                // Dialogue box buttons, the same in all three games: Auto = Triangle,
++                // Back = Square, Menu = Select (white label pixels and the frame edges).
++                {{{594, 362, 248, 248, 248}, {570, 386, 248, 248, 248}, {585, 393, 248, 248, 248},
++                  {601, 350, 88, 216, 248}, {609, 376, 79, 178, 216}, {602, 399, 40, 104, 128}},
++                 {{{540, 347, 622, 372}, kTriangle}, {{540, 377, 622, 402}, kSquare}, {{540, 407, 622, 432}, kSelect}}},
++            };
++            return table;
++        }
++
++        bool visible(const VisualDef &def)
++        {
++            for (const Probe &p : def.probes)
++            {
++                uint8_t rgb[3];
++                if (!ps2_mouse::pixel(p.x, p.y, rgb))
++                    return false;
++                if (std::abs(rgb[0] - p.r) > 40 || std::abs(rgb[1] - p.g) > 40 || std::abs(rgb[2] - p.b) > 40)
++                    return false;
++            }
++            return true;
++        }
++
++        // Menus recognised from the picture: each item's centre row is red when
++        // selected and blue otherwise; on screen when every item is one or the
++        // other and exactly one is red (that one is the cursor). Up/Down move it.
++        struct VisualMenu
++        {
++            std::vector<Item> items;
++            bool horizontal = false; // Left/Right instead of Up/Down
++        };
++
++        const std::vector<VisualMenu> &visualMenus()
++        {
++            static const std::vector<VisualMenu> table = {
++                // System menu (Select in dialogue): ロード / セーブ / オプション / ゲームをやめる.
++                {{{241, 121, 407, 149}, {241, 155, 407, 183}, {241, 188, 407, 216}, {241, 221, 407, 249}}},
++                // Yes/No prompts (save, load, overwrite): はい / いいえ.
++                {{{212, 233, 309, 255}, {329, 233, 426, 255}}, true},
++            };
++            return table;
++        }
++
++        int visualCursor(const VisualMenu &menu)
++        {
++            int selected = -1;
++            for (size_t i = 0; i < menu.items.size(); ++i)
++            {
++                const Item &it = menu.items[i];
++                const int y = static_cast<int>((it.y0 + it.y1) * 0.5f);
++                int r = 0, b = 0, n = 0;
++                for (int x = static_cast<int>(it.x0) + 15; x < static_cast<int>(it.x1) - 8; x += 6, ++n)
++                {
++                    uint8_t rgb[3];
++                    if (!ps2_mouse::pixel(x, y, rgb))
++                        return -1;
++                    r += rgb[0];
++                    b += rgb[2];
++                }
++                if (n == 0)
++                    return -1;
++                r /= n;
++                b /= n;
++                if (r > b + 30)
++                {
++                    if (selected >= 0)
++                        return -1;
++                    selected = static_cast<int>(i);
++                }
++                else if (b <= r + 30)
++                    return -1;
++            }
++            return selected;
++        }
++
++        // Story choices: a thought bubble listing options, each led by a dot
++        // that is white on the selected row and black on the others (all
++        // three games). Up/Down move the selection.
++        struct DotMenu
++        {
++            int dotX, firstY, pitch, maxRows;
++            float x0, x1;
++        };
++
++        const std::vector<DotMenu> &dotMenus()
++        {
++            static const std::vector<DotMenu> table = {
++                {138, 128, 28, 6, 118, 524},
++            };
++            return table;
++        }
++
++        // Rows and selected row of a dot menu on screen (or -1).
++        int dotCursor(const DotMenu &menu, std::vector<Item> &items)
++        {
++            items.clear();
++            int selected = -1;
++            for (int row = 0; row < menu.maxRows; ++row)
++            {
++                const int y = menu.firstY + row * menu.pitch;
++                int kind = -1; // 1 white, 0 black
++                for (int dx = -4; dx <= 4; dx += 4)
++                {
++                    uint8_t rgb[3];
++                    if (!ps2_mouse::pixel(menu.dotX + dx, y, rgb))
++                        return -1;
++                    const int k = (rgb[0] > 225 && rgb[1] > 225 && rgb[2] > 225) ? 1
++                                  : (rgb[0] < 30 && rgb[1] < 30 && rgb[2] < 30) ? 0 : -1;
++                    if (k < 0 || (dx > -4 && k != kind))
++                    {
++                        kind = -1;
++                        break;
++                    }
++                    kind = k;
++                }
++                if (kind < 0)
++                    break;
++                if (kind == 1)
++                {
++                    if (selected >= 0)
++                        return -1;
++                    selected = row;
++                }
++                const float half = static_cast<float>(menu.pitch) * 0.5f;
++                items.push_back(Item{menu.x0, static_cast<float>(y) - half, menu.x1, static_cast<float>(y) + half});
++            }
++            return items.size() >= 2 ? selected : -1;
++        }
++
+         const uint8_t *g_ram = nullptr;
+         std::string g_program;
+         std::vector<const MenuDef *> g_candidates;
+@@ -107,20 +259,6 @@ namespace ps2_mouse_menus
+                     }
+             }
+         }
+-
+-        int itemAt(float x, float y)
+-        {
+-            if (!g_menu)
+-                return -1;
+-            const auto hit = [x, y](const Item &it) { return x >= it.x0 && x < it.x1 && y >= it.y0 && y < it.y1; };
+-            for (size_t i = 0; i < g_menu->items.size(); ++i)
+-                if (hit(g_menu->items[i]))
+-                    return static_cast<int>(i);
+-            for (size_t i = 0; i < g_menu->extras.size(); ++i)
+-                if (hit(g_menu->extras[i].item))
+-                    return static_cast<int>(g_menu->items.size() + i);
+-            return -1;
+-        }
+     }
+ 
+     void attach(const uint8_t *rdram, std::string_view program)
+@@ -138,8 +276,63 @@ namespace ps2_mouse_menus
+         g_owns = false;
+         if (!g_ram)
+             return 0;
+-        locate();
+-        if (!g_menu)
++        // Pulses are 3 frames on, 3 off, whichever source started them.
++        if (g_phase > 0 && g_target < 0)
++        {
++            --g_phase;
++            return g_phase >= 3 ? g_pulse : 0;
++        }
++        // Visual on-screen buttons (dialogue Auto/Back/Menu).
++        {
++            float x = 0, y = 0;
++            if (ps2_mouse::pointer(x, y))
++                for (const VisualDef &def : visuals())
++                    for (const Spot &spot : def.spots)
++                        if (x >= spot.rect.x0 && x < spot.rect.x1 && y >= spot.rect.y0 && y < spot.rect.y1 &&
++                            visible(def))
++                        {
++                            g_owns = true;
++                            if (ps2_mouse::clickedGame())
++                            {
++                                g_pulse = spot.button;
++                                g_phase = 6;
++                                return g_pulse;
++                            }
++                            return 0;
++                        }
++        }
++        // The menu on screen: one recognised from the picture, else a known
++        // game object found in RAM.
++        const std::vector<Item> *items = nullptr;
++        const std::vector<Extra> *extras = nullptr;
++        int cursor = -1;
++        uint16_t prevKey = kUp, nextKey = kDown;
++        static std::vector<Item> dotItems;
++        for (const VisualMenu &menu : visualMenus())
++            if ((cursor = visualCursor(menu)) >= 0)
++            {
++                items = &menu.items;
++                if (menu.horizontal)
++                {
++                    prevKey = kLeft;
++                    nextKey = kRight;
++                }
++                break;
++            }
++        for (size_t i = 0; !items && i < dotMenus().size(); ++i)
++            if ((cursor = dotCursor(dotMenus()[i], dotItems)) >= 0)
++                items = &dotItems;
++        if (!items)
++        {
++            locate();
++            if (g_menu)
++            {
++                items = &g_menu->items;
++                extras = &g_menu->extras;
++                cursor = g_ram[g_object + g_menu->anchorOffset];
++            }
++        }
++        if (!items)
+         {
+             g_target = -1;
+             g_confirm = false;
+@@ -149,7 +342,17 @@ namespace ps2_mouse_menus
+ 
+         float x = 0, y = 0;
+         const bool on = ps2_mouse::pointer(x, y);
+-        const int hovered = on ? itemAt(x, y) : -1;
++        int hovered = -1;
++        if (on)
++        {
++            const auto hit = [x, y](const Item &it) { return x >= it.x0 && x < it.x1 && y >= it.y0 && y < it.y1; };
++            for (size_t i = 0; i < items->size() && hovered < 0; ++i)
++                if (hit((*items)[i]))
++                    hovered = static_cast<int>(i);
++            for (size_t i = 0; extras && i < extras->size() && hovered < 0; ++i)
++                if (hit((*extras)[i].item))
++                    hovered = static_cast<int>(items->size() + i);
++        }
+         g_owns = hovered >= 0;
+         const bool moved = on && (x != g_lastX || y != g_lastY);
+         if (on) { g_lastX = x; g_lastY = y; }
+@@ -170,20 +373,16 @@ namespace ps2_mouse_menus
+         }
+         if (g_target < 0)
+             return 0;
+-        const int cursor = g_ram[g_object + g_menu->anchorOffset];
+-        const int count = static_cast<int>(g_menu->count);
+-        const int list = static_cast<int>(g_menu->items.size());
++        const int list = static_cast<int>(items->size());
++        const int count = list + (extras ? static_cast<int>(extras->size()) : 0);
+         if (cursor != g_target && g_moves < 2 * count)
+         {
+             if (cursor >= list)                       // on an extra: back to the list
+-                g_pulse = g_menu->extras[size_t(cursor - list)].exit;
++                g_pulse = (*extras)[size_t(cursor - list)].exit;
+             else if (g_target >= list)                // to an extra
+-                g_pulse = g_menu->extras[size_t(g_target - list)].enter;
++                g_pulse = (*extras)[size_t(g_target - list)].enter;
+             else
+-            {
+-                const int down = (g_target - cursor + list) % list;
+-                g_pulse = down <= list - down ? kDown : kUp;
+-            }
++                g_pulse = g_target > cursor ? nextKey : prevKey; // works whether or not the list wraps
+             ++g_moves;
+             g_phase = 6;
+             return g_pulse;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4190d9e..eca699b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -412,6 +412,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             UpdateTexture(tex, s_pgsFrame.data());
+             s_pgsWidth = w;
+             s_pgsHeight = h;
++            ps2_mouse::setFrame(s_pgsFrame.data(), w, h);
+         }
+         outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+         outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
+@@ -514,6 +515,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     }
+ 
+     UpdateTexture(tex, s_uploadBuffer.data());
++    ps2_mouse::setFrame(s_uploadBuffer.data(), FB_WIDTH, height);
+     outWidth = width;
+     outHeight = height;
+     s_hasUploadedFrame = true;
+-- 
+2.55.0
+

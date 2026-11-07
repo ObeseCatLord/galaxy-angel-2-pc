@@ -1,0 +1,161 @@
+From 4140c579852f9d1b52f34223e0c148719aec1ea0 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:15:10 -0500
+Subject: [PATCH] framerate: 3D-scene presentation switch in game time, RPC
+ trace call chain
+
+ga2_activity::scene3d() (the presentation's wide frame decision: VU1 ran within the last
+half second) now counts guest vblanks, not host time (last3dVsync; 30 vblanks), so the
+switch out of a 3D adventure scene at a fade happens at the same game time at every frame
+rate and host speed (it was a 100 ms difference in the scene-exit fade at 120 fps).
+ga2_trace::callChain walks guest stack frames; the GA2_FRAMETRACE_RPC lines carry the
+caller chain of the SIF RPC (ra=a<b<c...), which located the memory-card polling.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_activity.h  |  9 ++++-
+ ps2xRuntime/include/runtime/ga2_framepace.h |  3 ++
+ ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp |  9 ++++-
+ ps2xRuntime/src/lib/ga2_framepace.cpp       | 42 +++++++++++++++++++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp     |  2 +
+ 5 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_activity.h b/ps2xRuntime/include/runtime/ga2_activity.h
+index 996b729..172c881 100644
+--- a/ps2xRuntime/include/runtime/ga2_activity.h
++++ b/ps2xRuntime/include/runtime/ga2_activity.h
+@@ -13,6 +13,9 @@ namespace ga2_activity
+     extern std::atomic<uint64_t> vu1Runs;
+     // steady_clock nanoseconds of a recent VU1 run.
+     extern std::atomic<int64_t> last3dNanos;
++    // The guest vertical-blank count at a recent VU1 run (game time: scene changes
++    // that depend on it happen at the same game time at any host or frame rate).
++    extern std::atomic<int64_t> last3dVsync;
+ 
+     // Guest vertical blanks so far (60 Hz game time, independent of how fast the host runs it).
+     extern std::atomic<uint64_t> vsyncs;
+@@ -24,10 +27,12 @@ namespace ga2_activity
+             .count();
+     }
+ 
+-    // A 3D scene is on screen: VU1 ran within the last half second.
++    // A 3D scene is on screen: VU1 ran within the last half second of game time
++    // (30 guest vblanks; not host time: a transition out of a 3D scene then
++    // switches the presentation at the same game time at every frame rate).
+     inline bool scene3d()
+     {
+-        return nowNanos() - last3dNanos.load(std::memory_order_relaxed) < 500'000'000;
++        return int64_t(vsyncs.load(std::memory_order_relaxed)) - last3dVsync.load(std::memory_order_relaxed) < 30;
+     }
+ 
+     // > 1 when the game's 3D cameras render hor+ by this factor (anamorphic:
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index 0ee65e3..8745f80 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -94,6 +94,9 @@ namespace ga2_trace
+     // scans out, tagged with the game time of the iteration that drew it.
+     bool framesEnabled();
+     void frameSignature(const uint32_t *pixels, uint32_t width, uint32_t height, bool bgra, uint64_t flip, double gameTime);
++    // The guest call chain above (ra, sp): the return addresses of up to `depth` callers (found from the stack frames'
++    // prologues; stops where one cannot be found). out[0] = ra. Returns how many are filled in.
++    int callChain(const uint8_t *rdram, uint32_t ra, uint32_t sp, uint32_t *out, int depth);
+     // The guest vsync count and frame tick stamped into lines (scheduler).
+     void setClocks(uint64_t vsync, uint64_t tick);
+     // Starts logging the IOP's sound key-ons and CD reads as events (no-op
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 22302cd..12f4c39 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -479,8 +479,13 @@ namespace ps2_syscalls
+                 const uint32_t phys = sendBuf & 0x1FFFFFFFu;
+                 if (sendBuf != 0u && phys + sizeof(words) <= PS2_RAM_SIZE)
+                     std::memcpy(words, rdram + phys, sizeof(words));
+-                ga2_trace::line("R", "sid=%x fn=%u mode=%u words=%08x,%08x,%08x,%08x", sidHint, rpcNum, mode, words[0], words[1],
+-                                words[2], words[3]);
++                uint32_t chain[5] = {0, 0, 0, 0, 0};
++                const int depth = ga2_trace::callChain(rdram, getRegU32(ctx, 31), stackPointer, chain, 5);
++                char callers[64] = "";
++                for (int i = 0, at = 0; i < depth && at < 56; ++i)
++                    at += std::snprintf(callers + at, sizeof(callers) - at, i ? "<%x" : "%x", chain[i]);
++                ga2_trace::line("R", "sid=%x fn=%u mode=%u words=%08x,%08x,%08x,%08x ra=%s", sidHint, rpcNum, mode, words[0], words[1],
++                                words[2], words[3], callers);
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index 3281a8c..6464fd8 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -286,6 +286,48 @@ namespace ga2_trace
+         emit(kind, gt, body);
+     }
+ 
++    int callChain(const uint8_t *rdram, uint32_t ra, uint32_t sp, uint32_t *out, int depth)
++    {
++        auto word = [&](uint32_t address)
++        {
++            uint32_t v = 0;
++            std::memcpy(&v, rdram + (address & 0x1fffffcu), sizeof(v));
++            return v;
++        };
++        int n = 0;
++        while (n < depth)
++        {
++            out[n++] = ra;
++            if (!rdram || ra < 0x100000u || ra >= 0x2000000u)
++                break;
++            bool found = false;
++            for (uint32_t pc = ra - 8u, k = 0; k < 8192 && pc >= 0x100000u && !found; pc -= 4u, ++k)
++            {
++                const uint32_t op = word(pc);
++                if ((op >> 16) != 0x27bdu && (op >> 16) != 0x67bdu)
++                    continue;
++                const int16_t frame = int16_t(op & 0xffffu);
++                if (frame >= 0)
++                    continue;
++                for (uint32_t q = pc + 4u; q < pc + 4u * 48u && q < ra; q += 4u)
++                {
++                    const uint32_t save = word(q);
++                    if ((save >> 16) == 0xffbfu || (save >> 16) == 0x7fbfu || (save >> 16) == 0xafbfu)
++                    {
++                        ra = word(sp + uint32_t(int16_t(save & 0xffffu)));
++                        sp += uint32_t(-int32_t(frame));
++                        found = true;
++                        break;
++                    }
++                }
++                break;
++            }
++            if (!found)
++                break;
++        }
++        return n;
++    }
++
+     bool framesEnabled()
+     {
+         static const bool on = enabled() && [] { const char *v = std::getenv("GA2_FRAMETRACE_FRAMES"); return v && *v && *v != '0'; }();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 1d7eae6..034ecdd 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -985,6 +985,7 @@ namespace
+ std::atomic<uint64_t> ga2_activity::vu1Runs{0};
+ std::atomic<uint64_t> ga2_activity::vsyncs{0};
+ std::atomic<int64_t> ga2_activity::last3dNanos{INT64_MIN / 2};
++std::atomic<int64_t> ga2_activity::last3dVsync{INT64_MIN / 2};
+ std::atomic<float> ga2_activity::horPlus{1.0f};
+ 
+ VU1Interpreter::PerfSample VU1Interpreter::takePerfSample()
+@@ -1015,6 +1016,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     } perfScope{perfStart, perfCycle, m_cycle};
+     if ((ga2_activity::vu1Runs.fetch_add(1, std::memory_order_relaxed) & 31u) == 0u)
+         ga2_activity::last3dNanos.store(ga2_activity::nowNanos(), std::memory_order_relaxed);
++        ga2_activity::last3dVsync.store(int64_t(ga2_activity::vsyncs.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+-- 
+2.55.0
+

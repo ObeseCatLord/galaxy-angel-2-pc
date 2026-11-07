@@ -1,0 +1,222 @@
+From 936e6ac19016df7d115d97f38aa0e3082f551ce0 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:30:10 -0500
+Subject: [PATCH] ga2: IOP printf formatting and boot diagnostics
+
+- IOP printf formats %d/%u/%x/%c/%s/%p with o32 arguments (a1..a3, then the
+  stack), so module messages such as SCREAM errors carry their values.
+- GA2_IOP_FILE_TRACE logs ioman opens and sceCdSearchFile lookups;
+  GA2_RPC_TRACE also logs IOP->EE reverse RPCs through the generic service.
+- GA2_WATCHDOG prints argument/saved registers; GA2_WATCHDOG_DUMP=<addr>[,n]
+  hex-dumps guest RAM at each tick.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp  |  9 ++-
+ ps2xIOP/src/emulator/imports/iop_ioman.cpp |  7 +++
+ ps2xIOP/src/emulator/imports/iop_stdio.cpp | 69 +++++++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_iop_host.cpp       |  9 +++
+ ps2xRuntime/src/lib/ps2_runtime.cpp        | 22 ++++++-
+ 5 files changed, 113 insertions(+), 3 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index c66390f..8777848 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -286,8 +286,15 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 10: // sceCdSearchFile
+-                cpu.gpr[2] = searchFile(a0, a1) ? 1u : 0u;
++            {
++                const bool found = searchFile(a0, a1);
++                cpu.gpr[2] = found ? 1u : 0u;
++                static const bool trace = std::getenv("GA2_IOP_FILE_TRACE") != nullptr;
++                if (trace)
++                    host.log(LogLevel::Info, "[cdvd] sceCdSearchFile '" + memory.readString(a1, 256u) + "' -> " +
++                                                 (found ? "found" : "not found"));
+                 return true;
++            }
+ 
+             case 11: // sceCdSync
+                 cpu.gpr[2] = 0u;
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 0d3514e..85ffce5 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -8,6 +8,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <cstdlib>
++#include <string>
+ #include <limits>
+ #include <string_view>
+ #include <vector>
+@@ -192,6 +194,9 @@ namespace ps2x::iop::detail
+             }
+ 
+             const uint32_t flags = cpu.gpr[5];
++            static const bool trace = std::getenv("GA2_IOP_FILE_TRACE") != nullptr;
++            if (trace)
++                m_host.log(LogLevel::Info, "[ioman] open '" + guestPath + "' flags=" + std::to_string(flags));
+             if ((flags & ~kOpenKnownFlags) != 0u || (flags & kOpenReadWrite) == 0u ||
+                 (flags & kOpenNonBlocking) != 0u || (flags & kOpenNoWait) != 0u)
+             {
+@@ -230,6 +235,8 @@ namespace ps2x::iop::detail
+             const uint64_t hostHandle = m_host.openGuestFile(guestPath);
+             if (hostHandle == 0u)
+             {
++                if (trace)
++                    m_host.log(LogLevel::Info, "[ioman] open failed: no entry '" + guestPath + "'");
+                 setV0(static_cast<uint32_t>(kErrorNoEntry));
+                 return true;
+             }
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index eed2b61..1af1f10 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -4,6 +4,9 @@
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
+ #include <string>
+ 
+ namespace ps2x::iop::detail
+@@ -28,11 +31,75 @@ namespace ps2x::iop::detail
+             setV0(static_cast<uint32_t>(text.size()) + resultBias);
+         };
+ 
++        // printf-family formatting: o32 arguments after the format string come
++        // from a1..a3 and then the caller's stack (sp + 16 onward).
++        const auto formatted = [&](uint32_t formatAddress, unsigned firstArgument)
++        {
++            const std::string format = m_memory.readString(formatAddress, 2048u);
++            unsigned argument = firstArgument;
++            const auto next = [&]() -> uint32_t
++            {
++                const unsigned index = argument++;
++                if (index < 4u)
++                    return cpu.gpr[4 + index];
++                return m_memory.read32(cpu.gpr[29] + 4u * index);
++            };
++            std::string out;
++            for (size_t i = 0; i < format.size(); ++i)
++            {
++                if (format[i] != '%')
++                {
++                    out += format[i];
++                    continue;
++                }
++                size_t j = i + 1;
++                while (j < format.size() && std::strchr("-+ #0123456789.", format[j]))
++                    ++j;
++                while (j < format.size() && (format[j] == 'l' || format[j] == 'h'))
++                    ++j;
++                if (j >= format.size())
++                    break;
++                std::string spec = format.substr(i, j - i);
++                spec.erase(std::remove(spec.begin(), spec.end(), 'l'), spec.end());
++                spec.erase(std::remove(spec.begin(), spec.end(), 'h'), spec.end());
++                const char conversion = format[j];
++                char buffer[512];
++                switch (conversion)
++                {
++                case '%':
++                    out += '%';
++                    break;
++                case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'c':
++                    std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), next());
++                    out += buffer;
++                    break;
++                case 'p':
++                    std::snprintf(buffer, sizeof(buffer), "0x%08x", next());
++                    out += buffer;
++                    break;
++                case 's':
++                    std::snprintf(buffer, sizeof(buffer), (spec + 's').c_str(), m_memory.readString(next(), 256u).c_str());
++                    out += buffer;
++                    break;
++                default:
++                    out += spec;
++                    out += conversion;
++                    break;
++                }
++                i = j;
++            }
++            return out;
++        };
++
+         switch (ordinal)
+         {
+         case 4: // printf
+-            logString("[IOP printf] ", a0);
++        {
++            const std::string text = formatted(a0, 1u);
++            m_host.log(LogLevel::Info, "[IOP printf] " + text);
++            setV0(static_cast<uint32_t>(text.size()));
+             return true;
++        }
+         case 5: // getchar
+         case 10:
+             setV0(0xFFFFFFFFu);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 4bdbc61..1e1ce6f 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -205,6 +205,15 @@ bool PS2IopHostAdapter::submitGenericReverseRpc(const ps2x::iop::ReverseRpcReque
+     { std::memcpy(rdram + physical(address), &value, 4); };
+     const uint32_t sd = request.serverAddress;
+     const uint32_t func = word(sd + 4u);
++    static const bool trace = std::getenv("GA2_RPC_TRACE") != nullptr;
++    if (trace)
++    {
++        uint32_t opcode = 0;
++        std::memcpy(&opcode, request.send.data(), 4);
++        std::cerr << "[reverse rpc] nonce=" << request.nonce << " server=0x" << std::hex << sd << " func=0x" << func
++                  << " fno=" << std::dec << request.function << " opcode=" << opcode
++                  << (word(sd + 8u) != request.bufferAddress || !m_runtime.hasFunction(func) ? " REJECTED" : "") << '\n';
++    }
+     if (word(sd + 8u) != request.bufferAddress || !m_runtime.hasFunction(func))
+         return false;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f62ab44..ada0cb1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2626,8 +2626,28 @@ void PS2Runtime::run()
+                             // Racy sampling is fine for a stall diagnostic.
+                             const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                             std::cerr << "[watchdog] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+-                                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u) << std::dec
++                                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u);
++                            if (ctx)
++                                for (int r : {4, 5, 6, 7, 16, 17, 18, 19, 29})
++                                    std::cerr << " r" << std::dec << r << "=0x" << std::hex << getRegU32(ctx, r);
++                            std::cerr << std::dec
+                                       << " dispatch history: " << formatDispatchHistory() << std::endl;
++                            // GA2_WATCHDOG_DUMP=<hex address>[,<bytes>]: hex dump guest RAM.
++                            if (const char *dump = std::getenv("GA2_WATCHDOG_DUMP"); dump && *dump)
++                            {
++                                char *end = nullptr;
++                                const uint32_t address = static_cast<uint32_t>(std::strtoul(dump, &end, 16)) & 0x1FFFFFFu;
++                                const uint32_t bytes = (end && *end == ',') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : 64u;
++                                const uint8_t *ram = m_memory.getRDRAM();
++                                for (uint32_t i = 0; ram && i < bytes && address + i < PS2_RAM_SIZE; i += 16)
++                                {
++                                    char line[96];
++                                    int n = std::snprintf(line, sizeof(line), "[watchdog] %08x:", address + i);
++                                    for (uint32_t j = 0; j < 16 && address + i + j < PS2_RAM_SIZE; ++j)
++                                        n += std::snprintf(line + n, sizeof(line) - n, " %02x", ram[address + i + j]);
++                                    std::cerr << line << std::endl;
++                                }
++                            }
+                         } })
+             .detach();
+     }
+-- 
+2.55.0
+

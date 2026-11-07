@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "builds": [
+    {
+      "disc_id": "eigou-1",
+      "serial": "SLPM_551.18",
+      "elf_sha256": "37544fc408902b35e5248343afeb3b7c88ea6a24132c483ed4dc6be927996ce7",
+      "entry": 1048584,
+      "elf_size": 4404940,
+      "files": 30,
+      "irx_modules": 18,
+      "symbols": false,
+      "iso_sha256": "4e4b4641533c5da936e078243ee5fdaf3b61256d342b1e072321c33434e25d98",
+      "iso_size": 4349067264,
+      "manifest_sha256": "4a644afe8d8d734c5b9767bf89ca30e1678b8cffcb2ba9ff95ca83c2040391c6"
+    },
+    {
+      "disc_id": "eigou-2",
+      "serial": "SLPM_551.19",
+      "elf_sha256": "f4c47a716634fab0304ae04e70195e796bfc404ca66515cdbe43c1e49b3b0c93",
+      "entry": 1048584,
+      "elf_size": 4350668,
+      "files": 30,
+      "irx_modules": 18,
+      "symbols": false,
+      "iso_sha256": "1e1f3e269a7f771d281aa2c753f8ad6335cefc36efafa29b843a61ac701e3379",
+      "iso_size": 2531819520,
+      "manifest_sha256": "e7fdfb45b3f54e3c7057847416392e40b599265e339eb1ec38dd0554c1c95ed3"
+    },
+    {
+      "disc_id": "mugen-1",
+      "serial": "SLPM_667.79",
+      "elf_sha256": "b895cdb1c3195391bfd2bb85ec2c82ae0997ba85e243d9d5a6a7b291b53c4ab9",
+      "entry": 1048584,
+      "elf_size": 4345420,
+      "files": 30,
+      "irx_modules": 18,
+      "symbols": false,
+      "iso_sha256": "07596c4a6eedc55d1a70727566d36027815f0c5254c93a7062fb08b5c90cad3f",
+      "iso_size": 4527947776,
+      "manifest_sha256": "77acbcf52eb1eba8013e5d25a7625acd3618337cefb39f02e8758d0fa1dbb52d"
+    },
+    {
+      "disc_id": "mugen-2",
+      "serial": "SLPM_667.80",
+      "elf_sha256": "4c7699860da1613291059ae7bdbfed96fa5f5dd31e52bb05a91905fbd7fb3cb0",
+      "entry": 1048584,
+      "elf_size": 4230988,
+      "files": 30,
+      "irx_modules": 18,
+      "symbols": false,
+      "iso_sha256": "9f3955457e198bc77f829c1526d285e2771f53b90d002e68d5a3ee9755d93e4a",
+      "iso_size": 4258660352,
+      "manifest_sha256": "4ac7c5e12387c76b027bb40bc7a27264caea12437260dfde0b686c7b674ae7bd"
+    },
+    {
+      "disc_id": "zettai",
+      "serial": "SLPM_662.43",
+      "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+      "entry": 1048584,
+      "elf_size": 4223692,
+      "files": 27,
+      "irx_modules": 16,
+      "symbols": false,
+      "iso_sha256": "68bcca780aae925636b433bd5643e081196d18ba41ebf28491784b4a42564427",
+      "iso_size": 4076371968,
+      "manifest_sha256": "3374090674f627ce2da32b1e334f066ac213297cb1db756dd0cf6f2800ca2bcf"
+    }
+  ]
+}

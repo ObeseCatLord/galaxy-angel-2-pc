@@ -1,0 +1,612 @@
+From 1e78bebb7295ff1237d57faf18ab35940c017a4e Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:07:26 -0500
+Subject: [PATCH] ga2: hor+ support, texture packs and dumps
+
+- ga2_activity: shared 3D-scene test and the hor+ factor set by game
+  hooks; the presentation stretches hor+ 3D frames over the wide area and
+  the mouse maps through the squeezed 2D space.
+- gs_texpacks: textures identified by a hash of their decoded RGBA from the
+  CPU copy of GS memory; GA2_TEXTURE_PACKS folders of <hash>.png replace
+  them at any resolution (images kept alive, GENERAL layout as paraLLEl-GS
+  expects); GA2_TEX_DUMP writes every sampled texture; packs can be
+  switched at run time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                 |   1 +
+ ps2xRuntime/include/runtime/ga2_activity.h |  25 +-
+ ps2xRuntime/include/runtime/gs/gs_pgs.h    |   5 +
+ ps2xRuntime/src/lib/ga2_present.cpp        |  15 +-
+ ps2xRuntime/src/lib/ga2_present.h          |   5 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          |  10 +
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp     | 260 +++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_texpacks.h       |  30 +++
+ ps2xRuntime/src/lib/ps2_mouse.cpp          |   7 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |   7 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    |   5 +-
+ 11 files changed, 352 insertions(+), 18 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_texpacks.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index a56c5ef..d4f7ace 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -393,6 +393,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_ipu.cpp
+     src/lib/gs/gs_pgs.cpp
++    src/lib/gs/gs_texpacks.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_mouse.cpp
+     src/lib/ps2_mouse_menus.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_activity.h b/ps2xRuntime/include/runtime/ga2_activity.h
+index 54bca05..0e08c13 100644
+--- a/ps2xRuntime/include/runtime/ga2_activity.h
++++ b/ps2xRuntime/include/runtime/ga2_activity.h
+@@ -1,7 +1,9 @@
+-// Counters the presentation reads to tell 3D scenes from 2D ones.
++// What the game is showing, shared by the presentation (main thread) and
++// game hooks (game thread).
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ 
+ namespace ga2_activity
+@@ -9,4 +11,25 @@ namespace ga2_activity
+     // VU1 microprogram runs so far (the GA2 discs draw their 3D through VU1;
+     // their 2D visual-novel scenes do not run VU1 at all).
+     extern std::atomic<uint64_t> vu1Runs;
++    // steady_clock nanoseconds of a recent VU1 run.
++    extern std::atomic<int64_t> last3dNanos;
++
++    inline int64_t nowNanos()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++
++    // A 3D scene is on screen: VU1 ran within the last half second.
++    inline bool scene3d()
++    {
++        return nowNanos() - last3dNanos.load(std::memory_order_relaxed) < 500'000'000;
++    }
++
++    // > 1 when the game's 3D cameras render hor+ by this factor (anamorphic:
++    // the 640-wide frame holds a view k times wider); set by game hooks.
++    extern std::atomic<float> horPlus;
++
++    // A frame to show at the wide play-area shape: hor+ 3D on screen.
++    inline bool wideFrame() { return horPlus.load(std::memory_order_relaxed) > 1.0f && scene3d(); }
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index ee8e082..c6cdd38 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -10,6 +10,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ #include <vector>
+ 
+ struct GSRegisters;
+@@ -27,6 +28,10 @@ namespace ga2_pgs
+                      const uint8_t *data, size_t size);
+     // Local->host transfer data (TRXDIR=1) produced by the GPU's VRAM.
+     void readLocalToHost(uint8_t *dst, uint32_t qwords);
++    // Texture packs (gs_texpacks.h): the CPU copy of GS memory to identify
++    // textures from, and the pack folders to use (highest priority first).
++    void setVramMirror(const uint8_t *vram);
++    void setTexturePacks(const std::vector<std::string> &dirs);
+     // Game thread, at vblank: flush, scan out with the live CRTC registers and
+     // queue an asynchronous readback of the frame.
+     void vsync(const GSRegisters &regs);
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 4489375..1956435 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -66,9 +66,6 @@ namespace ga2_present
+         }
+ 
+         bool g_wide = false;
+-        // 3D scene: VU1 ran within the last half second.
+-        uint64_t g_lastVu1Runs = 0;
+-        double g_last3d = -10.0;
+         bool g_ready = false;
+         std::unique_ptr<ga2_mpv::Chain> g_chain; // smooth / Anime4K
+         Shader g_sharp{};
+@@ -283,18 +280,14 @@ void main() {
+         g_ready = true;
+     }
+ 
+-    void setWideFrame(bool wide) { g_wide = wide; }
+-
+     Rect draw(const Texture &frame, float srcWidth, float srcHeight)
+     {
+         const Settings &s = settings();
+-        const uint64_t runs = ga2_activity::vu1Runs.load(std::memory_order_relaxed);
+-        if (runs != g_lastVu1Runs)
+-            g_last3d = GetTime();
+-        g_lastVu1Runs = runs;
+         // Upscalers, smoothing and integer scaling are made for 2D art: 3D
+-        // scenes always fill the play area with plain bilinear.
+-        const bool scene3d = GetTime() - g_last3d < 0.5;
++        // scenes always fill the play area with plain bilinear. Hor+ 3D
++        // frames are anamorphic and fill the whole area.
++        const bool scene3d = ga2_activity::scene3d();
++        g_wide = ga2_activity::wideFrame();
+ 
+         const Rect window{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
+         const Rect area = fitAspect(window, s.aspect);
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+index d9be5a3..5f6cec1 100644
+--- a/ps2xRuntime/src/lib/ga2_present.h
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -16,7 +16,8 @@ struct Texture;
+ //               of 640x448 (3D scenes always fill)
+ //   GA2_LANG    ja | en                   window title language
+ // The PS2 picture (640x448) is shown at 4:3 like on a TV. A frame the game
+-// rendered for a wider view (hor+, see setWideFrame) fills the whole area.
++// rendered for a wider view (hor+, ga2_activity::wideFrame) fills the whole
++// area.
+ namespace ga2_present
+ {
+     struct Rect
+@@ -35,6 +36,4 @@ namespace ga2_present
+     // picture) and returns where the picture went, in window pixels.
+     Rect draw(const Texture &frame, float srcWidth, float srcHeight);
+ 
+-    // The current frame was rendered for the full play-area aspect (hor+).
+-    void setWideFrame(bool wide);
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index c7f179f..8c476ff 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -5,6 +5,7 @@
+ #if defined(PS2X_HAVE_PGS)
+ 
+ #include "runtime/ps2_memory.h"
++#include "gs_texpacks.h"
+ 
+ #include "context.hpp"
+ #include "device.hpp"
+@@ -213,6 +214,7 @@ namespace
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
+         s.gs.set_hacks(hacks);
++        s.gs.set_texture_replacement_interface(ga2_texpacks::interface());
+         s.ok = true;
+         g_rendering.store(true, std::memory_order_release);
+         std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s\n",
+@@ -309,6 +311,8 @@ namespace ga2_pgs
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
++        if (ga2_texpacks::takeChanged())
++            s.gs.invalidate_all_cached_textures();
+         const auto t0 = std::chrono::steady_clock::now();
+         s.gs.gif_transfer(path, data, size & ~size_t(15));
+         s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+@@ -340,6 +344,10 @@ namespace ga2_pgs
+         gifTransfer(3, packet.data(), packet.size());
+     }
+ 
++    void setVramMirror(const uint8_t *vram) { ga2_texpacks::setVram(vram); }
++
++    void setTexturePacks(const std::vector<std::string> &dirs) { ga2_texpacks::setPacks(dirs); }
++
+     void readLocalToHost(uint8_t *dst, uint32_t qwords)
+     {
+         State &s = state();
+@@ -453,6 +461,8 @@ namespace ga2_pgs
+     bool active() { return false; }
+     bool rendering() { return false; }
+     void gifTransfer(uint32_t, const uint8_t *, size_t) {}
++    void setVramMirror(const uint8_t *) {}
++    void setTexturePacks(const std::vector<std::string> &) {}
+     void imageUpload(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, size_t) {}
+     void readLocalToHost(uint8_t *, uint32_t) {}
+     void vsync(const GSRegisters &) {}
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+new file mode 100644
+index 0000000..5166d1f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -0,0 +1,260 @@
++// Texture packs for paraLLEl-GS (see gs_texpacks.h): every texture the GS
++// samples is identified by a hash of its decoded RGBA (texels through the
++// palette, at its full 2^TW x 2^TH size), read from the CPU copy of GS memory
++// that the runtime keeps alongside the GPU renderer. A PNG named after that
++// hash in a pack folder replaces it, at any resolution.
++#include "gs_texpacks.h"
++
++#if defined(PS2X_HAVE_PGS)
++
++#include "runtime/gs/ps2_gs_memory.h"
++#include "raylib.h"
++
++#include "device.hpp"
++#include "gs_interface.hpp"
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++using namespace Vulkan;
++using namespace ParallelGS;
++
++namespace ga2_texpacks
++{
++    namespace
++    {
++        const uint8_t *g_vram = nullptr;
++        std::mutex g_mutex;
++        std::vector<std::string> g_packs;     // highest priority first
++        std::unordered_map<uint64_t, std::string> g_index;
++        bool g_indexed = false;
++        std::atomic<bool> g_changed{false};
++        std::string g_dumpDir;
++        // paraLLEl-GS tells replacement images apart by address for as long
++        // as it runs, so every image handed out stays alive here (this also
++        // keeps PNGs from being decoded twice).
++        std::unordered_map<std::string, ImageHandle> g_images;
++        std::unordered_set<uint64_t> g_dumped;
++
++        uint32_t expand16(uint32_t c)
++        {
++            const uint32_t r = (c & 31u) << 3, g = ((c >> 5) & 31u) << 3, b = ((c >> 10) & 31u) << 3;
++            const uint32_t a = (c & 0x8000u) ? 0x80u : 0u;
++            return r | (g << 8) | (b << 16) | (a << 24);
++        }
++
++        // One CLUT entry (CSM1 layout) for index i.
++        uint32_t clutEntry(uint8_t *vram, uint32_t cbp, uint32_t cpsm, bool eightBit, uint32_t i)
++        {
++            uint32_t x, y;
++            if (eightBit)
++            {
++                const uint32_t swizzled = (i & 0xE7u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);
++                x = swizzled & 15u;
++                y = swizzled >> 4;
++            }
++            else
++            {
++                x = i & 7u;
++                y = i >> 3;
++            }
++            if (cpsm == 0x02u || cpsm == 0x0Au)
++                return expand16(GSMem::ReadCT16(vram, cbp, 1, x, y));
++            return GSMem::ReadCT32(vram, cbp, 1, x, y);
++        }
++
++        // The texture as RGBA (PS2 alpha, 0x80 = opaque); false for formats
++        // not handled here.
++        bool decode(uint64_t tex0, std::vector<uint32_t> &out, uint32_t &w, uint32_t &h)
++        {
++            uint8_t *vram = const_cast<uint8_t *>(g_vram);
++            const uint32_t tbp = uint32_t(tex0 & 0x3FFFu), tbw = uint32_t((tex0 >> 14) & 0x3Fu);
++            const uint32_t psm = uint32_t((tex0 >> 20) & 0x3Fu);
++            w = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 26) & 0xFu));
++            h = 1u << std::min<uint32_t>(10u, uint32_t((tex0 >> 30) & 0xFu));
++            const uint32_t cbp = uint32_t((tex0 >> 37) & 0x3FFFu), cpsm = uint32_t((tex0 >> 51) & 0xFu);
++            out.resize(size_t(w) * h);
++            uint32_t palette[256] = {};
++            const bool p8 = psm == 0x13u || psm == 0x1Bu, p4 = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
++            if (p8 || p4)
++                for (uint32_t i = 0; i < (p8 ? 256u : 16u); ++i)
++                    palette[i] = clutEntry(vram, cbp, cpsm, p8, i);
++            for (uint32_t y = 0; y < h; ++y)
++                for (uint32_t x = 0; x < w; ++x)
++                {
++                    uint32_t c = 0;
++                    switch (psm)
++                    {
++                    case 0x00u: c = GSMem::ReadCT32(vram, tbp, tbw, x, y); break;
++                    case 0x01u: c = GSMem::ReadCT24(vram, tbp, tbw, x, y) | 0x80000000u; break;
++                    case 0x02u: c = expand16(GSMem::ReadCT16(vram, tbp, tbw, x, y)); break;
++                    case 0x0Au: c = expand16(GSMem::ReadCT16S(vram, tbp, tbw, x, y)); break;
++                    case 0x13u: c = palette[GSMem::ReadP8(vram, tbp, tbw, x, y) & 255u]; break;
++                    case 0x1Bu: c = palette[GSMem::ReadP8H(vram, tbp, tbw, x, y) & 255u]; break;
++                    case 0x14u: c = palette[GSMem::ReadP4(vram, tbp, tbw, x, y) & 15u]; break;
++                    case 0x24u: c = palette[GSMem::ReadP4HL(vram, tbp, tbw, x, y) & 15u]; break;
++                    case 0x2Cu: c = palette[GSMem::ReadP4HH(vram, tbp, tbw, x, y) & 15u]; break;
++                    default: return false;
++                    }
++                    out[size_t(y) * w + x] = c;
++                }
++            return true;
++        }
++
++        uint64_t hashPixels(const std::vector<uint32_t> &px, uint32_t w, uint32_t h)
++        {
++            uint64_t hash = 0x9E3779B97F4A7C15ull ^ (uint64_t(w) << 32 | h);
++            for (uint32_t v : px)
++            {
++                hash ^= v;
++                hash *= 0x100000001B3ull;
++                hash ^= hash >> 29;
++            }
++            return hash;
++        }
++
++        void buildIndex()
++        {
++            g_index.clear();
++            for (const std::string &dir : g_packs)
++            {
++                std::error_code ec;
++                for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
++                     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
++                {
++                    const auto &p = it->path();
++                    if (p.extension() != ".png")
++                        continue;
++                    const std::string stem = p.stem().string();
++                    if (stem.size() != 16 || stem.find_first_not_of("0123456789abcdef") != std::string::npos)
++                        continue;
++                    g_index.emplace(std::stoull(stem, nullptr, 16), p.string()); // first pack wins
++                }
++            }
++            g_indexed = true;
++            if (!g_packs.empty())
++                std::fprintf(stderr, "[texpacks] %zu replacement textures in %zu pack(s)\n", g_index.size(), g_packs.size());
++        }
++
++        std::vector<std::string> splitList(const char *list)
++        {
++            std::vector<std::string> out;
++            if (!list)
++                return out;
++            std::string s = list;
++            size_t start = 0;
++            while (start <= s.size())
++            {
++                size_t end = s.find(';', start);
++                if (end == std::string::npos)
++                    end = s.size();
++                if (end > start)
++                    out.push_back(s.substr(start, end - start));
++                start = end + 1;
++            }
++            return out;
++        }
++
++        class Replacement final : public TextureReplacementInterface
++        {
++        public:
++            ImageHandle replace(const TextureDescriptor &, uint64_t tex0, uint64_t, Device &device) override
++            {
++                if (!g_vram)
++                    return {};
++                std::lock_guard<std::mutex> lock(g_mutex);
++                if (!g_indexed)
++                    buildIndex();
++                if (g_index.empty() && g_dumpDir.empty())
++                    return {};
++                std::vector<uint32_t> px;
++                uint32_t w = 0, h = 0;
++                if (!decode(tex0, px, w, h))
++                    return {};
++                const uint64_t hash = hashPixels(px, w, h);
++                char name[32];
++                std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
++                if (!g_dumpDir.empty() && g_dumped.insert(hash).second)
++                {
++                    // PNG alpha 255 = opaque (the GS's 0x80 doubled).
++                    std::vector<uint32_t> png(px);
++                    for (uint32_t &c : png)
++                    {
++                        const uint32_t a = std::min<uint32_t>(255u, (c >> 24) * 2u);
++                        c = (c & 0x00FFFFFFu) | (a << 24);
++                    }
++                    ::Image image{png.data(), int(w), int(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                    ExportImage(image, (std::filesystem::path(g_dumpDir) / (std::string(name) + ".png")).string().c_str());
++                }
++                const auto it = g_index.find(hash);
++                if (it == g_index.end())
++                    return {};
++                if (const auto cached = g_images.find(it->second); cached != g_images.end())
++                    return cached->second;
++                ::Image image = LoadImage(it->second.c_str());
++                if (!image.data)
++                    return {};
++                ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                // Back to the GS's alpha range.
++                auto *texels = static_cast<uint32_t *>(image.data);
++                for (int i = 0; i < image.width * image.height; ++i)
++                {
++                    const uint32_t a = ((texels[i] >> 24) + 1u) >> 1;
++                    texels[i] = (texels[i] & 0x00FFFFFFu) | (a << 24);
++                }
++                // paraLLEl-GS takes replacement images in the GENERAL layout.
++                ImageCreateInfo info = ImageCreateInfo::immutable_2d_image(uint32_t(image.width), uint32_t(image.height),
++                                                                          VK_FORMAT_R8G8B8A8_UNORM);
++                info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;
++                info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++                ImageInitialData initial{image.data, 0, 0};
++                ImageHandle handle = device.create_image(info, &initial);
++                UnloadImage(image);
++                g_images.emplace(it->second, handle);
++                return handle;
++            }
++        };
++
++        Replacement g_replacement;
++    }
++
++    void setVram(const uint8_t *vram) { g_vram = vram; }
++
++    TextureReplacementInterface *interface()
++    {
++        static bool configured = false;
++        if (!configured)
++        {
++            configured = true;
++            std::lock_guard<std::mutex> lock(g_mutex);
++            g_packs = splitList(std::getenv("GA2_TEXTURE_PACKS"));
++            if (const char *dump = std::getenv("GA2_TEX_DUMP"); dump && *dump)
++            {
++                g_dumpDir = dump;
++                std::error_code ec;
++                std::filesystem::create_directories(g_dumpDir, ec);
++            }
++        }
++        return &g_replacement;
++    }
++
++    void setPacks(const std::vector<std::string> &dirs)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (dirs == g_packs)
++            return;
++        g_packs = dirs;
++        g_indexed = false;
++        g_changed.store(true);
++    }
++
++    bool takeChanged() { return g_changed.exchange(false); }
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+new file mode 100644
+index 0000000..e1d6feb
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -0,0 +1,30 @@
++// Texture packs and dumps for the paraLLEl-GS bridge (gs_texpacks.cpp).
++//
++//   GA2_TEXTURE_PACKS=<dir>[;<dir>...]  folders of <hash>.png replacements
++//                                       (first folder wins; any resolution)
++//   GA2_TEX_DUMP=<dir>                  writes every texture the GS samples
++//                                       as <hash>.png (alpha 255 = opaque)
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#if defined(PS2X_HAVE_PGS)
++namespace ParallelGS
++{
++    class TextureReplacementInterface;
++}
++
++namespace ga2_texpacks
++{
++    // The CPU copy of GS memory (texels are decoded from it).
++    void setVram(const uint8_t *vram);
++    ParallelGS::TextureReplacementInterface *interface();
++    // Replace the pack list (e.g. button packs on a device change).
++    void setPacks(const std::vector<std::string> &dirs);
++    // The pack list changed since the last call (the bridge then drops its
++    // cached textures).
++    bool takeChanged();
++}
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index cc13658..327c25e 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -1,6 +1,7 @@
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
+ #include "ps2_host_backend.h"
++#include "runtime/ga2_activity.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -287,6 +288,9 @@ namespace ps2_mouse
+ 
+     bool pixel(int x, int y, uint8_t rgb[3])
+     {
++        // Hor+ 3D: 2D overlays were squeezed toward the centre by 1/k.
++        if (ga2_activity::wideFrame())
++            x = int(std::lround(320.0f + (float(x) - 320.0f) / ga2_activity::horPlus.load()));
+         if (!g_frame || g_frameWidth == 0 || g_frameHeight == 0)
+             return false;
+         // The presented picture may be supersampled (2x/4x): scale from 640x448.
+@@ -323,6 +327,9 @@ namespace ps2_mouse
+             return false;
+         x = (mouse.x - g_game.x) * g_sourceWidth / g_game.width;
+         y = (mouse.y - g_game.y) * g_sourceHeight / g_game.height;
++        // Hor+ 3D: report positions in the unsqueezed 2D space menus use.
++        if (ga2_activity::wideFrame())
++            x = 320.0f + (x - 320.0f) * ga2_activity::horPlus.load();
+         return true;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e71ca7e..0501c3d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
+ #include "ga2_vr.h"
++#include "runtime/ga2_activity.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -835,6 +836,7 @@ bool PS2Runtime::syncCoreSubsystems()
+                           });
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
++    ga2_pgs::setVramMirror(m_memory.getGSVRAM());
+     if (ga2_pgs::active())
+         m_gifArbiter.setTapFn([](GifPathId path, const uint8_t *data, uint32_t size)
+                               { ga2_pgs::gifTransfer(static_cast<uint32_t>(path), data, size); });
+@@ -2972,14 +2974,15 @@ void PS2Runtime::run()
+         // VR headset: both eyes first (paced by the headset); the window
+         // keeps the flat picture.
+         if (ga2_vr::headsetRunning())
+-            ga2_vr::renderHeadset(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight, false);
++            ga2_vr::renderHeadset(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight,
++                                  ga2_activity::wideFrame());
+         BeginDrawing();
+         ClearBackground(BLACK);
+         // Aspect, side fill and filters: ga2_present (or the VR preview).
+         ga2_present::Rect dstRect;
+         if (ga2_vr::mode() == ga2_vr::Mode::Preview)
+         {
+-            ga2_vr::drawPreview(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight, false);
++            ga2_vr::drawPreview(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight, ga2_activity::wideFrame());
+             dstRect = ga2_present::Rect{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
+         }
+         else
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index d235353..3528769 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -956,6 +956,8 @@ namespace
+ }
+ 
+ std::atomic<uint64_t> ga2_activity::vu1Runs{0};
++std::atomic<int64_t> ga2_activity::last3dNanos{INT64_MIN / 2};
++std::atomic<float> ga2_activity::horPlus{1.0f};
+ 
+ VU1Interpreter::PerfSample VU1Interpreter::takePerfSample()
+ {
+@@ -983,7 +985,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                  std::memory_order_relaxed);
+         }
+     } perfScope{perfStart, perfCycle, m_cycle};
+-    ga2_activity::vu1Runs.fetch_add(1, std::memory_order_relaxed);
++    if ((ga2_activity::vu1Runs.fetch_add(1, std::memory_order_relaxed) & 31u) == 0u)
++        ga2_activity::last3dNanos.store(ga2_activity::nowNanos(), std::memory_order_relaxed);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+-- 
+2.55.0
+

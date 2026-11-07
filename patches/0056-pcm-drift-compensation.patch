@@ -1,0 +1,154 @@
+From 29f9454c4be6438433cf467e0559f3c98eff7c73 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:30:30 -0500
+Subject: [PATCH] ga2: PCM queue drift compensation
+
+The SPU producer is paced by guest vblanks, the audio device by its own
+crystal; a steady rate difference became periodic drops at the 150 ms
+bound or zero-filled gaps. The device-side consume now runs up to 0.5%
+faster or slower to hold the queue near 75 ms, interpolating between
+frames (exact at the nominal rate). Tested with +/-0.2% producer drift
+over 200 s of audio: no drops, no underruns (review 55 G9).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_pcm_queue.h   | 45 +++++++++++++++++++++++----
+ ps2xTest/src/ps2_runtime_io_tests.cpp | 37 ++++++++++++++++++++++
+ 2 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+index d2daeea..535cc38 100644
+--- a/ps2xRuntime/src/lib/ps2_pcm_queue.h
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -2,6 +2,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstddef>
++#include <cmath>
+ #include <cstdint>
+ #include <span>
+ 
+@@ -36,22 +37,54 @@ public:
+         m_count += samples.size() / 2u;
+         return true;
+     }
++    // The producer is paced by guest vblanks and the device by its own
++    // crystal; a steady difference would turn into periodic drops at the
++    // latency bound or zero-filled gaps. Consumption runs up to 0.5% faster
++    // or slower to hold the queue near half the bound, interpolating between
++    // frames (exact at the nominal rate). Underruns still zero-fill.
++    static constexpr size_t SteadyLevelFrames = TargetLatencyFrames / 2u;
++    static constexpr double MaxRateDeviation = 0.005;
+     void consume(std::span<int16_t> output)
+     {
+         std::fill(output.begin(), output.end(), int16_t{});
+-        const size_t frames = std::min(output.size() / 2u, m_count);
+-        for (size_t i = 0; i < frames; ++i)
++        const double error = (static_cast<double>(m_count) - SteadyLevelFrames) / SteadyLevelFrames;
++        const double step = 1.0 + std::clamp(error * MaxRateDeviation, -MaxRateDeviation, MaxRateDeviation);
++        const size_t frames = output.size() / 2u;
++        size_t written = 0;
++        for (; written < frames; ++written)
+         {
+-            const size_t p = ((m_head + i) % CapacityFrames) * 2u;
+-            output[2u*i] = m_samples[p]; output[2u*i+1u] = m_samples[p+1u];
++            const size_t index = static_cast<size_t>(m_phase);
++            const double fraction = m_phase - static_cast<double>(index);
++            if (index + (fraction != 0.0 ? 1u : 0u) >= m_count)
++                break; // underrun
++            const size_t a = ((m_head + index) % CapacityFrames) * 2u;
++            if (fraction == 0.0)
++            {
++                output[2u*written] = m_samples[a];
++                output[2u*written+1u] = m_samples[a+1u];
++            }
++            else
++            {
++                const size_t b = ((m_head + index + 1u) % CapacityFrames) * 2u;
++                for (size_t c = 0; c < 2u; ++c)
++                    output[2u*written+c] = static_cast<int16_t>(std::lround(
++                        m_samples[a+c] + (m_samples[b+c] - m_samples[a+c]) * fraction));
++            }
++            m_phase += step;
+         }
+-        m_head = (m_head + frames) % CapacityFrames; m_count -= frames;
++        const size_t consumed = std::min(m_count, static_cast<size_t>(m_phase));
++        m_head = (m_head + consumed) % CapacityFrames;
++        m_count -= consumed;
++        m_phase -= static_cast<double>(consumed);
++        if (written < frames)
++            m_phase = 0.0; // restart cleanly after an underrun
+     }
+-    void clear() noexcept { m_head = m_count = 0; }
++    void clear() noexcept { m_head = m_count = 0; m_phase = 0.0; }
+     size_t queuedFrames() const noexcept { return m_count; }
+     uint64_t droppedFrames() const noexcept { return m_dropped; }
+ private:
+     std::array<int16_t, CapacityFrames * 2u> m_samples{};
+     size_t m_head = 0, m_count = 0;
++    double m_phase = 0.0; // fractional read position past m_head
+     uint64_t m_dropped = 0;
+ };
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 4f979be..08e4556 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -2,12 +2,15 @@
+ #include "ps2_runtime.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
++#include "ps2_pcm_queue.h"
+ 
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
+ #include <utility>
+ #include <vector>
++#include <memory>
++#include <algorithm>
+ #include <cstring>
+ #include <chrono>
+ 
+@@ -742,5 +745,39 @@ void register_ps2_runtime_io_tests()
+             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
+                      "sceCdRead should copy sector data from the configured image");
+         });
++
++        tc.Run("PCM queue is exact at the nominal rate and absorbs producer drift", [](TestCase &t)
++        {
++            {
++                auto queue = std::make_unique<SpuPcmQueue>();
++                std::vector<int16_t> in(SpuPcmQueue::SteadyLevelFrames * 2u);
++                for (size_t i = 0; i < in.size(); ++i)
++                    in[i] = static_cast<int16_t>(i * 7);
++                queue->push(in);
++                std::vector<int16_t> out(480u * 2u);
++                queue->consume(out);
++                t.IsTrue(std::equal(out.begin(), out.end(), in.begin()), "at the steady level samples pass through unchanged");
++            }
++            for (const size_t produced : {481u, 479u}) // producer 0.2% fast / slow
++            {
++                auto queue = std::make_unique<SpuPcmQueue>();
++                std::vector<int16_t> chunk(produced * 2u, int16_t{1000});
++                std::vector<int16_t> out(480u * 2u);
++                for (int i = 0; i < 8; ++i) // prefill to the steady level
++                    queue->push(chunk);
++                size_t silentFrames = 0;
++                for (int i = 0; i < 20000; ++i) // ~200 s of audio
++                {
++                    queue->push(chunk);
++                    queue->consume(out);
++                    if (i > 2000)
++                        for (size_t f = 0; f < 480u; ++f)
++                            silentFrames += out[2u * f] == 0;
++                }
++                t.Equals(queue->droppedFrames(), uint64_t{0}, "drift must not reach the latency bound");
++                t.Equals(silentFrames, size_t{0}, "drift must not underrun once settled");
++                t.IsTrue(queue->queuedFrames() < SpuPcmQueue::TargetLatencyFrames, "level stays below the bound");
++            }
++        });
+     });
+ }
+-- 
+2.55.0
+

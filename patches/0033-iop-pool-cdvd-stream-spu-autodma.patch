@@ -1,0 +1,582 @@
+From f379139cfea07be2b460ba129cc111668ba4c198 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:57:09 -0500
+Subject: [PATCH 33/34] ga2: IOP two-tier memory pool, CDVD stream HLE
+ (sceCdRE, stm callbacks), SPU2 AutoDMA
+
+- IOP heap: relocatable modules come from a low pool at 0x10000 before the
+  main heap, so CDVDSTM/LIBSD buffers fit; allocation failures dump the map
+  under GA2_IOP_ALLOC_TRACE.
+- cdvdman: sceCdSC/Nop/RE/stm0Cb/stm1Cb/Break imports; stream-flagged reads
+  complete through the registered stream callback.
+- SPU2: AutoDMA (ADMA) with split-stereo input consumption, completion
+  interrupts and restart/stop handling; ADMA writes no longer fault.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/spu2core/include/ga2/spu_device.h     |  5 ++
+ ps2xIOP/spu2core/spu_device.cpp               | 88 +++++++++++++++++--
+ ps2xIOP/src/emulator/core/iop_memory.cpp      | 60 ++++++++++++-
+ ps2xIOP/src/emulator/core/iop_memory.h        | 13 +++
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp     | 71 +++++++++++++++
+ ps2xIOP/src/emulator/iop_emulator.cpp         | 16 +++-
+ .../emulator/services/iop_module_loader.cpp   | 10 ++-
+ ps2xIOP/tests/iop_import_tests.cpp            |  3 +-
+ ps2xIOP/tests/iop_spu31_boundaries.inc        | 18 ++--
+ 9 files changed, 265 insertions(+), 19 deletions(-)
+
+diff --git a/ps2xIOP/spu2core/include/ga2/spu_device.h b/ps2xIOP/spu2core/include/ga2/spu_device.h
+index 95736fa..fdb6997 100644
+--- a/ps2xIOP/spu2core/include/ga2/spu_device.h
++++ b/ps2xIOP/spu2core/include/ga2/spu_device.h
+@@ -68,6 +68,11 @@ public:
+     // completion. The bus owner must call settleOrdinaryDma() exactly once.
+     [[nodiscard]] DmaResult transfer(OrdinaryDma transfer);
+     [[nodiscard]] bool settleOrdinaryDma(std::uint8_t core) noexcept;
++    // AutoDMA (ADMA): a transfer with auto_dma=true is consumed by the mixer at
++    // the sample rate; completed cores are reported here (bit per core).
++    [[nodiscard]] bool autoDmaEnabled(std::uint8_t core) const noexcept;
++    [[nodiscard]] std::uint8_t takeAutoDmaCompletions() noexcept;
++    bool cancelAutoDma(std::uint8_t core) noexcept;
+     [[nodiscard]] bool cancelOrdinaryDma(std::uint8_t core) noexcept;
+ 
+     // `iop_cycles` is a monotonic 64-bit timestamp.  Every elapsed 768-cycle
+diff --git a/ps2xIOP/spu2core/spu_device.cpp b/ps2xIOP/spu2core/spu_device.cpp
+index fd70ba3..c27e4a0 100644
+--- a/ps2xIOP/spu2core/spu_device.cpp
++++ b/ps2xIOP/spu2core/spu_device.cpp
+@@ -6,6 +6,7 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <utility>
++#include <vector>
+ 
+ #include "Global.h"
+ 
+@@ -140,15 +141,34 @@ void (*dma4callback)() = nullptr;
+ void (*dma7callback)() = nullptr;
+ u32 lClocks = 0;
+ 
++// AutoDMA (from pinned PCSX2 SPU2-X v1.6.0 Dma.cpp, split-stereo mode only):
++// each call moves one 512-byte half block (256 L + 256 R samples) from the
++// device-owned transfer copy into the core's input area in sample RAM.
++std::uint8_t g_adma_completed = 0;
++static void ga2_adma_done_core0() { g_adma_completed |= 1u; }
++static void ga2_adma_done_core1() { g_adma_completed |= 2u; }
++
+ void V_Core::AutoDMAReadBuffer(int)
+ {
+-    throw std::logic_error("AutoDMA consumption is unsupported by this prototype");
++    const int spos = ((InputPosRead + 0xff) & 0x100);
++    if (DMAPtr != NULL)
++        memcpy(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
++    MADR += 0x200;
++    InputDataLeft -= 0x100;
++    InputDataProgress += 0x100;
++    if (DMAPtr != NULL)
++        memcpy(GetMemPtr(0x2200 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
++    MADR += 0x200;
++    InputDataLeft -= 0x100;
++    InputDataProgress += 0x100;
+ }
+ 
+ namespace ga2::spu {
+ 
+ struct Device::Impl {
+     std::array<bool, 2> dma_pending{};
++    std::array<std::vector<std::uint16_t>, 2> adma_data{};
++    std::array<bool, 2> adma_active{};
+     std::uint64_t last_cycles{};
+     std::uint64_t cache_invalidations{};
+     bool in_operation{};
+@@ -291,6 +311,9 @@ void Device::reset()
+         reset_upstream_state();
+         std::memset(pcm_cache_data, 0, sizeof(PcmCacheEntry) * pcm_BlockCount);
+         impl.dma_pending = {};
++        impl.adma_active = {};
++        impl.adma_data = {};
++        g_adma_completed = 0;
+         impl.last_cycles = 0;
+         impl.cache_invalidations = 0;
+         g_pcm_batch = nullptr;
+@@ -324,8 +347,6 @@ void Device::write16(std::uint32_t address, std::uint16_t value)
+         throw std::logic_error("moved-from Device has no legacy core");
+     auto& impl = *m_impl;
+     Operation operation(impl.in_operation, impl.faulted);
+-    if ((address & 0x3ff) == 0x1b0 && value != 0)
+-        throw std::logic_error("AutoDMA is unsupported by the ordinary-DMA prototype");
+     try {
+         SPU2_FastWrite(address, value);
+     } catch (...) {
+@@ -344,8 +365,36 @@ DmaResult Device::transfer(OrdinaryDma transfer)
+     Operation operation(impl.in_operation, impl.faulted);
+     if (transfer.core > 1)
+         return {.status = DmaStatus::InvalidCore};
+-    if (transfer.auto_dma)
+-        return {.status = DmaStatus::UnsupportedAutoDma};
++    if (transfer.auto_dma) {
++        if (transfer.direction != DmaDirection::ToSpuRam || transfer.words.size() < 512)
++            return {.status = DmaStatus::UnsupportedAutoDma};
++        V_Core& core = Cores[transfer.core];
++        if (impl.adma_active[transfer.core]) {
++            // A restart replaces the running stream (libsd stops/restarts on seek).
++            core.InputDataLeft = 0;
++            core.AdmaInProgress = 0;
++        }
++        auto& data = impl.adma_data[transfer.core];
++        data.assign(transfer.words.begin(), transfer.words.end());
++        // StartADMAWrite: whole 512-word blocks feed the input area as the mixer consumes them.
++        const auto size = static_cast<std::uint32_t>(data.size()) & ~511u;
++        core.DMAPtr = data.data();
++        core.InputDataProgress = 0;
++        core.InputDataLeft = size;
++        core.MADR = transfer.canonical_guest_address;
++        if (!core.AdmaInProgress) {
++            if (((PlayMode & 4) == 4) && transfer.core == 0)
++                Cores[0].InputPosRead = 0;
++            core.AutoDMAReadBuffer(0);
++        }
++        core.AdmaInProgress = 1;
++        core.TADR = core.MADR + (size << 1);
++        impl.adma_active[transfer.core] = true;
++        dma4callback = ga2_adma_done_core0;
++        dma7callback = ga2_adma_done_core1;
++        return {.status = DmaStatus::Consumed, .words_transferred = static_cast<std::uint32_t>(transfer.words.size()),
++                .start_tsa = core.TSA & kSampleRamMask, .end_tsa = core.TSA & kSampleRamMask};
++    }
+     if (transfer.words.empty() || transfer.words.size() > kSampleRamWords ||
+         transfer.words.size() > std::numeric_limits<std::uint32_t>::max())
+         return {.status = DmaStatus::InvalidRange};
+@@ -395,6 +444,35 @@ DmaResult Device::transfer(OrdinaryDma transfer)
+     }
+ }
+ 
++bool Device::autoDmaEnabled(std::uint8_t core) const noexcept
++{
++    return core <= 1 && (Cores[core].AutoDMACtrl & (core + 1)) != 0;
++}
++
++bool Device::cancelAutoDma(std::uint8_t core) noexcept
++{
++    if (!m_impl || core > 1 || !m_impl->adma_active[core])
++        return false;
++    Cores[core].InputDataLeft = 0;
++    Cores[core].AdmaInProgress = 0;
++    Cores[core].DMAPtr = nullptr;
++    m_impl->adma_active[core] = false;
++    g_adma_completed &= static_cast<std::uint8_t>(~(1u << core));
++    return true;
++}
++
++std::uint8_t Device::takeAutoDmaCompletions() noexcept
++{
++    const std::uint8_t done = g_adma_completed;
++    g_adma_completed = 0;
++    if (m_impl) {
++        for (std::uint8_t core = 0; core < 2; ++core)
++            if (done & (1u << core))
++                m_impl->adma_active[core] = false;
++    }
++    return done;
++}
++
+ bool Device::settleOrdinaryDma(std::uint8_t core) noexcept
+ {
+     if (!m_impl || m_impl->faulted || m_impl->in_operation || core > 1 || !m_impl->dma_pending[core])
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index cb3a8ef..334a6a2 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <cstdlib>
++#include <algorithm>
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
+@@ -380,12 +383,13 @@ namespace ps2x::iop::detail
+             const int irq = core ? kDmaSpu1Irq : kDmaSpu0Irq;
+             if ((value & kDmaStart) == 0u)
+             {
++                (void)m_spu->cancelAutoDma(core);
+                 if (m_spu->cancelOrdinaryDma(core))
+                     m_dmaStart = DmaStart{irq, 0u, core, true};
+                 return;
+             }
+-            // First slice accepts the observed ordinary request mode only.
+-            if ((value & 0x00fffffeu) != 0x200u)
++            // Block mode (sync mode 1). libsd uses it for both ordinary and AutoDMA writes.
++            if ((value & 0x00000600u) != 0x200u)
+                 throw std::runtime_error("unsupported SPU DMA mode");
+             const uint32_t bcr = m_hardware[address - 4u];
+             const uint64_t words32 = uint64_t(bcr & 0xffffu) * (bcr >> 16u);
+@@ -397,10 +401,15 @@ namespace ps2x::iop::detail
+             const bool toSpu = (value & 1u) != 0u;
+             if (toSpu && !readRam(madr, words.data(), words.size() * 2u))
+                 throw std::runtime_error("SPU DMA source read failed");
++            const bool autoDma = toSpu && m_spu->autoDmaEnabled(core);
+             const auto result = m_spu->transfer({core, toSpu ? ga2::spu::DmaDirection::ToSpuRam :
+-                ga2::spu::DmaDirection::FromSpuRam, madr, words, false});
++                ga2::spu::DmaDirection::FromSpuRam, madr, words, autoDma});
+             if (result.status != ga2::spu::DmaStatus::Consumed || result.words_transferred != words.size())
+-                throw std::runtime_error("SPU DMA rejected by device");
++                throw std::runtime_error("SPU DMA rejected by device: status=" + std::to_string(int(result.status)) +
++                                         " words=" + std::to_string(words.size()) + " core=" + std::to_string(core) +
++                                         " auto=" + std::to_string(autoDma) + " chcr=" + std::to_string(value));
++            if (autoDma)
++                return; // completes when the mixer has consumed it (IopEmulator polls the device)
+             if (!toSpu && !writeRam(madr, words.data(), words.size() * 2u))
+                 throw std::runtime_error("SPU DMA destination write failed");
+             m_dmaStart = DmaStart{irq, std::max<uint64_t>(words32 * 2u, 64u), core, false};
+@@ -508,7 +517,26 @@ namespace ps2x::iop::detail
+                 return true;
+             });
+             if (!valid || !reused)
++            {
++                // The preferred heap range is full: use free pool space below it.
++                if (const uint32_t low = allocateLowest(size, alignment))
++                    return low;
++                static int dumps = 0;
++                if (std::getenv("GA2_IOP_ALLOC_TRACE") && dumps++ < 3)
++                {
++                    std::vector<Allocation> sorted = m_allocations;
++                    std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
++                    uint64_t used = 0;
++                    std::fprintf(stderr, "[iop-alloc] FAIL size=%x align=%x blocks=%zu\n", size, alignment, sorted.size());
++                    for (const auto &b : sorted)
++                    {
++                        used += b.size;
++                        std::fprintf(stderr, "[iop-alloc]   %06x-%06x (%x)\n", b.address, b.address + b.size, b.size);
++                    }
++                    std::fprintf(stderr, "[iop-alloc] used=%llx of heap %x-%x\n", (unsigned long long)used, HeapBase, HeapLimit);
++                }
+                 return 0u;
++            }
+             candidate = *reused;
+         }
+         m_allocations.push_back({uint32_t(candidate), size});
+@@ -517,6 +545,30 @@ namespace ps2x::iop::detail
+         return uint32_t(candidate);
+     }
+ 
++    uint32_t IopMemory::allocateLowest(uint32_t size, uint32_t alignment)
++    {
++        size = alignUp(std::max(size, 1u), 16u);
++        alignment = std::max<uint32_t>(alignment, 4u);
++        if ((alignment & (alignment - 1u)) != 0u || size > HeapLimit - PoolBase)
++            return 0u;
++        std::vector<Allocation> sorted = m_allocations;
++        std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
++        uint64_t cursor = PoolBase;
++        for (const Allocation &block : sorted)
++        {
++            const uint64_t aligned = alignUpChecked(uint32_t(std::min<uint64_t>(cursor, 0xFFFFFFFFull)), alignment);
++            if (aligned + size <= block.address)
++                break;
++            cursor = std::max<uint64_t>(cursor, uint64_t(block.address) + block.size);
++        }
++        const uint64_t aligned = alignUpChecked(uint32_t(std::min<uint64_t>(cursor, 0xFFFFFFFFull)), alignment);
++        if (aligned + size > HeapLimit)
++            return 0u;
++        m_allocations.push_back({uint32_t(aligned), size});
++        markOwned(uint32_t(aligned), size);
++        return uint32_t(aligned);
++    }
++
+     uint32_t IopMemory::allocateLast(uint32_t size, uint32_t alignment)
+     {
+         if (size > HeapLimit - HeapBase)
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index b68b5db..fff1717 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <cstdio>
++#include <exception>
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -26,6 +28,9 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+         static constexpr uint32_t HeapBase = 0x00120000u;
++        // Module images and overflow heap blocks share [PoolBase, HeapLimit),
++        // like the real sysmem; HeapBase is only the heap's preferred start.
++        static constexpr uint32_t PoolBase = 0x00010000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+@@ -62,6 +67,8 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+         [[nodiscard]] uint32_t allocateLast(uint32_t size, uint32_t alignment = 16u);
++        // Lowest free placement anywhere in [PoolBase, HeapLimit).
++        [[nodiscard]] uint32_t allocateLowest(uint32_t size, uint32_t alignment = 16u);
+         [[nodiscard]] bool freeAllocation(uint32_t address);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
+         [[nodiscard]] uint32_t totalFreeMemory() const;
+@@ -100,6 +107,12 @@ namespace ps2x::iop::detail
+         template<class Access> decltype(auto) accessSpu(Access &&access) const
+         {
+             try { m_spuSynchronize(); return access(); }
++            catch (const std::exception &error)
++            {
++                std::fprintf(stderr, "[IOP SPU] bus fault: %s\n", error.what());
++                if (m_spuFailed) m_spuFailed();
++                throw;
++            }
+             catch (...) { if (m_spuFailed) m_spuFailed(); throw; }
+         }
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 1e6aa0e..c66390f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "iop_cdvd.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -36,6 +38,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdInitExit = 5u;
+         constexpr uint32_t kCdvdCallbackRead = 1u;
+         constexpr uint32_t kCdvdCallbackSeek = 4u;
++        constexpr uint32_t kCdvdCallbackNop = 0u;
+         constexpr uint32_t kCdvdInterruptReadyBits = 0x29u;
+         constexpr uint32_t kEventFlagMulti = 2u;
+         constexpr uint32_t kCdvdStreamTimeout = 5000u;
+@@ -200,6 +203,8 @@ namespace ps2x::iop::detail
+                 (void)memory.freeAllocation(fsvReadBuffer);
+             fsvReadBuffer = 0u;
+             callback = {};
++            streamCallbacks[0] = {};
++            streamCallbacks[1] = {};
+             initialized = false;
+             mediaMode = 0u;
+             currentLsn = 0u;
+@@ -399,6 +404,59 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
++            // CD streaming hooks used by SCE's CDVDSTM (movie and voice streams).
++            // cdvdman calls the registered stream callback, with argument 1, on
++            // command completion while a stream owner is selected via sceCdSC.
++            case 39: // sceCdBreak: HLE commands complete synchronously; nothing to abort.
++                cpu.gpr[2] = 1u;
++                return true;
++
++            case 40: // sceCdReadCDDA: not used by DVD titles.
++                lastError = kCdvdErrorRead;
++                cpu.gpr[2] = 0u;
++                return true;
++
++            case 46: // sceCdNop
++                lastError = kCdvdErrorNone;
++                signalCommandComplete();
++                scheduleStreamOrUserCallback(kCdvdCallbackNop);
++                cpu.gpr[2] = 1u;
++                return true;
++
++            case 48: // sceCdstm0Cb (IOP stream owner)
++                streamCallbacks[0] = {a0, cpu.gpr[28]};
++                cpu.gpr[2] = 0u;
++                return true;
++
++            case 49: // sceCdstm1Cb (EE stream owner)
++                streamCallbacks[1] = {a0, cpu.gpr[28]};
++                cpu.gpr[2] = 0u;
++                return true;
++
++            case 61: // sceCdStStop (native stream API; CDVDSTM keeps its own state)
++                cpu.gpr[2] = 1u;
++                return true;
++
++            case 114: // sceCdRE(lsn, sectors, buf, mode): read used by the stream engine
++                if (std::getenv("GA2_IPU_TRACE"))
++                    std::fprintf(stderr, "[cdvd] sceCdRE lsn=%x sectors=%u buf=%08x owned=%d\n", a0, a1, a2,
++                                 memory.ownsRamRange(a2, size_t(a1) * kSectorSize) ? 1 : 0);
++                if (readSectors(a0, a1, a2))
++                {
++                    currentLsn = a0 + a1;
++                    signalCommandComplete();
++                    scheduleStreamOrUserCallback(kCdvdCallbackRead);
++                    cpu.gpr[2] = 1u;
++                }
++                else
++                {
++                    lastError = kCdvdErrorRead;
++                    signalCommandComplete();
++                    scheduleStreamOrUserCallback(kCdvdCallbackRead);
++                    cpu.gpr[2] = 1u; // command accepted; the callback observes the error
++                }
++                return true;
++
+             case 75: // sceCdMmode
+                 mediaMode = a0;
+                 cpu.gpr[2] = 1u;
+@@ -409,6 +467,18 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        void scheduleStreamOrUserCallback(uint32_t reason)
++        {
++            if ((streamFlag == 1u || streamFlag == 2u) && streamCallbacks[streamFlag - 1u].address != 0u)
++            {
++                const Callback &stream = streamCallbacks[streamFlag - 1u];
++                completionCallback = CompletionCallback{stream.address, stream.gp, 1u};
++                return;
++            }
++            if (callback.address != 0u)
++                completionCallback = CompletionCallback{callback.address, callback.gp, reason};
++        }
++
+         std::optional<CompletionCallback> takeCompletionCallback() noexcept
+         {
+             std::optional<CompletionCallback> result = completionCallback;
+@@ -911,6 +981,7 @@ namespace ps2x::iop::detail
+         IopMemory &memory;
+         IopKernel &kernel;
+         Callback callback;
++        Callback streamCallbacks[2]{};
+         std::optional<CompletionCallback> completionCallback;
+         bool initialized = false;
+         uint32_t mediaMode = 0u;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 297fd31..2600070 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -287,6 +287,18 @@ namespace ps2x::iop::detail
+                 }
+                 if (access || totalCycles - spu->lastIopCycle() >= ga2::spu::kIopCyclesPerSample)
+                     spu->advanceTo(totalCycles);
++                if (const uint8_t done = spu->takeAutoDmaCompletions())
++                {
++                    // An AutoDMA block was consumed: end the IOP DMA and raise its interrupt.
++                    for (uint8_t core = 0; core < 2; ++core)
++                    {
++                        if ((done & (1u << core)) == 0u)
++                            continue;
++                        memory.finishSpuDma(core);
++                        pendingDmaInterrupts[core ? 0x28 : 0x24] = // IOP DMA IRQ 40/36 (SPU2 core 1/0)
++                            PendingDma{totalCycles, reserveCallbackIdentity(), core, true};
++                    }
++                }
+             }
+             catch (...)
+             {
+@@ -881,6 +893,8 @@ namespace ps2x::iop::detail
+                     // with identity0. Production transfers reserve nonzero IDs.
+                     settleDevice = identity != 0u;
+ #endif
++                    if (live->second.autoDma)
++                        settleDevice = false; // already finished by the device
+                     if (settleDevice)
+                     {
+                         if (!spu || !spu->settleOrdinaryDma(core))
+@@ -1298,7 +1312,7 @@ namespace ps2x::iop::detail
+         IopImportRegistry imports;
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+-        struct PendingDma { uint64_t deadline; uint64_t identity; uint8_t core; };
++        struct PendingDma { uint64_t deadline; uint64_t identity; uint8_t core; bool autoDma = false; };
+         std::map<int, PendingDma> pendingDmaInterrupts;
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+         uint64_t nextCallbackIdentity = 1u;
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 2b445df..128bba7 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -437,8 +437,12 @@ namespace ps2x::iop::detail
+         int64_t delta = 0;
+         if (relocate)
+         {
+-            base = alignUp(moduleCursor, 0x100u);
+-            if (base + span >= IopMemory::HeapBase)
++            // Module images and AllocSysMemory blocks share one pool, as in the
++            // real sysmem; a fixed module/heap split exhausted the heap while
++            // leaving module space unused (CD stream buffers failed to allocate).
++            (void)moduleCursor;
++            base = memory.allocateLowest(span, 0x100u);
++            if (base == 0u)
+             {
+                 result.error = IopImageLoadError::ArenaExhausted;
+                 return result;
+@@ -449,6 +453,8 @@ namespace ps2x::iop::detail
+         else
+         {
+             base = minVaddr;
++            if (base >= IopMemory::HeapBase && base < IopMemory::HeapLimit)
++                (void)memory.allocate(span, 0x100u, base); // reserve when it lies in the heap range
+         }
+ 
+         if (hasLoad)
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 9f4debe..c03da95 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -455,7 +455,8 @@ namespace
+         cdvd.reset();
+         memory.reset();
+         const uint32_t exhausted = memory.allocate(IopMemory::HeapLimit - IopMemory::HeapBase, 16u);
+-        return expect(exhausted != 0u, "could not exhaust the IOP allocator") &&
++        const uint32_t exhaustedLow = memory.allocateLowest(IopMemory::HeapBase - IopMemory::PoolBase, 16u);
++        return expect(exhausted != 0u && exhaustedLow != 0u, "could not exhaust the IOP allocator") &&
+                expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] == 0u,
+                       "allocation failure produced a fake transfer-buffer pointer");
+     }
+diff --git a/ps2xIOP/tests/iop_spu31_boundaries.inc b/ps2xIOP/tests/iop_spu31_boundaries.inc
+index a54c7fd..ee442e7 100644
+--- a/ps2xIOP/tests/iop_spu31_boundaries.inc
++++ b/ps2xIOP/tests/iop_spu31_boundaries.inc
+@@ -126,12 +126,13 @@ void ga2_spu31_boundary_checks() {
+             "checked+idle partition preserves all ticks");
+     h.acceptPcm = false;
+     s.runCycles(768u);
+-    require(s.resetRequired && s.spu->faulted(),
+-            "host rejection halts unchecked runtime path");
++    // Host PCM output is best effort: a rejection must not stop emulation.
++    require(!s.resetRequired && !s.spu->faulted(),
++            "host rejection keeps the IOP running");
+     h.acceptPcm = true;
+     s.reset();
+     require(!s.resetRequired && h.pcm.empty(),
+-            "reset recovers failed device and drains PCM");
++            "reset drains PCM");
+   }
+   {
+     iop_test::Host h;
+@@ -206,7 +207,7 @@ void ga2_spu31_boundary_checks() {
+     s.runCycles(128u * 768u);
+     require(s.read16(base + 0xau) == 0u, "KOFF stops actual IOP voice");
+   }
+-  for (unsigned failure = 0u; failure != 5u; ++failure) {
++  for (unsigned failure = 0u; failure != 4u; ++failure) {
+     iop_test::Host h;
+     State s(h);
+     try {
+@@ -218,13 +219,18 @@ void ga2_spu31_boundary_checks() {
+         s.write16(base + 1u, 1u);
+       if (failure == 3u)
+         dma(s, 0u, 0x11000u, 4u); // unowned
+-      if (failure == 4u)
+-        s.write16(base + 0x1b0u, 1u); // AutoDMA
+       require(false, "unsupported input must fail");
+     } catch (const std::exception &) {
+       require(s.resetRequired, "unsupported operation cannot report success");
+     }
+   }
++  {
++    iop_test::Host h;
++    State s(h);
++    s.write16(base + 0x1b0u, 1u); // ADMA is implemented: enabling it is not a fault
++    require(!s.resetRequired && s.read16(base + 0x1b0u) == 1u,
++            "AutoDMA enable is accepted device state");
++  }
+   {
+     iop_test::Host h;
+     State s(h);
+-- 
+2.55.0
+

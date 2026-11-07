@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "runtime_patch_prefix": 11,
+  "config_sha256": "0ed16994622a6d2baf07367e846dfbb55d9ac67fb184d9a86486d234b3577096",
+  "entry_points": [
+    "0x00222608",
+    "0x00222640",
+    "0x002226b8",
+    "0x002226c0",
+    "0x00222f98",
+    "0x00222fd0",
+    "0x00223048",
+    "0x00223050",
+    "0x0023fd00",
+    "0x00240328",
+    "0x00240698",
+    "0x00241bd0",
+    "0x00241cb0",
+    "0x00241df8"
+  ],
+  "additional_entries": [
+    "0x23fd00",
+    "0x240328",
+    "0x240698",
+    "0x241bd0",
+    "0x241cb0",
+    "0x241df8"
+  ],
+  "generation_method": "actual existing entry_points generator hint, staged and unchanged-file publication",
+  "changed_outputs": [
+    {
+      "file": "entry_00241df0_0x241df0.cpp",
+      "old_sha256": "ab8c47a56a22ed556dbf4b3b43e16672c6b59098078b6dc34c3cecbcd44f4429",
+      "new_sha256": "b26abc0f710a65b02b132098a1a52fc2165df11df6dfb45f1349ca38802f0849"
+    },
+    {
+      "file": "entry_23fd00_0x23fdb8.cpp",
+      "old_sha256": null,
+      "new_sha256": "56bb592324a817f3ace6d0b513deeab89050f1b264601f2c33f873a84ff2ff07"
+    },
+    {
+      "file": "entry_240328_0x240358.cpp",
+      "old_sha256": null,
+      "new_sha256": "5aa8edba2e4f7654a7696ce10c3d132a41efc2bb24b0380d65190c6bbf97df5b"
+    },
+    {
+      "file": "entry_240698_0x2406c0.cpp",
+      "old_sha256": null,
+      "new_sha256": "dc3885bd14724f91c7bdb811669a755c9a57392cdfc913f48cce98fcaf67a769"
+    },
+    {
+      "file": "entry_241bd0_0x241c08.cpp",
+      "old_sha256": null,
+      "new_sha256": "45112f362f65fb041ac4b1d5fe2290cd7d83977fc296b152770648de57a59655"
+    },
+    {
+      "file": "entry_241cb0_0x241ce0.cpp",
+      "old_sha256": null,
+      "new_sha256": "82b741dbd1a1c2d69774ce38901bfc7fee4f5f73a55795ab99a3a66002d5dd58"
+    },
+    {
+      "file": "ps2_recompiled_functions.h",
+      "old_sha256": "0627d94d38fa52b133e0adeed9f96cc7f50638859487e25bd5efa55e813cac83",
+      "new_sha256": "bff9bb6319e8632618c849ebb7efb8a08dc7aed1909f2bb177e05260ce3912d5"
+    },
+    {
+      "file": "register_functions.cpp",
+      "old_sha256": "a0b0de0ad5a0d07dec5969f433e957c5be5c0e6f1130b62e0293a5d9ad1b9e0a",
+      "new_sha256": "ab87ff176e242b80b7a82cd0f7b26b1edd63adba699d385cd9f3c7d214da65bf"
+    }
+  ],
+  "obsolete_outputs": [],
+  "instruction_comment_words_verified": 100,
+  "omitted_zero_delay_words_verified": 2,
+  "switch_tables": [
+    {
+      "table": "0x2ecfe0",
+      "entries": 35,
+      "unique_targets": [
+        "0x240358",
+        "0x240360",
+        "0x240368",
+        "0x240370",
+        "0x240378",
+        "0x240380",
+        "0x240388"
+      ],
+      "all_targets_registered": true
+    },
+    {
+      "table": "0x2ed6d0",
+      "entries": 35,
+      "unique_targets": [
+        "0x241ce0",
+        "0x241ce8",
+        "0x241cf0",
+        "0x241cf8",
+        "0x241d00",
+        "0x241d08",
+        "0x241d10"
+      ],
+      "all_targets_registered": true
+    }
+  ],
+  "review": "Astra gpt-6-astra Ultra; exact original pointer/boundary, executable translations, shared-entry routing, case tables, output/config hashes accepted; runtime stack independently reproduced",
+  "native_build": "completed ordinary CMake ga2_zettai target",
+  "native_scene_passed": false,
+  "runtime_unchanged": "pinned upstream plus eleven reviewed patches; previous467/467runtime and9IOPsuites; profile-only change does not rerun unchanged runtime suite",
+  "tooling_tests": {
+    "passed": 15,
+    "failed": 0
+  },
+  "binary_size": 364303280,
+  "binary_sha256": "527545259b42ad1c12547a70885e5ac03ec0e02218e1affca6b9192ac0a04aa9",
+  "native_capture": "captures/native-zettai/20261009-012628/capture.json",
+  "idle_guard_capture": "captures/native-zettai/20261009-012816/capture.json",
+  "native_entries_observed": [
+    "0x0023fd00",
+    "0x00241bd0"
+  ],
+  "other_additional_entries_observed": false,
+  "native_entry_registers": {
+    "sp": "0x01ffff00",
+    "ra": "0x0022f94c",
+    "gp": "0x004ee3f0"
+  },
+  "first_initializer_effects_observed": [
+    "0x007fe170",
+    "0x007fe180",
+    "0x007fe1d0",
+    "0x007fe1e0"
+  ],
+  "visual_result": "black bounded capture output inspected; no scene",
+  "next_native_blocker": {
+    "error": "EE callback stack overlaps declared thread stack",
+    "preceding_missing_target_observed": false,
+    "independent_owner": -1,
+    "pending_kind": "Interrupt",
+    "pending_entry": "0x002377f8",
+    "cause": 2,
+    "pending_gp": "0x004ee3f0",
+    "pending_initial_sp": 0,
+    "published_waits": [
+      {
+        "id": 1,
+        "pc": "0x0026f768",
+        "sp": "0x01fff990",
+        "reason": "Semaphore",
+        "wait_id": 8,
+        "invocation_depth": 0
+      },
+      {
+        "id": 2,
+        "pc": "0x0026f648",
+        "reason": "Sleep",
+        "invocation_depth": 0
+      },
+      {
+        "id": 3,
+        "pc": "0x0026f648",
+        "reason": "Sleep",
+        "invocation_depth": 0
+      }
+    ],
+    "scope": "read-only actual pending state plus last published positive-thread snapshot; independent handler rejected before execution"
+  },
+  "limits": [
+    "registration does not establish execution of all six entries",
+    "second initializer entry observed; post-return packet writes not separately sampled",
+    "idle interrupt stack ownership requires a new verified decision",
+    "guard capture debugger did not finish naturally; capture cleanup stopped it after record/guest exception",
+    "all scene/audio/battle/save/disc-transition gates remain open",
+    "first initializer additional words7fe190..7fe19c not sampled"
+  ],
+  "native_review": "Astra Ultra; final binary hash, both initializer entries, four sampled first initializer headers, idle IRQ guard and read-only observer accepted; no native scene"
+}

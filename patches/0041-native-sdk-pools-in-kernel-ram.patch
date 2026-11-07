@@ -1,0 +1,177 @@
+From f24d62d26d18ef074613f890fc5be55a279a5461 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 11:51:42 -0500
+Subject: [PATCH] ga2: native SDK pools in kernel RAM; SIF/EE-write traces,
+ full-RAM watchdog dump
+
+The native SIF RPC packet/server/TLS/boot-mode pools sat at
+0x01F00000-0x01F31000, inside user RAM. Eigou loads files into that range;
+server records overwrote compressed model data, the ARZ decompressor produced
+garbage and the model parser walked off the end (stall before the title).
+The pools now live in kernel RAM at 0x20000-0x51000, which games never use.
+
+Diagnostics: GA2_SIF_TRACE (IOP sceSifSetDma), GA2_EE_WRITE_TRACE=lo,hi
+(IOP->EE writes into a range), GA2_WATCHDOG prints all GPRs and
+GA2_WATCHDOG_RAM=<file> writes a full RAM image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/services/iop_rpc.cpp         | 15 +++++++++++++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp        |  2 +-
+ .../src/lib/Kernel/Syscalls/Helpers/State.h       | 14 ++++++++++----
+ ps2xRuntime/src/lib/ps2_iop_host.cpp              | 13 +++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp               |  9 ++++++++-
+ 5 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 4f76aea..19817bb 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -279,8 +281,18 @@ namespace ps2x::iop::detail
+                     continue;
+ 
+                 const uint32_t size = static_cast<uint32_t>(signedSize);
++                static const bool sifTrace = std::getenv("GA2_SIF_TRACE") != nullptr;
++                if (sifTrace)
++                {
++                    char line[128];
++                    std::snprintf(line, sizeof(line), "[sif] SetDma iop=0x%08x ee=0x%08x size=0x%x attr=0x%x", source,
++                                  destination, size, descriptorWords[i * 4u + 3u]);
++                    m_host.log(LogLevel::Info, line);
++                }
+                 if (!m_memory.ownsRamRange(source, size))
+                 {
++                    if (sifTrace)
++                        m_host.log(LogLevel::Warning, "[sif] SetDma rejected: IOP source outside owned RAM");
+                     setV0(0u);
+                     return true;
+                 }
+@@ -298,6 +310,9 @@ namespace ps2x::iop::detail
+                 const PendingTransfer &transfer = pending[i];
+                 if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
+                 {
++                    static const bool sifTrace = std::getenv("GA2_SIF_TRACE") != nullptr;
++                    if (sifTrace)
++                        m_host.log(LogLevel::Warning, "[sif] SetDma rejected: EE destination not addressable");
+                     setV0(0u);
+                     return true;
+                 }
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 960806a..8b27a6b 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1451,7 +1451,7 @@ void EeScheduler::configureInvocationStackArena(uint32_t begin, uint32_t end)
+     if (overlaps(m_runtime.guestHeapBase(), m_runtime.guestHeapLimit()))
+         throw std::runtime_error("EE callback arena overlaps guest heap entitlement");
+     // Existing native SDK packet/server/TLS/boot-mode pools are fixed claims.
+-    if (overlaps(0x01F00000u, 0x01F31000u))
++    if (overlaps(0x00020000u, 0x00051000u)) // kNativeSdkPoolBase..kNativeSdkPoolEnd
+         throw std::runtime_error("EE callback arena overlaps native SDK storage");
+     for (const auto &[id, owner] : m_threads)
+     {
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index 899ffd4..fcc388b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -257,21 +257,27 @@ inline std::filesystem::path g_host_cwd;
+ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
++// Native SDK pools live in kernel RAM (below 0x80000), which games never
++// touch; at the top of user RAM they overlapped game heaps (Eigou's file
++// buffers at 0x01F0xxxx were corrupted by server records).
++static constexpr uint32_t kNativeSdkPoolBase = 0x00020000;
++static constexpr uint32_t kNativeSdkPoolEnd = 0x00051000;
+ static constexpr uint32_t kRpcPacketSize = 64;
+-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
++static constexpr uint32_t kRpcPacketPoolBase = kNativeSdkPoolBase;
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
+-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
++static constexpr uint32_t kRpcServerPoolBase = kNativeSdkPoolBase + 0x10000;
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
+-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
++static constexpr uint32_t kTlsPoolBase = kNativeSdkPoolBase + 0x20000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
+ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
+ 
+-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
++static constexpr uint32_t kBootModePoolBase = kNativeSdkPoolBase + 0x30000;
++static_assert(kBootModePoolBase + 0x1000 == kNativeSdkPoolEnd);
+ static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+ 
+ static constexpr uint32_t kSifRpcModeNowait = 0x01;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 4bc9382..9763e7f 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -10,6 +10,7 @@
+ #include "Kernel/Syscalls/Common.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <array>
+ #include <memory>
+ #include <cstring>
+@@ -377,6 +378,18 @@ bool PS2IopHostAdapter::writeGuest(uint32_t address, const void *source, size_t
+     {
+         uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+         ps2TraceGuestRangeWrite(rdram, address, static_cast<uint32_t>(size), "IopHost::writeGuest", nullptr);
++        // GA2_EE_WRITE_TRACE=<lo>,<hi> (hex): log IOP writes into that EE range.
++        static const auto traceRange = []() -> std::pair<uint32_t, uint32_t> {
++            const char *env = std::getenv("GA2_EE_WRITE_TRACE");
++            if (!env)
++                return {1u, 0u};
++            char *end = nullptr;
++            const uint32_t lo = static_cast<uint32_t>(std::strtoul(env, &end, 16));
++            const uint32_t hi = (end && *end == ',') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16)) : lo + 1u;
++            return {lo, hi};
++        }();
++        if ((address & 0x1FFFFFFu) < traceRange.second && (address & 0x1FFFFFFu) + size > traceRange.first)
++            std::cerr << "[eewrite] 0x" << std::hex << address << " size=0x" << size << std::dec << std::endl;
+         std::memcpy(destination, source, size);
+     }
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 71dcc27..b1f592b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2641,7 +2641,7 @@ void PS2Runtime::run()
+                             std::cerr << "[watchdog] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                                       << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u);
+                             if (ctx)
+-                                for (int r : {4, 5, 6, 7, 16, 17, 18, 19, 29})
++                                for (int r = 1; r < 31; ++r)
+                                     std::cerr << " r" << std::dec << r << "=0x" << std::hex << getRegU32(ctx, r);
+                             std::cerr << std::dec
+                                       << " dispatch history: " << formatDispatchHistory() << std::endl;
+@@ -2657,6 +2657,13 @@ void PS2Runtime::run()
+                                     if (sem.waiters)
+                                         std::cerr << "[watchdog] sema " << sem.id << " count=" << sem.count << " waiters=" << sem.waiters << std::endl;
+                             }
++                            // GA2_WATCHDOG_RAM=<file>: write all of guest RAM (overwritten each period).
++                            if (const char *ramPath = std::getenv("GA2_WATCHDOG_RAM"); ramPath && *ramPath)
++                                if (FILE *f = std::fopen(ramPath, "wb"))
++                                {
++                                    std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
++                                    std::fclose(f);
++                                }
+                             // GA2_WATCHDOG_DUMP=<hex address>[,<bytes>][;...]: hex dump guest RAM.
+                             for (const char *dump = std::getenv("GA2_WATCHDOG_DUMP"); dump && *dump;
+                                  dump = std::strchr(dump, ';') ? std::strchr(dump, ';') + 1 : nullptr)
+-- 
+2.55.0
+

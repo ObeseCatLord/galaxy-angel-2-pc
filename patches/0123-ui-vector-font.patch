@@ -1,0 +1,424 @@
+From bf1249814764b5a77f5de38d01c95e63d68d2950 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:18:41 -0500
+Subject: [PATCH] ui: draw launcher-independent overlay text (F1/F2 menus, pad
+ labels) with the bundled vector UI font
+
+ga2_ui_font.h rasterises Noto Sans JP at the pixel size drawn (one atlas per size,
+glyphs added on demand), falls back to raylib's default font when the file is missing.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_ui_font.h | 227 ++++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp    |  15 +-
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp |  29 +--
+ ps2xRuntime/src/lib/ps2_mouse.cpp         |   5 +-
+ 4 files changed, 253 insertions(+), 23 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_ui_font.h
+
+diff --git a/ps2xRuntime/include/runtime/ga2_ui_font.h b/ps2xRuntime/include/runtime/ga2_ui_font.h
+new file mode 100644
+index 0000000..743f42e
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_ui_font.h
+@@ -0,0 +1,227 @@
++#pragma once
++
++// The port's own UI font (Noto Sans JP, native/fonts, shipped next to the executables) for the text the launcher and
++// the engines draw with raylib: menus, notices, on-screen pad labels. The font is a vector font rasterised at the
++// pixel size actually drawn (one atlas per size, built the first time that size is used, with only the glyphs the
++// text needs), so the text is as sharp as the window is at any resolution; bitmap fonts blown up would not be.
++// A glyph the atlas does not have yet is added by rebuilding that size's atlas, so any Japanese string works.
++//
++// Without the file (or when it cannot be rasterised) every call falls back to raylib's default font, so a missing
++// font never breaks a menu. GL thread only: atlases are textures.
++//
++//   GA2_UI_FONT=<file>   use this font file instead of <app dir>/fonts/NotoSansJP-Medium.otf
++//
++// Sizes are "DrawText font sizes": a size-20 line is about as tall as raylib's default font at 20.
++
++#include "raylib.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace ga2_ui_font
++{
++    namespace detail
++    {
++        // raylib sizes a TTF by its ascent-to-descent height; Noto Sans JP's is about 1.45 em with capitals 0.73 em
++        // tall, so this factor gives capitals about as tall as the default font's at the same nominal size.
++        constexpr float kRasterScale = 1.38f;
++        // Where the baseline sits in a text box of the nominal size (top of the box = y of the draw call).
++        constexpr float kBaseline = 0.80f;
++        constexpr size_t kMaxFaces = 24;
++
++        struct Face
++        {
++            Font font{};
++            std::vector<int> have; // sorted codepoints in the atlas
++            int baseline = 0;      // from the top of a glyph line to the baseline, in atlas pixels
++            uint64_t used = 0;
++        };
++
++        struct State
++        {
++            std::filesystem::path file;
++            bool fileSet = false, tried = false;
++            std::vector<unsigned char> data;
++            std::map<int, Face> faces;
++            uint64_t tick = 0;
++        };
++
++        inline State &state()
++        {
++            static State s;
++            return s;
++        }
++
++        inline std::filesystem::path pathFromUtf8(const char *text)
++        {
++            const std::string s(text);
++            return std::filesystem::path(std::u8string(s.begin(), s.end()));
++        }
++
++        inline bool available()
++        {
++            State &s = state();
++            if (s.tried)
++                return !s.data.empty();
++            s.tried = true;
++            std::filesystem::path file = s.file;
++            if (!s.fileSet)
++            {
++                if (const char *env = std::getenv("GA2_UI_FONT"); env && *env)
++                    file = pathFromUtf8(env);
++                else
++                    file = pathFromUtf8(GetApplicationDirectory()) / "fonts" / "NotoSansJP-Medium.otf";
++            }
++            std::ifstream in(file, std::ios::binary);
++            if (in)
++                s.data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++            return !s.data.empty();
++        }
++
++        // Codepoints every atlas starts with: ASCII, Latin-1 and the arrows and punctuation the menus use.
++        inline const std::vector<int> &baseCodepoints()
++        {
++            static const std::vector<int> base = [] {
++                std::vector<int> v;
++                for (int c = 32; c < 127; ++c) v.push_back(c);
++                for (int c = 160; c < 256; ++c) v.push_back(c);
++                for (int c : {0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x2190, 0x2191, 0x2192, 0x2193})
++                    v.push_back(c);
++                return v;
++            }();
++            return base;
++        }
++
++        inline void unload(Face &face)
++        {
++            if (face.font.texture.id)
++                UnloadFont(face.font);
++            face.font = Font{};
++        }
++
++        inline bool build(Face &face, int pixels, const std::vector<int> &codepoints)
++        {
++            State &s = state();
++            Font font = LoadFontFromMemory(".otf", s.data.data(), int(s.data.size()), pixels,
++                                           const_cast<int *>(codepoints.data()), int(codepoints.size()));
++            if (!font.texture.id || font.glyphCount <= 0)
++            {
++                if (font.texture.id)
++                    UnloadFont(font);
++                return false;
++            }
++            SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
++            unload(face);
++            face.font = font;
++            face.have = codepoints;
++            // The bottom of a capital H sits on the baseline.
++            const int h = GetGlyphIndex(font, 'H');
++            face.baseline = font.glyphs[h].offsetY + int(font.recs[h].height);
++            return true;
++        }
++
++        // The atlas for `pixels` with every codepoint of `text` in it, or nullptr to fall back.
++        inline Face *face(int pixels, const char *text)
++        {
++            if (!available())
++                return nullptr;
++            State &s = state();
++            int count = 0;
++            int *decoded = LoadCodepoints(text, &count);
++            std::vector<int> wanted(decoded, decoded + count);
++            UnloadCodepoints(decoded);
++            auto it = s.faces.find(pixels);
++            const bool fresh = it == s.faces.end();
++            Face &f = fresh ? s.faces[pixels] : it->second;
++            std::vector<int> missing;
++            for (int c : wanted)
++                if (c > 32 && c != 0xFFFD && !std::binary_search(f.have.begin(), f.have.end(), c) &&
++                    std::find(missing.begin(), missing.end(), c) == missing.end())
++                    missing.push_back(c);
++            if (fresh || !missing.empty())
++            {
++                std::vector<int> all = fresh ? baseCodepoints() : f.have;
++                all.insert(all.end(), missing.begin(), missing.end());
++                std::sort(all.begin(), all.end());
++                all.erase(std::unique(all.begin(), all.end()), all.end());
++                if (!build(f, pixels, all) && fresh)
++                {
++                    s.faces.erase(pixels);
++                    s.data.clear(); // cannot rasterise: the default font from now on
++                    return nullptr;
++                }
++                // Resizing a window walks through many sizes: keep the recent ones.
++                while (s.faces.size() > kMaxFaces)
++                {
++                    auto oldest = s.faces.end();
++                    for (auto i = s.faces.begin(); i != s.faces.end(); ++i)
++                        if (i->first != pixels && (oldest == s.faces.end() || i->second.used < oldest->second.used))
++                            oldest = i;
++                    unload(oldest->second);
++                    s.faces.erase(oldest);
++                }
++            }
++            Face &used = s.faces[pixels];
++            used.used = ++s.tick;
++            return used.font.texture.id ? &used : nullptr;
++        }
++
++        inline int rasterPixels(float size) { return std::max(6, int(std::lround(size * kRasterScale))); }
++    }
++
++    // Use this font file (UTF-8 aware path) instead of GA2_UI_FONT / <app dir>/fonts. Call before the first draw.
++    inline void setFile(const std::filesystem::path &file)
++    {
++        detail::State &s = detail::state();
++        s.file = file;
++        s.fileSet = true;
++        s.tried = false;
++        s.data.clear();
++    }
++
++    // Frees the atlases (before the window and its GL context go away).
++    inline void shutdown()
++    {
++        detail::State &s = detail::state();
++        for (auto &entry : s.faces)
++            detail::unload(entry.second);
++        s.faces.clear();
++        s.tried = false;
++        s.data.clear();
++    }
++
++    // Width in pixels of `text` (UTF-8, one line) at `size`.
++    inline float measure(const char *text, float size)
++    {
++        if (detail::Face *f = detail::face(detail::rasterPixels(size), text))
++            return MeasureTextEx(f->font, text, float(f->font.baseSize), 0.0f).x;
++        return float(MeasureText(text, int(size)));
++    }
++
++    // Draws one line with the top of its box at (x, y), like DrawText.
++    inline void draw(const char *text, float x, float y, float size, Color tint)
++    {
++        if (detail::Face *f = detail::face(detail::rasterPixels(size), text))
++        {
++            // Whole pixels, so a glyph's edges land on pixel edges.
++            const float top = std::round(y + size * detail::kBaseline - float(f->baseline));
++            DrawTextEx(f->font, text, Vector2{std::round(x), top}, float(f->font.baseSize), 0.0f, tint);
++            return;
++        }
++        DrawText(text, int(x), int(y), int(size), tint);
++    }
++
++    inline void draw(const std::string &text, float x, float y, float size, Color tint)
++    {
++        draw(text.c_str(), x, y, size, tint);
++    }
++    inline float measure(const std::string &text, float size) { return measure(text.c_str(), size); }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index b35947b..3f72921 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/ga2_menu_select.h"
+ 
+ #include "raylib.h"
++#include "runtime/ga2_ui_font.h"
+ #include "rlgl.h"
+ 
+ #include <string>
+@@ -263,9 +264,9 @@ namespace ga2_cheat_menu
+                 if (GetTime() < g_noticeUntil)
+                 {
+                     const int fs = int(22 * k);
+-                    const int w = MeasureText(g_notice.c_str(), fs);
++                    const int w = ga2_ui_font::measure(g_notice.c_str(), fs);
+                     DrawRectangle(int(20 * k), int(20 * k), w + int(24 * k), int(36 * k), Color{10, 16, 40, 210});
+-                    DrawText(g_notice.c_str(), int(32 * k), int(27 * k), fs, Color{150, 205, 255, 255});
++                    ga2_ui_font::draw(g_notice.c_str(), int(32 * k), int(27 * k), fs, Color{150, 205, 255, 255});
+                 }
+                 return;
+             }
+@@ -279,9 +280,9 @@ namespace ga2_cheat_menu
+                 DrawRectangle(0, 0, int(c.width), int(c.height), Color{0, 0, 0, 120});
+             DrawRectangleRounded(p, 0.06f, 8, Color{12, 18, 44, 235});
+             DrawRectangleRoundedLinesEx(p, 0.06f, 8, 2.0f * k, Color{90, 160, 255, 255});
+-            DrawText("CHEATS", int(p.x + 20 * k), int(p.y + 18 * k), int(30 * k), Color{230, 236, 250, 255});
++            ga2_ui_font::draw("CHEATS", int(p.x + 20 * k), int(p.y + 18 * k), int(30 * k), Color{230, 236, 250, 255});
+             const char *hint = c.vr ? "Cross / L3+R3: close" : "F1 / L3+R3: close, F2: settings";
+-            DrawText(hint, int(p.x + p.width - (c.vr ? 210 : 270) * k), int(p.y + 26 * k), int(16 * k), Color{130, 140, 170, 255});
++            ga2_ui_font::draw(hint, int(p.x + p.width - (c.vr ? 210 : 270) * k), int(p.y + 26 * k), int(16 * k), Color{130, 140, 170, 255});
+             const auto list = items();
+             const bool battle = ga2_cheats::battleActive(rdram);
+             for (int i = 0; i < int(list.size()); ++i)
+@@ -290,12 +291,12 @@ namespace ga2_cheat_menu
+                 if (i == g_sel.shown())
+                     DrawRectangleRec(r, Color{30, 44, 90, 255});
+                 const bool enabled = list[size_t(i)].toggle || list[size_t(i)].settings || battle;
+-                DrawText(list[size_t(i)].settings && !c.vr ? "Settings (F2)" : list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
++                ga2_ui_font::draw(list[size_t(i)].settings && !c.vr ? "Settings (F2)" : list[size_t(i)].label, int(r.x + 14 * k), int(r.y + 10 * k), int(20 * k),
+                          enabled ? Color{230, 236, 250, 255} : Color{110, 118, 140, 255});
+                 const char *value = list[size_t(i)].toggle ? (list[size_t(i)].toggle->load() ? "ON" : "OFF")
+                                    : (battle || list[size_t(i)].settings ? (c.vr ? "Circle" : "Enter") : "no battle");
+-                const int w = MeasureText(value, int(20 * k));
+-                DrawText(value, int(r.x + r.width) - w - int(14 * k), int(r.y + 10 * k), int(20 * k),
++                const int w = ga2_ui_font::measure(value, int(20 * k));
++                ga2_ui_font::draw(value, int(r.x + r.width) - w - int(14 * k), int(r.y + 10 * k), int(20 * k),
+                          list[size_t(i)].toggle && list[size_t(i)].toggle->load() ? Color{120, 220, 150, 255}
+                                                                                  : Color{150, 160, 190, 255});
+             }
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index 98211c4..5a7bd6b 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -8,6 +8,7 @@
+ #include "ga2_vr.h"
+ 
+ #include "raylib.h"
++#include "runtime/ga2_ui_font.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -221,7 +222,7 @@ namespace ga2_settings_menu
+                 if (!word.empty())
+                 {
+                     const std::string trial = line.empty() ? word : line + " " + word;
+-                    if (!line.empty() && float(MeasureText(trial.c_str(), fontSize)) > width)
++                    if (!line.empty() && float(ga2_ui_font::measure(trial.c_str(), fontSize)) > width)
+                     {
+                         lines.push_back(line);
+                         line = word;
+@@ -403,12 +404,12 @@ namespace ga2_settings_menu
+             DrawRectangle(0, 0, int(c.width), int(c.height), Color{0, 0, 0, 120});
+         DrawRectangleRounded(panel, 0.03f, 8, Color{12, 18, 44, 240});
+         DrawRectangleRoundedLinesEx(panel, 0.03f, 8, std::max(1.0f, 2.0f * u), Color{90, 160, 255, 255});
+-        DrawText("SETTINGS", int(l.x + 20 * u), int(l.y + 14 * u), int(28 * u), Color{230, 236, 250, 255});
++        ga2_ui_font::draw("SETTINGS", int(l.x + 20 * u), int(l.y + 14 * u), int(28 * u), Color{230, 236, 250, 255});
+         const char *hint = c.vr ? "Stick: choose and change   B: close" : "Up/Down: choose  Left/Right: change  F2/Esc: close";
+         {
+             const int fs = int(14 * u);
+-            const int w = MeasureText(hint, fs);
+-            DrawText(hint, int(l.x + l.w - w - 18 * u), int(l.y + 24 * u), fs, Color{130, 140, 170, 255});
++            const int w = ga2_ui_font::measure(hint, fs);
++            ga2_ui_font::draw(hint, int(l.x + l.w - w - 18 * u), int(l.y + 24 * u), fs, Color{130, 140, 170, 255});
+         }
+ 
+         const int fontSize = std::max(8, int(18 * u));
+@@ -421,24 +422,24 @@ namespace ga2_settings_menu
+             const bool highlighted = i == g_sel.shown();
+             if (highlighted)
+                 DrawRectangleRec(r, Color{30, 44, 90, 255});
+-            DrawText(table[key].label, int(r.x + 8 * u), ty, fontSize, Color{230, 236, 250, 255});
++            ga2_ui_font::draw(table[key].label, int(r.x + 8 * u), ty, fontSize, Color{230, 236, 250, 255});
+ 
+             const bool pending = ga2_settings::restartPending(key);
+             const std::string label = valueLabel(key);
+             const float vx0 = r.x + r.width * kValueFrom, vx1 = r.x + r.width * kValueTo;
+             const Color valueColor = pending ? Color{255, 190, 90, 255} : Color{150, 200, 255, 255};
+-            const int w = MeasureText(label.c_str(), fontSize);
+-            DrawText(label.c_str(), int((vx0 + vx1) * 0.5f) - w / 2, ty, fontSize, valueColor);
++            const int w = ga2_ui_font::measure(label, fontSize);
++            ga2_ui_font::draw(label, int((vx0 + vx1) * 0.5f) - w / 2, ty, fontSize, valueColor);
+             if (highlighted)
+             {
+-                DrawText("<", int(vx0), ty, fontSize, Color{230, 236, 250, 255});
+-                DrawText(">", int(vx1) - MeasureText(">", fontSize), ty, fontSize, Color{230, 236, 250, 255});
++                ga2_ui_font::draw("<", int(vx0), ty, fontSize, Color{230, 236, 250, 255});
++                ga2_ui_font::draw(">", int(vx1) - ga2_ui_font::measure(">", fontSize), ty, fontSize, Color{230, 236, 250, 255});
+             }
+             const char *tag = pending ? "after restart" : table[key].apply == ga2_options::Apply::Restart ? "restart" : "";
+             if (*tag)
+             {
+                 const int tf = std::max(8, int(13 * u));
+-                DrawText(tag, int(r.x + r.width - 8 * u) - MeasureText(tag, tf), int(r.y + (r.height - float(tf)) * 0.5f), tf,
++                ga2_ui_font::draw(tag, int(r.x + r.width - 8 * u) - ga2_ui_font::measure(tag, tf), int(r.y + (r.height - float(tf)) * 0.5f), tf,
+                          pending ? Color{255, 190, 90, 255} : Color{110, 118, 140, 255});
+             }
+         }
+@@ -453,7 +454,7 @@ namespace ga2_settings_menu
+         {
+             for (const std::string &line : wrap(table[key].help, helpSize, l.w - 36.0f * u))
+             {
+-                DrawText(line.c_str(), int(l.x + 18 * u), int(y), helpSize, Color{190, 198, 220, 255});
++                ga2_ui_font::draw(line, int(l.x + 18 * u), int(y), helpSize, Color{190, 198, 220, 255});
+                 y += float(helpSize) * 1.25f;
+             }
+         }
+@@ -466,14 +467,14 @@ namespace ga2_settings_menu
+             float sy = bottom - float(lines.size()) * float(helpSize) * 1.25f + 2.0f * u;
+             for (const std::string &line : lines)
+             {
+-                DrawText(line.c_str(), int(l.x + 18 * u), int(sy), helpSize, Color{255, 205, 120, 255});
++                ga2_ui_font::draw(line.c_str(), int(l.x + 18 * u), int(sy), helpSize, Color{255, 205, 120, 255});
+                 sy += float(helpSize) * 1.25f;
+             }
+         }
+         const int footer = std::max(8, int(12 * u));
+         // A long folder name loses its beginning.
+-        while (saved.size() > 12 && float(MeasureText(saved.c_str(), footer)) > l.w - 36.0f * u)
++        while (saved.size() > 12 && float(ga2_ui_font::measure(saved.c_str(), footer)) > l.w - 36.0f * u)
+             saved = "..." + saved.substr(saved.size() > 60 ? saved.size() - 60 : 4);
+-        DrawText(saved.c_str(), int(l.x + 18 * u), int(l.y + l.h - (kFooterHeight - 6.0f) * u), footer, Color{110, 118, 140, 255});
++        ga2_ui_font::draw(saved.c_str(), int(l.x + 18 * u), int(l.y + l.h - (kFooterHeight - 6.0f) * u), footer, Color{110, 118, 140, 255});
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index b4375fb..e90f1b9 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ga2_settings.h"
+ #include "ps2_host_backend.h"
+ #include "runtime/ga2_activity.h"
++#include "runtime/ga2_ui_font.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -569,8 +570,8 @@ namespace ps2_mouse
+             case Shape::Label:
+             {
+                 const int size = static_cast<int>(b.r * 0.55f);
+-                const int width = MeasureText(b.label, size);
+-                DrawText(b.label, static_cast<int>(c.x) - width / 2, static_cast<int>(c.y) - size / 2, size, edge);
++                const int width = ga2_ui_font::measure(b.label, size);
++                ga2_ui_font::draw(b.label, static_cast<int>(c.x) - width / 2, static_cast<int>(c.y) - size / 2, size, edge);
+                 break;
+             }
+             }
+-- 
+2.56.0
+

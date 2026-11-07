@@ -1,0 +1,520 @@
+From 587b769f486caedb3f45ef75640e46b4c306b931 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 18:46:36 -0500
+Subject: [PATCH] ga2: working saves (GS interrupts, GS->memory downloads,
+ device latency, card fixes)
+
+Zettai's save/load now works end to end (save screen with a captured
+thumbnail, files on the host card, Continue/Load restores the scene).
+
+- GS SIGNAL/FINISH raise INTC cause 0 on the 0->1 CSR edge when unmasked in
+  IMR, delivered through the scheduler after ~2000 EE cycles. Transfers are
+  synchronous here, but the thumbnail capture starts the transfer and then
+  calls SleepThread, relying on the hardware delay before the interrupt.
+- VIF1 DMA with CHCR.DIR = 0 fills memory from the GS local->host transfer;
+  its completion interrupt is likewise delivered after a size-based latency
+  (EeEventType::Dmac now dispatches DMAC handlers).
+- Memory card: opens without access bits (CREAT alone) are read/write, and
+  MCSERV GetDir returns the host directory listing (the game verifies saves
+  with it); card requests carry six arguments.
+- Diagnostics: GA2_DMA_TRACE (non-chain GIF/VIF1 starts, GS interrupts),
+  GA2_MC_TRACE, GA2_PAD_TRACE, thread/interrupt syscalls in
+  GA2_SYSCALL_TRACE, EE thread states in GA2_WATCHDOG, several dump ranges.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/include/ps2x/iop/iop_host.h           |  4 +-
+ ps2xIOP/src/modules/mcserv.cpp                | 13 ++--
+ ps2xRuntime/include/runtime/ee_scheduler.h    |  4 ++
+ ps2xRuntime/include/runtime/gs/gs_frontend.h  |  8 +++
+ ps2xRuntime/include/runtime/ps2_memory.h      |  8 +++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    | 20 ++++++
+ .../src/lib/Kernel/Stubs/MemoryCard.cpp       |  8 ++-
+ ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp      | 13 ++++
+ .../src/lib/Kernel/Syscalls/Dispatcher.cpp    | 14 ++++
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        | 17 ++++-
+ ps2xRuntime/src/lib/ps2_iop_host.cpp          | 11 ++-
+ ps2xRuntime/src/lib/ps2_memory.cpp            | 72 +++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 30 +++++++-
+ 13 files changed, 208 insertions(+), 14 deletions(-)
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index c890e63..f48b524 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -104,8 +104,8 @@ namespace ps2x::iop
+     struct MemoryCardRequest
+     {
+         MemoryCardOperation operation = MemoryCardOperation::Init;
+-        // The fifth argument is carried in $t0 by the EE n32 ABI
+-        std::array<uint32_t, 5> arguments{};
++        // The fifth and sixth arguments are carried in $t0/$t1 by the EE n32 ABI
++        std::array<uint32_t, 6> arguments{};
+     };
+ 
+     struct DiscExtent { uint32_t lba = 0u; uint32_t size = 0u; };
+diff --git a/ps2xIOP/src/modules/mcserv.cpp b/ps2xIOP/src/modules/mcserv.cpp
+index 4d0e6c5..fe94d03 100644
+--- a/ps2xIOP/src/modules/mcserv.cpp
++++ b/ps2xIOP/src/modules/mcserv.cpp
+@@ -260,9 +260,10 @@ namespace ps2x::iop::detail
+                          uint32_t a1 = 0u,
+                          uint32_t a2 = 0u,
+                          uint32_t a3 = 0u,
+-                         uint32_t stackArgument = 0u)
++                         uint32_t stackArgument = 0u,
++                         uint32_t stackArgument2 = 0u)
+             {
+-                return m_host.memoryCard({operation, {a0, a1, a2, a3, stackArgument}});
++                return m_host.memoryCard({operation, {a0, a1, a2, a3, stackArgument, stackArgument2}});
+             }
+ 
+             void writeResult(GuestBuffer receive, int32_t result)
+@@ -298,9 +299,11 @@ namespace ps2x::iop::detail
+                 case Operation::Delete:
+                     return call(MemoryCardOperation::Delete, port, slot, nameAddress);
+                 case Operation::GetDir:
+-                    // MCSERV normally DMA-writes entries. The existing HLE returns
+-                    // zero entries instead of fabricating directory contents.
+-                    return kSucceeded;
++                    // The host fills the guest table (sceMcTblGetDir entries) that
++                    // MCSERV would DMA back; the result is the entry count.
++                    return call(MemoryCardOperation::GetDir, port, slot, nameAddress,
++                                static_cast<uint32_t>(parameter.flags),
++                                static_cast<uint32_t>(std::max(parameter.maxEntries, 0)), parameter.pointer);
+                 case Operation::GetEnt:
+                     return 1024;
+                 default:
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 017f86d..7ca9cc7 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -262,6 +262,7 @@ enum class EeEventType : uint8_t
+     Dmac,
+     ExternalWake,
+     Alarm,
++    GsInterrupt, // INTC cause 0 (GS SIGNAL/FINISH)
+ };
+ 
+ struct EeEvent
+@@ -304,6 +305,9 @@ public:
+     void run();
+     void requestStop();
+     void postEvent(EeEvent event);
++    // Delivers an event once the EE has executed `cycles` more cycles (device
++    // latency, e.g. a GS FINISH after the transfer that requested it).
++    void postEventAfterCycles(EeEvent event, uint64_t cycles);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 4c3f641..ead0993 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -1,6 +1,7 @@
+ #ifndef PS2_GS_FRONTEND_H
+ #define PS2_GS_FRONTEND_H
+ 
++#include <functional>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -180,6 +181,13 @@ private:
+     uint8_t *m_localMemoryStorage = nullptr;
+     uint32_t m_localMemorySize = 0u;
+     struct GSRegisters *m_privRegs = nullptr;
++public:
++    // Called with the CSR bits (SIGNAL=1, FINISH=2) that became set while
++    // unmasked in IMR; the runtime raises INTC cause 0 (GS) for them.
++    void setInterruptSink(std::function<void(uint32_t)> sink) { m_interruptSink = std::move(sink); }
++private:
++    std::function<void(uint32_t)> m_interruptSink;
++    void raiseCsrInterrupt(uint32_t bit, uint64_t maskBit);
+     mutable std::recursive_mutex m_stateMutex;
+     mutable std::mutex m_backendLifetimeMutex;
+     mutable std::mutex m_presentationMutex;
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 54c1369..6664f78 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -330,6 +330,9 @@ public:
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
++    // GS local->host data for VIF1 DMA in the to-memory direction (image
++    // downloads after a TRXDIR=1 transfer).
++    void setLocalToHostReader(std::function<uint32_t(uint8_t *, uint32_t)> reader) { m_localToHostReader = std::move(reader); }
+ 
+     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
+     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
+@@ -360,6 +363,8 @@ public:
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
++    // Completions whose interrupt is delivered after a device latency (cause, EE cycles).
++    std::vector<std::pair<uint32_t, uint64_t>> consumeDelayedDmacCauses();
+     // IPU command completion is an INTC source, distinct from DMAC channel 4.
+     bool consumeIpuInterrupt();
+ 
+@@ -416,6 +421,7 @@ public:
+ 
+     GifPacketCallback m_gifPacketCallback;
+     GifArbiter *m_gifArbiter = nullptr;
++    std::function<uint32_t(uint8_t *, uint32_t)> m_localToHostReader;
+     Vu1MscalCallback m_vu1MscalCallback;
+     Vu1MscntCallback m_vu1MscntCallback;
+ 
+@@ -442,6 +448,7 @@ public:
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+     std::mutex m_completedDmacMutex;
++    std::vector<std::pair<uint32_t, uint64_t>> m_delayedDmacCauses;
+     std::vector<uint32_t> m_completedDmacCauses;
+ 
+     struct CodeRegion
+@@ -476,6 +483,7 @@ public:
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     bool processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, uint32_t mode);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
++    void completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause, uint64_t latencyCycles);
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index d7d520e..960806a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -451,6 +451,11 @@ void EeScheduler::requestStop()
+     m_eventCv.notify_all();
+ }
+ 
++void EeScheduler::postEventAfterCycles(EeEvent event, uint64_t cycles)
++{
++    scheduleEvent(m_eeCycle + cycles, std::chrono::steady_clock::now(), event);
++}
++
+ void EeScheduler::postEvent(EeEvent event)
+ {
+     if (event.type == EeEventType::Stop)
+@@ -2416,7 +2421,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+         dispatchIrq(false, 3u);
+         break;
+     case EeEventType::Dmac:
++        dispatchIrq(true, event.id);
++        break;
++    case EeEventType::GsInterrupt:
++    {
++        static const bool trace = std::getenv("GA2_DMA_TRACE") != nullptr;
++        if (trace)
++        {
++            size_t count = 0;
++            for (const auto &[id, handler] : m_intcHandlers)
++                if (handler.cause == 0u && handler.enabled)
++                    ++count;
++            std::fprintf(stderr, "[gs] interrupt: enabled=%d handlers=%zu\n", (m_enabledIntcMask & 1u) != 0u, count);
++        }
++        dispatchIrq(false, 0u);
+         break;
++    }
+     case EeEventType::Alarm:
+     {
+         auto it = m_alarms.find(static_cast<int>(event.id));
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..80b6d5a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -443,7 +443,13 @@ namespace ps2_stubs
+             const bool exists = std::filesystem::exists(hostPath, ec) && !ec;
+ 
+             const char *mode = "rb";
+-            if (read && write)
++            // No access bits (Zettai opens saves with CREAT alone and then
++            // writes): the card driver allows reading and writing.
++            if (!read && !write)
++            {
++                mode = exists ? "r+b" : "w+b";
++            }
++            else if (read && write)
+             {
+                 if (append)
+                 {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index fe595ce..9e30e97 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "Common.h"
+ #include "Pad.h"
+ 
+@@ -649,6 +650,18 @@ namespace ps2_stubs
+             setReturnS32(ctx, 0);
+             return;
+         }
++        static const bool padTrace = std::getenv("GA2_PAD_TRACE") != nullptr;
++        if (padTrace)
++        {
++            static uint16_t last = 0xFFFFu;
++            const uint16_t buttons = static_cast<uint16_t>(data[2] | (data[3] << 8));
++            if (buttons != last)
++            {
++                std::fprintf(stderr, "[pad] port=%d slot=%d buttons=0x%04x pressed=0x%04x\n", port, slot, buttons,
++                             static_cast<uint16_t>(~buttons));
++                last = buttons;
++            }
++        }
+ 
+         PS2_IF_AGRESSIVE_LOGS({
+             if (g_padReadLogCount < 48)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+index 121fcc7..30e2a16 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "Common.h"
+ #include "Dispatcher.h"
+ #include "System.h"
+@@ -10,6 +12,18 @@ namespace ps2_syscalls
+         {
+             return true;
+         }
++        // GA2_SYSCALL_TRACE also logs thread/interrupt syscalls (not the
++        // per-frame semaphore traffic).
++        static const bool trace = std::getenv("GA2_SYSCALL_TRACE") != nullptr;
++        if (trace)
++        {
++            const int32_t n = static_cast<int32_t>(syscallNumber);
++            const int32_t a = n < 0 ? -n : n;
++            if ((a >= 0x10 && a <= 0x17) || a == 0x2F || (a >= 0x32 && a <= 0x35) || a == 0x04)
++                std::fprintf(stderr, "[syscall] %d a0=0x%x a1=0x%x thread=%d pc=0x%x ra=0x%x\n", n, getRegU32(ctx, 4),
++                             getRegU32(ctx, 5), runtime ? runtime->eeScheduler().currentThreadId() : -1, ctx->pc,
++                             getRegU32(ctx, 31));
++        }
+ 
+         switch (syscallNumber)
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 3520752..6fc59e6 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1478,7 +1478,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
+             lo = (lo & ~mask) | (id & mask);
+             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
+-            m_privRegs->csr.fetch_or(0x1);
++            raiseCsrInterrupt(0x1u, 0x100u);
+         }
+         break;
+     }
+@@ -1490,7 +1490,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             m_backend->Sync(GSSyncReason::Finish);
+         }
+         if (m_privRegs)
+-            m_privRegs->csr.fetch_or(0x2);
++            raiseCsrInterrupt(0x2u, 0x200u);
+         break;
+     }
+     case GS_REG_LABEL:
+@@ -1634,6 +1634,19 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
++// SIGNAL/FINISH set their CSR bit; the GS interrupt is raised on the 0->1
++// edge when the matching IMR mask bit (SIGMSK 8, FINISHMSK 9) is clear.
++void GS::raiseCsrInterrupt(uint32_t bit, uint64_t maskBit)
++{
++    const uint64_t previous = m_privRegs->csr.fetch_or(bit);
++    static const bool trace = std::getenv("GA2_DMA_TRACE") != nullptr;
++    if (trace)
++        std::fprintf(stderr, "[gs] csr bit %u set (prev csr=%llx imr=%llx)\n", bit,
++                     static_cast<unsigned long long>(previous), static_cast<unsigned long long>(m_privRegs->imr));
++    if ((previous & bit) == 0u && (m_privRegs->imr & maskBit) == 0u && m_interruptSink)
++        m_interruptSink(bit);
++}
++
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 1e1ce6f..4bc9382 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -791,13 +791,20 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
+         setRegU32(&context, static_cast<int>(4 + i), request.arguments[i]);
+     }
+ 
+-    // EE n32 ABI: the fifth argument travels in $t0, matching the sceMc* stubs.
++    // EE n32 ABI: the fifth and sixth arguments travel in $t0/$t1, matching the sceMc* stubs.
+     setRegU32(&context, 8, request.arguments[4]);
++    setRegU32(&context, 9, request.arguments[5]);
+ 
+     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
+             &context,
+             &m_runtime);
+-    return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
++    const int32_t result = ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
++    static const bool trace = std::getenv("GA2_MC_TRACE") != nullptr;
++    if (trace)
++        std::cerr << "[mc] op=" << static_cast<int>(request.operation) << std::hex << " args=0x" << request.arguments[0]
++                  << ",0x" << request.arguments[1] << ",0x" << request.arguments[2] << ",0x" << request.arguments[3]
++                  << ",0x" << request.arguments[4] << std::dec << " -> " << result << std::endl;
++    return result;
+ }
+ 
+ bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index cffe272..749537d 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1440,6 +1440,59 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
++            static const bool dmaTrace = std::getenv("GA2_DMA_TRACE") != nullptr;
++            if (dmaTrace && (channelBase == 0x10009000u || channelBase == 0x1000A000u) && (value & 0x0Du) != 0x05u)
++                std::fprintf(stderr, "[dma] start ch=%08x chcr=%08x madr=%08x qwc=%u tadr=%08x\n", channelBase, value,
++                             m_ioRegisters[channelBase + 0x10u], m_ioRegisters[channelBase + 0x20u] & 0xFFFFu,
++                             m_ioRegisters[channelBase + 0x30u]);
++            if (dmaTrace && channelBase == 0x10009000u && (value & 0x0Cu) == 0u)
++            {
++                const uint32_t count = std::min<uint32_t>(m_ioRegisters[channelBase + 0x20u] & 0xFFFFu, 16u);
++                for (uint32_t i = 0; i < count; ++i)
++                {
++                    uint32_t w[4]{};
++                    try
++                    {
++                        std::memcpy(w, m_rdram + translateAddress((m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u) + i * 16u), 16);
++                    }
++                    catch (const std::exception &)
++                    {
++                    }
++                    std::fprintf(stderr, "[dma]   %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3]);
++                }
++            }
++            // VIF1 to memory (CHCR.DIR = 0): drain the GS local->host transfer.
++            if (channelBase == 0x10009000u && (value & 1u) == 0u && m_localToHostReader)
++            {
++                const uint32_t count = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
++                uint32_t address = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
++                for (uint32_t i = 0; i < count; ++i)
++                {
++                    uint8_t qword[16]{};
++                    (void)m_localToHostReader(qword, 16u);
++                    uint32_t offset = 0;
++                    try
++                    {
++                        offset = translateAddress(address);
++                    }
++                    catch (const std::exception &)
++                    {
++                        break;
++                    }
++                    if (offset + 16u > PS2_RAM_SIZE)
++                        break;
++                    std::memcpy(m_rdram + offset, qword, 16u);
++                    markModified(offset, 16u);
++                    address += 16u;
++                }
++                m_ioRegisters[channelBase + 0x10u] = address;
++                m_ioRegisters[channelBase + 0x20u] = 0u;
++                // The GS streams a download at roughly a qword per bus cycle;
++                // the completion interrupt must not beat the guest to SleepThread.
++                completeDmacChannelDelayed(channelBase, 1u, std::max<uint64_t>(2000u, uint64_t(count) * 4u));
++                return true;
++            }
++
+             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1919,6 +1972,25 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+     return false;
+ }
+ 
++void PS2Memory::completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause, uint64_t latencyCycles)
++{
++    completeDmacChannel(channelBase, cause);
++    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++    // completeDmacChannel queued the cause for immediate dispatch; move it.
++    auto it = std::find(m_completedDmacCauses.rbegin(), m_completedDmacCauses.rend(), cause);
++    if (it != m_completedDmacCauses.rend())
++        m_completedDmacCauses.erase(std::next(it).base());
++    m_delayedDmacCauses.emplace_back(cause, latencyCycles);
++}
++
++std::vector<std::pair<uint32_t, uint64_t>> PS2Memory::consumeDelayedDmacCauses()
++{
++    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++    std::vector<std::pair<uint32_t, uint64_t>> causes;
++    causes.swap(m_delayedDmacCauses);
++    return causes;
++}
++
+ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ {
+     static constexpr uint32_t kDStat = 0x1000E010u;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ada0cb1..71dcc27 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -807,12 +807,22 @@ bool PS2Runtime::syncCoreSubsystems()
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
++    // GIF/DMA work is synchronous here, but on hardware SIGNAL/FINISH arrive
++    // microseconds after the kick. Games rely on that: Zettai's thumbnail
++    // capture starts the transfer and then calls SleepThread, expecting the
++    // interrupt to wake it. Deliver after ~2000 EE cycles via the scheduler.
++    m_gs.setInterruptSink([this](uint32_t)
++                          {
++                              if (m_eeScheduler)
++                                  m_eeScheduler->postEventAfterCycles(EeEvent{EeEventType::GsInterrupt, 0, 0}, 2000u);
++                          });
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     if (ga2_pgs::active())
+         m_gifArbiter.setTapFn([](GifPathId path, const uint8_t *data, uint32_t size)
+                               { ga2_pgs::gifTransfer(static_cast<uint32_t>(path), data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    m_memory.setLocalToHostReader([this](uint8_t *dst, uint32_t bytes) { return m_gs.consumeLocalToHostBytes(dst, bytes); });
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+@@ -1661,6 +1671,9 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+     {
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
++    for (const auto &[cause, cycles] : m_memory.consumeDelayedDmacCauses())
++        eeScheduler().postEventAfterCycles(EeEvent{EeEventType::Dmac, cause, 0}, cycles);
++
+ }
+ 
+ // IPU completion is produced only by EE-owned MMIO/FIFO/DMA work. Queue handlers
+@@ -2632,8 +2645,21 @@ void PS2Runtime::run()
+                                     std::cerr << " r" << std::dec << r << "=0x" << std::hex << getRegU32(ctx, r);
+                             std::cerr << std::dec
+                                       << " dispatch history: " << formatDispatchHistory() << std::endl;
+-                            // GA2_WATCHDOG_DUMP=<hex address>[,<bytes>]: hex dump guest RAM.
+-                            if (const char *dump = std::getenv("GA2_WATCHDOG_DUMP"); dump && *dump)
++                            if (m_eeScheduler)
++                            {
++                                const EeKernelSnapshot snap = m_eeScheduler->snapshot();
++                                for (const auto &t : snap.threads)
++                                    std::cerr << "[watchdog] thread " << t.id << " status=" << static_cast<int>(t.status)
++                                              << " wait=" << static_cast<int>(t.waitReason) << "/" << t.waitId << " pc=0x"
++                                              << std::hex << t.pc << " ra=0x" << t.ra << std::dec << " prio=" << t.currentPriority
++                                              << " inv=" << t.invocationDepth << std::endl;
++                                for (const auto &sem : snap.semaphores)
++                                    if (sem.waiters)
++                                        std::cerr << "[watchdog] sema " << sem.id << " count=" << sem.count << " waiters=" << sem.waiters << std::endl;
++                            }
++                            // GA2_WATCHDOG_DUMP=<hex address>[,<bytes>][;...]: hex dump guest RAM.
++                            for (const char *dump = std::getenv("GA2_WATCHDOG_DUMP"); dump && *dump;
++                                 dump = std::strchr(dump, ';') ? std::strchr(dump, ';') + 1 : nullptr)
+                             {
+                                 char *end = nullptr;
+                                 const uint32_t address = static_cast<uint32_t>(std::strtoul(dump, &end, 16)) & 0x1FFFFFFu;
+-- 
+2.55.0
+

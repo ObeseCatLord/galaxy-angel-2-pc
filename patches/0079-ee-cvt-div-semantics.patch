@@ -1,0 +1,138 @@
+From 61df6a5914493df3b1953d95501531a0d0d10b22 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:18:42 -0500
+Subject: [PATCH] recomp: EE CVT.W.S truncates, DIV.S by zero gives max float,
+ VFTOI saturates
+
+CVT.W.S (every (int)float in game code) rounded to nearest; the EE
+truncates toward zero and saturates out-of-range values. DIV.S by zero
+produced infinity (later NaN); the EE gives the largest float with the
+quotient's sign and sets D/SD (I/SI for 0/0). VU0 VFTOI returned
+0x80000000 for large positive values instead of 0x7FFFFFFF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRecomp/src/lib/fpu_translator.cpp         |  5 +---
+ ps2xRecomp/src/lib/vu_translation_helpers.cpp |  2 +-
+ ps2xRuntime/include/ps2_runtime_macros.h      | 24 ++++++++++++++++++-
+ ps2xTest/src/code_generator_tests.cpp         | 11 +++++++++
+ ps2xTest/src/ps2_vu_tests.cpp                 | 17 +++++++++++++
+ 5 files changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 358fb49..5a4d6e1 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -53,10 +53,7 @@ namespace ps2recomp
+             case COP1_S_MUL:
+                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_DIV:
+-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+-                                   ft, fd, fs, fd, fs, ft);
++                return fmt::format("ctx->f[{}] = ps2_fpu_div_s(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_SQRT: // EE: SQRT.S fd, ft (the operand is in the ft field)
+                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 08ccb98..611b5f0 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -759,7 +759,7 @@ namespace ps2recomp
+ 
+         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
+                            "src = _mm_mul_ps(src, _mm_set1_ps({})); "
+-                           "__m128i res_i = _mm_cvttps_epi32(src); "
++                           "__m128i res_i = _mm_xor_si128(_mm_cvttps_epi32(src), _mm_castps_si128(_mm_cmpge_ps(src, _mm_set1_ps(2147483648.0f)))); "
+                            "__m128 res = _mm_castsi128_ps(res_i); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index f4e7a2a..895032e 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -626,7 +626,29 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++// EE CVT.W.S truncates toward zero (what C casts compile to) and saturates.
++static inline int32_t ps2_fpu_cvt_w_s(float a)
++{
++    if (a >= 2147483648.0f)
++        return INT32_MAX;
++    if (a <= -2147483648.0f)
++        return INT32_MIN;
++    if (a != a)
++        return std::signbit(a) ? INT32_MIN : INT32_MAX;
++    return static_cast<int32_t>(a);
++}
++#define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
++// EE DIV.S by zero: the largest float with the quotient's sign; FCR31 I/SI
++// for 0/0, D/SD otherwise.
++static inline float ps2_fpu_div_s(uint32_t &fcr31, float a, float b)
++{
++    if (b == 0.0f)
++    {
++        fcr31 |= a == 0.0f ? 0x00020040u : 0x00010020u;
++        return std::signbit(a) != std::signbit(b) ? -3.402823466e+38f : 3.402823466e+38f;
++    }
++    return a / b;
++}
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index d3513ce..721c1bc 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1048,6 +1048,17 @@ void register_code_generator_tests()
+             t.IsTrue(rsqrtCode.find("ctx->f[4] = FPU_RSQRT_S(ctx->f[3], ctx->f[2])") != std::string::npos,
+                      "RSQRT.S computes fs / sqrt(ft)");
+ 
++            Instruction div{};
++            div.opcode = OPCODE_COP1;
++            div.rs = COP1_S;
++            div.function = COP1_S_DIV;
++            div.rt = 2;
++            div.rd = 3;
++            div.sa = 4;
++            t.IsTrue(gen.translateInstruction(div).find("ctx->f[4] = ps2_fpu_div_s(ctx->fcr31, ctx->f[3], ctx->f[2])") !=
++                         std::string::npos,
++                     "DIV.S divides fs by ft with the EE's zero-divisor result");
++
+             Instruction vrsqrt{};
+             vrsqrt.rd = 5;
+             vrsqrt.rt = 6;
+diff --git a/ps2xTest/src/ps2_vu_tests.cpp b/ps2xTest/src/ps2_vu_tests.cpp
+index b96befe..d4bf0ec 100644
+--- a/ps2xTest/src/ps2_vu_tests.cpp
++++ b/ps2xTest/src/ps2_vu_tests.cpp
+@@ -81,6 +81,23 @@ void register_ps2_vu_tests()
+ {
+     MiniTest::Case("PS2VU0Math", [](TestCase &tc)
+     {
++        tc.Run("EE FPU CVT.W.S truncates and saturates; DIV.S by zero gives max float", [](TestCase &t)
++        {
++            t.Equals(ps2_fpu_cvt_w_s(0.6f), 0, "0.6 truncates to 0");
++            t.Equals(ps2_fpu_cvt_w_s(-0.6f), 0, "-0.6 truncates to 0");
++            t.Equals(ps2_fpu_cvt_w_s(254.99f), 254, "254.99 truncates to 254");
++            t.Equals(ps2_fpu_cvt_w_s(3.0e9f), INT32_MAX, "large positive saturates");
++            t.Equals(ps2_fpu_cvt_w_s(-3.0e9f), INT32_MIN, "large negative saturates");
++            uint32_t fcr31 = 0u;
++            t.IsTrue(ps2_fpu_div_s(fcr31, 2.0f, 0.0f) == 3.402823466e+38f, "x/+0 is +max");
++            t.IsTrue((fcr31 & 0x00010020u) == 0x00010020u, "x/0 sets D and SD");
++            t.IsTrue(ps2_fpu_div_s(fcr31, 2.0f, -0.0f) == -3.402823466e+38f, "x/-0 is -max");
++            fcr31 = 0u;
++            ps2_fpu_div_s(fcr31, 0.0f, 0.0f);
++            t.IsTrue((fcr31 & 0x00020040u) == 0x00020040u, "0/0 sets I and SI");
++            t.IsTrue(ps2_fpu_div_s(fcr31, 3.0f, 2.0f) == 1.5f, "ordinary division");
++        });
++
+         tc.Run("MulVector_componentwise", [](TestCase &t)
+         {
+             VuEnv env;
+-- 
+2.55.0
+

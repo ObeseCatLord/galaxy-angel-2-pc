@@ -1,0 +1,233 @@
+From db2e953e032fdfae0a80f4f1a56d016e806b8d70 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 10:36:32 -0500
+Subject: [PATCH] gs_pgs: hand the readback buffer to the presentation thread
+ instead of copying it on the game thread
+
+The BGRA->RGBA conversion had already moved to the presentation thread
+(takeEyeFrame), but consumeSlotLocked still memcpy'd every finished scanout
+readback (frame bytes = width x height x 4) into a per-eye vector under the
+frame mutex on the game thread: ~0.8 % of the game thread at 640x448 and 16x
+that at the 2560x1792 hi-res scanout.
+
+The mapped readback buffer itself is now the frame: consumeSlotLocked keeps the
+slot pending and publishes (slot, pointer, size, format) for the presentation
+thread; takeEyeFrame/takeUiFrame convert straight from it into the caller's
+RGBA vector (one pass instead of memcpy + convert) and then release the slot.
+A frame the presentation thread never saw is released when a newer one
+replaces it; the slot ring and the "drop the copy if the GPU/presenter is
+behind" rule are unchanged (pending is an atomic cleared by either thread).
+The scanout image and fence are released at hand-over; reading a host buffer
+needs no unmap.
+
+Measured (Zettai title, normal speed, GameThread CPU 20..70 s, runs side by
+side, item 1 build vs this one): default scanout 19.3 -> 19.2 % of a core (no
+change visible); GA2_PGS_SSAA=4 (1280x896 scanout) 21.8 -> 21.0 %;
+GA2_PGS_SSAA=16 (2560x1792 scanout) 27.8 -> 23.2 % (-17 %). Screenshots of the
+title screen are pixel-identical (3 of 6 captures; the rest differ by animation
+timing, 0.05-0.1 % of pixels).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp | 138 +++++++++++++++++++-----------
+ 1 file changed, 90 insertions(+), 48 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 5bb57d5..ee3bf00 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -124,7 +124,10 @@ namespace
+         ImageHandle image;
+         uint32_t width = 0, height = 0;
+         VkFormat format = VK_FORMAT_UNDEFINED;
+-        bool pending = false;
++        // True from the copy's submission until the frame is no longer needed: for a finished copy that is
++        // when the presentation thread has converted it (or a newer frame replaced it unseen), because the
++        // frame is handed over as the mapped readback buffer itself, not copied. Cleared by either thread.
++        std::atomic<bool> pending{false};
+         ga2_stereo::Setup setup; // the stereo setup of the copied frame
+         bool uiSplit = false;    // the frame was drawn without its UI layer (HUD panel)
+         uint64_t flip = 0;       // the guest flip it shows and that iteration's game time (GA2_FRAMETRACE_FRAMES)
+@@ -146,7 +149,10 @@ namespace
+         ReadbackSlot slots[3];
+         uint32_t slotIndex = 0;
+ 
+-        std::vector<uint8_t> frame; // guarded by State::frameMutex
++        // The newest finished frame, not yet taken by the presentation thread (guarded by State::frameMutex):
++        // the mapped BGRA/RGBA bytes of freshSlot's readback buffer.
++        ReadbackSlot *freshSlot = nullptr;
++        const uint32_t *frameSrc = nullptr;
+         uint32_t frameWidth = 0, frameHeight = 0;
+         bool frameFresh = false;
+         bool frameBgra = false;
+@@ -572,9 +578,12 @@ namespace
+         }
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
+-            // Raw copy only; the present thread converts (takeFrame).
+-            eye.frame.resize(pixels * 4u);
+-            std::memcpy(eye.frame.data(), src, pixels * 4u);
++            // No copy: the readback buffer stays mapped and owned by the frame until the presentation thread has
++            // converted it (takeEyeFrame / takeUiFrame release it). A frame it never saw is replaced and released.
++            if (eye.freshSlot)
++                eye.freshSlot->pending.store(false, std::memory_order_release);
++            eye.freshSlot = &slot;
++            eye.frameSrc = src;
+             eye.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+             eye.frameWidth = slot.width;
+             eye.frameHeight = slot.height;
+@@ -598,8 +607,8 @@ namespace
+                 (isUi ? s.dbgUiH : s.dbgSceneH) = slot.height;
+             }
+         }
+-        eye.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
+-        slot.pending = false;
++        // The scanout image is no longer needed (the copy finished). The buffer stays mapped (reading needs no
++        // unmap) and the slot stays pending until the frame is released.
+         slot.image.reset();
+         slot.fence.reset();
+     }
+@@ -939,35 +948,70 @@ namespace ga2_pgs
+ 
+     bool uiLayer() { return state().uiLayer; }
+ 
+-    bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit)
++    namespace
+     {
+-        State &s = state();
+-        if (!s.uiLayer)
+-            return false;
+-        Eye &eye = s.eyes[2];
+-        bool bgra = false;
++        // Takes the newest unseen frame of `eye`: the pointer to its mapped pixels (valid until releaseFrame) and
++        // its description. The conversion that follows runs on the calling (presentation) thread without any lock.
++        struct TakenFrame
++        {
++            ReadbackSlot *slot = nullptr;
++            const uint32_t *src = nullptr;
++            uint32_t width = 0, height = 0;
++            bool bgra = false;
++            bool uiSplit = false;
++            ga2_stereo::Setup setup;
++        };
++
++        bool acquireFrame(State &s, Eye &eye, TakenFrame &out)
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
+             if (!eye.frameFresh)
+                 return false;
+-            rgba.swap(eye.frame);
+-            width = eye.frameWidth;
+-            height = eye.frameHeight;
+-            bgra = eye.frameBgra;
+-            uiSplit = eye.frameUiSplit;
++            out.slot = eye.freshSlot;
++            out.src = eye.frameSrc;
++            out.width = eye.frameWidth;
++            out.height = eye.frameHeight;
++            out.bgra = eye.frameBgra;
++            out.uiSplit = eye.frameUiSplit;
++            out.setup = eye.frameSetup;
++            eye.freshSlot = nullptr; // now owned by the caller; a newer frame will not release it
++            eye.frameSrc = nullptr;
+             eye.frameFresh = false;
++            return out.slot != nullptr;
+         }
+-        // Straight RGBA with the alpha the game wrote (0x80 = opaque; ga2_vr scales it).
+-        if (bgra)
++
++        void releaseFrame(TakenFrame &frame)
+         {
+-            auto *px = reinterpret_cast<uint32_t *>(rgba.data());
+-            const size_t pixels = size_t(width) * height;
++            if (frame.slot)
++                frame.slot->pending.store(false, std::memory_order_release);
++            frame.slot = nullptr;
++        }
++    }
++
++    bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit)
++    {
++        State &s = state();
++        if (!s.uiLayer)
++            return false;
++        TakenFrame frame;
++        if (!acquireFrame(s, s.eyes[2], frame))
++            return false;
++        width = frame.width;
++        height = frame.height;
++        uiSplit = frame.uiSplit;
++        const size_t pixels = size_t(width) * height;
++        rgba.resize(pixels * 4u);
++        auto *dst = reinterpret_cast<uint32_t *>(rgba.data());
++        // Straight RGBA with the alpha the game wrote (0x80 = opaque; ga2_vr scales it).
++        if (frame.bgra)
+             for (size_t i = 0; i < pixels; ++i)
+             {
+-                const uint32_t p = px[i];
+-                px[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
++                const uint32_t p = frame.src[i];
++                dst[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+             }
+-        }
++        else
++            std::memcpy(dst, frame.src, pixels * 4u);
++        releaseFrame(frame);
+         return true;
+     }
+ 
+@@ -977,30 +1021,28 @@ namespace ga2_pgs
+         State &s = state();
+         if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
+             return false;
+-        Eye &eye = s.eyes[eyeIndex];
+-        bool bgra = false;
+-        {
+-            std::lock_guard<std::mutex> lock(s.frameMutex);
+-            if (!eye.frameFresh)
+-                return false;
+-            rgba.swap(eye.frame);
+-            width = eye.frameWidth;
+-            height = eye.frameHeight;
+-            bgra = eye.frameBgra;
+-            setup = eye.frameSetup;
+-            if (uiSplit)
+-                *uiSplit = eye.frameUiSplit;
+-            eye.frameFresh = false;
+-        }
+-        // Convert to opaque RGBA here, on the present thread.
+-        auto *px = reinterpret_cast<uint32_t *>(rgba.data());
++        TakenFrame frame;
++        if (!acquireFrame(s, s.eyes[eyeIndex], frame))
++            return false;
++        width = frame.width;
++        height = frame.height;
++        setup = frame.setup;
++        if (uiSplit)
++            *uiSplit = frame.uiSplit;
++        // Convert to opaque RGBA here, on the present thread, straight from the mapped readback buffer.
+         const size_t pixels = size_t(width) * height;
+-        for (size_t i = 0; i < pixels; ++i)
+-        {
+-            const uint32_t p = px[i];
+-            px[i] = bgra ? (((p >> 16) & 0xFFu) | (p & 0xFF00u) | ((p & 0xFFu) << 16) | 0xFF000000u)
+-                         : (p | 0xFF000000u);
+-        }
++        rgba.resize(pixels * 4u);
++        auto *dst = reinterpret_cast<uint32_t *>(rgba.data());
++        if (frame.bgra)
++            for (size_t i = 0; i < pixels; ++i)
++            {
++                const uint32_t p = frame.src[i];
++                dst[i] = ((p >> 16) & 0xFFu) | (p & 0xFF00u) | ((p & 0xFFu) << 16) | 0xFF000000u;
++            }
++        else
++            for (size_t i = 0; i < pixels; ++i)
++                dst[i] = frame.src[i] | 0xFF000000u;
++        releaseFrame(frame);
+         return true;
+     }
+ }
+-- 
+2.56.0
+

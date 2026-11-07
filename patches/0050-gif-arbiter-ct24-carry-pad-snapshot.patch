@@ -1,0 +1,478 @@
+From e947775cf7c6f984ee9a21074f6d655dcd969a2c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:49:30 -0500
+Subject: [PATCH] ga2: GIF arbiter rank, PSMCT24 chunk carry, pad snapshot
+
+- GIF arbiter: one integer rank per packet (PATH1, PATH2, PATH3 in
+  submission order, DIRECTHL behind queued PATH3 IMAGE data); the old
+  comparator was not a strict weak ordering (UB in stable_sort) when a
+  batch held PATH3 IMAGE, PATH3 non-image and DIRECTHL packets (review 55 G11).
+- CPU GS backend: PSMCT24/Z24 host->local uploads carry the 0-2 bytes of a
+  pixel that straddles an IMAGE chunk instead of dropping them (G14).
+- Pad: the main thread samples raylib input after EndDrawing() and
+  publishes a snapshot; the game thread no longer reads raylib state (G10).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../include/runtime/gs/gs_cpu_backend.h       |   3 +
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp     |  21 +-
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    |  33 +--
+ ps2xRuntime/src/lib/ps2_pad.cpp               | 212 ++++++++++--------
+ ps2xRuntime/src/lib/ps2_pad_input.h           |   5 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |   2 +
+ ps2xTest/src/ps2_gs_tests.cpp                 |  33 +++
+ ps2xTest/src/ps2_memory_tests.cpp             |  26 +++
+ 8 files changed, 228 insertions(+), 107 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ps2_pad_input.h
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..cbd4c7a 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -76,6 +76,9 @@ private:
+ 
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
++    // PSMCT24/Z24 pixels straddle 16-byte image chunks; 0-2 leftover bytes.
++    std::array<uint8_t, 2> m_uploadCarry{};
++    uint32_t m_uploadCarryBytes = 0u;
+     std::vector<uint8_t> m_localToHostBuffer;
+     size_t m_localToHostReadPos = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 4d613a1..e6f0290 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1473,6 +1473,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.copiedPixels = 0u;
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
++    m_uploadCarryBytes = 0u;
+ 
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+@@ -1531,13 +1532,23 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         case GS_PSM_CT24:
+         case GS_PSM_Z24:
+         {
+-            if (sizeBytes - offset < 3u)
++            uint8_t bytes[3];
++            uint32_t have = m_uploadCarryBytes;
++            std::memcpy(bytes, m_uploadCarry.data(), have);
++            while (have < 3u && offset < sizeBytes)
++                bytes[have++] = data[offset++];
++            m_uploadCarryBytes = 0u;
++            if (have < 3u)
++            {
++                // The pixel continues in the next chunk.
++                std::memcpy(m_uploadCarry.data(), bytes, have);
++                m_uploadCarryBytes = have;
+                 return;
+-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
+-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
++            }
++            const uint32_t value = static_cast<uint32_t>(bytes[0]) |
++                                   (static_cast<uint32_t>(bytes[1]) << 8u) |
++                                   (static_cast<uint32_t>(bytes[2]) << 16u);
+             WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 3u;
+             advancePixel(1u);
+             break;
+         }
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 88b190c..76c5fd4 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -44,20 +44,27 @@ void GifArbiter::drain()
+     if (!m_processFn)
+         return;
+ 
++    // PATH1/PATH2 drain as they arrive, so a batch is queued PATH3 packets plus
++    // at most a few later PATH1/PATH2 ones, all pending together. Those win
++    // arbitration over PATH3 (kept in submission order), except that DIRECTHL
++    // cannot preempt PATH3 IMAGE data. One integer rank per packet keeps the
++    // ordering strict-weak for stable_sort.
+     if (m_count > 1u)
+-        std::stable_sort(m_queue.begin(), m_queue.begin() + static_cast<std::ptrdiff_t>(m_count),
+-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+-                     {
+-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+-                         {
+-                             if (a.path3Image && b.path2DirectHl)
+-                                 return true;
+-                             if (a.path2DirectHl && b.path3Image)
+-                                 return false;
+-                         }
+-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
+-                     });
++    {
++        const auto end = m_queue.begin() + static_cast<std::ptrdiff_t>(m_count);
++        const bool path3ImageQueued = std::any_of(m_queue.begin(), end,
++            [](const GifArbiterPacket &packet) { return packet.path3Image; });
++        const auto rank = [path3ImageQueued](const GifArbiterPacket &packet)
++        {
++            if (packet.pathId == GifPathId::Path3)
++                return 2;
++            if (packet.path2DirectHl && path3ImageQueued)
++                return 3;
++            return pathPriority(packet.pathId) == pathPriority(GifPathId::Path1) ? 0 : 1;
++        };
++        std::stable_sort(m_queue.begin(), end, [&rank](const GifArbiterPacket &a, const GifArbiterPacket &b)
++                         { return rank(a) < rank(b); });
++    }
+ 
+     for (size_t i = 0; i < m_count; ++i)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..3e05cb9 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,9 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include "ps2_pad_input.h"
++#include <array>
+ #include <cstring>
++#include <mutex>
+ 
+ namespace
+ {
+@@ -25,101 +28,132 @@ namespace
+     constexpr uint16_t PAD_L2 = 0x0100u;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++namespace
+ {
+-    if (!data || size < 32)
+-        return false;
+-
+-    std::memset(data, 0, 32);
+-    data[0] = 0x01;
+-    data[1] = kPadAnalogMarker;
+-    data[2] = 0xFF;
+-    data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
++    // raylib input state belongs to the main thread, which polls it in
++    // EndDrawing(); the game thread reads this snapshot instead.
++    std::mutex g_hostPadMutex;
++    std::array<uint8_t, 32> g_hostPad{};
++    bool g_hostPadSampled = false;
+ 
+-    if (useGamepad)
++    void neutralPad(uint8_t *data)
+     {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
++        std::memset(data, 0, 32);
++        data[0] = 0x01;
++        data[1] = kPadAnalogMarker;
++        data[2] = 0xFF;
++        data[3] = 0xFF;
++        data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+     }
+-    else
++
++    void sampleHostPad(uint8_t *data)
+     {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
++        neutralPad(data);
++
++        uint16_t btns = 0xFFFFu;
++        constexpr int kGamepad = 0;
++        const bool useGamepad = IsGamepadAvailable(kGamepad);
++        auto clearBit = [&btns](uint16_t mask)
++        { btns &= ~mask; };
++
++        if (useGamepad)
++        {
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
++                clearBit(PAD_UP);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
++                clearBit(PAD_DOWN);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
++                clearBit(PAD_LEFT);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
++                clearBit(PAD_RIGHT);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
++                clearBit(PAD_CROSS);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
++                clearBit(PAD_CIRCLE);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
++                clearBit(PAD_SQUARE);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
++                clearBit(PAD_TRIANGLE);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
++                clearBit(PAD_L1);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
++                clearBit(PAD_R1);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
++                clearBit(PAD_L2);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
++                clearBit(PAD_R2);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
++                clearBit(PAD_START);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
++                clearBit(PAD_SELECT);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
++                clearBit(PAD_L3);
++            if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
++                clearBit(PAD_R3);
++
++            float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
++            float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
++            float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
++            float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
++            data[6] = static_cast<uint8_t>(128 + lx * 127);
++            data[7] = static_cast<uint8_t>(128 + ly * 127);
++            data[4] = static_cast<uint8_t>(128 + rx * 127);
++            data[5] = static_cast<uint8_t>(128 + ry * 127);
++        }
++        else
++        {
++            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
++                clearBit(PAD_UP);
++            if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
++                clearBit(PAD_DOWN);
++            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
++                clearBit(PAD_LEFT);
++            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
++                clearBit(PAD_RIGHT);
++            if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
++                clearBit(PAD_CROSS);
++            if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
++                clearBit(PAD_CIRCLE);
++            if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
++                clearBit(PAD_SQUARE);
++            if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
++                clearBit(PAD_TRIANGLE);
++            if (IsKeyDown(KEY_Q))
++                clearBit(PAD_L1);
++            if (IsKeyDown(KEY_E))
++                clearBit(PAD_R1);
++            if (IsKeyDown(KEY_LEFT_SHIFT))
++                clearBit(PAD_L2);
++            if (IsKeyDown(KEY_RIGHT_SHIFT))
++                clearBit(PAD_R2);
++            if (IsKeyDown(KEY_ENTER))
++                clearBit(PAD_START);
++            if (IsKeyDown(KEY_TAB))
++                clearBit(PAD_SELECT);
++        }
++
++        data[2] = static_cast<uint8_t>(btns & 0xFF);
++        data[3] = static_cast<uint8_t>(btns >> 8);
+     }
++}
++
++void ps2PadSampleHostInput()
++{
++    std::array<uint8_t, 32> pad{};
++    sampleHostPad(pad.data());
++    std::lock_guard<std::mutex> lock(g_hostPadMutex);
++    g_hostPad = pad;
++    g_hostPadSampled = true;
++}
+ 
+-    data[2] = static_cast<uint8_t>(btns & 0xFF);
+-    data[3] = static_cast<uint8_t>(btns >> 8);
++bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++{
++    if (!data || size < 32)
++        return false;
++    std::lock_guard<std::mutex> lock(g_hostPadMutex);
++    if (g_hostPadSampled)
++        std::memcpy(data, g_hostPad.data(), 32);
++    else
++        neutralPad(data); // no window has presented yet
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_pad_input.h b/ps2xRuntime/src/lib/ps2_pad_input.h
+new file mode 100644
+index 0000000..a1ebe2b
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pad_input.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++// Main thread only, right after EndDrawing() polled host input: publish the
++// pad state that PSPadBackend::readState hands to the game thread.
++void ps2PadSampleHostInput();
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 2646f86..fb51a7a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_pgs.h"
+ #include "ps2_runtime.h"
+ #include "ps2_disc_mount.h"
++#include "ps2_pad_input.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -2912,6 +2913,7 @@ void PS2Runtime::run()
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
+         EndDrawing();
++        ps2PadSampleHostInput();
+ 
+         if (WindowShouldClose())
+         {
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 7645c54..0f18e06 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -2414,6 +2414,39 @@ void register_ps2_gs_tests()
+             }
+         });
+ 
++        tc.Run("GS PSMCT24 upload carries pixels split across IMAGE qwords", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            const uint64_t bitblt = (static_cast<uint64_t>(1u) << 16) | (static_cast<uint64_t>(GS_PSM_CT24) << 24) |
++                                    (static_cast<uint64_t>(1u) << 48) | (static_cast<uint64_t>(GS_PSM_CT24) << 56);
++            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
++            gs.writeRegister(GS_REG_TRXPOS, 0ull);
++            gs.writeRegister(GS_REG_TRXREG, (32ull << 0) | (1ull << 32)); // 32 pixels => 96 bytes
++            gs.writeRegister(GS_REG_TRXDIR, 0ull);
++
++            uint8_t source[96] = {};
++            for (uint32_t i = 0; i < 96u; ++i)
++                source[i] = static_cast<uint8_t>(0x30u + i * 7u);
++            for (uint32_t qw = 0; qw < 6u; ++qw) // one qword per packet: pixels straddle every boundary
++            {
++                std::vector<uint8_t> packet;
++                appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
++                appendU64(packet, 0ull);
++                packet.insert(packet.end(), source + qw * 16u, source + qw * 16u + 16u);
++                gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++            }
++            for (uint32_t x = 0; x < 32u; ++x)
++            {
++                const uint32_t expected = static_cast<uint32_t>(source[x * 3u]) |
++                                          (static_cast<uint32_t>(source[x * 3u + 1u]) << 8u) |
++                                          (static_cast<uint32_t>(source[x * 3u + 2u]) << 16u);
++                t.Equals(gs.ReadVram(GS_PSM_CT24, 0u, 1u, x, 0u) & 0xFFFFFFu, expected,
++                         "every PSMCT24 pixel must survive qword-split IMAGE packets");
++            }
++        });
++
+         tc.Run("GS CT32 upload aliases cleanly into later PSMT8 sampling", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 6656399..094b20c 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1011,6 +1011,32 @@ void register_ps2_memory_tests()
+             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
+         });
+ 
++        tc.Run("GIF arbiter keeps PATH3 order when DIRECTHL waits for queued IMAGE data", [](TestCase &t)
++        {
++            std::vector<uint8_t> order;
++            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                if (data && sizeBytes > 0u)
++                    order.push_back(data[0]);
++            });
++            std::vector<uint8_t> image;
++            appendU64(image, makeGifTag(0x00AAu, 2u, 0u, true)); // IMAGE, first byte 0xAA
++            appendU64(image, 0ull);
++            std::vector<uint8_t> draw;
++            appendU64(draw, makeGifTag(0x00BBu, 0u, 0u, true)); // PACKED, first byte 0xBB
++            appendU64(draw, 0ull);
++            const std::vector<uint8_t> directHl(16u, 0xD2u);
++            const std::vector<uint8_t> direct(16u, 0x22u);
++            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
++            arbiter.submit(GifPathId::Path3, draw.data(), static_cast<uint32_t>(draw.size()));
++            arbiter.submit(GifPathId::Path2, directHl.data(), static_cast<uint32_t>(directHl.size()), true);
++            arbiter.submit(GifPathId::Path2, direct.data(), static_cast<uint32_t>(direct.size()));
++            arbiter.drain();
++            const std::vector<uint8_t> expected{0x22u, 0xAAu, 0xBBu, 0xD2u};
++            t.IsTrue(order == expected,
++                     "DIRECT preempts PATH3, PATH3 keeps its order, DIRECTHL waits for the IMAGE data");
++        });
++
+         tc.Run("GIF DMA mode0 copies RDRAM packet and clears channel", [](TestCase &t)
+         {
+             PS2Memory mem;
+-- 
+2.55.0
+

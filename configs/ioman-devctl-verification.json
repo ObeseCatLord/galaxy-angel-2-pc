@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "runtime_patch": {
+    "file": "0013-ioman-devctl-original-driver.patch",
+    "sha256": "3e22d2eaeed35f6519e0140656e2bb30b5dd62b2a879d71576ffc541b0b96d02",
+    "prefix": 13,
+    "reproduced_source_files": 65
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "document": "docs/reviews/ioman-devctl-original-driver.md",
+    "status": "accepted final source, boundary fixtures and observer fixes; required passing runs verified by main"
+  },
+  "tests": {
+    "runtime_passed": 475,
+    "runtime_failed": 0,
+    "iop_suites_passed": 9,
+    "iop_suites_failed": 0,
+    "tooling_passed": 15,
+    "tooling_failed": 0,
+    "new_ioman_cases": 3,
+    "incomplete_variants": [
+      "yield-to-return-sentinel",
+      "missing-import",
+      "budget-exhaustion"
+    ],
+    "boundary_checks": [
+      "otherwise-complete sentinel CPU after real nested budget failure",
+      "actual outer devctl fault precedence and both scratch slots quarantined",
+      "due callback failure before unrelated ready-thread selection; all CPU fields/state/canary preserved"
+    ]
+  },
+  "native_evidence": {
+    "capture": "20261009-035210",
+    "resolved_hooks": 4,
+    "probe_errors": 0,
+    "original_device": "cdrom",
+    "command": "4391",
+    "handler": "0001685c",
+    "gp": "00029410",
+    "lock_event": 6,
+    "checked_status": "Completed",
+    "reset_required": false,
+    "ioman_return": 0,
+    "output_event": 2,
+    "fileio_thread": {
+      "id": 7,
+      "state": "EventFlag",
+      "priority": 96,
+      "wait_id": 2,
+      "wait_bits": "10"
+    },
+    "original_mcserv": {
+      "current_thread": 12,
+      "sid": "80000400",
+      "handler": "0006d824",
+      "gp": "00076790",
+      "server_data": "00070bf8",
+      "buffer": "000707b0",
+      "queue": "00070be0"
+    },
+    "coverage": "bounded read-only function-entry/return observations; not total event counts",
+    "original_capture": "20261009-033137",
+    "servers_truncated": false,
+    "threads_truncated": false,
+    "debugger_exit_code": null,
+    "natural_exit_code": null,
+    "bounded_stop": true,
+    "observer_version": "final error/cap/truncation reporting; expected positive returns repeated; cleanup interrupts debugger shutdown"
+  },
+  "ordinary_capture": {
+    "id": "20261009-033023",
+    "last_frame": "20.2s magenta rectangle with black borders",
+    "scene_verified": false,
+    "audible_output_verified": false
+  },
+  "contract": "synchronous original driver callback; rejection before execution is recoverable; incomplete execution globally requires IOP reset and quarantines scratch",
+  "next_step": "inspect later EE main20A95C/RPC12345 receiving and presentation behavior against reference; do not change scheduling without original evidence",
+  "latest_debug_frame": {
+    "capture": "20261009-035210",
+    "frame": "15.2s magenta rectangle with black borders",
+    "visually_inspected": true,
+    "scene_verified": false
+  }
+}

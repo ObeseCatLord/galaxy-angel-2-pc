@@ -1,0 +1,1106 @@
+From 37aa5498d440b174e663e3296ddcf1ac43c730dd Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:22:08 -0500
+Subject: [PATCH] ga2: presentation module, filters, 2D/3D aware display,
+ dither off
+
+- ga2_present: play-area shape (GA2_ASPECT 4:3/16:9/21:9/fit), 4:3
+  picture with black, blurred or skybox sides, integer 2D scaling, window
+  title = the game's name per GA2_LANG.
+- Filters for 2D scenes only (VU1 activity marks 3D scenes): nearest,
+  sharp bilinear, smooth (edge-preserving de-dither), and mpv user shaders
+  through ga2_mpv_shader (Anime4K fast/HQ).
+- paraLLEl-GS dither off unless GA2_PGS_DITHER=1.
+- On-screen pad only with GA2_ONSCREEN_PAD=1; dialogue Auto button stays
+  recognised while auto mode is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                 |   2 +
+ ps2xRuntime/include/runtime/ga2_activity.h |  12 +
+ ps2xRuntime/src/lib/ga2_mpv_shader.cpp     | 387 +++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_mpv_shader.h       |  58 +++
+ ps2xRuntime/src/lib/ga2_present.cpp        | 352 +++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_present.h          |  40 +++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          |  12 +-
+ ps2xRuntime/src/lib/ps2_mouse.cpp          |   9 +
+ ps2xRuntime/src/lib/ps2_mouse.h            |   7 +-
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp    |   5 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  21 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    |   4 +
+ 12 files changed, 887 insertions(+), 22 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_activity.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_mpv_shader.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_present.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_present.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index ad76ef2..7eb6fbe 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -396,6 +396,8 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_mouse.cpp
+     src/lib/ps2_mouse_menus.cpp
++    src/lib/ga2_present.cpp
++    src/lib/ga2_mpv_shader.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_activity.h b/ps2xRuntime/include/runtime/ga2_activity.h
+new file mode 100644
+index 0000000..54bca05
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_activity.h
+@@ -0,0 +1,12 @@
++// Counters the presentation reads to tell 3D scenes from 2D ones.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace ga2_activity
++{
++    // VU1 microprogram runs so far (the GA2 discs draw their 3D through VU1;
++    // their 2D visual-novel scenes do not run VU1 at all).
++    extern std::atomic<uint64_t> vu1Runs;
++}
+diff --git a/ps2xRuntime/src/lib/ga2_mpv_shader.cpp b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+new file mode 100644
+index 0000000..48298b1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+@@ -0,0 +1,387 @@
++#include "ga2_mpv_shader.h"
++
++// raylib's GL loader (its function pointers are already loaded by InitWindow).
++#include "external/glad.h"
++
++#include <cmath>
++#include <cstdio>
++#include <map>
++#include <set>
++#include <sstream>
++
++namespace ga2_mpv
++{
++    namespace
++    {
++        std::string trim(const std::string &s)
++        {
++            const size_t a = s.find_first_not_of(" \t\r");
++            const size_t b = s.find_last_not_of(" \t\r");
++            return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
++        }
++
++        // mpv's hook points that carry the (RGB) picture in this port.
++        std::string alias(const std::string &hook)
++        {
++            if (hook == "NATIVE" || hook == "PREKERNEL" || hook == "LUMA" || hook == "MAINPRESUB")
++                return "MAIN";
++            return hook;
++        }
++
++        struct Size
++        {
++            float w = 0.0f, h = 0.0f;
++        };
++
++        // Reverse Polish expression: numbers, NAME.w / NAME.h (or .width /
++        // .height), + - * / > < = and ! (not).
++        bool evaluate(const std::string &expr, const std::map<std::string, Size> &sizes, float &out)
++        {
++            std::vector<float> stack;
++            std::istringstream in(expr);
++            for (std::string token; in >> token;)
++            {
++                if (token.size() == 1 && std::string("+-*/><=").find(token[0]) != std::string::npos)
++                {
++                    if (stack.size() < 2)
++                        return false;
++                    const float b = stack.back();
++                    stack.pop_back();
++                    float &a = stack.back();
++                    switch (token[0])
++                    {
++                    case '+': a = a + b; break;
++                    case '-': a = a - b; break;
++                    case '*': a = a * b; break;
++                    case '/': a = b != 0.0f ? a / b : 0.0f; break;
++                    case '>': a = a > b ? 1.0f : 0.0f; break;
++                    case '<': a = a < b ? 1.0f : 0.0f; break;
++                    case '=': a = a == b ? 1.0f : 0.0f; break;
++                    }
++                    continue;
++                }
++                if (token == "!")
++                {
++                    if (stack.empty())
++                        return false;
++                    stack.back() = stack.back() == 0.0f ? 1.0f : 0.0f;
++                    continue;
++                }
++                const size_t dot = token.rfind('.');
++                if (dot != std::string::npos && dot > 0 && !std::isdigit(static_cast<unsigned char>(token[0])))
++                {
++                    const auto it = sizes.find(alias(token.substr(0, dot)));
++                    if (it == sizes.end())
++                        return false;
++                    const std::string field = token.substr(dot + 1);
++                    stack.push_back(field == "w" || field == "width" ? it->second.w : it->second.h);
++                    continue;
++                }
++                char *end = nullptr;
++                const float value = std::strtof(token.c_str(), &end);
++                if (!end || *end)
++                    return false;
++                stack.push_back(value);
++            }
++            if (stack.size() != 1)
++                return false;
++            out = stack.back();
++            return true;
++        }
++
++        uint32_t compileShader(GLenum type, const std::string &source, const std::string &what)
++        {
++            const GLuint shader = glCreateShader(type);
++            const char *text = source.c_str();
++            glShaderSource(shader, 1, &text, nullptr);
++            glCompileShader(shader);
++            GLint ok = 0;
++            glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++            if (!ok)
++            {
++                char log[2048] = {};
++                glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++                std::fprintf(stderr, "[filter] %s: %s\n", what.c_str(), log);
++                glDeleteShader(shader);
++                return 0;
++            }
++            return shader;
++        }
++
++        const char *kVertex = "#version 330\n"
++                              "layout(location = 0) in vec2 position;\n"
++                              "out vec2 v_pos;\n"
++                              "void main() { v_pos = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }\n";
++    }
++
++    Chain::~Chain()
++    {
++        // The GL context may already be gone at exit; textures die with it.
++    }
++
++    bool Chain::add(const std::string &source, const std::string &name, std::string &error)
++    {
++        std::istringstream in(source);
++        Pass *current = nullptr;
++        bool inHeader = false;
++        int lineNumber = 0;
++        for (std::string line; std::getline(in, line);)
++        {
++            ++lineNumber;
++            if (line.rfind("//!", 0) == 0)
++            {
++                const std::string directive = trim(line.substr(3));
++                const size_t space = directive.find(' ');
++                const std::string key = directive.substr(0, space);
++                const std::string value = space == std::string::npos ? std::string() : trim(directive.substr(space + 1));
++                if (!inHeader)
++                {
++                    m_passes.emplace_back();
++                    current = &m_passes.back();
++                    inHeader = true;
++                }
++                if (key == "HOOK")
++                    current->hook = value;
++                else if (key == "BIND")
++                    current->binds.push_back(value);
++                else if (key == "SAVE")
++                    current->save = value;
++                else if (key == "WIDTH")
++                    current->width = value;
++                else if (key == "HEIGHT")
++                    current->height = value;
++                else if (key == "WHEN")
++                    current->when = value;
++                else if (key == "DESC")
++                    current->desc = value;
++                else if (key == "COMPONENTS" || key == "OFFSET")
++                    ;
++                else
++                {
++                    error = name + ":" + std::to_string(lineNumber) + ": unsupported directive //!" + key;
++                    return false;
++                }
++                continue;
++            }
++            inHeader = false;
++            if (current)
++                current->body += line + "\n";
++        }
++        for (const Pass &pass : m_passes)
++            if (pass.hook.empty())
++            {
++                error = name + ": a pass without //!HOOK";
++                return false;
++            }
++        return true;
++    }
++
++    bool Chain::compile(Pass &pass)
++    {
++        std::string fs = "#version 330\nin vec2 v_pos;\nout vec4 ga2_out;\n"
++                         "uniform vec2 target_size;\nuniform int frame;\nuniform float random;\n"
++                         "#define PI 3.14159265358979323846\n";
++        std::set<std::string> declared;
++        auto declare = [&](const std::string &n) {
++            if (!declared.insert(n).second)
++                return;
++            fs += "uniform sampler2D " + n + "_raw;\nuniform vec2 " + n + "_size;\nuniform vec2 " + n + "_pt;\n"
++                  "#define " + n + "_pos v_pos\n#define " + n + "_mul 1.0\n"
++                  "#define " + n + "_tex(pos) (" + n + "_mul * texture(" + n + "_raw, pos))\n"
++                  "#define " + n + "_texOff(off) " + n + "_tex(" + n + "_pos + " + n + "_pt * vec2(off))\n";
++        };
++        for (const std::string &b : pass.binds)
++            declare(b);
++        // Binding HOOKED also names the hooked texture by its hook name.
++        for (const std::string &b : pass.binds)
++            if (b == "HOOKED" && !declared.count(pass.hook))
++            {
++                declared.insert(pass.hook);
++                for (const char *suffix : {"_raw", "_size", "_pt", "_pos", "_mul"})
++                    fs += "#define " + pass.hook + suffix + " HOOKED" + suffix + "\n";
++                fs += "#define " + pass.hook + "_tex(pos) HOOKED_tex(pos)\n#define " + pass.hook + "_texOff(off) HOOKED_texOff(off)\n";
++            }
++        fs += pass.body + "\nvoid main() { ga2_out = hook(); }\n";
++
++        const GLuint vs = compileShader(GL_VERTEX_SHADER, kVertex, pass.desc + " (vertex)");
++        const GLuint ps = compileShader(GL_FRAGMENT_SHADER, fs, pass.desc);
++        if (!vs || !ps)
++        {
++            if (vs) glDeleteShader(vs);
++            if (ps) glDeleteShader(ps);
++            return false;
++        }
++        const GLuint program = glCreateProgram();
++        glAttachShader(program, vs);
++        glAttachShader(program, ps);
++        glBindAttribLocation(program, 0, "position");
++        glLinkProgram(program);
++        glDeleteShader(vs);
++        glDeleteShader(ps);
++        GLint ok = 0;
++        glGetProgramiv(program, GL_LINK_STATUS, &ok);
++        if (!ok)
++        {
++            char log[2048] = {};
++            glGetProgramInfoLog(program, sizeof(log), nullptr, log);
++            std::fprintf(stderr, "[filter] %s: link: %s\n", pass.desc.c_str(), log);
++            glDeleteProgram(program);
++            return false;
++        }
++        pass.program = program;
++        return true;
++    }
++
++    Chain::Surface *Chain::surface(int width, int height)
++    {
++        for (Surface &s : m_pool)
++            if (!s.busy && s.width == width && s.height == height)
++            {
++                s.busy = true;
++                return &s;
++            }
++        // Surfaces are handed out by pointer: never reallocate the pool.
++        if (m_pool.capacity() < 64)
++            m_pool.reserve(64);
++        if (m_pool.size() == m_pool.capacity())
++            return nullptr;
++        Surface s;
++        s.width = width;
++        s.height = height;
++        glGenTextures(1, &s.texture);
++        glBindTexture(GL_TEXTURE_2D, s.texture);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glGenFramebuffers(1, &s.framebuffer);
++        glBindFramebuffer(GL_FRAMEBUFFER, s.framebuffer);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.texture, 0);
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++            std::fprintf(stderr, "[filter] incomplete framebuffer %dx%d\n", width, height);
++        s.busy = true;
++        m_pool.push_back(s);
++        return &m_pool.back();
++    }
++
++    uint32_t Chain::run(uint32_t input, int width, int height, int outputWidth, int outputHeight,
++                        int &resultWidth, int &resultHeight)
++    {
++        if (m_passes.empty() || width <= 0 || height <= 0)
++            return 0;
++        if (!m_vertexArray)
++        {
++            static const float quad[12] = {-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1};
++            glGenVertexArrays(1, &m_vertexArray);
++            glBindVertexArray(m_vertexArray);
++            glGenBuffers(1, &m_vertexBuffer);
++            glBindBuffer(GL_ARRAY_BUFFER, m_vertexBuffer);
++            glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
++            glEnableVertexAttribArray(0);
++            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
++            glGenSamplers(1, &m_sampler);
++            glSamplerParameteri(m_sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glSamplerParameteri(m_sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glSamplerParameteri(m_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glSamplerParameteri(m_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        }
++        for (Surface &s : m_pool)
++            s.busy = false;
++        ++m_frame;
++
++        struct Image
++        {
++            uint32_t texture;
++            int width, height;
++            Surface *owner;
++        };
++        std::map<std::string, Image> images;
++        images["MAIN"] = {input, width, height, nullptr};
++
++        glDisable(GL_BLEND);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_SCISSOR_TEST);
++        glDisable(GL_CULL_FACE);
++        glBindVertexArray(m_vertexArray);
++        bool ok = true;
++        for (Pass &pass : m_passes)
++        {
++            const std::string hooked = alias(pass.hook);
++            if (!images.count(hooked))
++                continue; // hook point that never occurs here
++            std::map<std::string, Size> sizes;
++            for (const auto &[name, image] : images)
++                sizes[name] = {float(image.width), float(image.height)};
++            sizes["HOOKED"] = sizes[hooked];
++            sizes["OUTPUT"] = {float(outputWidth), float(outputHeight)};
++            float value = 0.0f;
++            if (!pass.when.empty() && evaluate(pass.when, sizes, value) && value == 0.0f)
++                continue;
++            int w = images[hooked].width, h = images[hooked].height;
++            if (!pass.width.empty() && evaluate(pass.width, sizes, value))
++                w = std::max(1, int(std::lround(value)));
++            if (!pass.height.empty() && evaluate(pass.height, sizes, value))
++                h = std::max(1, int(std::lround(value)));
++            if (!pass.program && !pass.failed)
++                pass.failed = !compile(pass);
++            if (pass.failed)
++            {
++                ok = false;
++                break;
++            }
++            Surface *target = surface(w, h);
++            if (!target)
++            {
++                ok = false;
++                break;
++            }
++            glBindFramebuffer(GL_FRAMEBUFFER, target->framebuffer);
++            glViewport(0, 0, w, h);
++            glUseProgram(pass.program);
++            glUniform2f(glGetUniformLocation(pass.program, "target_size"), float(w), float(h));
++            glUniform1i(glGetUniformLocation(pass.program, "frame"), int(m_frame));
++            glUniform1f(glGetUniformLocation(pass.program, "random"), float((m_frame * 2654435761u) & 0xFFFFu) / 65535.0f);
++            int unit = 0;
++            for (const std::string &b : pass.binds)
++            {
++                const std::string source = b == "HOOKED" ? hooked : alias(b);
++                const auto it = images.find(source);
++                if (it == images.end())
++                {
++                    std::fprintf(stderr, "[filter] %s: unknown texture %s\n", pass.desc.c_str(), b.c_str());
++                    ok = false;
++                    break;
++                }
++                glActiveTexture(GL_TEXTURE0 + unit);
++                glBindTexture(GL_TEXTURE_2D, it->second.texture);
++                glBindSampler(unit, m_sampler);
++                glUniform1i(glGetUniformLocation(pass.program, (b + "_raw").c_str()), unit);
++                glUniform2f(glGetUniformLocation(pass.program, (b + "_size").c_str()), float(it->second.width),
++                            float(it->second.height));
++                glUniform2f(glGetUniformLocation(pass.program, (b + "_pt").c_str()), 1.0f / float(it->second.width),
++                            1.0f / float(it->second.height));
++                ++unit;
++            }
++            if (!ok)
++                break;
++            glDrawArrays(GL_TRIANGLES, 0, 6);
++            for (int u = 0; u < unit; ++u)
++                glBindSampler(u, 0);
++            const std::string saved = pass.save.empty() ? hooked : pass.save;
++            if (const auto old = images.find(saved); old != images.end() && old->second.owner)
++                old->second.owner->busy = false; // pass inputs are done with it
++            images[saved] = {target->texture, w, h, target};
++        }
++        glBindVertexArray(0);
++        glUseProgram(0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        if (!ok)
++            return 0;
++        const Image &out = images["MAIN"];
++        resultWidth = out.width;
++        resultHeight = out.height;
++        return out.texture;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_mpv_shader.h b/ps2xRuntime/src/lib/ga2_mpv_shader.h
+new file mode 100644
+index 0000000..23fe0b7
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_mpv_shader.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Runs mpv user shaders (the "//!HOOK" GLSL format used by Anime4K and many
++// other scalers) on an OpenGL texture. Supported: HOOK (MAIN and its aliases
++// NATIVE, PREKERNEL, LUMA, which all mean the game picture here), BIND, SAVE,
++// WIDTH/HEIGHT/WHEN (reverse Polish expressions over NAME.w/NAME.h and
++// OUTPUT), DESC and COMPONENTS (intermediates are RGBA16F regardless).
++// Main thread only, with the window's GL context current.
++namespace ga2_mpv
++{
++    class Chain
++    {
++    public:
++        Chain() = default;
++        Chain(const Chain &) = delete;
++        Chain &operator=(const Chain &) = delete;
++        ~Chain();
++
++        // Appends the passes of one shader file's text; false (with a
++        // message) when it cannot be parsed.
++        bool add(const std::string &source, const std::string &name, std::string &error);
++        bool empty() const { return m_passes.empty(); }
++
++        // Runs every pass on `input` (an RGBA texture, `width` x `height`,
++        // first row at t = 0). outputWidth/outputHeight are the size it will
++        // be shown at (mpv's OUTPUT). Returns the resulting texture (owned by
++        // the chain, valid until the next run) and its size; 0 on failure.
++        uint32_t run(uint32_t input, int width, int height, int outputWidth, int outputHeight,
++                     int &resultWidth, int &resultHeight);
++
++    private:
++        struct Pass
++        {
++            std::string desc, hook, save, width, height, when, body;
++            std::vector<std::string> binds;
++            uint32_t program = 0;
++            bool failed = false;
++        };
++        struct Surface
++        {
++            uint32_t texture = 0, framebuffer = 0;
++            int width = 0, height = 0;
++            bool busy = false;
++        };
++
++        bool compile(Pass &pass);
++        Surface *surface(int width, int height);
++
++        std::vector<Pass> m_passes;
++        std::vector<Surface> m_pool;
++        uint32_t m_vertexArray = 0, m_vertexBuffer = 0, m_sampler = 0;
++        uint32_t m_frame = 0;
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+new file mode 100644
+index 0000000..4489375
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -0,0 +1,352 @@
++#include "ga2_present.h"
++#include "ga2_mpv_shader.h"
++#include "runtime/ga2_activity.h"
++
++#include "raylib.h"
++#include "rlgl.h"
++#include "external/glad.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <sstream>
++
++namespace ga2_present
++{
++    namespace
++    {
++        enum class Sides { Black, Blur, Skybox };
++        enum class Filter { Nearest, Bilinear, Sharp, Smooth, Anime4K, Anime4KHQ };
++
++        std::string env(const char *name, const char *fallback)
++        {
++            const char *v = std::getenv(name);
++            return v && *v ? std::string(v) : std::string(fallback);
++        }
++
++        struct Settings
++        {
++            float aspect = 16.0f / 9.0f; // 0: the window's own shape
++            Sides sides = Sides::Black;
++            Filter filter = Filter::Bilinear;
++            std::string skybox;
++            bool english = false;
++            bool integer2d = false; // 2D scenes at whole multiples of 640x448
++        };
++
++        Settings load()
++        {
++            Settings s;
++            const std::string aspect = env("GA2_ASPECT", "16:9");
++            s.aspect = aspect == "4:3" ? 4.0f / 3.0f : aspect == "21:9" ? 64.0f / 27.0f : aspect == "fit" ? 0.0f : 16.0f / 9.0f;
++            const std::string sides = env("GA2_SIDES", "black");
++            s.sides = sides == "blur" ? Sides::Blur : sides == "skybox" ? Sides::Skybox : Sides::Black;
++            s.skybox = env("GA2_SKYBOX", "");
++            const std::string filter = env("GA2_FILTER", "bilinear");
++            s.filter = filter == "nearest" ? Filter::Nearest
++                       : filter == "sharp" ? Filter::Sharp
++                       : filter == "smooth" ? Filter::Smooth
++                       : filter == "anime4k" ? Filter::Anime4K
++                       : filter == "anime4k-hq" ? Filter::Anime4KHQ
++                                                : Filter::Bilinear;
++            s.english = env("GA2_LANG", "ja") == "en";
++            s.integer2d = env("GA2_SCALE_2D", "fill") == "integer";
++            return s;
++        }
++
++        Settings &settings()
++        {
++            static Settings s = load();
++            return s;
++        }
++
++        bool g_wide = false;
++        // 3D scene: VU1 ran within the last half second.
++        uint64_t g_lastVu1Runs = 0;
++        double g_last3d = -10.0;
++        bool g_ready = false;
++        std::unique_ptr<ga2_mpv::Chain> g_chain; // smooth / Anime4K
++        Shader g_sharp{};
++        bool g_sharpLoaded = false;
++        RenderTexture2D g_blur[3]{};
++        Texture2D g_skybox{};
++
++        // Edge-preserving 3x3 average: evens out the ordered/error-diffusion
++        // dither baked into the games' 16-bit and paletted art while keeping
++        // edges and line art (weights fall off with colour distance).
++        const char *kSmooth = R"(//!DESC GA2 smooth (de-dither)
++//!HOOK MAIN
++//!BIND HOOKED
++vec4 hook() {
++    vec4 c = HOOKED_tex(HOOKED_pos);
++    vec4 sum = vec4(0.0);
++    float total = 0.0;
++    for (int y = -1; y <= 1; ++y)
++        for (int x = -1; x <= 1; ++x) {
++            vec4 s = HOOKED_texOff(vec2(x, y));
++            vec3 d = s.rgb - c.rgb;
++            float spatial = (x == 0 && y == 0) ? 1.0 : ((x == 0 || y == 0) ? 0.6 : 0.35);
++            float w = spatial * exp(-dot(d, d) / (2.0 * 0.06 * 0.06));
++            sum += s * w;
++            total += w;
++        }
++    return sum / total;
++}
++)";
++
++        // Sharp bilinear: nearest within each texel, bilinear only across
++        // the texel edges (crisp pixels at non-integer scales).
++        const char *kSharp = R"(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec4 colDiffuse;
++uniform vec2 sourceSize;
++uniform vec2 scale;
++out vec4 finalColor;
++void main() {
++    vec2 texel = fragTexCoord * sourceSize;
++    vec2 region = 0.5 - 0.5 / max(scale, vec2(1.0));
++    vec2 center = fract(texel) - 0.5;
++    vec2 f = (center - clamp(center, -region, region)) * max(scale, vec2(1.0)) + 0.5;
++    finalColor = texture(texture0, (floor(texel) + f) / sourceSize) * fragColor * colDiffuse;
++}
++)";
++
++        std::string readFile(const std::filesystem::path &path)
++        {
++            std::ifstream in(path, std::ios::binary);
++            std::ostringstream out;
++            out << in.rdbuf();
++            return out.str();
++        }
++
++        std::filesystem::path shaderDir()
++        {
++            if (const char *dir = std::getenv("GA2_SHADER_DIR"); dir && *dir)
++                return dir;
++            return std::filesystem::path(GetApplicationDirectory()) / "shaders";
++        }
++
++        bool loadChain(const std::vector<std::string> &files)
++        {
++            g_chain = std::make_unique<ga2_mpv::Chain>();
++            for (const std::string &file : files)
++            {
++                const std::filesystem::path path = shaderDir() / file;
++                const std::string text = readFile(path);
++                std::string error;
++                if (text.empty() || !g_chain->add(text, file, error))
++                {
++                    std::fprintf(stderr, "[filter] cannot use %s%s%s\n", path.string().c_str(),
++                                 error.empty() ? "" : ": ", error.c_str());
++                    g_chain.reset();
++                    return false;
++                }
++            }
++            return true;
++        }
++
++        Rect fitAspect(Rect area, float aspect)
++        {
++            if (aspect <= 0.0f || area.width <= 0.0f || area.height <= 0.0f)
++                return area;
++            Rect r = area;
++            if (area.width / area.height > aspect)
++            {
++                r.width = area.height * aspect;
++                r.x = area.x + (area.width - r.width) * 0.5f;
++            }
++            else
++            {
++                r.height = area.width / aspect;
++                r.y = area.y + (area.height - r.height) * 0.5f;
++            }
++            return r;
++        }
++
++        void drawBlurredSides(const Texture2D &frame, float srcWidth, float srcHeight, Rect area)
++        {
++            // Downsample in steps (each bilinear tap averages its neighbours),
++            // then stretch the tiny copy over the area: a soft, dimmed backdrop.
++            static const int sizes[3][2] = {{320, 224}, {80, 56}, {20, 14}};
++            for (int i = 0; i < 3; ++i)
++                if (g_blur[i].id == 0)
++                {
++                    g_blur[i] = LoadRenderTexture(sizes[i][0], sizes[i][1]);
++                    SetTextureFilter(g_blur[i].texture, TEXTURE_FILTER_BILINEAR);
++                }
++            const Texture2D *src = &frame;
++            Rectangle srcRect{0, 0, srcWidth, srcHeight};
++            for (int i = 0; i < 3; ++i)
++            {
++                BeginTextureMode(g_blur[i]);
++                DrawTexturePro(*src, srcRect, Rectangle{0, 0, float(sizes[i][0]), float(sizes[i][1])}, Vector2{0, 0}, 0.0f,
++                               WHITE);
++                EndTextureMode();
++                src = &g_blur[i].texture;
++                // Render textures are stored bottom-up.
++                srcRect = Rectangle{0, 0, float(sizes[i][0]), -float(sizes[i][1])};
++            }
++            DrawTexturePro(*src, srcRect, Rectangle{area.x, area.y, area.width, area.height}, Vector2{0, 0}, 0.0f,
++                           Color{110, 110, 120, 255});
++        }
++
++        void drawSkybox(Rect area)
++        {
++            if (g_skybox.id == 0)
++                return;
++            // A slowly turning window onto the panorama's horizon band.
++            const float bandHeight = g_skybox.height * 0.5f;
++            const float bandWidth = bandHeight * area.width / area.height;
++            const float turn = std::fmod(float(GetTime()) * 2.0f, float(g_skybox.width));
++            const Rectangle src{turn, (g_skybox.height - bandHeight) * 0.5f, bandWidth, bandHeight};
++            DrawTexturePro(g_skybox, src, Rectangle{area.x, area.y, area.width, area.height}, Vector2{0, 0}, 0.0f, WHITE);
++        }
++    }
++
++    float windowAspect()
++    {
++        const float aspect = settings().aspect;
++        return aspect > 0.0f ? aspect : 16.0f / 9.0f;
++    }
++
++    std::string title(const std::string &program)
++    {
++        const bool en = settings().english;
++        if (program.rfind("SLPM_662", 0) == 0)
++            return en ? "Galaxy Angel II: Zettai Ryouiki no Tobira" : "ギャラクシーエンジェルⅡ 絶対領域の扉";
++        if (program.rfind("SLPM_667", 0) == 0)
++            return en ? "Galaxy Angel II: Mugen Kairou no Kagi" : "ギャラクシーエンジェルⅡ 無限回廊の鍵";
++        if (program.rfind("SLPM_551", 0) == 0)
++            return en ? "Galaxy Angel II: Eigou Kaiki no Toki" : "ギャラクシーエンジェルⅡ 永劫回帰の刻";
++        return en ? "Galaxy Angel II" : "ギャラクシーエンジェルⅡ";
++    }
++
++    void init(const std::string &program)
++    {
++        SetWindowTitle(title(program).c_str());
++        Settings &s = settings();
++        switch (s.filter)
++        {
++        case Filter::Smooth:
++        {
++            g_chain = std::make_unique<ga2_mpv::Chain>();
++            std::string error;
++            if (!g_chain->add(kSmooth, "smooth", error))
++            {
++                std::fprintf(stderr, "[filter] smooth: %s\n", error.c_str());
++                g_chain.reset();
++            }
++            break;
++        }
++        case Filter::Anime4K:
++            // Anime4K "mode A (fast)": restore, then a CNN 2x upscale.
++            loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_M.glsl",
++                       "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
++            break;
++        case Filter::Anime4KHQ:
++            // Anime4K "mode A (HQ)": larger networks and a second 2x step.
++            loadChain({"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_VL.glsl",
++                       "anime4k/Anime4K_Upscale_CNN_x2_VL.glsl", "anime4k/Anime4K_AutoDownscalePre_x2.glsl",
++                       "anime4k/Anime4K_AutoDownscalePre_x4.glsl", "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"});
++            break;
++        case Filter::Sharp:
++            g_sharp = LoadShaderFromMemory(nullptr, kSharp);
++            g_sharpLoaded = IsShaderValid(g_sharp);
++            break;
++        default:
++            break;
++        }
++        if (s.sides == Sides::Skybox)
++        {
++            if (!s.skybox.empty() && std::filesystem::exists(s.skybox))
++            {
++                g_skybox = LoadTexture(s.skybox.c_str());
++                SetTextureFilter(g_skybox, TEXTURE_FILTER_BILINEAR);
++                SetTextureWrap(g_skybox, TEXTURE_WRAP_REPEAT);
++            }
++            if (g_skybox.id == 0)
++            {
++                std::fprintf(stderr, "[present] no skybox image (GA2_SKYBOX); sides stay black\n");
++                s.sides = Sides::Black;
++            }
++        }
++        std::fprintf(stderr, "[present] aspect %.3f, filter %s\n", s.aspect,
++                     g_chain ? "shader chain" : g_sharpLoaded ? "sharp bilinear"
++                                              : s.filter == Filter::Nearest ? "nearest" : "bilinear");
++        g_ready = true;
++    }
++
++    void setWideFrame(bool wide) { g_wide = wide; }
++
++    Rect draw(const Texture &frame, float srcWidth, float srcHeight)
++    {
++        const Settings &s = settings();
++        const uint64_t runs = ga2_activity::vu1Runs.load(std::memory_order_relaxed);
++        if (runs != g_lastVu1Runs)
++            g_last3d = GetTime();
++        g_lastVu1Runs = runs;
++        // Upscalers, smoothing and integer scaling are made for 2D art: 3D
++        // scenes always fill the play area with plain bilinear.
++        const bool scene3d = GetTime() - g_last3d < 0.5;
++
++        const Rect window{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
++        const Rect area = fitAspect(window, s.aspect);
++        // A PS2 picture is 4:3 on a TV, whatever its pixel count.
++        Rect picture = g_wide ? area : fitAspect(area, 4.0f / 3.0f);
++        if (s.integer2d && !scene3d && !g_wide)
++        {
++            // Whole multiples of 640x448 (square pixels): crisp 2x, 3x...
++            const float k = std::max(1.0f, std::floor(std::min(area.width / 640.0f, area.height / 448.0f)));
++            picture = Rect{area.x + (area.width - 640.0f * k) * 0.5f, area.y + (area.height - 448.0f * k) * 0.5f,
++                           640.0f * k, 448.0f * k};
++        }
++
++        Texture2D shown = frame;
++        Rectangle source{0.0f, 0.0f, srcWidth, srcHeight};
++        if (g_ready && g_chain && !scene3d && frame.width == int(srcWidth) && frame.height == int(srcHeight))
++        {
++            rlDrawRenderBatchActive();
++            int w = 0, h = 0;
++            const uint32_t result =
++                g_chain->run(frame.id, frame.width, frame.height, int(picture.width), int(picture.height), w, h);
++            glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++            if (result)
++            {
++                shown = Texture2D{result, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16};
++                source = Rectangle{0.0f, 0.0f, float(w), float(h)};
++            }
++        }
++        else
++            SetTextureFilter(frame, s.filter == Filter::Nearest && !scene3d ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
++
++        if (!g_wide && (picture.width < area.width || picture.height < area.height))
++        {
++            if (s.sides == Sides::Blur)
++                drawBlurredSides(frame, srcWidth, srcHeight, area);
++            else if (s.sides == Sides::Skybox)
++                drawSkybox(area);
++        }
++
++        const Rectangle dst{picture.x, picture.y, picture.width, picture.height};
++        if (g_sharpLoaded && !scene3d && shown.id == frame.id)
++        {
++            const float sourceSize[2] = {srcWidth, srcHeight};
++            const float scale[2] = {picture.width / srcWidth, picture.height / srcHeight};
++            SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "sourceSize"), sourceSize, SHADER_UNIFORM_VEC2);
++            SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "scale"), scale, SHADER_UNIFORM_VEC2);
++            BeginShaderMode(g_sharp);
++            DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
++            EndShaderMode();
++        }
++        else
++            DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
++        return picture;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+new file mode 100644
+index 0000000..d9be5a3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <string>
++
++struct Texture;
++
++// How the game picture reaches the window (main thread only).
++//
++// Settings come from the environment (the launcher's options):
++//   GA2_ASPECT  4:3 | 16:9 | 21:9 | fit   shape of the play area / window
++//   GA2_SIDES   black | blur | skybox     what fills the sides of a 4:3 picture
++//   GA2_SKYBOX  <png>                     equirectangular panorama for "skybox"
++//   GA2_FILTER  nearest | bilinear | sharp | smooth | anime4k | anime4k-hq
++//               (2D scenes only: 3D scenes, which run VU1, stay bilinear)
++//   GA2_SCALE_2D fill | integer           2D scenes: fill, or whole multiples
++//               of 640x448 (3D scenes always fill)
++//   GA2_LANG    ja | en                   window title language
++// The PS2 picture (640x448) is shown at 4:3 like on a TV. A frame the game
++// rendered for a wider view (hor+, see setWideFrame) fills the whole area.
++namespace ga2_present
++{
++    struct Rect
++    {
++        float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
++    };
++
++    // Width / height of the window to open (from GA2_ASPECT; 16:9 for "fit").
++    float windowAspect();
++    // After the program is known: window title, filters (GL context current).
++    void init(const std::string &program);
++    // The title for a program ("SLPM_662.43") in the chosen language.
++    std::string title(const std::string &program);
++
++    // Inside BeginDrawing: draws the frame (srcWidth x srcHeight of it is the
++    // picture) and returns where the picture went, in window pixels.
++    Rect draw(const Texture &frame, float srcWidth, float srcHeight);
++
++    // The current frame was rendered for the full play-area aspect (hor+).
++    void setWideFrame(bool wide);
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index c66d91e..c7f179f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -205,10 +205,18 @@ namespace
+             std::fprintf(stderr, "[pgs] GSInterface init failed; using the software GS\n");
+             return false;
+         }
++        // The GA2 discs render into a 32-bit buffer, copy it with the GS's
++        // ordered dither into a 16-bit scanout buffer and draw the UI on top
++        // there (so backbuffer promotion cannot apply). Without the dither the
++        // copy truncates to 16 bits; GA2_PGS_DITHER=1 (launcher option) keeps
++        // the PS2 checkerboard.
++        Hacks hacks = {};
++        hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
++        s.gs.set_hacks(hacks);
+         s.ok = true;
+         g_rendering.store(true, std::memory_order_release);
+-        std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u\n",
+-                     s.device.get_gpu_properties().deviceName, s.ssaa);
++        std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s\n",
++                     s.device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on");
+         return true;
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+index 2f7bbb3..2f3d1ce 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <cstdlib>
+ 
+ namespace ps2_mouse
+ {
+@@ -42,11 +43,19 @@ namespace ps2_mouse
+ 
+         bool g_inBars = true;
+ 
++        // GA2_ONSCREEN_PAD=1 (launcher option, off by default) enables the pad.
++        const bool g_padEnabled = [] {
++            const char *v = std::getenv("GA2_ONSCREEN_PAD");
++            return v && *v == '1';
++        }();
++
+         // In the side bars the pad shows whenever the mouse moved recently;
+         // over the image (no bars) only while the pointer is near its edges,
+         // so it does not cover menus being pointed at.
+         bool padVisible()
+         {
++            if (!g_padEnabled)
++                return false;
+             if (g_overPad)
+                 return true;
+             if (GetTime() - g_lastMove >= 2.5)
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.h b/ps2xRuntime/src/lib/ps2_mouse.h
+index db41591..a1bb78f 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse.h
++++ b/ps2xRuntime/src/lib/ps2_mouse.h
+@@ -4,10 +4,9 @@
+ 
+ // Mouse play (main thread only). Over the game image: left click = Circle,
+ // right click = Cross, middle click = Select, wheel = D-pad up/down, and
+-// menus the game is known to show (ps2_mouse_menus) follow the pointer. An
+-// on-screen pad (D-pad, face buttons, shoulders, Select, Start) appears in the
+-// side bars while the mouse moves, so every part of a game can be played with
+-// the mouse alone.
++// menus the game is known to show (ps2_mouse_menus) follow the pointer. With
++// GA2_ONSCREEN_PAD=1 an on-screen pad (D-pad, face buttons, shoulders,
++// Select, Start) appears in the side bars while the mouse moves.
+ namespace ps2_mouse
+ {
+     struct Rect
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index 9a38f00..d555105 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -82,8 +82,9 @@ namespace ps2_mouse_menus
+         {
+             static const std::vector<VisualDef> table = {
+                 // Dialogue box buttons, the same in all three games: Auto = Triangle,
+-                // Back = Square, Menu = Select (white label pixels and the frame edges).
+-                {{{594, 362, 248, 248, 248}, {570, 386, 248, 248, 248}, {585, 393, 248, 248, 248},
++                // Back = Square, Menu = Select (white Back/Menu label pixels and the
++                // frame edges; the Auto label turns dark while auto mode is on).
++                {{{570, 386, 248, 248, 248}, {585, 393, 248, 248, 248},
+                   {601, 350, 88, 216, 248}, {609, 376, 79, 178, 216}, {602, 399, 40, 104, 128}},
+                  {{{540, 347, 622, 372}, kTriangle}, {{540, 377, 622, 402}, kSquare}, {{540, 407, 622, 432}, kSelect}}},
+             };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index eca699b..7273808 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -4,6 +4,7 @@
+ #include "ps2_pad_input.h"
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
++#include "ga2_present.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -912,9 +913,10 @@ bool PS2Runtime::initialize(const char *title)
+         int windowScale = 1;
+         if (const char *scale = std::getenv("GA2_WINDOW_SCALE"))
+             windowScale = std::clamp(std::atoi(scale), 1, 8);
+-        // 16:9 so the 4:3 picture leaves side bars for the mouse pad.
++        // The play area's shape (GA2_ASPECT, see ga2_present.h); the title is
++        // the game's name once the program is known.
+         const int windowHeight = HOST_WINDOW_HEIGHT * windowScale;
+-        InitWindow(windowHeight * 16 / 9, windowHeight, title);
++        InitWindow(int(std::lround(windowHeight * ga2_present::windowAspect())), windowHeight, title);
+         if (const char *full = std::getenv("GA2_FULLSCREEN"); full && *full == '1')
+             ToggleBorderlessWindowed();
+         InitAudioDevice();
+@@ -2827,6 +2829,7 @@ void PS2Runtime::run()
+     ps2_stubs::resetMpegStubState();
+     initializeEeKernelState(m_memory.getRDRAM());
+     ps2_mouse_menus::attach(m_memory.getRDRAM(), g_programName);
++    ga2_present::init(g_programName);
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
+@@ -2966,18 +2969,8 @@ void PS2Runtime::run()
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+-        const float screenWidth = static_cast<float>(GetScreenWidth());
+-        const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
+-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+-        const Rectangle dstRect{
+-            (screenWidth - dstWidth) * 0.5f,
+-            (screenHeight - dstHeight) * 0.5f,
+-            dstWidth,
+-            dstHeight};
+-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        // Aspect, side fill and filters: ga2_present.
++        const ga2_present::Rect dstRect = ga2_present::draw(frameTex, srcWidth, srcHeight);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 0b0b9ba..d235353 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_pgs.h"
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/ps2_vu1_reach.h"
++#include "runtime/ga2_activity.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+@@ -954,6 +955,8 @@ namespace
+     std::atomic<uint64_t> g_vu1Runs{0}, g_vu1Cycles{0}, g_vu1Nanos{0};
+ }
+ 
++std::atomic<uint64_t> ga2_activity::vu1Runs{0};
++
+ VU1Interpreter::PerfSample VU1Interpreter::takePerfSample()
+ {
+     return {g_vu1Runs.exchange(0), g_vu1Cycles.exchange(0), g_vu1Nanos.exchange(0)};
+@@ -980,6 +983,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                  std::memory_order_relaxed);
+         }
+     } perfScope{perfStart, perfCycle, m_cycle};
++    ga2_activity::vu1Runs.fetch_add(1, std::memory_order_relaxed);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+-- 
+2.55.0
+

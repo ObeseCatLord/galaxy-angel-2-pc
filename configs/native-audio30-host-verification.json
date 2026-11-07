@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "private_diagnostic_only": true,
+  "production_approved": false,
+  "accepted_public_source_patch_prefix": 23,
+  "accepted_public_native_patch_prefix": 22,
+  "allfive_public_native_binaries_unchanged": true,
+  "private27_native_unchanged": true,
+  "review": {
+    "effective_model": "gpt-6-astra",
+    "effective_effort": "ultra",
+    "bounded_desktop_host_component_approved": true,
+    "chip_component_approved": true,
+    "native_game_audio_accepted": false,
+    "full_port_accepted": false,
+    "closed_host_findings": [
+      "pre-device-close stream teardown",
+      "rejected first submit and creation failure release ownership",
+      "Vita explicit unsupported reset"
+    ]
+  },
+  "dependent_rebuild": {
+    "source_units": 71,
+    "runtime_source_units": 47,
+    "iop_source_units": 24,
+    "header_identities": 100,
+    "compile_failures": 0,
+    "runtime_archive_sha256": "8a93d93e66cc645d46cf1f7b70968beff4e7f9caf2087fed7ea1a5856f3a6411",
+    "iop_archive_sha256": "a90533b99883c6f1014e44b6c03263fa98999327f05f71c36547ba3beae413a7",
+    "outside_consumer_abi_accepted": false
+  },
+  "checks": {
+    "ordered_stereo_wrap_overflow_underrun_flush": "passed",
+    "host_reset_restart_cycles": 32,
+    "real_runtime_live_stream_shutdown_trials": 3,
+    "assertions_enabled": true,
+    "oversized_first_submit_owner_reuse": "passed",
+    "simulated_stream_creation_failure_owner_reuse": "passed",
+    "Vita_conditional_unsupported_methods": "passed",
+    "actual_Vita_cross_build": false
+  },
+  "authored_tone": {
+    "rate": 48000,
+    "channels": 2,
+    "frames": 117679,
+    "nonzero_channel_samples": 133206,
+    "peak": 5500,
+    "channel_correlation": -1.0,
+    "binary_sha256": "1a70ce4d17d5a9fe494326520588abe0679b145754ddfd29bb12099ff7c47f50",
+    "wav_sha256": "64b58c073b1b267bfa45f351e5c613b14d10e3ef4571d99f44e298824e9f1cf1",
+    "driver_exit": 0,
+    "recorder_exit": 0,
+    "module_unload_exit": 0
+  },
+  "authored_runtime_shutdown": {
+    "rate": 48000,
+    "channels": 2,
+    "frames": 112593,
+    "nonzero_channel_samples": 14794,
+    "peak": 619,
+    "channel_correlation": 1.0,
+    "binary_sha256": "140fbe5c869e5ffbbb4927f7d685f74794a2359590f960ea27810fcf3c24dbeb",
+    "wav_sha256": "1f3af829852bcf633472d4a805269ef35161885f11a25ccce81bee832530cfd1",
+    "driver_exit": 0,
+    "recorder_exit": 0,
+    "module_unload_exit": 0
+  },
+  "core_status": "bounded purecore accepted at770/800; actual IOP/host/native game integration unaccepted",
+  "next": "connect accepted pure device and host components through existing IOP bus/time/DMA, then original audible reference proof",
+  "goal_status": "active",
+  "reopened_device_design": {
+    "effective_model": "gpt-6-astra",
+    "effective_effort": "ultra",
+    "fix_design_approved": true,
+    "corrected_implementation_approved": true,
+    "production_approved": false,
+    "counted_adapter_line_ceiling": 800,
+    "upstream_file_ceiling": 25,
+    "structural_limits_preserved": true
+  }
+}

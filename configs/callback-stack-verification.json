@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "runtime_patch_prefix": 11,
+  "patch_sha256": "3279cf5fcc66a42c532576040817ff3db54ffb26242f57786ad327b4f586a4da",
+  "binary_sha256": "8f9e71aff139ad8cc1f44a8a9aee77c943bda805d35e1df91f09720346f87216",
+  "runtime_tests": {
+    "passed": 467,
+    "failed": 0,
+    "scope": "primary patch0011; seven callback stack ownership/lifecycle regression cases, scheduler unit cold retirement only"
+  },
+  "tooling_tests": {
+    "passed": 15,
+    "failed": 0
+  },
+  "iop_test_suites": {
+    "passed": 9,
+    "failed": 0
+  },
+  "reproduction": {
+    "source_files": 62,
+    "byte_match": true,
+    "idempotent_prefix": 11
+  },
+  "native_capture": "captures/native-zettai/20261009-011250/capture.json",
+  "native_scene_passed": false,
+  "visual_result": "black5.1s inspected",
+  "original_main_stack": [
+    "0x01fe0000",
+    "0x02000000"
+  ],
+  "paused_parent_sp": "0x01fffe80",
+  "observed_callback_entries": [
+    "0x00223a38",
+    "0x0020a398"
+  ],
+  "observed_callback_sp": "0x01fffe60",
+  "frame_store_address": "0x01fffe48",
+  "protected_saved_ra_slot": "0x01ffffd8",
+  "restored_ra": "0x00100348",
+  "epilogue_probe": {
+    "host_function": "FUN_00112b28_0x112b28",
+    "original_restore_instruction": "0x00112db4",
+    "observed_sp": "0x01ffff60"
+  },
+  "observed_runtime_heap": {
+    "base": "0x00839920",
+    "end": "0x00839920",
+    "limit": "0x01fe0000",
+    "scope": "runtime allocation metadata; end is not the original game allocator break"
+  },
+  "next_missing_original_entry": {
+    "descriptor": "0x002cf840",
+    "callsite": "0x0022f944",
+    "target": "0x0023fd00"
+  },
+  "post_missing_code_failure": "independent queued callback rejects isolated stack overlapping declared main stack",
+  "review": "Astra gpt-6-astra Ultra; accepted demonstrated positive-owner savedRA correction and reviewed API/reset lifecycle subset; no blocking production finding within scope",
+  "limits": [
+    "16KiB plus32-byte borrowed headroom is a conservative bring-up capacity",
+    "unit cold-reset/retirement tests do not prove real ELF reload",
+    "no independently owned normal idle callback pool proven",
+    "other fixed scratch pools retain separate ownership risks",
+    "title/story/audio/battle/save/disc-transition and trilogy integration gates open",
+    "already-written outer callback frame preservation with deliberate child-register clobber not proven",
+    "common resolver alias limitations retained; universal alias support not established",
+    "complete original allocator bounds not reverified"
+  ],
+  "frame_store_address_provenance": "computed from observed entrySP and unchanged original frame decrement/store offset"
+}

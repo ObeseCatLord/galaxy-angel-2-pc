@@ -1,0 +1,204 @@
+From 424fc81599e7c74d4d37c65e5e62ce4cded8379e Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:39:36 -0500
+Subject: [PATCH] ga2: coalesce delayed DMAC completions with immediate ones
+
+A VIF1 download completes at once but delays its interrupt. If the guest
+re-armed the channel and an immediate completion of the same cause
+dispatched before that deadline, the delayed event ran the handlers a
+second time. Delayed events now carry the cause's dispatch epoch and are
+dropped when an immediate dispatch happened meanwhile (one CIS latch);
+consecutive delayed completions still dispatch individually (review 55 C9).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h   |  5 ++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp   | 20 ++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  2 +-
+ ps2xTest/src/ps2_runtime_interrupt_tests.cpp | 72 ++++++++++++++++++++
+ 4 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index daf1270..b0b4c91 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -386,6 +386,10 @@ public:
+     int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
+     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
+     void dispatchIrq(bool dmac, uint32_t cause);
++    // A DMAC completion whose interrupt the device delays (VIF1 downloads).
++    // Dropped at its deadline if an immediate completion of the same cause
++    // already dispatched meanwhile: CIS is one latch, so they coalesce.
++    void postDelayedDmac(uint32_t cause, uint64_t cycles);
+     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
+     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+@@ -491,6 +495,7 @@ private:
+     // delivered when the cause is enabled again.
+     uint32_t m_pendingIntcMask = 0u;
+     uint32_t m_pendingDmacMask = 0u;
++    std::array<uint64_t, 32> m_dmacDispatchEpoch{};
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 171311a..335c33a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -125,6 +125,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_enabledDmacMask = 0xFFFFFFFFu;
+     m_pendingIntcMask = 0u;
+     m_pendingDmacMask = 0u;
++    m_dmacDispatchEpoch.fill(0u);
+     m_currentThreadId = 0;
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+@@ -1744,9 +1745,18 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+     return KE_OK;
+ }
+ 
++void EeScheduler::postDelayedDmac(uint32_t cause, uint64_t cycles)
++{
++    assertExecutor();
++    const uint64_t epoch = cause < 32u ? m_dmacDispatchEpoch[cause] : 0u;
++    postEventAfterCycles(EeEvent{EeEventType::Dmac, cause, epoch + 1u}, cycles);
++}
++
+ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+ {
+     assertExecutor();
++    if (dmac && cause < 32u)
++        ++m_dmacDispatchEpoch[cause];
+     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+     if (cause < 32u && (mask & (1u << cause)) == 0u)
+     {
+@@ -2465,6 +2475,16 @@ void EeScheduler::processEvent(const EeEvent &event)
+         dispatchIrq(false, 3u);
+         break;
+     case EeEventType::Dmac:
++        // value = 1 + dispatch epoch when posted (0: not a delayed completion).
++        if (event.value != 0u && event.id < 32u)
++        {
++            if (m_dmacDispatchEpoch[event.id] + 1u != event.value)
++                break; // an immediate completion of this cause already dispatched
++            const uint64_t epoch = m_dmacDispatchEpoch[event.id];
++            dispatchIrq(true, event.id);
++            m_dmacDispatchEpoch[event.id] = epoch; // later delayed completions still count
++            break;
++        }
+         dispatchIrq(true, event.id);
+         break;
+     case EeEventType::GsInterrupt:
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a78e61a..2646f86 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1811,7 +1811,7 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+     for (const auto &[cause, cycles] : m_memory.consumeDelayedDmacCauses())
+-        eeScheduler().postEventAfterCycles(EeEvent{EeEventType::Dmac, cause, 0}, cycles);
++        eeScheduler().postDelayedDmac(cause, cycles);
+ 
+ }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 4261bfa..8a9b629 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -67,6 +67,9 @@ namespace
+     constexpr uint32_t kEventResumePc = 0x00160410u;
+     constexpr uint32_t kEventProducerPc = 0x00160420u;
+     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
++    constexpr uint32_t kDelayedDmacMainPc = 0x00160600u;
++    constexpr uint32_t kDelayedDmacResumePc = 0x00160610u;
++    constexpr uint32_t kDelayedDmacHandlerPc = 0x00160620u;
+     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
+     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
+@@ -302,6 +305,37 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    int g_delayedDmacCalls = 0;
++    bool g_delayedDmacImmediate = false;
++    std::atomic<bool> g_delayedDmacDone{false};
++
++    void delayedDmacHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++g_delayedDmacCalls;
++        ctx->pc = 0u;
++    }
++
++    void delayedDmacMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        scheduler.addIrqHandler(true, 1u, kDelayedDmacHandlerPc, true, 0u, 0u, 0u);
++        scheduler.setIrqCauseEnabled(true, 1u, true);
++        scheduler.postDelayedDmac(1u, 2000u);
++        if (g_delayedDmacImmediate)
++            scheduler.dispatchIrq(true, 1u); // guest re-armed; this one completed at once
++        else
++            scheduler.postDelayedDmac(1u, 4000u);
++        ctx->pc = kDelayedDmacResumePc;
++        scheduler.waitVSync(scheduler.currentVSyncTick() + 1u);
++    }
++
++    void delayedDmacResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_delayedDmacDone.store(true, std::memory_order_release);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
+     void schedulerTimer2Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         g_dispatchTrace.push_back(2);
+@@ -706,6 +740,44 @@ void register_ps2_runtime_interrupt_tests()
+                      "the Timer2 handler should hand the semaphore directly to the waiter");
+         });
+ 
++        tc.Run("delayed DMAC completion coalesces with an immediate one of the same cause", [](TestCase &t)
++        {
++            for (const bool immediate : {true, false})
++            {
++                TestEnv env;
++                t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++                env.runtime.registerFunction(kDelayedDmacMainPc, delayedDmacMain);
++                env.runtime.registerFunction(kDelayedDmacResumePc, delayedDmacResume);
++                env.runtime.registerFunction(kDelayedDmacHandlerPc, delayedDmacHandler);
++                g_delayedDmacCalls = 0;
++                g_delayedDmacImmediate = immediate;
++                g_delayedDmacDone.store(false, std::memory_order_release);
++                R5900Context mainContext{};
++                mainContext.pc = kDelayedDmacMainPc;
++                std::thread gameThread([&]()
++                {
++                    try
++                    {
++                        env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                        env.runtime.eeScheduler().run();
++                    }
++                    catch (...)
++                    {
++                    }
++                });
++                const bool done = waitUntil([]() { return g_delayedDmacDone.load(std::memory_order_acquire); },
++                                            std::chrono::milliseconds(500));
++                if (!done)
++                    env.runtime.requestStop();
++                gameThread.join();
++                t.IsTrue(done, "guest must resume after two vsyncs");
++                t.Equals(g_delayedDmacCalls, immediate ? 1 : 2,
++                         immediate ? "an immediate completion absorbs the outstanding delayed one"
++                                   : "two delayed completions each run the handler");
++                cleanupRuntime(env);
++            }
++        });
++
+         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.55.0
+

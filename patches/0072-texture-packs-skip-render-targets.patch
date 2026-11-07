@@ -1,0 +1,34 @@
+From d64a1136d5db4404a8248d3c75942eb09d9722d7 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:01:20 -0500
+Subject: [PATCH] ga2: texture packs skip render-target sources
+
+Dumps of render targets (post-process inputs) produced a new hash every
+frame: 1119 junk 256x256 files in Mugen's tutorial battle. paraLLEl-GS's
+rendered_source flag (page tracker) now excludes them from dumps and
+replacement.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 11c3f07..0edc9ff 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -312,7 +312,10 @@ namespace ga2_texpacks
+         public:
+             ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, Device &device) override
+             {
+-                if (!g_vram)
++                // Render targets (post-process inputs, frame copies) are not
++                // art: new pixels every frame, and the CPU VRAM mirror does not
++                // hold what the GPU rendered there.
++                if (!g_vram || desc.rendered_source)
+                     return {};
+                 std::lock_guard<std::mutex> lock(g_mutex);
+                 if (!g_indexed)
+-- 
+2.55.0
+

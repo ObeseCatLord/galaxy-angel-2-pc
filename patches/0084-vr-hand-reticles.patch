@@ -1,0 +1,258 @@
+From 8127eb63c9dc3322b204ec0b84e13aca1ae545cb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 15:08:33 -0500
+Subject: [PATCH] vr: holographic hand reticles, also over the stereo 3D scenes
+
+Each controller shows a clear holographic reticle across its aim (glassy
+disc, bright rim, counter-rotating dashed ring and ticks, centre pip) with
+its beam. In stereo 3D scenes (battles, the ship map) the hands were not
+drawn at all; they now appear over each eye's frame, rendered from the pose
+the frame is submitted with, with a short guide beam that fades out. The
+desktop preview's hand is held in view.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_vr.cpp | 145 +++++++++++++++++++++++++--------
+ 1 file changed, 110 insertions(+), 35 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 426df1b..813174d 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -161,11 +161,12 @@ namespace ga2_vr
+             bool visible = false;
+             V3 from, to;
+             bool hit = false;
++            bool active = false; // the hand that clicks
+         };
+ 
+         struct Renderer
+         {
+-            GLuint quad = 0, frame = 0, sky = 0, beam = 0, dot = 0;
++            GLuint quad = 0, frame = 0, sky = 0, beam = 0, dot = 0, cursor = 0;
+             GLuint vao = 0, vbo = 0, skyVao = 0, skyVbo = 0;
+             GLuint skyTexture = 0;
+             bool ready = false;
+@@ -275,6 +276,7 @@ void main() {
+ in vec2 v_uv;
+ uniform float time;
+ uniform float beamLength;
++uniform float fadeEnd; // how much of the beam fades out at its end (1: all)
+ out vec4 o;
+ float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+ void main() {
+@@ -289,7 +291,8 @@ void main() {
+         float d = length(vec2((f - 0.5) * 2.2, (v_uv.y - y) * 2.0));
+         sparkle = smoothstep(0.45, 0.0, d) * (0.55 + 0.45 * sin(time * 17.0 + cell * 3.1));
+     }
+-    float fade = smoothstep(0.0, 0.08, v_uv.x) * (1.0 - smoothstep(beamLength - 0.15, beamLength, v_uv.x) * 0.6);
++    float fade = smoothstep(0.0, 0.08, v_uv.x) *
++                 (1.0 - smoothstep(beamLength - max(0.15, beamLength * 0.8 * fadeEnd), beamLength, v_uv.x) * mix(0.6, 1.0, fadeEnd));
+     vec3 col = vec3(0.30, 0.62, 1.0) * (core * 1.3 + glow) + vec3(0.75, 0.88, 1.0) * sparkle;
+     float a = clamp(core * 0.6 + glow * 0.5 + sparkle * 0.8, 0.0, 1.0) * fade;
+     o = vec4(col * a, a);
+@@ -305,6 +308,33 @@ void main() {
+     o = vec4(vec3(0.5, 0.78, 1.0) * a, a);
+ })";
+ 
++        // The hand: a clear holographic reticle across the aim (uv 0..1): a
++        // glassy disc with a bright rim, a dashed ring turning one way and
++        // four ticks the other, a centre pip, faint scan lines.
++        const char *kCursorFs = R"(#version 330
++in vec2 v_uv;
++uniform float time;
++uniform float strength; // 1 for the hand that clicks, dimmer for the other
++out vec4 o;
++void main() {
++    vec2 p = (v_uv - 0.5) * 2.0;
++    float r = length(p);
++    if (r > 1.0) discard;
++    float a = atan(p.y, p.x);
++    float rim = exp(-pow((r - 0.88) * 30.0, 2.0));
++    float halo = exp(-pow((r - 0.88) * 7.0, 2.0)) * 0.25;
++    float dash = step(0.35, fract(a / 6.2831853 * 12.0 + time * 0.35));
++    float ring = exp(-pow((r - 0.62) * 45.0, 2.0)) * dash;
++    float tickA = fract(a / 6.2831853 * 4.0 - time * 0.2);
++    float ticks = smoothstep(0.035, 0.0, abs(tickA - 0.5) - 0.0) * smoothstep(0.0, 0.03, r - 0.70) * smoothstep(0.0, 0.03, 0.80 - r);
++    float pip = exp(-r * r * 160.0);
++    float glass = (0.05 + 0.10 * r * r) * smoothstep(0.9, 0.85, r);
++    float scan = 0.8 + 0.2 * sin(p.y * 70.0 - time * 7.0);
++    vec3 cyan = vec3(0.32, 0.70, 1.0), white = vec3(0.85, 0.95, 1.0);
++    vec3 col = cyan * (rim * 1.1 + halo + ring * 0.8 + ticks * 0.9 + glass) * scan + white * (pip * 1.2 + rim * 0.35);
++    o = vec4(col * strength, 1.0);
++})";
++
+         void initRenderer()
+         {
+             if (g_gl.ready)
+@@ -314,6 +344,7 @@ void main() {
+             g_gl.sky = compile(kSkyVs, kSkyFs, "sky");
+             g_gl.beam = compile(kMeshVs, kBeamFs, "laser");
+             g_gl.dot = compile(kMeshVs, kDotFs, "dot");
++            g_gl.cursor = compile(kMeshVs, kCursorFs, "cursor");
+             glGenVertexArrays(1, &g_gl.vao);
+             glGenBuffers(1, &g_gl.vbo);
+             glBindVertexArray(g_gl.vao);
+@@ -382,6 +413,55 @@ void main() {
+             return s;
+         }
+ 
++        // The hands: beam, reticle and (on the screen) the hit point; additive
++        // light, so they read as clear holograms over whatever is behind.
++        void drawHands(const M4 &viewProj, V3 eye, const std::array<Laser, 2> &lasers, float time)
++        {
++            for (const Laser &l : lasers)
++            {
++                if (!l.visible)
++                    continue;
++                const V3 axis = l.to - l.from;
++                const float length = std::sqrt(dot(axis, axis));
++                if (length < 1e-3f)
++                    continue;
++                const V3 dir = axis * (1.0f / length);
++                const V3 mid = (l.from + l.to) * 0.5f;
++                V3 side = cross(dir, normalize(eye - mid));
++                side = normalize(side) * 0.012f;
++                const V3 a0 = l.from - side, a1 = l.from + side, b0 = l.to - side, b1 = l.to + side;
++                const float beam[30] = {a0.x, a0.y, a0.z, 0, -1, b0.x, b0.y, b0.z, length, -1, b1.x, b1.y, b1.z, length, 1,
++                                        a0.x, a0.y, a0.z, 0, -1, b1.x, b1.y, b1.z, length, 1, a1.x, a1.y, a1.z, 0, 1};
++                glUseProgram(g_gl.beam);
++                setMatrix(g_gl.beam, "mvp", viewProj);
++                glUniform1f(glGetUniformLocation(g_gl.beam, "time"), time);
++                glUniform1f(glGetUniformLocation(g_gl.beam, "beamLength"), length);
++                glUniform1f(glGetUniformLocation(g_gl.beam, "fadeEnd"), l.hit || length > 2.0f ? 0.0f : 1.0f);
++                drawMesh(beam, 6);
++                // The reticle just ahead of the controller, across the aim.
++                {
++                    const V3 up = std::fabs(dir.y) > 0.95f ? V3{1, 0, 0} : V3{0, 1, 0};
++                    const V3 u = normalize(cross(dir, up)) * 0.032f;
++                    const V3 v = normalize(cross(u, dir)) * 0.032f;
++                    glUseProgram(g_gl.cursor);
++                    setMatrix(g_gl.cursor, "mvp", viewProj);
++                    glUniform1f(glGetUniformLocation(g_gl.cursor, "time"), time);
++                    glUniform1f(glGetUniformLocation(g_gl.cursor, "strength"), l.active ? 1.0f : 0.55f);
++                    rect(l.from + dir * 0.05f, u, v, false);
++                }
++                if (l.hit)
++                {
++                    const V3 toEye = normalize(eye - l.to);
++                    V3 u = normalize(cross(V3{0, 1, 0}, toEye)) * 0.045f;
++                    V3 v = normalize(cross(toEye, u)) * 0.045f;
++                    glUseProgram(g_gl.dot);
++                    setMatrix(g_gl.dot, "mvp", viewProj);
++                    glUniform1f(glGetUniformLocation(g_gl.dot, "time"), time);
++                    rect(l.to + toEye * 0.01f, u, v, false);
++                }
++            }
++        }
++
+         // Draws sky, screen and lasers for one eye. view/proj: the eye; eye:
+         // its position (for billboarding).
+         void drawScene(const M4 &view, const M4 &proj, V3 eye, GLuint picture, float extentX, float extentY, bool wide,
+@@ -434,37 +514,7 @@ void main() {
+                         0.5f * s.halfHeight / (s.halfHeight + grow));
+             rect(s.center - V3{0, 0, 0.01f}, V3{s.halfWidth + grow, 0, 0}, V3{0, s.halfHeight + grow, 0}, false);
+ 
+-            for (const Laser &l : lasers)
+-            {
+-                if (!l.visible)
+-                    continue;
+-                const V3 axis = l.to - l.from;
+-                const float length = std::sqrt(dot(axis, axis));
+-                if (length < 1e-3f)
+-                    continue;
+-                const V3 dir = axis * (1.0f / length);
+-                const V3 mid = (l.from + l.to) * 0.5f;
+-                V3 side = cross(dir, normalize(eye - mid));
+-                side = normalize(side) * 0.012f;
+-                const V3 a0 = l.from - side, a1 = l.from + side, b0 = l.to - side, b1 = l.to + side;
+-                const float beam[30] = {a0.x, a0.y, a0.z, 0, -1, b0.x, b0.y, b0.z, length, -1, b1.x, b1.y, b1.z, length, 1,
+-                                        a0.x, a0.y, a0.z, 0, -1, b1.x, b1.y, b1.z, length, 1, a1.x, a1.y, a1.z, 0, 1};
+-                glUseProgram(g_gl.beam);
+-                setMatrix(g_gl.beam, "mvp", viewProj);
+-                glUniform1f(glGetUniformLocation(g_gl.beam, "time"), time);
+-                glUniform1f(glGetUniformLocation(g_gl.beam, "beamLength"), length);
+-                drawMesh(beam, 6);
+-                if (l.hit)
+-                {
+-                    const V3 toEye = normalize(eye - l.to);
+-                    V3 u = normalize(cross(V3{0, 1, 0}, toEye)) * 0.045f;
+-                    V3 v = normalize(cross(toEye, u)) * 0.045f;
+-                    glUseProgram(g_gl.dot);
+-                    setMatrix(g_gl.dot, "mvp", viewProj);
+-                    glUniform1f(glGetUniformLocation(g_gl.dot, "time"), time);
+-                    rect(l.to + toEye * 0.01f, u, v, false);
+-                }
+-            }
++            drawHands(viewProj, eye, lasers, time);
+             glDepthMask(GL_TRUE);
+             glDisable(GL_BLEND);
+             glUseProgram(0);
+@@ -1078,6 +1128,7 @@ void main() {
+             float px = 0, py = 0;
+             l.hit = hitScreen(from, dir, wide, srcWidth, srcHeight, point, px, py);
+             l.to = l.hit ? point : from + dir * 8.0f;
++            l.active = h == g_xr.activeHand;
+             if (l.hit && h == g_xr.activeHand)
+             {
+                 pointerHit = true;
+@@ -1089,8 +1140,14 @@ void main() {
+         if (stereo)
+         {
+             pointerHit = false; // no screen to point at
++            // The game's view fills the eyes: the hands show as their
++            // reticles with a short guide beam that fades out.
+             for (Laser &l : lasers)
+-                l.hit = false;
++                if (l.visible)
++                {
++                    l.hit = false;
++                    l.to = l.from + normalize(l.to - l.from) * 0.45f;
++                }
+         }
+         ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f, false, false, 0.0f);
+         uint16_t pad = 0;
+@@ -1201,6 +1258,23 @@ void main() {
+                         const ga2_stereo::Setup &st = image.setup;
+                         submitPose = eyePose(st, int(v));
+                         submitFov = {std::atan(st.tanLeft), std::atan(st.tanRight), std::atan(st.tanUp), std::atan(st.tanDown)};
++                        // The hands over it, seen from the pose it is submitted with.
++                        const M4 submitWorld =
++                            mul(world, pose(Q{submitPose.orientation.x, submitPose.orientation.y, submitPose.orientation.z,
++                                              submitPose.orientation.w},
++                                            V3{submitPose.position.x, submitPose.position.y, submitPose.position.z}));
++                        const M4 handProj = projection(st.tanLeft, st.tanRight, st.tanUp, st.tanDown, 0.05f, 100.0f);
++                        glDisable(GL_DEPTH_TEST);
++                        glEnable(GL_BLEND);
++                        glBlendFunc(GL_ONE, GL_ONE);
++                        glDepthMask(GL_FALSE);
++                        drawHands(mul(handProj, inverseRigid(submitWorld)),
++                                  V3{submitWorld.m[12], submitWorld.m[13], submitWorld.m[14]}, lasers, float(GetTime()));
++                        glDepthMask(GL_TRUE);
++                        glDisable(GL_BLEND);
++                        glEnable(GL_DEPTH_TEST);
++                        glUseProgram(0);
++                        glBindVertexArray(0);
+                     }
+                     else
+                         drawScene(inverseRigid(eyeWorld),
+@@ -1268,7 +1342,7 @@ void main() {
+         const Vector2 mouse = GetMousePosition();
+         const float nx = mouse.x / float(GetScreenWidth()) * 2.0f - 1.0f, ny = 1.0f - mouse.y / float(GetScreenHeight()) * 2.0f;
+         const V3 lookAt = normalize(V3{nx * tanH, ny * tanV, -1.0f});
+-        const V3 hand{0.18f, -0.28f, -0.25f};
++        const V3 hand{0.20f, -0.24f, -0.42f}; // held out, in view (bottom right)
+         V3 target = lookAt * 8.0f;
+         V3 screenPoint;
+         float px = 0, py = 0;
+@@ -1277,6 +1351,7 @@ void main() {
+         std::array<Laser, 2> lasers{};
+         Laser &l = lasers[1];
+         l.visible = true;
++        l.active = true;
+         l.from = hand;
+         const V3 dir = normalize(target - hand);
+         l.hit = hitScreen(hand, dir, wide, srcWidth, srcHeight, screenPoint, px, py);
+-- 
+2.55.0
+

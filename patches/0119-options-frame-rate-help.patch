@@ -1,0 +1,27 @@
+From 38ae47d116e5bdf85547ffdce97cf14fb42c3756 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:22:53 -0500
+Subject: [PATCH] options: frame rate help text (the rate drops by itself; VR
+ uses the headset rate)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_options.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index aeffb58..69d72b1 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -82,7 +82,7 @@ namespace ga2_options
+              {{"bilinear", "Bilinear"}, {"smooth", "Smooth (removes dither grain)"}, {"anime4k", "Anime4K"},
+               {"anime4k-hq", "Anime4K HQ (fast GPU)"}, {"sharp", "Sharp pixels"}, {"nearest", "Nearest (raw pixels)"}}},
+             {"fps", "Frame rate",
+-             "Frames drawn per second; the game keeps its own speed. Needs a fast PC (a PC that can't keep up runs the game slower); VR keeps the PS2 rate.",
++             "Frames drawn per second; the game keeps its own speed. The rate drops by itself when the PC can't keep up. In VR the headset's refresh rate is used.",
+              "GA2_FPS", Apply::Live, {{"60", "60 (PS2)"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"240", "240"}}},
+             {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+              Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
+-- 
+2.55.0
+

@@ -1,0 +1,508 @@
+From 9cb2f02a790aab2d6bcb565d75f07cb4247bb99a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:57:09 -0500
+Subject: [PATCH 34/34] ga2: movie playback (IPU BDEC fields, output DMA probe,
+ scratchpad chain/interleave DMA), vblank rebase
+
+- IPU BDEC: DT/DCR/MBI decoded from bits 25/26/27; output FIFO drains only
+  when fromIPU DMA is armed; per-opcode stats under GA2_PERF and traces
+  under GA2_IPU_TRACE.
+- Scratchpad DMA: chain (mode 1) and interleave (mode 2) for toSPR/fromSPR.
+  libmpeg's motion compensation fetches reference blocks with chain-mode
+  toSPR; dropping them left predicted macroblocks empty (green frames).
+- EE scheduler: after a slow stretch, rebase vblank pacing to wall time
+  instead of firing vblanks back to back.
+- IPU init tests now check a real reset of a busy IPU; GA2_RPC_TRACE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_memory.h     |   1 +
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp   |  11 +-
+ ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp  |  15 ++
+ ps2xRuntime/src/lib/ps2_ipu.cpp              |  61 ++++++-
+ ps2xRuntime/src/lib/ps2_memory.cpp           | 173 ++++++++++++++++++-
+ ps2xTest/gs_cache/CMakeLists.txt             |   1 +
+ ps2xTest/src/ps2_runtime_expansion_tests.cpp |  15 +-
+ 7 files changed, 267 insertions(+), 10 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index b1eb3dd..54c1369 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -474,6 +474,7 @@ public:
+     void processIpuOutputDma();
+     void pumpIpu();
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
++    bool processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, uint32_t mode);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c71baa0..edb7298 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2324,11 +2324,18 @@ void EeScheduler::processDueDeadlines()
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                // Pace against wall time, but never "catch up": after a slow
++                // stretch, rebase instead of firing vblanks back to back
++                // (that fast-forwarded movies, audio and game logic).
++                auto hostBase = scheduled.hostDeadline;
++                const auto wallNow = std::chrono::steady_clock::now();
++                if (wallNow - hostBase > std::chrono::milliseconds(50))
++                    hostBase = wallNow;
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+-                              scheduled.hostDeadline + kVBlankDuration,
++                              hostBase + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              hostBase + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index f9704bc..8735cd1 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "Common.h"
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+@@ -36,6 +38,19 @@ namespace ps2_syscalls
+ 
+         void pushSifRpcDebugEvent(SifRpcDebugEvent event)
+         {
++            static const bool trace = std::getenv("GA2_RPC_TRACE") != nullptr;
++            if (trace)
++            {
++                std::fprintf(stderr, "[rpc] %s sid=%08x num=%u send=%08x/%u recv=%08x/%u mode=%u flags=%x result=%d send0=",
++                             event.op ? event.op : "", event.sid, event.rpcNum, event.sendBuf, event.sendSize,
++                             event.recvBuf, event.recvSize, event.mode, event.flags, event.result);
++                for (uint32_t i = 0; i < event.sendPreviewSize && i < 16u; ++i)
++                    std::fprintf(stderr, "%02x", event.sendPreview[i]);
++                std::fprintf(stderr, " recv0=");
++                for (uint32_t i = 0; i < event.recvPreviewSize && i < 16u; ++i)
++                    std::fprintf(stderr, "%02x", event.recvPreview[i]);
++                std::fprintf(stderr, "\n");
++            }
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             pushSifRpcDebugEventLocked(event);
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_ipu.cpp b/ps2xRuntime/src/lib/ps2_ipu.cpp
+index 7d32bd6..e95dee9 100644
+--- a/ps2xRuntime/src/lib/ps2_ipu.cpp
++++ b/ps2xRuntime/src/lib/ps2_ipu.cpp
+@@ -16,6 +16,10 @@
+ #include "ps2_ipu_vlc.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <iterator>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -498,6 +502,13 @@ uint32_t IpuDevice::readCommand()
+ uint64_t IpuDevice::readCommand64()
+ {
+     const uint32_t data = readCommand();
++    static const bool trace = [] { const char *v = std::getenv("GA2_IPU_TRACE"); return v && *v && *v != '0'; }();
++    if (trace)
++    {
++        static uint64_t reads = 0;
++        if (++reads < 400)
++            std::fprintf(stderr, "[ipu] read CMD64 data=%08x busy=%08x cmd=%08x ifc=%u bp=%u\n", data, m_cmdBusy, m_current, m_ifc, m_bp);
++    }
+     return static_cast<uint64_t>(data) | (static_cast<uint64_t>(m_cmdBusy) << 32u);
+ }
+ 
+@@ -561,6 +572,30 @@ bool IpuDevice::consumeInterrupt()
+ 
+ void IpuDevice::writeCommand(uint32_t val)
+ {
++    static const bool trace = [] { const char *v = std::getenv("GA2_IPU_TRACE"); return v && *v && *v != '0'; }();
++    if (trace)
++        std::fprintf(stderr, "[ipu] cmd %08x ifc=%u ofc=%u bp=%u busy=%d\n", val, m_ifc, m_ofc, m_bp, m_ctrlBusy ? 1 : 0);
++    {
++        // GA2_PERF: per-opcode command counts every 5 s, to confirm decoding in game.
++        static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++        if (perf)
++        {
++            static uint64_t counts[16]{};
++            static auto last = std::chrono::steady_clock::now();
++            ++counts[val >> 28];
++            const auto now = std::chrono::steady_clock::now();
++            if (now - last >= std::chrono::seconds(5))
++            {
++                std::fprintf(stderr, "[ga2 ipu] BCLR=%llu IDEC=%llu BDEC=%llu VDEC=%llu FDEC=%llu SETIQ=%llu SETVQ=%llu CSC=%llu PACK=%llu SETTH=%llu\n",
++                             (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2],
++                             (unsigned long long)counts[3], (unsigned long long)counts[4], (unsigned long long)counts[5],
++                             (unsigned long long)counts[6], (unsigned long long)counts[7], (unsigned long long)counts[8],
++                             (unsigned long long)counts[9]);
++                std::fill(std::begin(counts), std::end(counts), 0ull);
++                last = now;
++            }
++        }
++    }
+     m_ctrl &= ~((1u << 14) | (1u << 15)); // ECD, SCD
+     m_current = val;
+     m_index = 0;
+@@ -620,9 +655,10 @@ void IpuDevice::writeCommand(uint32_t val)
+         d.coding_type = I_TYPE;
+         const int qsc = static_cast<int>((val >> 16) & 0x1fu);
+         d.quantizer_scale = d.q_scale_type ? kNonLinearQuantizerScale[qsc] : qsc << 1;
+-        d.macroblock_modes = ((val >> 24) & 1) ? DCT_TYPE_INTERLACED : 0; // DT
+-        d.dcr = (val >> 25) & 1;                                           // DCR
+-        d.macroblock_modes |= ((val >> 26) & 1) ? MACROBLOCK_INTRA : MACROBLOCK_PATTERN;
++        // tIPU_CMD_BDEC: FB[5:0] QSC[20:16] DT[25] DCR[26] MBI[27]
++        d.macroblock_modes = ((val >> 25) & 1) ? DCT_TYPE_INTERLACED : 0;
++        d.dcr = (val >> 26) & 1;
++        d.macroblock_modes |= ((val >> 27) & 1) ? MACROBLOCK_INTRA : MACROBLOCK_PATTERN;
+         std::memset(&d.mb8, 0, sizeof(d.mb8));
+         std::memset(&d.mb16, 0, sizeof(d.mb16));
+         m_topBusy = 0x80000000u;
+@@ -1501,6 +1537,17 @@ bool IpuDevice::sliceBdec()
+         m_ctrl &= ~(1u << 15);
+         m_codedBlockPattern = d.coded_block_pattern;
+         d.setOutput(d.mb16);
++        {
++            static const bool trace = std::getenv("GA2_IPU_TRACE") != nullptr;
++            static int shown = 0;
++            if (trace && shown < 40)
++            {
++                ++shown;
++                std::fprintf(stderr, "[ipu] BDEC out modes=%x cbp=%x Y0=%d %d %d %d Cb0=%d Cr0=%d\n", d.macroblock_modes,
++                             d.coded_block_pattern, d.mb16.Y[0][0], d.mb16.Y[0][1], d.mb16.Y[7][7], d.mb16.Y[15][15],
++                             d.mb16.Cb[0][0], d.mb16.Cr[0][0]);
++            }
++        }
+         [[fallthrough]];
+     case 3:
+     {
+@@ -1682,6 +1729,14 @@ bool IpuDevice::commandCsc(uint32_t val)
+                 return false;
+         if (m_pos[1] == 0)
+         {
++            static const bool trace = std::getenv("GA2_IPU_TRACE") != nullptr;
++            static int shown = 0;
++            if (trace && shown < 40)
++            {
++                ++shown;
++                std::fprintf(stderr, "[ipu] CSC in mb=%d/%d Y=%u %u %u Cb=%u Cr=%u ofm=%d\n", m_index, mbc, d.mb8.Y[0][0],
++                             d.mb8.Y[8][8], d.mb8.Y[15][15], d.mb8.Cb[0][0], d.mb8.Cr[0][0], ofm);
++            }
+             colorConvert(0);
+             if (ofm)
+                 dither(dte);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3c2b3a9..cffe272 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include <array>
+ #include "runtime/ps2_memory.h"
+ #include "ps2_ipu.h"
+@@ -245,6 +246,13 @@ PS2Memory::PS2Memory()
+     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr),
+       m_ipu(std::make_unique<IpuDevice>())
+ {
++    // IDEC/BDEC only emit macroblocks while fromIPU (DMA ch3) is armed.
++    m_ipu->setOutputDmaReady([this]()
++                             {
++                                 const auto chcr = m_ioRegisters.find(0x1000B000u);
++                                 const auto qwc = m_ioRegisters.find(0x1000B020u);
++                                 return chcr != m_ioRegisters.end() && (chcr->second & 0x100u) != 0u &&
++                                        qwc != m_ioRegisters.end() && qwc->second != 0u; });
+     ps2SetScratchpadHostPtr(nullptr);
+ }
+ 
+@@ -1224,6 +1232,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+     if (address == IpuDevice::kControl)
+     {
++        if (std::getenv("GA2_IPU_TRACE"))
++            std::fprintf(stderr, "[ipu] ctrl write %08x\n", value);
+         m_ipu->writeControl(value);
+         pumpIpu();
+         return true;
+@@ -1273,6 +1283,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 qwc = 0x10000u;
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+             chcr = value;
++            if (std::getenv("GA2_IPU_TRACE"))
++                std::fprintf(stderr, "[ipu] fromIPU start madr=%08x qwc=%u ofc=%u\n", m_ioRegisters[address + 0x10u], qwc, m_ipu->outputCount());
+             processIpuOutputDma();
+             if ((chcr & 0x100u) != 0u && qwc == 0x10000u)
+             {
+@@ -1310,6 +1322,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             if (mode == 0u && qwc == 0u)
+                 qwc = 0x10000u;
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++            if (std::getenv("GA2_IPU_TRACE"))
++                std::fprintf(stderr, "[ipu] toIPU start chcr=%08x madr=%08x qwc=%u tadr=%08x\n", value,
++                             m_ioRegisters[address + 0x10u], m_ioRegisters[address + 0x20u], m_ioRegisters[address + 0x30u]);
+         }
+         chcr = value;
+         pumpIpu();
+@@ -1707,7 +1722,7 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
+     if (mode != 0u)
+-        return false;
++        return processScratchpadDmaModes(channelBase, chcr, mode);
+ 
+     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+     const uint32_t byteCount = qwc * 16u;
+@@ -1757,6 +1772,153 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+     return true;
+ }
+ 
++// Scratchpad DMA interleave (mode 2) and chain (mode 1) transfers. libmpeg's
++// motion compensation fetches reference blocks with interleave transfers;
++// dropping them left predicted macroblocks empty.
++bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, uint32_t mode)
++{
++    static constexpr uint32_t kSprFromChannel = 0x1000D000u;
++    const bool fromScratchpad = channelBase == kSprFromChannel;
++    uint32_t &madr = m_ioRegisters[channelBase + 0x10u];
++    uint32_t &qwcReg = m_ioRegisters[channelBase + 0x20u];
++    uint32_t &sadr = m_ioRegisters[channelBase + 0x80u];
++    static const bool trace = std::getenv("GA2_IPU_TRACE") != nullptr;
++    static int traced = 0;
++    if (trace && traced < 200)
++    {
++        ++traced;
++        std::fprintf(stderr, "[spr dma] ch=%s mode=%u chcr=%08x qwc=%u madr=%08x sadr=%04x tadr=%08x sqwc=%08x\n",
++                     fromScratchpad ? "from" : "to", mode, chcr, qwcReg & 0xFFFFu, madr, sadr,
++                     m_ioRegisters[channelBase + 0x30u], m_ioRegisters[0x1000E030u]);
++    }
++
++    auto copyQwords = [&](uint32_t mainAddress, uint32_t qwords) -> bool
++    {
++        for (uint32_t i = 0; i < qwords; ++i)
++        {
++            uint32_t mainOffset = 0u;
++            try
++            {
++                mainOffset = translateAddress((mainAddress + i * 16u) & 0x7FFFFFF0u);
++            }
++            catch (const std::exception &)
++            {
++                return false;
++            }
++            if (mainOffset + 16u > PS2_RAM_SIZE)
++                return false;
++            const uint32_t sprOffset = sadr & (PS2_SCRATCHPAD_SIZE - 16u);
++            if (fromScratchpad)
++            {
++                std::memcpy(m_rdram + mainOffset, m_scratchpad + sprOffset, 16);
++                markModified(mainOffset, 16u);
++            }
++            else
++                std::memcpy(m_scratchpad + sprOffset, m_rdram + mainOffset, 16);
++            sadr = (sadr + 16u) & 0x3FF0u;
++        }
++        return true;
++    };
++
++    if (mode == 2u)
++    {
++        // D_SQWC: SQWC (qwords skipped in main memory) [7:0], TQWC (qwords transferred) [23:16].
++        const uint32_t sqwc = m_ioRegisters[0x1000E030u] & 0xFFu;
++        const uint32_t tqwc = (m_ioRegisters[0x1000E030u] >> 16u) & 0xFFu;
++        uint32_t remaining = qwcReg & 0xFFFFu;
++        if (tqwc == 0u)
++            return false;
++        while (remaining != 0u)
++        {
++            const uint32_t run = std::min(tqwc, remaining);
++            if (!copyQwords(madr, run))
++                return false;
++            madr = (madr + run * 16u) & 0x7FFFFFF0u;
++            remaining -= run;
++            if (run == tqwc)
++                madr = (madr + sqwc * 16u) & 0x7FFFFFF0u;
++        }
++        qwcReg = 0u;
++        completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
++        return true;
++    }
++
++    if (mode == 1u)
++    {
++        for (int guard = 0; guard < 65536; ++guard)
++        {
++            if ((qwcReg & 0xFFFFu) != 0u)
++            {
++                const uint32_t qwc = qwcReg & 0xFFFFu;
++                if (!copyQwords(madr, qwc))
++                    return false;
++                madr = (madr + qwc * 16u) & 0x7FFFFFF0u;
++                qwcReg = 0u;
++            }
++            uint64_t tag = 0u;
++            if (fromScratchpad)
++            {
++                // Destination chain: the tag precedes the data in the scratchpad.
++                std::memcpy(&tag, m_scratchpad + (sadr & (PS2_SCRATCHPAD_SIZE - 16u)), sizeof(tag));
++                sadr = (sadr + 16u) & 0x3FF0u;
++            }
++            else
++            {
++                const uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++                uint32_t tagOffset = 0u;
++                try
++                {
++                    tagOffset = translateAddress(tadr & 0x7FFFFFF0u);
++                }
++                catch (const std::exception &)
++                {
++                    return false;
++                }
++                if (tagOffset + 16u > PS2_RAM_SIZE)
++                    return false;
++                std::memcpy(&tag, m_rdram + tagOffset, sizeof(tag));
++            }
++            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
++            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 7u);
++            const uint32_t address = static_cast<uint32_t>(tag >> 32u) & 0x7FFFFFF0u;
++            const bool irq = ((tag >> 31u) & 1u) != 0u && (chcr & 0x80u) != 0u;
++            m_ioRegisters[channelBase] = (m_ioRegisters[channelBase] & 0xFFFFu) | (static_cast<uint32_t>(tag >> 16u) & 0xFFFF0000u);
++            bool end = irq;
++            if (fromScratchpad)
++            {
++                // cnts/cnt (0) and end (7) both write at ADDR.
++                madr = address;
++                end = end || id == 7u;
++            }
++            else
++            {
++                const uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++                switch (id)
++                {
++                case 0u: madr = address; end = true; m_ioRegisters[channelBase + 0x30u] = tadr + 16u; break; // REFE
++                case 1u: madr = tadr + 16u; m_ioRegisters[channelBase + 0x30u] = tadr + 16u + qwc * 16u; break; // CNT
++                case 2u: madr = tadr + 16u; m_ioRegisters[channelBase + 0x30u] = address; break; // NEXT
++                case 3u: case 4u: madr = address; m_ioRegisters[channelBase + 0x30u] = tadr + 16u; break; // REF/REFS
++                case 7u: madr = tadr + 16u; end = true; break; // END
++                default: return false; // CALL/RET are not valid for scratchpad DMA
++                }
++            }
++            if (qwc != 0u)
++            {
++                if (!copyQwords(madr, qwc))
++                    return false;
++                madr = (madr + qwc * 16u) & 0x7FFFFFF0u;
++            }
++            if (end)
++                break;
++        }
++        qwcReg = 0u;
++        completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
++        return true;
++    }
++    return false;
++}
++
+ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ {
+     static constexpr uint32_t kDStat = 0x1000E010u;
+@@ -1807,10 +1969,13 @@ void PS2Memory::processIpuInputDma()
+         completeDmacChannel(kChannel, 4u);
+     };
+ 
++    static const bool ipuTrace = std::getenv("GA2_IPU_TRACE") != nullptr;
+     auto consumeBlock = [&]()
+     {
+         uint32_t &madr = m_ioRegisters[kChannel + 0x10u];
+         uint32_t &qwc = m_ioRegisters[kChannel + 0x20u];
++        if (ipuTrace)
++            std::fprintf(stderr, "[ipu] toIPU feed madr=%08x qwc=%u ifc=%u\n", madr, qwc, m_ipu->inputCount());
+         while (qwc != 0u && m_ipu->needsData())
+         {
+             std::array<uint8_t, 16> qword{};
+@@ -1854,6 +2019,8 @@ void PS2Memory::processIpuInputDma()
+             uint64_t tag = 0u;
+             std::memcpy(&tag, tagBytes.data(), sizeof(tag));
+             const uint16_t tagQwc = static_cast<uint16_t>(tag & 0xffffu);
++            if (ipuTrace)
++                std::fprintf(stderr, "[ipu] toIPU tag tadr=%08x tag=%016llx\n", tadr, (unsigned long long)tag);
+             const uint8_t id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
+             if (id == 5u || id == 6u)
+                 throw IpuUnsupportedOperation("unsupported IPU DMA tag id " + std::to_string(id));
+@@ -2620,6 +2787,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return 0u;
+     }
+ 
++    static const bool ipuTrace = std::getenv("GA2_IPU_TRACE") != nullptr;
++    static uint64_t ipuTraceReads = 0;
++    if (ipuTrace && address >= 0x10002000u && address < 0x10002040u && ++ipuTraceReads < 400)
++        std::fprintf(stderr, "[ipu] read32 %08x\n", address);
+     if (address == IpuDevice::kCommand)
+     {
+         const uint32_t result = m_ipu->readCommand();
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index 6b7210a..1db4cdf 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -13,6 +13,7 @@ option(PS2_GS_CACHE_BUILD_MEMORY_TESTS "Build tests for the new shared cached-re
+ find_package(Threads REQUIRED)
+ add_library(ps2_gs_cache_backend_under_test STATIC
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_pgs.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
+ )
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..3cb64d9 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -932,12 +932,17 @@ void register_ps2_runtime_expansion_tests()
+             R5900Context ctx{};
+             ctx.pc = 0x0010B470u;
+ 
++            // FDEC with an empty input FIFO leaves the IPU busy until it is reset.
++            runtime.memory().write32(0x10002000u, 0x30000000u);
++            t.IsTrue((runtime.memory().read32(0x10002010u) & 0x80000000u) != 0u,
++                     "precondition: FDEC without input keeps the IPU busy");
++
+             ps2_stubs::sceIpuInit(rdram.data(), &ctx, &runtime);
+ 
+             t.IsFalse(runtime.isStopRequested(),
+                       "sceIpuInit should tolerate the missing optional SetD4 helper");
+-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
+-                     "sceIpuInit should still program IPU_CTRL");
++            t.Equals(runtime.memory().read32(0x10002010u) & 0x80000000u, 0u,
++                     "sceIpuInit should reset the IPU through IPU_CTRL");
+             t.Equals(runtime.memory().read32(0x10002000u), 0u,
+                      "sceIpuInit should leave IPU_CMD reset after initialization");
+         });
+@@ -953,6 +958,8 @@ void register_ps2_runtime_expansion_tests()
+             gIpuSetD4Argument.store(0u, std::memory_order_release);
+             gIpuInitResult.store(-999, std::memory_order_release);
+ 
++            runtime.memory().write32(0x10002000u, 0x30000000u); // busy FDEC, cleared only by reset
++
+             R5900Context context{};
+             context.pc = kIpuInitMainPc;
+             runtime.eeScheduler().reset(rdram.data(), context);
+@@ -964,8 +971,8 @@ void register_ps2_runtime_expansion_tests()
+                      "the invocation should receive the SetD4 enable argument");
+             t.Equals(gIpuInitResult.load(std::memory_order_acquire), 0,
+                      "the HLE completion should resume the preserved base context with success");
+-            t.Equals(runtime.memory().read32(0x10002010u), 0x40000000u,
+-                     "IPU initialization should finish only after the guest invocation completes");
++            t.Equals(runtime.memory().read32(0x10002010u) & 0x80000000u, 0u,
++                     "IPU initialization should reset the IPU after the guest invocation completes");
+         });
+ 
+         tc.Run("sprintf consumes EE varargs from a2 a3 t0 and preserves width formatting", [](TestCase &t)
+-- 
+2.55.0
+

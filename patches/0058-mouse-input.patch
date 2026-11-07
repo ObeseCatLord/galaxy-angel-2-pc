@@ -1,0 +1,80 @@
+From 45752cc4aacf6bb9f25c8c435f45ccefc43fd9e7 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:07:08 -0500
+Subject: [PATCH] ga2: mouse input for in-game menus and text
+
+Left click = Circle (confirm, advance text), right click = Cross
+(cancel), middle click = Select (system menu), wheel = D-pad up/down
+(each notch a 3-frame press then release, so games polling the pad every
+other frame see it). Only while the pointer is inside the window; works
+alongside keyboard or gamepad.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_pad.cpp | 36 +++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 3e05cb9..9c69170 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_input.h"
++#include <algorithm>
+ #include <array>
+ #include <cstring>
+ #include <mutex>
+@@ -35,6 +36,10 @@ namespace
+     std::mutex g_hostPadMutex;
+     std::array<uint8_t, 32> g_hostPad{};
+     bool g_hostPadSampled = false;
++    // Main-thread mouse-wheel state (sampleHostPad only).
++    int g_wheelNotches = 0; // pending, negative = up
++    int g_wheelPhase = 0;
++    uint16_t g_wheelDirection = 0;
+ 
+     void neutralPad(uint8_t *data)
+     {
+@@ -132,6 +137,37 @@ namespace
+                 clearBit(PAD_SELECT);
+         }
+ 
++        // Mouse, with either device: left = Circle (confirm, advance text),
++        // right = Cross (cancel), middle = Select (system menu), wheel = D-pad
++        // up/down for the frame it turns. Only inside the window.
++        const Vector2 mouse = GetMousePosition();
++        if (mouse.x >= 0.0f && mouse.y >= 0.0f && mouse.x < GetScreenWidth() && mouse.y < GetScreenHeight())
++        {
++            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++                clearBit(PAD_CIRCLE);
++            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
++                clearBit(PAD_CROSS);
++            if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
++                clearBit(PAD_SELECT);
++            // Each notch is a 3-frame press then a 3-frame release, long
++            // enough for games that poll the pad every other frame.
++            const float wheel = GetMouseWheelMove();
++            if (wheel != 0.0f)
++                g_wheelNotches = std::clamp(g_wheelNotches + (wheel > 0.0f ? -1 : 1), -8, 8);
++        }
++        if (g_wheelPhase == 0 && g_wheelNotches != 0)
++        {
++            g_wheelDirection = g_wheelNotches < 0 ? PAD_UP : PAD_DOWN;
++            g_wheelNotches += g_wheelNotches < 0 ? 1 : -1;
++            g_wheelPhase = 6;
++        }
++        if (g_wheelPhase != 0)
++        {
++            if (g_wheelPhase > 3)
++                clearBit(g_wheelDirection);
++            --g_wheelPhase;
++        }
++
+         data[2] = static_cast<uint8_t>(btns & 0xFF);
+         data[3] = static_cast<uint8_t>(btns >> 8);
+     }
+-- 
+2.55.0
+

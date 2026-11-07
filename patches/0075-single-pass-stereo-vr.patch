@@ -1,0 +1,929 @@
+From fb82f57a0175f64b2f2adbecd61cf7a8add55c57 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:18:07 -0500
+Subject: [PATCH] ga2: single-pass stereo VR for the 3D scenes
+
+GA2_VR=1 (GA2_VR_STEREO=0 keeps theater mode): the GS stream goes to a
+second paraLLEl-GS instance (own Vulkan device: Granite frame contexts are
+per device and each renderer keeps a command buffer open) whose vertices
+move by the right eye's parallax; the left eye's by the opposite (paraLLEl-GS
+Hacks::stereo_shift_q, f * ipd/2 * Q). ga2_stereo carries the head pose and
+shared field of view from ga2_vr to the game hooks (native/compat) and tags
+each frame through the readback ring; ga2_vr shows each eye's frame full
+view, submitted with the pose/FOV it was rendered with. Texture-pack images
+are cached per device. GA2_VR_DUMP writes both eyes (no ImageFlipVertical on
+a vector buffer); GA2_VR_DUMP_AT, GA2_VR_SCALE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt               |   1 +
+ ps2xRuntime/include/runtime/ga2_stereo.h |  59 ++++++
+ ps2xRuntime/include/runtime/gs/gs_pgs.h  |   9 +
+ ps2xRuntime/src/lib/ga2_stereo.cpp       |  50 +++++
+ ps2xRuntime/src/lib/ga2_vr.cpp           | 168 +++++++++++++++--
+ ps2xRuntime/src/lib/ga2_vr.h             |   9 +
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp        | 222 +++++++++++++++--------
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp   |  15 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp      |  28 ++-
+ 9 files changed, 473 insertions(+), 88 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_stereo.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_stereo.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1f71939..28a1f63 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -402,6 +402,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
+     src/lib/ga2_cheat_menu.cpp
++    src/lib/ga2_stereo.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_stereo.h b/ps2xRuntime/include/runtime/ga2_stereo.h
+new file mode 100644
+index 0000000..52dd7b1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_stereo.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <cstdint>
++
++// Single-pass stereo for the 3D scenes in VR (docs/vr/stereo.md).
++//
++// The game renders each frame once, with its camera moved to the head (centre
++// eye) pose and a projection covering both eyes' fields of view (game hooks,
++// native/compat/ga2_vrstereo.cpp). The GS stream goes to two paraLLEl-GS
++// instances (gs_pgs.cpp); each moves every perspective vertex by its eye's
++// parallax, f * (+-ipd/2) * Q (Q = 1/view z), which is exactly the picture of
++// an eye moved along the camera x axis. ga2_vr shows each instance's frame in
++// its eye, submitted with the pose and field of view it was rendered with.
++namespace ga2_stereo
++{
++    struct Setup
++    {
++        bool active = false;
++        // Head pose relative to the VR anchor (the recentred origin), OpenXR
++        // axes (x right, y up, -z forward), metres; rigid, row-vector
++        // convention (translation in elements 12..14).
++        float headAnchor[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++        // The same pose in the OpenXR LOCAL space: orientation x y z w,
++        // position x y z (for frame submission).
++        float headLocal[7] = {0, 0, 0, 1, 0, 0, 0};
++        // Tangents of the shared field of view (left/down negative).
++        float tanLeft = -1, tanRight = 1, tanUp = 1, tanDown = -1;
++        float ipd = 0.064f;          // metres
++        float unitsPerMetre = 50.0f; // game units per metre
++        uint64_t serial = 0;
++    };
++
++    // The game's frame: 640 x 448 pixels over the shared field of view.
++    constexpr float kFrameWidth = 640.0f, kFrameHeight = 448.0f;
++
++    // VR (main thread): the newest setup, once per headset frame.
++    void publish(const Setup &setup);
++    // Turns stereo off (theater mode, VR stopped).
++    void clear();
++
++    // Game hooks (EE thread). Frame start takes the newest setup; the flip
++    // makes it the setup of the frame on screen.
++    void beginFrame();
++    Setup building();
++    void flip();
++
++    // GS (vsync): the setup of the frame on screen.
++    Setup displayed();
++
++    // Parallax for one eye in pixels per unit of Q (eye 0 left, 1 right).
++    inline float shiftPerQ(const Setup &s, int eye)
++    {
++        if (!s.active)
++            return 0.0f;
++        const float fx = kFrameWidth / (s.tanRight - s.tanLeft);
++        const float half = 0.5f * s.ipd * s.unitsPerMetre;
++        return eye == 0 ? fx * half : -fx * half;
++    }
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 3b077ce..d2d9297 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -14,6 +14,10 @@
+ #include <vector>
+ 
+ struct GSRegisters;
++namespace ga2_stereo
++{
++    struct Setup;
++}
+ 
+ namespace ga2_pgs
+ {
+@@ -39,4 +43,9 @@ namespace ga2_pgs
+     void vsync(const GSRegisters &regs);
+     // Present thread: newest frame as RGBA8. False when nothing new arrived.
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
++    // VR single-pass stereo: a right-eye GS instance runs (GA2_VR=1); each
++    // eye's newest frame with the stereo setup it was rendered with.
++    bool stereo();
++    bool takeEyeFrame(int eye, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
++                      ga2_stereo::Setup &setup);
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_stereo.cpp b/ps2xRuntime/src/lib/ga2_stereo.cpp
+new file mode 100644
+index 0000000..426951b
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_stereo.cpp
+@@ -0,0 +1,50 @@
++#include "runtime/ga2_stereo.h"
++
++#include <mutex>
++
++namespace ga2_stereo
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        Setup g_latest, g_building, g_displayed;
++        uint64_t g_serial = 0;
++    }
++
++    void publish(const Setup &setup)
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_latest = setup;
++        g_latest.serial = ++g_serial;
++    }
++
++    void clear()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_latest.active = false;
++    }
++
++    void beginFrame()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_building = g_latest;
++    }
++
++    Setup building()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        return g_building;
++    }
++
++    void flip()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_displayed = g_building;
++    }
++
++    Setup displayed()
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        return g_displayed;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 8c9ec1b..c713b14 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -1,6 +1,8 @@
+ #include "ga2_vr.h"
+ #include "ps2_mouse.h"
+ #include "ga2_present.h"
++#include "runtime/ga2_activity.h"
++#include "runtime/gs/gs_pgs.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -913,6 +915,69 @@ void main() {
+             g_xr.recentered = true;
+         }
+ 
++        // One eye's stereo frame over the whole view.
++        void drawEyeImage(GLuint picture, float extentX, float extentY)
++        {
++            glDisable(GL_CULL_FACE);
++            glDisable(GL_BLEND);
++            glDisable(GL_DEPTH_TEST);
++            glClearColor(0, 0, 0, 1);
++            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++            M4 identity{};
++            identity.m[0] = identity.m[5] = identity.m[10] = identity.m[15] = 1.0f;
++            glUseProgram(g_gl.quad);
++            setMatrix(g_gl.quad, "mvp", identity);
++            glActiveTexture(GL_TEXTURE0);
++            glBindTexture(GL_TEXTURE_2D, picture);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glUniform1i(glGetUniformLocation(g_gl.quad, "tex"), 0);
++            glUniform2f(glGetUniformLocation(g_gl.quad, "extent"), extentX, extentY);
++            rect(V3{0, 0, 0}, V3{1, 0, 0}, V3{0, 1, 0}, false);
++            glUseProgram(0);
++            glBindVertexArray(0);
++            glEnable(GL_DEPTH_TEST);
++        }
++
++        // ---- single-pass stereo (ga2_stereo.h) --------------------------------
++        struct EyeImage
++        {
++            GLuint texture = 0;
++            int texWidth = 0, texHeight = 0;
++            float srcWidth = 0, srcHeight = 0;
++            ga2_stereo::Setup setup;
++        };
++        EyeImage g_eyeImages[2];
++
++        // Game units per metre (GA2_VR_SCALE): the size the 3D world appears.
++        float unitsPerMetre()
++        {
++            static const float scale = [] {
++                const char *v = std::getenv("GA2_VR_SCALE");
++                const float f = v && *v ? float(std::atof(v)) : 0.0f;
++                return f > 0.0f ? f : 50.0f;
++            }();
++            return scale;
++        }
++
++        // Both eyes' frames are stereo frames of a 3D scene.
++        bool stereoShowing()
++        {
++            return ga2_activity::scene3d() && g_eyeImages[0].texture && g_eyeImages[1].texture &&
++                   g_eyeImages[0].setup.active && g_eyeImages[1].setup.active;
++        }
++
++        // An eye's pose in the setup: the head pose moved by -+ipd/2 along its x axis.
++        XrPosef eyePose(const ga2_stereo::Setup &s, int eye)
++        {
++            const Q q{s.headLocal[0], s.headLocal[1], s.headLocal[2], s.headLocal[3]};
++            const V3 offset = rotate(q, V3{(eye == 0 ? -0.5f : 0.5f) * s.ipd, 0.0f, 0.0f});
++            XrPosef p{};
++            p.orientation = {q.x, q.y, q.z, q.w};
++            p.position = {s.headLocal[4] + offset.x, s.headLocal[5] + offset.y, s.headLocal[6] + offset.z};
++            return p;
++        }
++
+         // LOCAL space -> the screen's frame.
+         M4 worldFromLocal()
+         {
+@@ -955,6 +1020,14 @@ void main() {
+ 
+     uint16_t padButtons() { return g_xr.pad; }
+ 
++    void setEyeFrame(int eye, uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight,
++                     const ga2_stereo::Setup &setup)
++    {
++        if (eye < 0 || eye > 1)
++            return;
++        g_eyeImages[eye] = EyeImage{texture, texWidth, texHeight, srcWidth, srcHeight, setup};
++    }
++
+     void renderHeadset(uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight, bool wide)
+     {
+         if (!headsetRunning())
+@@ -1012,6 +1085,13 @@ void main() {
+                 pointerY = py;
+             }
+         }
++        const bool stereo = stereoShowing();
++        if (stereo)
++        {
++            pointerHit = false; // no screen to point at
++            for (Laser &l : lasers)
++                l.hit = false;
++        }
+         ps2_mouse::setExternalPointer(pointerHit, pointerX, pointerY, triggers[g_xr.activeHand] > 0.6f, false, false, 0.0f);
+         uint16_t pad = 0;
+         if (boolean(g_xr.circle)) pad |= 0x2000;
+@@ -1058,6 +1138,40 @@ void main() {
+             uint32_t viewCount = 0;
+             if (XR_SUCCEEDED(xr.xrLocateViews(g_xr.session, &locate, &viewState, uint32_t(views.size()), &viewCount, views.data())))
+             {
++                // Stereo setup for the game's next frame: the head between the
++                // eyes, a field of view covering both.
++                if (ga2_pgs::stereo() && viewCount >= 2 && ga2_activity::scene3d())
++                {
++                    ga2_stereo::Setup setup;
++                    setup.active = true;
++                    const XrPosef &l = views[0].pose, &r = views[1].pose;
++                    const V3 pl{l.position.x, l.position.y, l.position.z}, pr{r.position.x, r.position.y, r.position.z};
++                    const V3 mid = (pl + pr) * 0.5f;
++                    const V3 between = pr - pl;
++                    setup.ipd = std::sqrt(dot(between, between));
++                    const Q q{l.orientation.x, l.orientation.y, l.orientation.z, l.orientation.w};
++                    const float local[7] = {q.x, q.y, q.z, q.w, mid.x, mid.y, mid.z};
++                    std::memcpy(setup.headLocal, local, sizeof(local));
++                    const M4 head = mul(world, pose(q, mid));
++                    std::memcpy(setup.headAnchor, head.m, sizeof(setup.headAnchor));
++                    setup.tanLeft = std::min(std::tan(views[0].fov.angleLeft), std::tan(views[1].fov.angleLeft));
++                    setup.tanRight = std::max(std::tan(views[0].fov.angleRight), std::tan(views[1].fov.angleRight));
++                    setup.tanUp = std::max(std::tan(views[0].fov.angleUp), std::tan(views[1].fov.angleUp));
++                    setup.tanDown = std::min(std::tan(views[0].fov.angleDown), std::tan(views[1].fov.angleDown));
++                    setup.unitsPerMetre = unitsPerMetre();
++                    ga2_stereo::publish(setup);
++                    static bool logged = false;
++                    if (!logged)
++                    {
++                        logged = true;
++                        std::fprintf(stderr, "[vr] stereo: fov tan L%.3f R%.3f U%.3f D%.3f, ipd %.4f m, head at (%.3f %.3f %.3f) "
++                                             "from the anchor, %.0f units/m\n",
++                                     setup.tanLeft, setup.tanRight, setup.tanUp, setup.tanDown, setup.ipd, head.m[12],
++                                     head.m[13], head.m[14], setup.unitsPerMetre);
++                    }
++                }
++                else
++                    ga2_stereo::clear();
+                 projected.resize(viewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                 for (uint32_t v = 0; v < viewCount && v < g_xr.eyes.size(); ++v)
+                 {
+@@ -1074,27 +1188,55 @@ void main() {
+                     const M4 eyeWorld = mul(world, pose(Q{p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w},
+                                                         V3{p.position.x, p.position.y, p.position.z}));
+                     const XrFovf &f = views[v].fov;
+-                    drawScene(inverseRigid(eyeWorld),
+-                              projection(std::tan(f.angleLeft), std::tan(f.angleRight), std::tan(f.angleUp),
+-                                         std::tan(f.angleDown), 0.05f, 100.0f),
+-                              V3{eyeWorld.m[12], eyeWorld.m[13], eyeWorld.m[14]}, texture, srcWidth / float(texWidth),
+-                              srcHeight / float(texHeight), wide, lasers);
+-                    // GA2_VR_DUMP=<png>: the left eye once, 20 s in (diagnostics).
+-                    static bool dumped = false;
+-                    if (v == 0 && !dumped && GetTime() > 20.0)
++                    XrPosef submitPose = views[v].pose;
++                    XrFovf submitFov = views[v].fov;
++                    if (stereo && v < 2)
++                    {
++                        // The eye's frame fills its view; submitted with the pose and
++                        // field of view it was rendered with, so the compositor
++                        // reprojects it to the current head pose.
++                        const EyeImage &image = g_eyeImages[v];
++                        drawEyeImage(image.texture, image.srcWidth / float(image.texWidth),
++                                     image.srcHeight / float(image.texHeight));
++                        const ga2_stereo::Setup &st = image.setup;
++                        submitPose = eyePose(st, int(v));
++                        submitFov = {std::atan(st.tanLeft), std::atan(st.tanRight), std::atan(st.tanUp), std::atan(st.tanDown)};
++                    }
++                    else
++                        drawScene(inverseRigid(eyeWorld),
++                                  projection(std::tan(f.angleLeft), std::tan(f.angleRight), std::tan(f.angleUp),
++                                             std::tan(f.angleDown), 0.05f, 100.0f),
++                                  V3{eyeWorld.m[12], eyeWorld.m[13], eyeWorld.m[14]}, texture, srcWidth / float(texWidth),
++                                  srcHeight / float(texHeight), wide, lasers);
++                    // GA2_VR_DUMP=<png>: both eyes once (eye 1 as <png>-eye1.png),
++                    // GA2_VR_DUMP_AT seconds in (default 20; diagnostics).
++                    static bool dumped[2] = {false, false};
++                    static const double dumpAt = [] {
++                        const char *at = std::getenv("GA2_VR_DUMP_AT");
++                        return at && *at ? std::atof(at) : 20.0;
++                    }();
++                    if (v < 2 && !dumped[v] && GetTime() > dumpAt)
+                         if (const char *dump = std::getenv("GA2_VR_DUMP"); dump && *dump)
+                         {
+                             std::vector<unsigned char> pixels(size_t(eye.width) * eye.height * 4);
+                             glReadPixels(0, 0, eye.width, eye.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++                            // GL rows run bottom-up (ImageFlipVertical would free our buffer).
++                            const size_t row = size_t(eye.width) * 4;
++                            for (int y = 0; y < eye.height / 2; ++y)
++                                std::swap_ranges(pixels.begin() + y * row, pixels.begin() + (y + 1) * row,
++                                                 pixels.begin() + (eye.height - 1 - y) * row);
+                             Image image{pixels.data(), eye.width, eye.height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+-                            ImageFlipVertical(&image);
+-                            ExportImage(image, dump);
+-                            dumped = true;
++                            std::string path = dump;
++                            if (v == 1)
++                                path = (path.size() > 4 ? path.substr(0, path.size() - 4) : path) + "-eye1.png";
++                            ExportImage(image, path.c_str());
++                            std::fprintf(stderr, "[vr] eye %u dumped (%s)\n", v, stereo ? "stereo" : "theater");
++                            dumped[v] = true;
+                         }
+                     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                     xr.xrReleaseSwapchainImage(eye.swapchain, &release);
+-                    projected[v].pose = views[v].pose;
+-                    projected[v].fov = views[v].fov;
++                    projected[v].pose = submitPose;
++                    projected[v].fov = submitFov;
+                     projected[v].subImage.swapchain = eye.swapchain;
+                     projected[v].subImage.imageRect.extent = {eye.width, eye.height};
+                 }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.h b/ps2xRuntime/src/lib/ga2_vr.h
+index 98f7088..e619de7 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.h
++++ b/ps2xRuntime/src/lib/ga2_vr.h
+@@ -2,6 +2,8 @@
+ 
+ #include <cstdint>
+ 
++#include "runtime/ga2_stereo.h"
++
+ // VR theater mode (main thread only).
+ //
+ // GA2_VR=1 starts an OpenXR session (SteamVR, Monado, ...) on the window's
+@@ -39,6 +41,13 @@ namespace ga2_vr
+     // Inside BeginDrawing: the preview view into the window.
+     void drawPreview(uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight, bool wide);
+ 
++    // Single-pass stereo (runtime/ga2_stereo.h, GA2_VR=1): each eye's newest
++    // frame (GL texture; the picture is srcWidth x srcHeight of it) with the
++    // stereo setup it was rendered with. 3D scenes show these full-view in
++    // their eyes instead of the theater screen.
++    void setEyeFrame(int eye, uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight,
++                     const ga2_stereo::Setup &setup);
++
+     // Controller buttons as PS2 pad bits (active-high).
+     uint16_t padButtons();
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 0513ea2..ab9d884 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -4,6 +4,7 @@
+ 
+ #if defined(PS2X_HAVE_PGS)
+ 
++#include "runtime/ga2_stereo.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_texpacks.h"
+ 
+@@ -48,6 +49,29 @@ namespace
+         uint32_t width = 0, height = 0;
+         VkFormat format = VK_FORMAT_UNDEFINED;
+         bool pending = false;
++        ga2_stereo::Setup setup; // the stereo setup of the copied frame
++    };
++
++    // One GS instance per eye. Eye 0 is the only one outside VR stereo; eye
++    // 1 (GA2_VR=1, GA2_VR_STEREO not 0) gets the same packets and differs only
++    // by its parallax (Hacks::stereo_shift_q, ga2_stereo.h).
++    struct Eye
++    {
++        // Each instance has its own device: Granite's frame contexts are
++        // per device, and a GS renderer keeps its command buffer open between
++        // packets, so two renderers on one device wait on each other.
++        Context context;
++        Device device;
++        GSInterface gs;
++        Hacks hacks;
++        ReadbackSlot slots[3];
++        uint32_t slotIndex = 0;
++
++        std::vector<uint8_t> frame; // guarded by State::frameMutex
++        uint32_t frameWidth = 0, frameHeight = 0;
++        bool frameFresh = false;
++        bool frameBgra = false;
++        ga2_stereo::Setup frameSetup, takenSetup;
+     };
+ 
+     struct State
+@@ -55,21 +79,15 @@ namespace
+         std::mutex mutex;
+         bool tried = false;
+         bool ok = false;
+-        Context context;
+-        Device device;
+-        GSInterface gs;
++        Eye eyes[2];
++        uint32_t eyeCount = 1;
++        std::vector<uint8_t> downloadScratch;
+         uint32_t ssaa = 1;
+         uint32_t field = 0;
+         int hiresShift = -1; // GA2_PGS_HIRES, read once
+         uint64_t totalSwaps = 0;
+-        ReadbackSlot slots[3];
+-        uint32_t slotIndex = 0;
+ 
+         std::mutex frameMutex;
+-        std::vector<uint8_t> frame;
+-        uint32_t frameWidth = 0, frameHeight = 0;
+-        bool frameFresh = false;
+-        bool frameBgra = false;
+ 
+         // statistics
+         uint64_t swaps = 0, packets = 0, bytes = 0;
+@@ -177,35 +195,49 @@ namespace
+             std::fprintf(stderr, "[pgs] Vulkan loader unavailable; using the software GS\n");
+             return false;
+         }
+-        s.context.set_num_thread_indices(1);
+-        if (!s.context.init_instance_and_device(nullptr, 0, nullptr, 0,
+-                                                CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
+-                                                    CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
+-                                                    CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++        auto initDevice = [](Eye &eye) {
++            eye.context.set_num_thread_indices(1);
++            if (!eye.context.init_instance_and_device(nullptr, 0, nullptr, 0,
++                                                      CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
++                                                          CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
++                                                          CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++                return false;
++            eye.device.set_context(eye.context);
++            eye.device.init_frame_contexts(4);
++            loadPipelineCache(eye.device);
++            return true;
++        };
++        if (!initDevice(s.eyes[0]))
+         {
+             std::fprintf(stderr, "[pgs] no usable Vulkan device; using the software GS\n");
+             return false;
+         }
+-        s.device.set_context(s.context);
+-        s.device.init_frame_contexts(4);
+-        loadPipelineCache(s.device);
+         std::atexit([]
+                     {
+                         State &st = state();
+                         std::unique_lock<std::mutex> lock(st.mutex, std::try_to_lock);
+                         if (lock.owns_lock() && st.ok)
+-                            savePipelineCache(st.device); });
++                            savePipelineCache(st.eyes[0].device); });
+ 
+         GSOptions options = {};
+         const int r = envInt("GA2_PGS_SSAA", 1);
+         options.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8
+                                  : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+         s.ssaa = static_cast<uint32_t>(options.super_sampling);
+-        if (!s.gs.init(&s.device, options))
++        if (!s.eyes[0].gs.init(&s.eyes[0].device, options))
+         {
+             std::fprintf(stderr, "[pgs] GSInterface init failed; using the software GS\n");
+             return false;
+         }
++        // VR headset: a second instance for the right eye (single-pass stereo).
++        const char *vr = std::getenv("GA2_VR");
++        if (vr && std::string(vr) == "1" && !envOff("GA2_VR_STEREO", "0"))
++        {
++            if (initDevice(s.eyes[1]) && s.eyes[1].gs.init(&s.eyes[1].device, options))
++                s.eyeCount = 2;
++            else
++                std::fprintf(stderr, "[pgs] second GS instance failed; VR stays in theater mode\n");
++        }
+         // The GA2 discs render into a 32-bit buffer, copy it with the GS's
+         // ordered dither into a 16-bit scanout buffer and draw the UI on top
+         // there (so backbuffer promotion cannot apply). Without the dither the
+@@ -214,47 +246,53 @@ namespace
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
+         hacks.replacements_cover_rect = true; // gs_texpacks identifies and replaces cached regions
+-        s.gs.set_hacks(hacks);
+-        s.gs.set_texture_replacement_interface(ga2_texpacks::interface());
++        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        {
++            s.eyes[e].hacks = hacks;
++            s.eyes[e].gs.set_hacks(hacks);
++            s.eyes[e].gs.set_texture_replacement_interface(ga2_texpacks::interface());
++        }
+         s.ok = true;
+         g_rendering.store(true, std::memory_order_release);
+-        std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s\n",
+-                     s.device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on");
++        std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s%s\n",
++                     s.eyes[0].device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on",
++                     s.eyeCount == 2 ? ", stereo (two instances)" : "");
+         return true;
+     }
+ 
+-    void consumeSlotLocked(State &s, ReadbackSlot &slot)
++    void consumeSlotLocked(State &s, Eye &eye, ReadbackSlot &slot)
+     {
+-        const auto *src = static_cast<const uint32_t *>(s.device.map_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT));
++        const auto *src = static_cast<const uint32_t *>(eye.device.map_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT));
+         const size_t pixels = size_t(slot.width) * slot.height;
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
+             // Raw copy only; the present thread converts (takeFrame).
+-            s.frame.resize(pixels * 4u);
+-            std::memcpy(s.frame.data(), src, pixels * 4u);
+-            s.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+-            s.frameWidth = slot.width;
+-            s.frameHeight = slot.height;
+-            s.frameFresh = true;
++            eye.frame.resize(pixels * 4u);
++            std::memcpy(eye.frame.data(), src, pixels * 4u);
++            eye.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
++            eye.frameWidth = slot.width;
++            eye.frameHeight = slot.height;
++            eye.frameSetup = slot.setup;
++            eye.frameFresh = true;
+         }
+-        s.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
++        eye.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
+         slot.pending = false;
+         slot.image.reset();
+         slot.fence.reset();
+     }
+ 
+     // Asynchronous readback ring: never wait for the GPU on the game thread.
+-    void readbackLocked(State &s, const ScanoutResult &result)
++    void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup)
+     {
+         // slotIndex is the oldest submission: consume finished slots oldest
+         // first so the newest finished frame is the one presented.
+         for (int k = 0; k < 3; ++k)
+         {
+-            ReadbackSlot &old = s.slots[(s.slotIndex + k) % 3];
++            ReadbackSlot &old = eye.slots[(eye.slotIndex + k) % 3];
+             if (old.pending && old.fence && old.fence->wait_timeout(0))
+-                consumeSlotLocked(s, old);
++                consumeSlotLocked(s, eye, old);
+         }
+-        ReadbackSlot &slot = s.slots[s.slotIndex];
++        ReadbackSlot &slot = eye.slots[eye.slotIndex];
+         if (slot.pending)
+             return; // GPU is behind; drop this frame's copy
+         const uint32_t w = result.image->get_width(), h = result.image->get_height();
+@@ -264,12 +302,12 @@ namespace
+             info.size = VkDeviceSize(w) * h * 4u;
+             info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+             info.domain = BufferDomain::CachedHost;
+-            slot.buffer = s.device.create_buffer(info);
++            slot.buffer = eye.device.create_buffer(info);
+             slot.width = w;
+             slot.height = h;
+         }
+         slot.format = result.image->get_format();
+-        auto cmd = s.device.request_command_buffer();
++        auto cmd = eye.device.request_command_buffer();
+         cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+@@ -278,11 +316,12 @@ namespace
+         cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+         Fence fence;
+-        s.device.submit(cmd, &fence);
++        eye.device.submit(cmd, &fence);
+         slot.fence = std::move(fence);
+         slot.image = result.image;
++        slot.setup = setup;
+         slot.pending = true;
+-        s.slotIndex = (s.slotIndex + 1u) % 3u;
++        eye.slotIndex = (eye.slotIndex + 1u) % 3u;
+     }
+ 
+     template <typename T>
+@@ -312,10 +351,14 @@ namespace ga2_pgs
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
+-        if (ga2_texpacks::takeChanged())
+-            s.gs.invalidate_all_cached_textures();
++        const bool changed = ga2_texpacks::takeChanged();
+         const auto t0 = std::chrono::steady_clock::now();
+-        s.gs.gif_transfer(path, data, size & ~size_t(15));
++        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        {
++            if (changed)
++                s.eyes[e].gs.invalidate_all_cached_textures();
++            s.eyes[e].gs.gif_transfer(path, data, size & ~size_t(15));
++        }
+         s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         ++s.packets;
+         s.bytes += size;
+@@ -357,7 +400,13 @@ namespace ga2_pgs
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
+-        s.gs.read_transfer_fifo(dst, qwords);
++        s.eyes[0].gs.read_transfer_fifo(dst, qwords);
++        // The right eye's GS completes the same download into scratch.
++        if (s.eyeCount == 2)
++        {
++            s.downloadScratch.resize(size_t(qwords) * 16u);
++            s.eyes[1].gs.read_transfer_fifo(s.downloadScratch.data(), qwords);
++        }
+     }
+ 
+     void vsync(const GSRegisters &r)
+@@ -367,22 +416,24 @@ namespace ga2_pgs
+         if (!initLocked(s))
+             return;
+         const auto t0 = std::chrono::steady_clock::now();
+-        s.gs.flush();
+-
+-        auto &p = s.gs.get_priv_register_state();
+-        put(p.pmode, r.pmode);
+-        // NTSC default when the CRTC was never programmed.
+-        put(p.smode1, r.smode1 ? r.smode1 : 0x0000000740814504ull);
+-        put(p.smode2, r.smode2);
+-        put(p.syncv, r.syncv);
+-        put(p.dispfb1, r.dispfb1);
+-        put(p.display1, r.display1);
+-        put(p.dispfb2, r.dispfb2);
+-        put(p.display2, r.display2);
+-        put(p.extbuf, r.extbuf);
+-        put(p.extdata, r.extdata);
+-        put(p.extwrite, r.extwrite);
+-        put(p.bgcolor, r.bgcolor);
++        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        {
++            s.eyes[e].gs.flush();
++            auto &p = s.eyes[e].gs.get_priv_register_state();
++            put(p.pmode, r.pmode);
++            // NTSC default when the CRTC was never programmed.
++            put(p.smode1, r.smode1 ? r.smode1 : 0x0000000740814504ull);
++            put(p.smode2, r.smode2);
++            put(p.syncv, r.syncv);
++            put(p.dispfb1, r.dispfb1);
++            put(p.display1, r.display1);
++            put(p.dispfb2, r.dispfb2);
++            put(p.display2, r.display2);
++            put(p.extbuf, r.extbuf);
++            put(p.extdata, r.extdata);
++            put(p.extwrite, r.extwrite);
++            put(p.bgcolor, r.bgcolor);
++        }
+ 
+         VSyncInfo info = {};
+         info.phase = s.field ^= 1u;
+@@ -401,9 +452,23 @@ namespace ga2_pgs
+         info.high_resolution_scanout = shift >= 1;
+         info.high_resolution_scanout_shift = shift >= 2 ? 2u : 1u;
+ 
+-        const ScanoutResult result = s.gs.vsync(info);
+-        if (result.image)
+-            readbackLocked(s, result);
++        // The frame on screen carries its stereo setup; the eyes' parallax for
++        // the frames that follow comes from the newest one being built.
++        const ga2_stereo::Setup shown = s.eyeCount == 2 ? ga2_stereo::displayed() : ga2_stereo::Setup{};
++        const ga2_stereo::Setup next = s.eyeCount == 2 ? ga2_stereo::building() : ga2_stereo::Setup{};
++        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        {
++            Eye &eye = s.eyes[e];
++            const ScanoutResult result = eye.gs.vsync(info);
++            if (result.image)
++                readbackLocked(s, eye, result, shown);
++            const float shift = ga2_stereo::shiftPerQ(next, int(e));
++            if (shift != eye.hacks.stereo_shift_q)
++            {
++                eye.hacks.stereo_shift_q = shift;
++                eye.gs.set_hacks(eye.hacks);
++            }
++        }
+         const auto t1 = std::chrono::steady_clock::now();
+         s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+         ++s.swaps;
+@@ -411,7 +476,7 @@ namespace ga2_pgs
+         // since the process may be killed rather than exit.
+         ++s.totalSwaps;
+         if (s.totalSwaps == 600 || s.totalSwaps == 3600 || s.totalSwaps == 10800 || s.totalSwaps == 36000)
+-            savePipelineCache(s.device);
++            savePipelineCache(s.eyes[0].device);
+ 
+         const double elapsed = std::chrono::duration<double>(t1 - s.statStart).count();
+         if (elapsed >= 5.0 && std::getenv("GA2_PERF"))
+@@ -419,7 +484,7 @@ namespace ga2_pgs
+             std::fprintf(stderr, "[pgs] %.1f swaps/s, %.0f packets/s, %.2f MB/s, gif %.2f ms/swap, vsync %.2f ms/swap, frame %ux%u\n",
+                          s.swaps / elapsed, s.packets / elapsed, s.bytes / elapsed / 1048576.0,
+                          s.swaps ? s.gifMs / s.swaps : 0.0, s.swaps ? s.vsyncMs / s.swaps : 0.0,
+-                         s.frameWidth, s.frameHeight);
++                         s.eyes[0].frameWidth, s.eyes[0].frameHeight);
+             std::fprintf(stderr, "[pgs] pmode=%llx smode1=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
+                          (unsigned long long)r.pmode, (unsigned long long)r.smode1, (unsigned long long)r.smode2,
+                          (unsigned long long)r.dispfb1, (unsigned long long)r.display1,
+@@ -430,19 +495,32 @@ namespace ga2_pgs
+         }
+     }
+ 
++    bool stereo() { return state().eyeCount == 2; }
++
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
++    {
++        ga2_stereo::Setup setup;
++        return takeEyeFrame(0, rgba, width, height, setup);
++    }
++
++    bool takeEyeFrame(int eyeIndex, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
++                      ga2_stereo::Setup &setup)
+     {
+         State &s = state();
++        if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
++            return false;
++        Eye &eye = s.eyes[eyeIndex];
+         bool bgra = false;
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
+-            if (!s.frameFresh)
++            if (!eye.frameFresh)
+                 return false;
+-            rgba.swap(s.frame);
+-            width = s.frameWidth;
+-            height = s.frameHeight;
+-            bgra = s.frameBgra;
+-            s.frameFresh = false;
++            rgba.swap(eye.frame);
++            width = eye.frameWidth;
++            height = eye.frameHeight;
++            bgra = eye.frameBgra;
++            setup = eye.frameSetup;
++            eye.frameFresh = false;
+         }
+         // Convert to opaque RGBA here, on the present thread.
+         auto *px = reinterpret_cast<uint32_t *>(rgba.data());
+@@ -471,6 +549,8 @@ namespace ga2_pgs
+     void readLocalToHost(uint8_t *, uint32_t) {}
+     void vsync(const GSRegisters &) {}
+     bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
++    bool stereo() { return false; }
++    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &) { return false; }
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 0edc9ff..471babb 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -307,6 +307,13 @@ namespace ga2_texpacks
+             return out;
+         }
+ 
++        std::string deviceKey(const Device &device)
++        {
++            char key[32];
++            std::snprintf(key, sizeof(key), "%p/", static_cast<const void *>(&device));
++            return key;
++        }
++
+         class Replacement final : public TextureReplacementInterface
+         {
+         public:
+@@ -357,7 +364,8 @@ namespace ga2_texpacks
+                     const auto spots = buttons ? g_buttonMap.find(hash) : g_buttonMap.end();
+                     if (spots == g_buttonMap.end())
+                         return {};
+-                    const std::string key = std::string(name) + "/" + g_style;
++                    // Images belong to one device (VR stereo runs one per eye).
++                    const std::string key = deviceKey(device) + name + "/" + g_style;
+                     if (const auto cached = g_images.find(key); cached != g_images.end())
+                         return cached->second;
+                     ::Image composed{};
+@@ -371,7 +379,8 @@ namespace ga2_texpacks
+                     g_images.emplace(key, handle);
+                     return handle;
+                 }
+-                if (const auto cached = g_images.find(it->second); cached != g_images.end())
++                const std::string fileKey = deviceKey(device) + it->second;
++                if (const auto cached = g_images.find(fileKey); cached != g_images.end())
+                     return cached->second;
+                 ::Image image = LoadImage(it->second.c_str());
+                 if (!image.data)
+@@ -379,7 +388,7 @@ namespace ga2_texpacks
+                 ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                 ImageHandle handle = upload(device, image);
+                 UnloadImage(image);
+-                g_images.emplace(it->second, handle);
++                g_images.emplace(fileKey, handle);
+                 return handle;
+             }
+         };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ac4a077..090d9ae 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -403,7 +403,31 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         static std::vector<uint8_t> s_pgsFrame;
+         static uint32_t s_pgsWidth = 0u, s_pgsHeight = 0u;
+         uint32_t w = 0u, h = 0u;
+-        if (ga2_pgs::takeFrame(s_pgsFrame, w, h) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
++        ga2_stereo::Setup setup;
++        // VR stereo: the right eye's frame goes to its own texture.
++        if (ga2_pgs::stereo())
++        {
++            static std::vector<uint8_t> s_eyeFrame;
++            static Texture2D s_eyeTex{};
++            uint32_t ew = 0u, eh = 0u;
++            ga2_stereo::Setup eyeSetup;
++            if (ga2_pgs::takeEyeFrame(1, s_eyeFrame, ew, eh, eyeSetup) && ew && eh &&
++                s_eyeFrame.size() >= size_t(ew) * eh * 4u)
++            {
++                if (s_eyeTex.width != int(ew) || s_eyeTex.height != int(eh))
++                {
++                    if (s_eyeTex.id)
++                        UnloadTexture(s_eyeTex);
++                    Image image = GenImageColor(int(ew), int(eh), BLACK);
++                    s_eyeTex = LoadTextureFromImage(image);
++                    UnloadImage(image);
++                    SetTextureFilter(s_eyeTex, TEXTURE_FILTER_BILINEAR);
++                }
++                UpdateTexture(s_eyeTex, s_eyeFrame.data());
++                ga2_vr::setEyeFrame(1, s_eyeTex.id, s_eyeTex.width, s_eyeTex.height, float(ew), float(eh), eyeSetup);
++            }
++        }
++        if (ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
+         {
+             if (tex.width != int(w) || tex.height != int(h))
+             {
+@@ -416,6 +440,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             UpdateTexture(tex, s_pgsFrame.data());
+             s_pgsWidth = w;
+             s_pgsHeight = h;
++            if (ga2_pgs::stereo())
++                ga2_vr::setEyeFrame(0, tex.id, tex.width, tex.height, float(w), float(h), setup);
+             ps2_mouse::setFrame(s_pgsFrame.data(), w, h);
+         }
+         outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+-- 
+2.55.0
+

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "image_sha256": "02d314464c17c715d7e809297b0aba184173a98616b1fafeac27fe33fc480c82",
+  "scope": "original-service-modules-on-existing-emulator-adapters",
+  "full_image_boot_verified": false,
+  "native_game_boot_verified": false,
+  "modules": [
+    "CDVDMAN",
+    "CDVDFSV",
+    "LOADFILE"
+  ],
+  "physical_rpc_servers": 7,
+  "cd_init_response_words": [
+    1,
+    549,
+    550,
+    0
+  ],
+  "no_provider_and_post_reset_requests_unhandled": true,
+  "startup_and_cd_init_return_sentinel_verified": true,
+  "original_cdvdman_startup_exhausts_instruction_budget": false,
+  "original_cdvdman_startup_error": 0,
+  "original_cdvdman_startup_instructions": 1782,
+  "original_cdvdman_startup_verified_for_discs": [
+    "zettai",
+    "mugen-1",
+    "mugen-2",
+    "eigou-1",
+    "eigou-2"
+  ],
+  "cdvd_subcommand_fifo_verified": true,
+  "cdvd_subcommands_supported": [
+    "03:00",
+    "08",
+    "1b"
+  ],
+  "unsupported_cdvd_subcommand_status": 128,
+  "cdvdman_irq_registration_observed": true,
+  "cdvdman_irq_delivery_verified": false,
+  "first_sector_read_matches_image": true,
+  "first_sector_read_reply": 2048,
+  "iso_sector_verified_for_discs": [
+    "zettai",
+    "mugen-1",
+    "mugen-2",
+    "eigou-1",
+    "eigou-2"
+  ],
+  "disc_type_mmio_routes_original_service_to_dvd_import": 63,
+  "no_image_read_preserves_destination": true,
+  "multi_chunk_transfer_verified": false,
+  "controller_internal_state_record_verified": false,
+  "missing_module_returns_negative_error": true,
+  "missing_module_error": -203,
+  "implemented_modload_imports": [
+    15,
+    7
+  ],
+  "positive_original_module": "SIO2MAN",
+  "positive_module_start_result": 0,
+  "positive_module_rpc_verified_for_discs": [
+    "zettai",
+    "mugen-1",
+    "mugen-2",
+    "eigou-1",
+    "eigou-2"
+  ],
+  "positive_module_irq17_handler_gp_and_return_observed": true,
+  "complete_module_ownership_retirement_verified": false,
+  "synthetic_startup_argv_gp_metadata_through_original_loadfile_verified": true,
+  "prestartup_error_preserves_previous_entry_result": true,
+  "generated_ee_module_call_layout_verified": false,
+  "last_capture": "captures/iop-probe/20261009-011724-cdvd-final/summary.json",
+  "iop_test_executables_passed": 6,
+  "runtime_tests_passed": 439
+}

@@ -1,0 +1,1762 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index a374bdd..7c79eb9 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -89,6 +89,11 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_include_directories(ps2_iop_reset_boundary_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_reset_boundary_tests COMMAND ps2_iop_reset_boundary_tests)
+ 
++    add_executable(ps2_iop_rpc_wait_tests tests/iop_rpc_wait_tests.cpp)
++    target_link_libraries(ps2_iop_rpc_wait_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_rpc_wait_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_rpc_wait_tests COMMAND ps2_iop_rpc_wait_tests)
++
+ endif()
+ 
+ install(TARGETS ps2_iop
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index f7178d2..75b7f97 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -23,6 +23,28 @@ namespace ps2x::iop::detail
+     {
+     }
+ 
++    bool IopKernel::hasRpcWait(const IopThread &thread) noexcept
++    {
++        return thread.rpcWaitNonce != 0u &&
++               (thread.state == IopThreadState::RpcWait || thread.state == IopThreadState::Suspended);
++    }
++
++    void IopKernel::invalidateRpcWait(IopThread &thread) noexcept
++    {
++        thread.rpcWaitGeneration = 0u;
++        thread.rpcWaitNonce = 0u;
++        thread.rpcWaitResult = 0;
++        thread.rpcWaitResultReady = false;
++    }
++
++    uint64_t IopKernel::nextRpcLifetimeGeneration() noexcept
++    {
++        // Zero permanently marks exhaustion; never reuse an issued identity.
++        if (m_nextRpcLifetimeGeneration == 0u)
++            return 0u;
++        return m_nextRpcLifetimeGeneration++;
++    }
++
+     void IopKernel::reset()
+     {
+         m_threads.clear();
+@@ -38,6 +60,13 @@ namespace ps2x::iop::detail
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+     {
++        // A blocked RPC worker cannot execute a thread import, even while its
++        // yielded timeslice still owns m_currentThread. Reject before writing V0
++        // or changing wait/suspension state; other CPUs retain legacy behavior.
++        for (const auto &[id, thread] : m_threads)
++            if (&thread.cpu == &cpu && hasRpcWait(thread))
++                return false;
++
+         const auto setV0 = [&](int32_t value)
+         {
+             cpu.gpr[2] = static_cast<uint32_t>(value);
+@@ -50,6 +79,7 @@ namespace ps2x::iop::detail
+             const uint32_t descriptor = cpu.gpr[4];
+             IopThread thread;
+             thread.id = static_cast<int>(m_nextThreadId++);
++            thread.rpcLifetimeGeneration = nextRpcLifetimeGeneration();
+             thread.attr = m_memory.read32(descriptor + 0u);
+             thread.option = m_memory.read32(descriptor + 4u);
+             thread.entry = m_memory.read32(descriptor + 8u);
+@@ -93,6 +123,8 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             IopThread &thread = it->second;
++            invalidateRpcWait(thread);
++            thread.rpcLifetimeGeneration = nextRpcLifetimeGeneration();
+             thread.cpu = {};
+             thread.cpu.pc = thread.entry;
+             thread.cpu.gpr[4] = cpu.gpr[5];
+@@ -108,6 +140,7 @@ namespace ps2x::iop::detail
+         case 9: // ExitDeleteThread
+             if (m_currentThread != nullptr)
+             {
++                invalidateRpcWait(*m_currentThread);
+                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                 cpu.stopped = true;
+                 cpu.yielded = true;
+@@ -124,6 +157,7 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            invalidateRpcWait(it->second);
+             it->second.state = IopThreadState::Dormant;
+             setV0(0);
+             return true;
+@@ -203,6 +237,11 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (hasRpcWait(it->second))
++            {
++                setV0(0);
++                return true;
++            }
+             if (it->second.state == IopThreadState::Sleep)
+                 it->second.state = IopThreadState::Ready;
+             else
+@@ -236,7 +275,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             it->second.state = IopThreadState::Suspended;
+-            if (m_currentThread == &it->second)
++            if (m_currentThread == &it->second && !hasRpcWait(it->second))
+                 cpu.yielded = true;
+             setV0(0);
+             return true;
+@@ -252,7 +291,25 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             if (it->second.state == IopThreadState::Suspended)
+-                it->second.state = IopThreadState::Ready;
++            {
++                if (it->second.rpcWaitNonce != 0u)
++                {
++                    if (it->second.rpcWaitResultReady)
++                    {
++                        it->second.cpu.gpr[2] = static_cast<uint32_t>(it->second.rpcWaitResult);
++                        invalidateRpcWait(it->second);
++                        it->second.state = IopThreadState::Ready;
++                    }
++                    else
++                    {
++                        it->second.state = IopThreadState::RpcWait;
++                    }
++                }
++                else
++                {
++                    it->second.state = IopThreadState::Ready;
++                }
++            }
+             setV0(0);
+             return true;
+         }
+@@ -326,6 +383,7 @@ namespace ps2x::iop::detail
+         case IopThreadState::Delay:
+         case IopThreadState::Semaphore:
+         case IopThreadState::EventFlag:
++        case IopThreadState::RpcWait:
+             status = 0x04u;
+             break;
+         case IopThreadState::Suspended:
+@@ -706,6 +764,57 @@ namespace ps2x::iop::detail
+         cpu.yielded = true;
+     }
+ 
++    std::optional<IopKernel::RpcWaitOwner> IopKernel::beginRpcWait(IopCpuState &cpu, uint64_t transactionNonce) noexcept
++    {
++        if (transactionNonce == 0u || m_currentThread == nullptr || &m_currentThread->cpu != &cpu ||
++            m_currentThread->state != IopThreadState::Running || m_currentThread->rpcWaitNonce != 0u ||
++            m_currentThread->rpcLifetimeGeneration == 0u)
++            return std::nullopt;
++
++        const uint64_t waitGeneration = nextRpcLifetimeGeneration();
++        if (waitGeneration == 0u)
++            return std::nullopt;
++        m_currentThread->rpcWaitGeneration = waitGeneration;
++        m_currentThread->rpcWaitNonce = transactionNonce;
++        m_currentThread->rpcWaitResultReady = false;
++        m_currentThread->state = IopThreadState::RpcWait;
++        cpu.yielded = true;
++        return RpcWaitOwner{m_currentThread->rpcLifetimeGeneration, waitGeneration, m_currentThread->id, transactionNonce};
++    }
++
++    bool IopKernel::isRpcWaitCurrent(const RpcWaitOwner &owner) const noexcept
++    {
++        if (owner.m_lifetimeGeneration == 0u || owner.m_waitGeneration == 0u || owner.m_transactionNonce == 0u)
++            return false;
++        const auto it = m_threads.find(owner.m_threadId);
++        return it != m_threads.end() && hasRpcWait(it->second) && !it->second.rpcWaitResultReady &&
++               it->second.rpcLifetimeGeneration == owner.m_lifetimeGeneration &&
++               it->second.rpcWaitGeneration == owner.m_waitGeneration &&
++               it->second.rpcWaitNonce == owner.m_transactionNonce;
++    }
++
++    bool IopKernel::completeRpcWait(const RpcWaitOwner &owner, int32_t result) noexcept
++    {
++        if (!isRpcWaitCurrent(owner))
++            return false;
++
++        IopThread &thread = m_threads.find(owner.m_threadId)->second;
++        if (thread.rpcWaitResultReady)
++            return false;
++
++        thread.cpu.gpr[2] = static_cast<uint32_t>(result);
++        if (thread.state == IopThreadState::Suspended)
++        {
++            thread.rpcWaitResult = result;
++            thread.rpcWaitResultReady = true;
++            return true;
++        }
++
++        invalidateRpcWait(thread);
++        thread.state = IopThreadState::Ready;
++        return true;
++    }
++
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+         for (auto &[id, thread] : m_threads)
+@@ -775,7 +884,10 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+             if (pc >= base && pc < base + size)
++            {
++                invalidateRpcWait(thread);
+                 thread.state = IopThreadState::Dead;
++            }
+         }
+     }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 360513f..de7cd07 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <optional>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -19,6 +20,7 @@ namespace ps2x::iop::detail
+         Delay,
+         Semaphore,
+         EventFlag,
++        RpcWait,
+         Suspended,
+         Dead,
+     };
+@@ -41,11 +43,38 @@ namespace ps2x::iop::detail
+         uint32_t waitMode = 0;
+         uint32_t waitResultAddress = 0;
+         int wakeupCount = 0;
++        uint64_t rpcLifetimeGeneration = 0;
++        uint64_t rpcWaitGeneration = 0;
++        uint64_t rpcWaitNonce = 0;
++        int32_t rpcWaitResult = 0;
++        bool rpcWaitResultReady = false;
+     };
+ 
+     class IopKernel
+     {
+     public:
++        // Copyable identity for one outstanding RPC wait. It intentionally
++        // carries only values, never a CPU, frame, or thread-container pointer.
++        class RpcWaitOwner
++        {
++        public:
++            RpcWaitOwner() = default;
++
++        private:
++            friend class IopKernel;
++
++            RpcWaitOwner(uint64_t lifetimeGeneration, uint64_t waitGeneration, int threadId, uint64_t transactionNonce) noexcept
++                : m_lifetimeGeneration(lifetimeGeneration), m_waitGeneration(waitGeneration),
++                  m_threadId(threadId), m_transactionNonce(transactionNonce)
++            {
++            }
++
++            uint64_t m_lifetimeGeneration = 0;
++            uint64_t m_waitGeneration = 0;
++            int m_threadId = 0;
++            uint64_t m_transactionNonce = 0;
++        };
++
+         // A scoped synchronous caller participates in the existing semaphore
+         // handoff while its exact CPU/C++ frame remains held by the executor.
+         struct DetachedSemaphoreWait
+@@ -74,6 +103,10 @@ namespace ps2x::iop::detail
+         void sleepCurrent(IopCpuState &cpu);
+         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+ 
++        [[nodiscard]] std::optional<RpcWaitOwner> beginRpcWait(IopCpuState &cpu, uint64_t transactionNonce) noexcept;
++        [[nodiscard]] bool isRpcWaitCurrent(const RpcWaitOwner &owner) const noexcept;
++        [[nodiscard]] bool completeRpcWait(const RpcWaitOwner &owner, int32_t result) noexcept;
++
+         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
+@@ -105,6 +138,9 @@ namespace ps2x::iop::detail
+         };
+ 
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
++        [[nodiscard]] static bool hasRpcWait(const IopThread &thread) noexcept;
++        void invalidateRpcWait(IopThread &thread) noexcept;
++        [[nodiscard]] uint64_t nextRpcLifetimeGeneration() noexcept;
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+         void wakeEventWaiters(EventFlag &event);
+@@ -116,6 +152,7 @@ namespace ps2x::iop::detail
+         uint32_t m_nextThreadId = 1;
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
++        uint64_t m_nextRpcLifetimeGeneration = 1;
+         int m_systemStatusEventFlag = 0;
+         IopThread *m_currentThread = nullptr;
+         DetachedSemaphoreWait *m_detachedSemaphoreWait = nullptr;
+diff --git a/ps2xIOP/tests/iop_rpc_wait_tests.cpp b/ps2xIOP/tests/iop_rpc_wait_tests.cpp
+new file mode 100644
+index 0000000..e58ebc4
+--- /dev/null
++++ b/ps2xIOP/tests/iop_rpc_wait_tests.cpp
+@@ -0,0 +1,414 @@
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/iop_emulator_const.h"
++
++#include <cstdint>
++#include <array>
++#include <cstring>
++#include <exception>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <tuple>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++
++    constexpr uint32_t kDescriptorAddress = 0x1000u;
++    constexpr uint32_t kThreadEntry = 0x4000u;
++    constexpr uint32_t kArgument = 0x12345678u;
++    constexpr uint32_t kSecondArgument = 0x87654321u;
++    constexpr uint32_t kGp = 0x00123450u;
++
++    void require(bool condition, std::string_view message)
++    {
++        if (!condition)
++            throw std::runtime_error(std::string(message));
++    }
++
++    auto cpuFields(const IopCpuState &cpu)
++    {
++        return std::tie(cpu.gpr, cpu.hi, cpu.lo, cpu.pc, cpu.cop0,
++                        cpu.pendingLoadReg, cpu.pendingLoadValue, cpu.pendingLoad,
++                        cpu.branchPending, cpu.branchTarget, cpu.stopped, cpu.yielded,
++                        cpu.exception, cpu.missingImport, cpu.executionFault);
++    }
++
++    void requireCpu(const IopCpuState &cpu, const IopCpuState &expected, std::string_view message)
++    {
++        require(cpuFields(cpu) == cpuFields(expected), message);
++    }
++
++    void seedContinuation(IopCpuState &cpu, int id)
++    {
++        for (size_t index = 0; index < cpu.gpr.size(); ++index)
++        {
++            cpu.gpr[index] = 0xA5000000u + static_cast<uint32_t>(index);
++            cpu.cop0[index] = 0xB6000000u + static_cast<uint32_t>(index);
++        }
++        cpu.gpr[4] = static_cast<uint32_t>(id); // Also valid target for aliased imports.
++        cpu.pc = kThreadEntry + 0x24u;
++        cpu.hi = 0x13579BDFu;
++        cpu.lo = 0x2468ACE0u;
++        cpu.pendingLoadReg = 8u;
++        cpu.pendingLoadValue = 0xCAFEBABEu;
++        cpu.pendingLoad = true;
++        cpu.branchPending = true;
++        cpu.branchTarget = kThreadEntry + 0x80u;
++    }
++
++    struct KernelFixture
++    {
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCpuState control{};
++
++        int createThread(uint32_t entry = kThreadEntry)
++        {
++            memory.write32(kDescriptorAddress + 0u, 0u);
++            memory.write32(kDescriptorAddress + 4u, 0u);
++            memory.write32(kDescriptorAddress + 8u, entry);
++            memory.write32(kDescriptorAddress + 12u, 0x400u);
++            memory.write32(kDescriptorAddress + 16u, 10u);
++            control = {};
++            control.gpr[4] = kDescriptorAddress;
++            require(kernel.dispatchThreadImport(4u, control, 0u), "CreateThread was not handled");
++            require(static_cast<int32_t>(control.gpr[2]) > 0, "CreateThread failed");
++            return static_cast<int>(control.gpr[2]);
++        }
++
++        void startThread(int id)
++        {
++            control = {};
++            control.gpr[4] = static_cast<uint32_t>(id);
++            control.gpr[5] = kArgument;
++            control.gpr[6] = kSecondArgument;
++            control.gpr[28] = kGp;
++            require(kernel.dispatchThreadImport(7u, control, 0u), "StartThreadArgs was not handled");
++            require(control.gpr[2] == 0u, "StartThreadArgs failed");
++        }
++
++        IopThread &runThread()
++        {
++            IopThread *thread = kernel.beginNextReady(0u);
++            require(thread != nullptr, "no ready worker");
++            require(thread->state == IopThreadState::Running, "worker did not enter running state");
++            require(thread->cpu.gpr[4] == kArgument && thread->cpu.gpr[5] == kSecondArgument &&
++                        thread->cpu.gpr[28] == kGp,
++                    "StartThreadArgs did not preserve continuation arguments");
++            return *thread;
++        }
++
++        void endSlice(IopThread &thread)
++        {
++            kernel.endTimeslice(thread, kThreadReturnSentinel);
++            require(!kernel.hasCurrentThread(), "timeslice owner was retained");
++        }
++
++        void importForThread(uint16_t ordinal, int id)
++        {
++            control = {};
++            control.gpr[4] = static_cast<uint32_t>(id);
++            IopCpuState expected = control;
++            expected.gpr[2] = 0u;
++            require(kernel.dispatchThreadImport(ordinal, control, 0u), "thread import was not handled");
++            require(control.gpr[2] == 0u, "thread import failed");
++            requireCpu(control, expected, "thread import altered separate caller continuation");
++        }
++
++        [[nodiscard]] IopKernel::RpcWaitOwner beginWait(IopThread &thread, uint64_t nonce)
++        {
++            IopCpuState expected = thread.cpu;
++            expected.yielded = true;
++            const auto owner = kernel.beginRpcWait(thread.cpu, nonce);
++            require(owner.has_value(), "beginRpcWait rejected the running worker");
++            require(thread.state == IopThreadState::RpcWait && thread.cpu.yielded,
++                    "beginRpcWait did not block and yield the worker");
++            requireCpu(thread.cpu, expected, "beginRpcWait changed worker continuation");
++            return *owner;
++        }
++    };
++
++    constexpr uint32_t kReplyAddress = 0x2000u;
++    using Reply = std::array<uint8_t, 16>;
++
++    Reply readReply(KernelFixture &fixture)
++    {
++        Reply reply{};
++        require(fixture.memory.readRam(kReplyAddress, reply.data(), reply.size()), "reply read failed");
++        return reply;
++    }
++
++    bool guardedReply(KernelFixture &fixture, const IopKernel::RpcWaitOwner &owner, uint8_t byte, int32_t result)
++    {
++        // Mirror the required bridge ordering: validate before any reply bytes
++        // are written, then complete. Predicate alone must reject stale owners.
++        if (!fixture.kernel.isRpcWaitCurrent(owner))
++            return false;
++        Reply reply{};
++        reply.fill(byte);
++        require(fixture.memory.writeRam(kReplyAddress, reply.data(), reply.size()), "reply write failed");
++        return fixture.kernel.completeRpcWait(owner, result);
++    }
++
++    void requireStaleOwner(KernelFixture &fixture, IopThread &thread,
++                           const IopKernel::RpcWaitOwner &owner)
++    {
++        const IopCpuState before = thread.cpu;
++        const auto state = thread.state;
++        const Reply reply = readReply(fixture);
++        require(!fixture.kernel.isRpcWaitCurrent(owner), "stale owner predicate remained true");
++        require(!guardedReply(fixture, owner, 0xEEu, -123), "stale owner passed guarded reply write");
++        require(readReply(fixture) == reply, "stale guarded reply changed memory");
++        require(!fixture.kernel.completeRpcWait(owner, -456), "stale direct completion accepted");
++        requireCpu(thread.cpu, before, "stale completion changed CPU continuation");
++        require(thread.state == state, "stale completion changed thread state");
++    }
++
++    void rejectAliasImport(KernelFixture &fixture, IopThread &thread, uint16_t ordinal)
++    {
++        const IopCpuState before = thread.cpu;
++        const auto state = thread.state;
++        const auto lifetime = thread.rpcLifetimeGeneration;
++        const auto generation = thread.rpcWaitGeneration;
++        const auto nonce = thread.rpcWaitNonce;
++        const auto result = thread.rpcWaitResult;
++        const auto ready = thread.rpcWaitResultReady;
++        const auto wakeups = thread.wakeupCount;
++        const auto current = fixture.kernel.hasCurrentThread();
++        require(!fixture.kernel.dispatchThreadImport(ordinal, thread.cpu, 0u), "blocked CPU import alias was accepted");
++        requireCpu(thread.cpu, before, "rejected alias changed CPU continuation");
++        require(thread.state == state && thread.rpcLifetimeGeneration == lifetime &&
++                    thread.rpcWaitGeneration == generation && thread.rpcWaitNonce == nonce &&
++                    thread.rpcWaitResult == result && thread.rpcWaitResultReady == ready &&
++                    thread.wakeupCount == wakeups && fixture.kernel.hasCurrentThread() == current,
++                "rejected alias changed owned wait or scheduler state");
++    }
++
++    void exactOwnershipWakeReleaseAndCompletion()
++    {
++        KernelFixture fixture;
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        thread.cpu.gpr[2] = 0xA5A5A5A5u;
++        const uint32_t continuation = thread.cpu.pc;
++
++        IopCpuState impostor;
++        std::memcpy(&impostor, &thread.cpu, sizeof(impostor));
++        require(std::memcmp(&impostor, &thread.cpu, sizeof(impostor)) == 0, "foreign CPU copy was not byte-identical");
++        const IopCpuState beforeAdmission = thread.cpu;
++        require(!fixture.kernel.beginRpcWait(impostor, 1u).has_value(), "foreign CPU acquired RPC wait ownership");
++        require(!fixture.kernel.beginRpcWait(thread.cpu, 0u).has_value(), "zero RPC nonce was accepted");
++        requireCpu(thread.cpu, beforeAdmission, "rejected admission changed worker CPU");
++        requireCpu(impostor, beforeAdmission, "rejected admission changed foreign CPU");
++        const auto first = fixture.beginWait(thread, 1u);
++        const IopCpuState pendingCpu = thread.cpu;
++        const auto pendingGeneration = thread.rpcWaitGeneration;
++        require(!fixture.kernel.beginRpcWait(thread.cpu, 1u), "duplicate pending admission accepted same nonce");
++        require(!fixture.kernel.beginRpcWait(thread.cpu, 2u), "duplicate pending admission accepted new nonce");
++        requireCpu(thread.cpu, pendingCpu, "duplicate admission changed CPU");
++        require(thread.rpcWaitGeneration == pendingGeneration && fixture.kernel.isRpcWaitCurrent(first),
++                "duplicate admission changed owner");
++        require(thread.cpu.gpr[2] == 0xA5A5A5A5u && thread.cpu.pc == continuation,
++                "beginRpcWait modified V0 or continuation");
++        fixture.endSlice(thread);
++
++        fixture.importForThread(25u, id); // WakeupThread
++        fixture.importForThread(18u, id); // ReleaseWaitThread
++        require(thread.state == IopThreadState::RpcWait && fixture.kernel.beginNextReady(0u) == nullptr,
++                "generic wake or release advanced an RPC wait");
++
++        require(fixture.kernel.completeRpcWait(first, -37), "first RPC completion was rejected");
++        require(thread.state == IopThreadState::Ready && static_cast<int32_t>(thread.cpu.gpr[2]) == -37,
++                "negative RPC completion did not resume with V0");
++        require(!fixture.kernel.completeRpcWait(first, 99), "duplicate completion was accepted");
++        require(static_cast<int32_t>(thread.cpu.gpr[2]) == -37, "duplicate completion changed V0");
++
++        IopThread &secondRun = fixture.runThread();
++        const auto second = fixture.beginWait(secondRun, 2u);
++        fixture.endSlice(secondRun);
++        const uint32_t beforeWrongNonce = secondRun.cpu.gpr[2];
++        require(!fixture.kernel.completeRpcWait(first, 19), "wrong-nonce completion was accepted");
++        require(secondRun.state == IopThreadState::RpcWait && secondRun.cpu.gpr[2] == beforeWrongNonce,
++                "wrong-nonce completion changed the live wait");
++        require(fixture.kernel.completeRpcWait(second, 19), "success completion was rejected");
++        require(secondRun.state == IopThreadState::Ready && secondRun.cpu.gpr[2] == 19u,
++                "success completion did not resume the worker once");
++    }
++
++    void sameNonceCannotReviveCompletedOwner()
++    {
++        KernelFixture fixture;
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        seedContinuation(thread.cpu, id);
++        const auto first = fixture.beginWait(thread, 77u);
++        const auto firstGeneration = thread.rpcWaitGeneration;
++        fixture.endSlice(thread);
++        require(guardedReply(fixture, first, 0x31u, 17), "first guarded reply failed");
++        const auto lifetime = thread.rpcLifetimeGeneration;
++        IopCpuState expected = thread.cpu;
++        expected.yielded = false;
++        require(fixture.kernel.beginNextReady(0u) == &thread, "first completion did not resume exact worker");
++        requireCpu(thread.cpu, expected, "scheduler altered resumed continuation");
++        const auto second = fixture.beginWait(thread, 77u);
++        require(thread.rpcLifetimeGeneration == lifetime && thread.rpcWaitGeneration != firstGeneration,
++                "second wait did not preserve lifetime and issue fresh generation");
++        fixture.endSlice(thread);
++        requireStaleOwner(fixture, thread, first);
++        require(fixture.kernel.isRpcWaitCurrent(second), "same-nonce second owner was not live");
++        require(guardedReply(fixture, second, 0x42u, -17), "same-nonce second completion failed");
++        requireStaleOwner(fixture, thread, second);
++    }
++
++    void suspendResumeScenario(bool endBeforeImports, bool replyBeforeResume, uint16_t suspendOrdinal)
++    {
++        KernelFixture fixture;
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        seedContinuation(thread.cpu, id);
++        const auto owner = fixture.beginWait(thread, 3u);
++        const uint16_t resumeOrdinal = suspendOrdinal + 2u;
++        if (endBeforeImports)
++            fixture.endSlice(thread);
++        rejectAliasImport(fixture, thread, suspendOrdinal);
++        rejectAliasImport(fixture, thread, resumeOrdinal);
++        IopCpuState expected = thread.cpu;
++        fixture.importForThread(suspendOrdinal, id);
++        require(thread.state == IopThreadState::Suspended, "SuspendThread did not suspend RPC wait");
++        requireCpu(thread.cpu, expected, "separate suspension changed worker CPU");
++        rejectAliasImport(fixture, thread, suspendOrdinal);
++        rejectAliasImport(fixture, thread, resumeOrdinal);
++
++        const int32_t result = replyBeforeResume ? 42 : -9;
++        if (replyBeforeResume)
++        {
++            require(guardedReply(fixture, owner, 0x57u, result), "suspended reply failed");
++            expected.gpr[2] = static_cast<uint32_t>(result);
++            requireCpu(thread.cpu, expected, "suspended reply changed continuation beyond V0");
++            require(thread.state == IopThreadState::Suspended && fixture.kernel.beginNextReady(0u) == nullptr,
++                    "suspended reply made worker runnable");
++            requireStaleOwner(fixture, thread, owner);
++            rejectAliasImport(fixture, thread, suspendOrdinal);
++            rejectAliasImport(fixture, thread, resumeOrdinal);
++        }
++        fixture.importForThread(resumeOrdinal, id);
++        requireCpu(thread.cpu, expected, "separate resume changed worker continuation");
++        if (!replyBeforeResume)
++        {
++            require(thread.state == IopThreadState::RpcWait && fixture.kernel.isRpcWaitCurrent(owner),
++                    "resume-before-reply did not restore owned wait");
++            require(fixture.kernel.beginNextReady(0u) == nullptr, "resume-before-reply made worker runnable");
++            rejectAliasImport(fixture, thread, suspendOrdinal);
++            rejectAliasImport(fixture, thread, resumeOrdinal);
++            require(guardedReply(fixture, owner, 0x68u, result), "resumed wait reply failed");
++            expected.gpr[2] = static_cast<uint32_t>(result);
++        }
++        require(thread.state == IopThreadState::Ready, "completed resumed worker was not ready");
++        requireCpu(thread.cpu, expected, "reply/resume corrupted full continuation");
++        if (!endBeforeImports)
++            fixture.endSlice(thread);
++        expected.yielded = false;
++        require(fixture.kernel.beginNextReady(0u) == &thread, "reply/resume did not schedule exact worker");
++        requireCpu(thread.cpu, expected, "scheduler corrupted resumed RPC continuation");
++        fixture.endSlice(thread);
++    }
++
++    void suspendResumePreservesRpcWait()
++    {
++        for (bool endBeforeImports : {false, true})
++            for (bool replyBeforeResume : {false, true})
++                for (uint16_t suspendOrdinal : {29u, 30u})
++                    suspendResumeScenario(endBeforeImports, replyBeforeResume, suspendOrdinal);
++    }
++
++    void lifecycleInvalidatesOldOwners()
++    {
++        KernelFixture fixture;
++        const int id = fixture.createThread();
++        fixture.startThread(id);
++        IopThread &thread = fixture.runThread();
++        const auto beforeRestart = fixture.beginWait(thread, 5u);
++        fixture.endSlice(thread);
++
++        fixture.startThread(id);
++        IopThread &restarted = fixture.runThread();
++        const auto restartedOwner = fixture.beginWait(restarted, 5u);
++        fixture.endSlice(restarted);
++        const uint32_t restartV0 = restarted.cpu.gpr[2];
++        require(!fixture.kernel.completeRpcWait(beforeRestart, 1), "restart allowed an old owner to complete");
++        require(restarted.state == IopThreadState::RpcWait && restarted.cpu.gpr[2] == restartV0,
++                "restart late completion touched the replacement worker");
++        fixture.importForThread(11u, id); // TerminateThread
++        require(!fixture.kernel.isRpcWaitCurrent(restartedOwner) && !fixture.kernel.completeRpcWait(restartedOwner, 2),
++                "TerminateThread retained RPC ownership");
++
++        fixture.startThread(id);
++        IopThread &deletable = fixture.runThread();
++        const auto beforeDelete = fixture.beginWait(deletable, 6u);
++        fixture.endSlice(deletable);
++        fixture.importForThread(5u, id); // DeleteThread
++        require(!fixture.kernel.completeRpcWait(beforeDelete, 3), "DeleteThread retained RPC ownership");
++
++        const int rangeId = fixture.createThread(kThreadEntry + 0x100u);
++        fixture.startThread(rangeId);
++        IopThread &ranged = fixture.runThread();
++        const auto beforeRangeCleanup = fixture.beginWait(ranged, 7u);
++        fixture.endSlice(ranged);
++        fixture.kernel.terminateThreadsInRange(kThreadEntry + 0x100u, 4u);
++        fixture.kernel.cleanupDeadThreads();
++        require(!fixture.kernel.completeRpcWait(beforeRangeCleanup, 4),
++                "module-range cleanup retained RPC ownership");
++
++        const int resetId = fixture.createThread();
++        fixture.startThread(resetId);
++        IopThread &resettable = fixture.runThread();
++        const auto beforeReset = fixture.beginWait(resettable, 8u);
++        const auto preResetLifetime = resettable.rpcLifetimeGeneration;
++        const auto preResetWaitGeneration = resettable.rpcWaitGeneration;
++        fixture.endSlice(resettable);
++        fixture.kernel.reset();
++        require(!fixture.kernel.completeRpcWait(beforeReset, 5), "reset retained RPC ownership");
++
++        int reusedId = 0;
++        for (int expectedId = 1; expectedId <= resetId; ++expectedId)
++        {
++            reusedId = fixture.createThread();
++            require(reusedId == expectedId, "reset thread ID sequence changed");
++        }
++        require(reusedId == resetId, "reset replacement did not reuse exact old owner's thread ID");
++        fixture.startThread(reusedId);
++        IopThread &reused = fixture.runThread();
++        const auto reusedOwner = fixture.beginWait(reused, 8u);
++        require(reused.rpcLifetimeGeneration > preResetLifetime && reused.rpcWaitGeneration > preResetWaitGeneration,
++                "kernel-issued generation counter did not survive reset");
++        fixture.endSlice(reused);
++        const uint32_t reusedV0 = reused.cpu.gpr[2];
++        requireStaleOwner(fixture, reused, beforeReset);
++        require(reused.state == IopThreadState::RpcWait && reused.cpu.gpr[2] == reusedV0,
++                "stale reset completion touched reused ID and nonce");
++        require(fixture.kernel.completeRpcWait(reusedOwner, 7), "reused worker completion was rejected");
++    }
++}
++
++int main()
++{
++    try
++    {
++        exactOwnershipWakeReleaseAndCompletion();
++        sameNonceCannotReviveCompletedOwner();
++        suspendResumePreservesRpcWait();
++        lifecycleInvalidatesOldOwners();
++    }
++    catch (const std::exception &error)
++    {
++        std::cerr << "FAIL: " << error.what() << '\n';
++        return 1;
++    }
++    return 0;
++}
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..00b1ee6 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -263,6 +263,7 @@ namespace ps2recomp
+             m_ss << indent << "return;\n";
+             m_ss << indent << "#else\n";
+             m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
++            m_ss << indent << "runtime->observeGuestReturn(ctx, " << jumpTargetExpression << ");\n";
+             m_ss << indent << "return;\n";
+             m_ss << indent << "#endif\n";
+             return;
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 5348d37..40ba024 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -340,6 +340,9 @@ public:
+     bool registerFunction(uint32_t address, RecompiledFunction func);
+     RecompiledFunction lookupFunction(uint32_t address);
+     bool hasFunction(uint32_t address) const;
++    // Generated JR $ra keeps its existing transfer/timing behavior while
++    // reporting an actual return to opted-in checked invocation ownership.
++    void observeGuestReturn(R5900Context *ctx, uint32_t targetPc) noexcept;
+     bool dispatchGuestBranch(uint8_t *rdram,
+                              R5900Context *ctx,
+                              uint32_t targetPc,
+@@ -478,6 +481,7 @@ private:
+     void freeGuestBlockLocked(uint32_t guestAddr);
+     void coalesceGuestHeapLocked();
+     void HandleIntegerOverflow(R5900Context *ctx);
++    void raiseGuestException(R5900Context *ctx, uint32_t exceptionCode, bool tlbRefill = false);
+ 
+     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 026cf1a..771f0fa 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -79,6 +79,7 @@ struct EeWaitState
+     EeWaitReason reason = EeWaitReason::None;
+     EeWaitPayload payload{};
+     std::function<void(R5900Context &)> completion;
++    uint64_t ownerInvocationSequence = 0;
+ };
+ 
+ enum class GuestInvocationKind : uint8_t
+@@ -108,6 +109,11 @@ struct GuestInvocation
+     // Physical extent of a runtime-owned isolated stack, if one was assigned.
+     uint32_t stackReservationBegin = 0u;
+     uint32_t stackReservationEnd = 0u;
++    // Opted-in native service calls require an actual guest Return to PC0.
++    // Missing targets/faults also revoke descendants of a checked call.
++    bool requireGuestReturn = false;
++    bool guestReturnedNormally = false;
++    bool executionFailed = false;
+ };
+ 
+ struct GuestThread
+@@ -130,6 +136,7 @@ struct GuestThread
+     uint32_t tlsBase = 0;
+     EeWaitState wait{};
+     std::function<void(R5900Context &)> resumeCompletion;
++    uint64_t resumeCompletionOwner = 0;
+     std::vector<GuestInvocation> invocations;
+ 
+     [[nodiscard]] R5900Context &activeContext()
+@@ -325,6 +332,8 @@ public:
+     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
+     int cancelAlarm(int id);
+     void queueInvocation(GuestInvocation invocation);
++    void observeInvocationReturn(R5900Context *context) noexcept;
++    void failInvocation(R5900Context *context) noexcept;
+     [[nodiscard]] bool hasResetSensitiveInvocations() const;
+     // Quiescent runtime shutdown/reset: release owned packets without completion.
+     void discardInvocations();
+@@ -390,6 +399,10 @@ private:
+ 
+     void assertExecutor() const;
+     void prepareInvocationStack(GuestInvocation &invocation);
++    void failCurrentInvocation() noexcept;
++    void failInvocations(int ownerId) noexcept;
++    void retireInvocationCompletion(GuestThread &owner, uint64_t sequence) noexcept;
++    void cancelFailedInvocations(int ownerId) noexcept;
+     void validateIsolatedInvocationStack(uint32_t stackTop) const;
+     struct InvocationStackChoice { uint32_t top, begin, end; };
+     [[nodiscard]] InvocationStackChoice selectInvocationStack();
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 327e56f..2523656 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -202,32 +202,75 @@ void EeScheduler::run() try
+ 
+         GuestThread *running = currentThread();
+         assert(running != nullptr);
++        const int executingOwnerId = running->id;
+         if (!running->invocations.empty())
+         {
+             auto &invocation = running->invocations.back();
+-            if (invocation.isValid && !invocation.isValid())
++            bool valid = !invocation.executionFailed;
++            try
++            {
++                // Checked ownership covers its active descendants, including
++                // legacy frames whose own predicate may still be valid.
++                for (size_t i = 0; valid && i + 1u < running->invocations.size(); ++i)
++                {
++                    const auto &ancestor = running->invocations[i];
++                    if (ancestor.requireGuestReturn && ancestor.isValid && !ancestor.isValid())
++                    {
++                        failInvocations(executingOwnerId);
++                        valid = false;
++                    }
++                }
++                if (valid && invocation.isValid) valid = invocation.isValid();
++            }
++            catch (...)
+             {
++                failInvocations(executingOwnerId);
++                cancelFailedInvocations(executingOwnerId);
++                throw;
++            }
++            if (invocation.executionFailed || !valid)
++            {
++                // An explicitly cancelled descendant invalidates checked
++                // ownership regardless of its legacy return convention.
++                // The helper leaves entirely unchecked chains unchanged.
++                failInvocations(executingOwnerId);
+                 auto cancelled = std::move(invocation);
+                 running->invocations.pop_back();
+-                if (cancelled.onCancel) cancelled.onCancel();
++                retireInvocationCompletion(*running, cancelled.sequence);
++                try { if (cancelled.onCancel) cancelled.onCancel(); }
++                catch (...)
++                {
++                    failInvocations(executingOwnerId);
++                    cancelFailedInvocations(executingOwnerId);
++                    throw;
++                }
+                 continue;
+             }
+         }
+         if (running->resumeCompletion)
+         {
+             auto completion = std::move(running->resumeCompletion);
++            const uint64_t completionOwner = running->resumeCompletionOwner;
+             running->resumeCompletion = {};
++            running->resumeCompletionOwner = 0u;
++            const uint64_t activeOwner = running->invocations.empty() ? 0u : running->invocations.back().sequence;
++            // A deferred completion belongs to its original frame, never the
++            // parent that becomes active after cancellation or normal pop.
++            if (completionOwner != activeOwner) continue;
+             try
+             {
+                 completion(running->activeContext());
+             }
+-            catch (const EeDispatcherTransfer &)
++            catch (const EeDispatcherTransfer &) {}
++            catch (...)
+             {
++                failInvocations(executingOwnerId);
++                cancelFailedInvocations(executingOwnerId);
++                throw;
+             }
+-            if (m_currentThreadId == 0)
+-            {
+-                continue;
+-            }
++            // Completion may have attached another invocation or invalidated
++            // this one. Re-enter the validation gate before any guest effects.
++            continue;
+         }
+         R5900Context &context = running->activeContext();
+         if (m_debugPublishCountdown == 0u)
+@@ -247,16 +290,36 @@ void EeScheduler::run() try
+         {
+             if (!running->invocations.empty())
+             {
++                const auto &active = running->invocations.back();
++                if (active.requireGuestReturn && !active.guestReturnedNormally)
++                    failCurrentInvocation();
+                 GuestInvocation completed = std::move(running->invocations.back());
+                 running->invocations.pop_back();
++                retireInvocationCompletion(*running, completed.sequence);
++                if (completed.executionFailed ||
++                    (completed.requireGuestReturn && !completed.guestReturnedNormally))
++                {
++                    try { if (completed.onCancel) completed.onCancel(); }
++                    catch (...)
++                    {
++                        failInvocations(executingOwnerId);
++                        cancelFailedInvocations(executingOwnerId);
++                        throw;
++                    }
++                    continue;
++                }
+                 if (completed.onComplete)
+                 {
+                     try
+                     {
+                         completed.onComplete(completed.context, running->activeContext());
+                     }
+-                    catch (const EeDispatcherTransfer &)
++                    catch (const EeDispatcherTransfer &) {}
++                    catch (...)
+                     {
++                        failInvocations(executingOwnerId);
++                        cancelFailedInvocations(executingOwnerId);
++                        throw;
+                     }
+                 }
+                 continue;
+@@ -279,6 +342,7 @@ void EeScheduler::run() try
+ 
+         if (!m_runtime.hasFunction(context.pc))
+         {
++            failInvocation(&context);
+             if (!running->invocations.empty())
+             {
+                 context.pc = 0u;
+@@ -319,6 +383,11 @@ void EeScheduler::run() try
+         catch (...)
+         {
+             m_guestExecuting.store(false, std::memory_order_release);
++            m_insideInterrupt = false;
++            // Do not inspect the pre-call context reference: an invocation
++            // vector may have reallocated before a preparation failure.
++            failInvocations(executingOwnerId);
++            cancelFailedInvocations(executingOwnerId);
+             throw;
+         }
+ 
+@@ -1140,7 +1209,10 @@ void EeScheduler::discardInvocations()
+     for (auto &[id, owner] : m_threads)
+     {
+         for (auto &invocation : owner.invocations)
++        {
++            retireInvocationCompletion(owner, invocation.sequence);
+             if (invocation.onCancel) invocation.onCancel();
++        }
+         owner.invocations.clear();
+     }
+     for (auto &invocation : m_pendingInvocations)
+@@ -1148,6 +1220,65 @@ void EeScheduler::discardInvocations()
+     m_pendingInvocations.clear();
+ }
+ 
++void EeScheduler::observeInvocationReturn(R5900Context *context) noexcept
++{
++    GuestThread *owner = currentThread();
++    if (!owner || owner->invocations.empty() || &owner->activeContext() != context) return;
++    auto &active = owner->invocations.back();
++    if (active.requireGuestReturn && !active.executionFailed)
++        active.guestReturnedNormally = true;
++}
++
++void EeScheduler::failInvocation(R5900Context *context) noexcept
++{
++    GuestThread *owner = currentThread();
++    if (!owner || owner->invocations.empty() || &owner->activeContext() != context) return;
++    failCurrentInvocation();
++}
++
++void EeScheduler::failCurrentInvocation() noexcept
++{
++    failInvocations(m_currentThreadId);
++}
++
++void EeScheduler::failInvocations(int ownerId) noexcept
++{
++    GuestThread *owner = thread(ownerId);
++    if (!owner) return;
++    bool checked = false;
++    for (auto &invocation : owner->invocations)
++    {
++        checked = checked || invocation.requireGuestReturn;
++        if (checked) invocation.executionFailed = true;
++    }
++}
++
++void EeScheduler::retireInvocationCompletion(GuestThread &owner, uint64_t sequence) noexcept
++{
++    if (owner.resumeCompletionOwner == sequence)
++    {
++        owner.resumeCompletion = {};
++        owner.resumeCompletionOwner = 0u;
++    }
++    if (owner.wait.ownerInvocationSequence == sequence)
++        owner.wait.completion = {};
++}
++
++void EeScheduler::cancelFailedInvocations(int ownerId) noexcept
++{
++    GuestThread *owner = thread(ownerId);
++    while (owner && !owner->invocations.empty() && owner->invocations.back().executionFailed)
++    {
++        auto cancelled = std::move(owner->invocations.back());
++        owner->invocations.pop_back();
++        retireInvocationCompletion(*owner, cancelled.sequence);
++        // Called only while another exception is already being propagated.
++        // Drain every affected frame; cancellation cannot replace that fault.
++        try { if (cancelled.onCancel) cancelled.onCancel(); } catch (...) {}
++        owner = thread(ownerId);
++    }
++}
++
+ void EeScheduler::queueInvocation(GuestInvocation invocation)
+ {
+     assertExecutor();
+@@ -1163,13 +1294,16 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     assert(owner != nullptr);
+     try
+     {
++        invocation.executionFailed = invocation.executionFailed ||
++            std::any_of(owner->invocations.begin(), owner->invocations.end(),
++                        [](const GuestInvocation &parent) { return parent.executionFailed; });
+         prepareInvocationStack(invocation);
+         invocation.sequence = ++m_invocationSequence;
+         owner->invocations.push_back(std::move(invocation));
+     }
+     catch (...)
+     {
+-        if (invocation.onCancel) invocation.onCancel();
++        try { if (invocation.onCancel) invocation.onCancel(); } catch (...) {}
+         throw;
+     }
+     publishSnapshot();
+@@ -1184,13 +1318,19 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     assert(!invocations.empty());
+     try
+     {
+-        for (auto &invocation : invocations) prepareInvocationStack(invocation);
++        const bool failedParent = std::any_of(owner->invocations.begin(), owner->invocations.end(),
++            [](const GuestInvocation &parent) { return parent.executionFailed; });
++        for (auto &invocation : invocations)
++        {
++            invocation.executionFailed = invocation.executionFailed || failedParent;
++            prepareInvocationStack(invocation);
++        }
+         owner->invocations.reserve(owner->invocations.size() + invocations.size());
+     }
+     catch (...)
+     {
+         for (auto &invocation : invocations)
+-            if (invocation.onCancel) invocation.onCancel();
++            try { if (invocation.onCancel) invocation.onCancel(); } catch (...) {}
+         throw;
+     }
+     for (auto it = invocations.rbegin(); it != invocations.rend(); ++it)
+@@ -1901,6 +2041,7 @@ void EeScheduler::makeDormant(GuestThread &item)
+     item.status = EeThreadStatus::Dormant;
+     item.wait = {};
+     item.resumeCompletion = {};
++    item.resumeCompletionOwner = 0u;
+     item.suspendCount = 0;
+     item.wakeupCount = 0;
+     for (auto &invocation : item.invocations)
+@@ -1942,6 +2083,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
+ {
+     GuestThread *self = currentThread();
+     assert(self != nullptr);
++    wait.ownerInvocationSequence = self->invocations.empty() ? 0u : self->invocations.back().sequence;
+     self->wait = std::move(wait);
+     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+     m_currentThreadId = 0;
+@@ -1952,9 +2094,22 @@ void EeScheduler::blockCurrent(EeWaitState wait)
+ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
+ {
+     auto completion = std::move(item.wait.completion);
++    const uint64_t completionOwner = item.wait.ownerInvocationSequence;
+     item.wait = {};
+-    setReturnS32(&item.activeContext(), result);
+-    item.resumeCompletion = std::move(completion);
++    const uint64_t activeOwner = item.invocations.empty() ? 0u : item.invocations.back().sequence;
++    if (completionOwner == activeOwner)
++    {
++        setReturnS32(&item.activeContext(), result);
++        item.resumeCompletion = std::move(completion);
++        item.resumeCompletionOwner = completionOwner;
++    }
++    else
++    {
++        // A retired frame's late wake must not write even the scheduler result
++        // register into the newly active parent continuation.
++        item.resumeCompletion = {};
++        item.resumeCompletionOwner = 0u;
++    }
+     if (item.suspendCount != 0)
+     {
+         item.status = EeThreadStatus::Suspended;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b8c7b04..a6f81f8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1284,6 +1284,10 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+                                        GuestBranchKind kind,
+                                        const char *debugName)
+ {
++    // The callback Return sentinel is a valid guest return, not a missing
++    // target. All other missing transfers revoke an opted-in service call.
++    if (kind == GuestBranchKind::Return && targetPc == 0u) return;
++    if (m_eeScheduler) m_eeScheduler->failInvocation(ctx);
+     const MissingFunctionPolicy policy = missingFunctionPolicy();
+     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
+ 
+@@ -1435,6 +1439,12 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++void PS2Runtime::observeGuestReturn(R5900Context *ctx, uint32_t targetPc) noexcept
++{
++    if (m_eeScheduler && targetPc == 0u)
++        m_eeScheduler->observeInvocationReturn(ctx);
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1444,6 +1454,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      const char *debugName)
+ {
+     ctx->pc = targetPc;
++    if (kind == GuestBranchKind::Return) observeGuestReturn(ctx, targetPc);
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+@@ -1504,6 +1515,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     return ctx->pc == fallthroughPc;
+ }
+ 
++void PS2Runtime::raiseGuestException(R5900Context *ctx, uint32_t exceptionCode, bool tlbRefill)
++{
++    if (m_eeScheduler) m_eeScheduler->failInvocation(ctx);
++    raiseCop0Exception(ctx, exceptionCode, tlbRefill);
++}
++
+ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+ {
+     if (exception == EXCEPTION_INTEGER_OVERFLOW)
+@@ -1512,7 +1529,7 @@ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+         return;
+     }
+ 
+-    raiseCop0Exception(ctx, static_cast<uint32_t>(exception),
++    raiseGuestException(ctx, static_cast<uint32_t>(exception),
+                        exception == EXCEPTION_TLB_REFILL);
+ }
+ 
+@@ -1573,7 +1590,7 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+ 
+ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+ {
+-    raiseCop0Exception(ctx, EXCEPTION_BREAKPOINT);
++    raiseGuestException(ctx, EXCEPTION_BREAKPOINT);
+ }
+ 
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+@@ -1586,7 +1603,7 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ 
+ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
+ {
+-    raiseCop0Exception(ctx, EXCEPTION_TRAP);
++    raiseGuestException(ctx, EXCEPTION_TRAP);
+ }
+ 
+ void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
+@@ -1599,7 +1616,7 @@ void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
+     const uint32_t index = ctx->cop0_index & 0x3Fu;
+     if (!m_memory.tlbRead(index, vpn, pfn, mask, valid))
+     {
+-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
++        raiseGuestException(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+         return;
+     }
+ 
+@@ -1621,7 +1638,7 @@ void PS2Runtime::handleTLBWI(uint8_t *rdram, R5900Context *ctx)
+ 
+     if (!m_memory.tlbWrite(index, vpn, pfn, mask, valid))
+     {
+-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
++        raiseGuestException(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+     }
+ }
+ 
+@@ -1630,7 +1647,7 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
+     const uint32_t entryCount = static_cast<uint32_t>(m_memory.tlbEntryCount());
+     if (entryCount == 0)
+     {
+-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
++        raiseGuestException(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+         return;
+     }
+ 
+@@ -1648,7 +1665,7 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
+ 
+     if (!m_memory.tlbWrite(random, vpn, pfn, mask, valid))
+     {
+-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
++        raiseGuestException(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+         return;
+     }
+ 
+@@ -2440,7 +2457,7 @@ void PS2Runtime::initializeEeKernelState(uint8_t *rdram)
+ 
+ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+ {
+-    raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
++    raiseGuestException(ctx, EXCEPTION_INTEGER_OVERFLOW);
+ }
+ 
+ void PS2Runtime::run()
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 463b6cf..00bb9fb 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1753,6 +1753,13 @@ void register_code_generator_tests()
+                      "JR $31 should use the Return branch kind for precise diagnostics");
+             t.IsTrue(generated.find("\"JR $ra\"") != std::string::npos,
+                      "JR $31 should pass a return-specific debug name");
++            const size_t defaultPath = generated.find("#else");
++            const size_t defaultEnd = generated.find("#endif", defaultPath);
++            const std::string defaultReturn = generated.substr(defaultPath, defaultEnd - defaultPath);
++            t.IsTrue(defaultReturn.find("runtime->observeGuestReturn(ctx, jumpTarget);") != std::string::npos,
++                     "production JR returns must report the checked return even with strict diagnostics disabled");
++            t.IsFalse(defaultReturn.find("dispatchGuestBranch") != std::string::npos,
++                      "default return observation must preserve the existing transfer/checkpoint timing");
+         });
+ 
+         tc.Run("trailing JR $31 without decoded delay slot still emits return flow", [](TestCase &t) {
+diff --git a/ps2xTest/src/ps2_invocation_stack_tests.cpp b/ps2xTest/src/ps2_invocation_stack_tests.cpp
+index 777495c..9226170 100644
+--- a/ps2xTest/src/ps2_invocation_stack_tests.cpp
++++ b/ps2xTest/src/ps2_invocation_stack_tests.cpp
+@@ -339,6 +339,457 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    constexpr uint32_t kCheckedDriver = 0x00178300u;
++    constexpr uint32_t kCheckedParentResume = 0x00178310u;
++    constexpr uint32_t kCheckedCallee = 0x00178320u;
++    constexpr uint32_t kCheckedCalleeResume = 0x00178330u;
++    constexpr uint32_t kCheckedNestedMissing = 0x00178340u;
++    constexpr uint32_t kCheckedUnmapped = 0x00178350u;
++    constexpr uint32_t kCheckedMode = 0x00018200u;
++    constexpr uint32_t kCheckedCompleted = 0x00018204u;
++    constexpr uint32_t kCheckedCancelled = 0x00018208u;
++    constexpr uint32_t kCheckedReply = 0x0001820Cu;
++    constexpr uint32_t kCheckedParentIntact = 0x00018210u;
++    constexpr uint32_t kCheckedChildCompleted = 0x00018214u;
++    constexpr uint32_t kCheckedChildCancelled = 0x00018218u;
++    constexpr uint32_t kCheckedExternalWake = 0x00178360u;
++    constexpr uint32_t kCheckedThrowingChild = 0x00178370u;
++    constexpr uint32_t kCheckedDeferredRuns = 0x0001821Cu;
++    constexpr uint32_t kCheckedChildRuns = 0x00018220u;
++    constexpr uint32_t kCheckedWaitingChild = 0x00178380u;
++    constexpr uint32_t kCheckedWaitingChildResume = 0x00178390u;
++    constexpr uint32_t kCheckedAncestorValid = 0x00018224u;
++    constexpr uint32_t kCheckedChildResumed = 0x00018228u;
++    constexpr uint32_t kCheckedReplyValue = 0xB16B00B5u;
++    constexpr uint32_t kCheckedReplyCanary = 0xA5D37E19u;
++    R5900Context gCheckedParent{};
++
++    enum class CheckedMode : uint32_t
++    {
++        Return, YieldReturn, UnmappedEntry, MissingCall, MissingIndirect,
++        SkipMissingCall, JumpZero, NoReturnWitness, NestedMissing, HardwareFault,
++        CppFault, LegacyUnmapped, NestedNoReturn, StrictReturn, DeferredFault,
++        ChildCompletionFault, FailureThenWait, FailureThenLegacyChild,
++        FailureThenCheckedChild, NestedCancelFault, ValidityFault, ColdDiscardWait,
++        FailureThenSequence, ReturnCheckpoint, DeferredFailedChild, DeferredFailedSequence,
++        DeferredHealthyChild, DeferredInvalidChild, GeneratedReturn, AncestorRevokedWait,
++        AncestorThrowWait, AncestorRevokedCompletion, UncheckedAncestorRevoke,
++        LegacyChildRevokedChecked, LegacyChildRevokedUnchecked,
++    };
++
++    void checkedParentResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeU32(ram, kCheckedParentIntact,
++                 std::memcmp(ctx, &gCheckedParent, sizeof(*ctx)) == 0 ? 1u : 0u);
++        runtime->requestStop();
++    }
++
++    void checkedCalleeReturn(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setReg(*ctx, 2, kCheckedReplyValue);
++        if (static_cast<CheckedMode>(readU32(ram, kCheckedMode)) == CheckedMode::GeneratedReturn)
++        {
++            // The generator's normal, diagnostics-disabled JR $ra path.
++            const uint32_t jumpTarget = getReg(*ctx, 31);
++            ctx->pc = jumpTarget;
++            runtime->observeGuestReturn(ctx, jumpTarget);
++            return;
++        }
++        if (static_cast<CheckedMode>(readU32(ram, kCheckedMode)) == CheckedMode::ReturnCheckpoint)
++            runtime->eeScheduler().postEvent(EeEvent{EeEventType::ExternalWake, 999u, 999u});
++        runtime->dispatchGuestBranch(ram, ctx, 0u, kCheckedCalleeResume, 0u,
++                                     PS2Runtime::GuestBranchKind::Return, "checked JR");
++    }
++
++    void checkedExternalWake(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeU32(ram, kWakeRunsAddress, readU32(ram, kWakeRunsAddress) + 1u);
++        const auto mode = static_cast<CheckedMode>(readU32(ram, kCheckedMode));
++        if (mode == CheckedMode::AncestorRevokedWait || mode == CheckedMode::AncestorThrowWait ||
++            mode == CheckedMode::AncestorRevokedCompletion || mode == CheckedMode::UncheckedAncestorRevoke)
++            writeU32(ram, kCheckedAncestorValid, 0u);
++        if (mode == CheckedMode::ColdDiscardWait)
++            runtime->requestStop();
++        else if (mode == CheckedMode::AncestorRevokedCompletion)
++            runtime->eeScheduler().wakeupThread(EeScheduler::kMainThreadId, false);
++        else
++            runtime->eeScheduler().completeExternalWait(77u, 123u, 0);
++        ctx->pc = 0u;
++    }
++
++    void checkedChildThrow(uint8_t *ram, R5900Context *, PS2Runtime *)
++    {
++        writeU32(ram, kCheckedChildRuns, readU32(ram, kCheckedChildRuns) + 1u);
++        throw std::runtime_error("checked callee failure");
++    }
++
++    void checkedWaitingChildResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *)
++    {
++        writeU32(ram, kCheckedChildResumed, readU32(ram, kCheckedChildResumed) + 1u);
++        ctx->pc = 0u;
++    }
++
++    void checkedWaitingChild(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeU32(ram, kCheckedChildRuns, readU32(ram, kCheckedChildRuns) + 1u);
++        EeThreadCreateParams wake{};
++        wake.entry = kCheckedExternalWake;
++        wake.stack = 0x0001A000u;
++        wake.stackSize = 0x8000u;
++        wake.priority = 10;
++        const int id = runtime->eeScheduler().createThread(wake);
++        runtime->eeScheduler().startThread(id, 0u, *ctx, false);
++        if (static_cast<CheckedMode>(readU32(ram, kCheckedMode)) == CheckedMode::AncestorRevokedCompletion)
++        {
++            ctx->pc = 0u;
++            runtime->eeScheduler().sleepCurrent();
++        }
++        ctx->pc = kCheckedWaitingChildResume;
++        runtime->eeScheduler().waitExternal(EeWaitReason::External, 77u, 123u,
++            [ram](R5900Context &) {
++                writeU32(ram, kCheckedDeferredRuns, readU32(ram, kCheckedDeferredRuns) + 1u);
++            });
++    }
++
++    void checkedCallee(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const auto mode = static_cast<CheckedMode>(readU32(ram, kCheckedMode));
++        switch (mode)
++        {
++        case CheckedMode::YieldReturn:
++        {
++            EeThreadCreateParams wake{};
++            wake.entry = kWakeThreadEntry;
++            wake.stack = 0x0001A000u;
++            wake.stackSize = 0x8000u;
++            wake.priority = 10;
++            const int id = runtime->eeScheduler().createThread(wake);
++            runtime->eeScheduler().startThread(id, 0u, *ctx, false);
++            ctx->pc = kCheckedCalleeResume;
++            runtime->eeScheduler().sleepCurrent();
++            return;
++        }
++        case CheckedMode::DeferredFault:
++        case CheckedMode::FailureThenWait:
++        case CheckedMode::ColdDiscardWait:
++        case CheckedMode::DeferredFailedChild:
++        case CheckedMode::DeferredFailedSequence:
++        case CheckedMode::DeferredHealthyChild:
++        case CheckedMode::DeferredInvalidChild:
++        {
++            if (mode == CheckedMode::FailureThenWait)
++                runtime->dispatchGuestBranch(ram, ctx, kCheckedUnmapped, kCheckedCallee,
++                    kCheckedCalleeResume, PS2Runtime::GuestBranchKind::DirectCall, "failure before wait");
++            EeThreadCreateParams wake{};
++            wake.entry = kCheckedExternalWake;
++            wake.stack = 0x0001A000u;
++            wake.stackSize = 0x8000u;
++            wake.priority = 10;
++            const int id = runtime->eeScheduler().createThread(wake);
++            runtime->eeScheduler().startThread(id, 0u, *ctx, false);
++            ctx->pc = kCheckedCalleeResume;
++            runtime->eeScheduler().waitExternal(EeWaitReason::External, 77u, 123u,
++                [ram, mode, runtime](R5900Context &resumed) {
++                    writeU32(ram, kCheckedDeferredRuns, readU32(ram, kCheckedDeferredRuns) + 1u);
++                    if (mode == CheckedMode::DeferredFault)
++                        throw std::runtime_error("checked callee failure");
++                    if (mode == CheckedMode::DeferredFailedChild || mode == CheckedMode::DeferredFailedSequence ||
++                        mode == CheckedMode::DeferredHealthyChild || mode == CheckedMode::DeferredInvalidChild)
++                    {
++                        if (mode == CheckedMode::DeferredFailedChild || mode == CheckedMode::DeferredFailedSequence)
++                            runtime->dispatchGuestBranch(ram, &resumed, kCheckedUnmapped, kCheckedCallee,
++                                kCheckedCalleeResume, PS2Runtime::GuestBranchKind::DirectCall, "deferred failure before child");
++                        GuestInvocation child{};
++                        child.kind = GuestInvocationKind::RpcCallback;
++                        child.context = resumed;
++                        child.context.pc = kCheckedNestedMissing;
++                        child.onComplete = [ram](const R5900Context &, R5900Context &) {
++                            writeU32(ram, kCheckedChildCompleted, readU32(ram, kCheckedChildCompleted) + 1u);
++                        };
++                        child.onCancel = [ram] {
++                            writeU32(ram, kCheckedChildCancelled, readU32(ram, kCheckedChildCancelled) + 1u);
++                        };
++                        if (mode == CheckedMode::DeferredInvalidChild)
++                        {
++                            child.requireGuestReturn = true;
++                            child.isValid = [] { return false; };
++                        }
++                        resumed.pc = kCheckedCalleeResume;
++                        if (mode == CheckedMode::DeferredFailedSequence)
++                        {
++                            std::vector<GuestInvocation> children;
++                            children.push_back(child);
++                            children.push_back(std::move(child));
++                            runtime->eeScheduler().invokeCurrentSequence(std::move(children));
++                        }
++                        runtime->eeScheduler().invokeCurrent(std::move(child));
++                    }
++                    setReg(resumed, 16, 0xBAD0u);
++                });
++        }
++        case CheckedMode::MissingCall:
++        case CheckedMode::MissingIndirect:
++        case CheckedMode::SkipMissingCall:
++            runtime->dispatchGuestBranch(ram, ctx, kCheckedUnmapped, kCheckedCallee,
++                kCheckedCalleeResume, mode == CheckedMode::MissingIndirect
++                    ? PS2Runtime::GuestBranchKind::IndirectCall
++                    : PS2Runtime::GuestBranchKind::DirectCall, "checked missing callee");
++            // SkipCallDebug deliberately continues to a real return; it must
++            // still be rejected because the handler did not execute fully.
++            if (mode == CheckedMode::SkipMissingCall) checkedCalleeReturn(ram, ctx, runtime);
++            return;
++        case CheckedMode::JumpZero:
++            runtime->dispatchGuestBranch(ram, ctx, 0u, kCheckedCallee, 0u,
++                                         PS2Runtime::GuestBranchKind::DirectJump, "checked J zero");
++            return;
++        case CheckedMode::NoReturnWitness:
++            setReg(*ctx, 2, kCheckedReplyValue);
++            ctx->pc = 0u;
++            return;
++        case CheckedMode::NestedMissing:
++        case CheckedMode::NestedNoReturn:
++        case CheckedMode::ChildCompletionFault:
++        case CheckedMode::FailureThenLegacyChild:
++        case CheckedMode::FailureThenCheckedChild:
++        case CheckedMode::NestedCancelFault:
++        case CheckedMode::FailureThenSequence:
++        case CheckedMode::AncestorRevokedWait:
++        case CheckedMode::AncestorThrowWait:
++        case CheckedMode::AncestorRevokedCompletion:
++        case CheckedMode::UncheckedAncestorRevoke:
++        case CheckedMode::LegacyChildRevokedChecked:
++        case CheckedMode::LegacyChildRevokedUnchecked:
++        {
++            if (mode == CheckedMode::FailureThenLegacyChild || mode == CheckedMode::FailureThenCheckedChild ||
++                mode == CheckedMode::FailureThenSequence)
++                runtime->dispatchGuestBranch(ram, ctx, kCheckedUnmapped, kCheckedCallee,
++                    kCheckedCalleeResume, PS2Runtime::GuestBranchKind::DirectCall, "failure before child");
++            GuestInvocation child{};
++            child.context = *ctx;
++            child.context.pc = mode == CheckedMode::NestedMissing ? kCheckedUnmapped
++                               : mode == CheckedMode::NestedCancelFault ? kCheckedThrowingChild
++                               : (mode == CheckedMode::AncestorRevokedWait || mode == CheckedMode::AncestorThrowWait ||
++                                  mode == CheckedMode::AncestorRevokedCompletion || mode == CheckedMode::UncheckedAncestorRevoke)
++                                   ? kCheckedWaitingChild : kCheckedNestedMissing;
++            child.requireGuestReturn = mode == CheckedMode::NestedNoReturn || mode == CheckedMode::FailureThenCheckedChild;
++            child.kind = GuestInvocationKind::RpcCallback;
++            if (mode == CheckedMode::LegacyChildRevokedChecked || mode == CheckedMode::LegacyChildRevokedUnchecked)
++                child.isValid = [] { return false; };
++            child.onComplete = [ram, mode](const R5900Context &, R5900Context &) {
++                writeU32(ram, kCheckedChildCompleted, readU32(ram, kCheckedChildCompleted) + 1u);
++                if (mode == CheckedMode::ChildCompletionFault)
++                    throw std::runtime_error("checked callee failure");
++            };
++            child.onCancel = [ram, mode] {
++                writeU32(ram, kCheckedChildCancelled, readU32(ram, kCheckedChildCancelled) + 1u);
++                if (mode == CheckedMode::NestedCancelFault)
++                    throw std::runtime_error("cancel cleanup error");
++            };
++            ctx->pc = kCheckedCalleeResume;
++            if (mode == CheckedMode::FailureThenSequence)
++            {
++                std::vector<GuestInvocation> sequence;
++                sequence.push_back(child);
++                child.requireGuestReturn = true;
++                sequence.push_back(std::move(child));
++                runtime->eeScheduler().invokeCurrentSequence(std::move(sequence));
++            }
++            runtime->eeScheduler().invokeCurrent(std::move(child));
++        }
++        case CheckedMode::HardwareFault:
++            runtime->SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
++            return;
++        case CheckedMode::CppFault:
++            throw std::runtime_error("checked callee failure");
++        default:
++            checkedCalleeReturn(ram, ctx, runtime);
++            return;
++        }
++    }
++
++    void checkedChildNoReturn(uint8_t *ram, R5900Context *ctx, PS2Runtime *)
++    {
++        writeU32(ram, kCheckedChildRuns, readU32(ram, kCheckedChildRuns) + 1u);
++        ctx->pc = 0u;
++    }
++
++    void checkedDriver(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const auto mode = static_cast<CheckedMode>(readU32(ram, kCheckedMode));
++        GuestInvocation call{};
++        call.kind = GuestInvocationKind::RpcCallback;
++        call.context = *ctx;
++        call.context.pc = (mode == CheckedMode::UnmappedEntry || mode == CheckedMode::LegacyUnmapped)
++                              ? kCheckedUnmapped : kCheckedCallee;
++        setReg(call.context, 29, 0u);
++        setReg(call.context, 31, 0u);
++        call.requireGuestReturn = mode != CheckedMode::LegacyUnmapped && mode != CheckedMode::UncheckedAncestorRevoke &&
++                                  mode != CheckedMode::LegacyChildRevokedUnchecked;
++        if (mode == CheckedMode::AncestorRevokedWait || mode == CheckedMode::AncestorThrowWait ||
++            mode == CheckedMode::AncestorRevokedCompletion || mode == CheckedMode::UncheckedAncestorRevoke)
++            call.isValid = [ram, mode] {
++                const bool alive = readU32(ram, kCheckedAncestorValid) != 0u;
++                if (!alive && mode == CheckedMode::AncestorThrowWait)
++                    throw std::runtime_error("checked callee failure");
++                return alive;
++            };
++        if (mode == CheckedMode::ValidityFault)
++            call.isValid = []() -> bool { throw std::runtime_error("checked callee failure"); };
++        call.onComplete = [ram](const R5900Context &reply, R5900Context &) {
++            writeU32(ram, kCheckedCompleted, readU32(ram, kCheckedCompleted) + 1u);
++            writeU32(ram, kCheckedReply, getReg(reply, 2));
++        };
++        call.onCancel = [ram] {
++            writeU32(ram, kCheckedCancelled, readU32(ram, kCheckedCancelled) + 1u);
++        };
++        ctx->pc = kCheckedParentResume;
++        gCheckedParent = *ctx;
++        runtime->eeScheduler().invokeCurrent(std::move(call));
++    }
++
++    void runCheckedInvocation(TestCase &t, CheckedMode mode)
++    {
++        TestEnv env;
++        env.runtime.registerFunction(kCheckedDriver, checkedDriver);
++        env.runtime.registerFunction(kCheckedParentResume, checkedParentResume);
++        env.runtime.registerFunction(kCheckedCallee, checkedCallee);
++        env.runtime.registerFunction(kCheckedCalleeResume, checkedCalleeReturn);
++        env.runtime.registerFunction(kWakeThreadEntry, wakeThreadEntry);
++        env.runtime.registerFunction(kCheckedNestedMissing, checkedChildNoReturn);
++        env.runtime.registerFunction(kCheckedExternalWake, checkedExternalWake);
++        env.runtime.registerFunction(kCheckedThrowingChild, checkedChildThrow);
++        env.runtime.registerFunction(kCheckedWaitingChild, checkedWaitingChild);
++        env.runtime.registerFunction(kCheckedWaitingChildResume, checkedWaitingChildResume);
++        if (mode == CheckedMode::StrictReturn)
++            env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++        if (mode == CheckedMode::SkipMissingCall || mode == CheckedMode::FailureThenWait ||
++            mode == CheckedMode::FailureThenLegacyChild || mode == CheckedMode::FailureThenCheckedChild ||
++            mode == CheckedMode::FailureThenSequence || mode == CheckedMode::DeferredFailedChild ||
++            mode == CheckedMode::DeferredFailedSequence)
++            env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::SkipCallDebug);
++        writeU32(env.ram.data(), kCheckedMode, static_cast<uint32_t>(mode));
++        writeU32(env.ram.data(), kCheckedReply, kCheckedReplyCanary);
++        writeU32(env.ram.data(), kCheckedAncestorValid, 1u);
++        writeU64(env.ram.data(), kParentSavedReturn, kParentCanary);
++        R5900Context main{};
++        main.pc = kCheckedDriver;
++        setReg(main, 28, kParentGp);
++        setReg(main, 29, kLiveParentSp);
++        setReg(main, 16, kParentS0);
++        setReg(main, 2, 0xCE11u);
++        env.runtime.eeScheduler().reset(env.ram.data(), main);
++        bool threw = false;
++        try { env.runtime.eeScheduler().run(); }
++        catch (const std::runtime_error &e)
++        {
++            threw = true;
++            t.Equals(std::string(e.what()), std::string("checked callee failure"),
++                     "unexpected callback exception must not masquerade as the intended fault");
++        }
++        if (mode == CheckedMode::ColdDiscardWait)
++        {
++            t.Equals(readU32(env.ram.data(), kCheckedCancelled), 0u, "stopped waiting call must still own its frame");
++            t.IsTrue(env.runtime.eeScheduler().retireInvocationStacksForColdLoad(), "stopped cold load must retire frames");
++            env.runtime.eeScheduler().completeExternalWait(77u, 123u, 12345);
++            const auto &parent = env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId)->context;
++            const bool intact = std::memcmp(&parent, &gCheckedParent, sizeof(parent)) == 0;
++            t.IsTrue(intact, "late wake of a retired callback must not overwrite parent result or CPU state");
++            writeU32(env.ram.data(), kCheckedParentIntact, intact ? 1u : 0u);
++            t.Equals(readU32(env.ram.data(), kCheckedDeferredRuns), 0u, "cold retirement must release deferred completion");
++        }
++        const bool successful = mode == CheckedMode::Return || mode == CheckedMode::YieldReturn ||
++                                mode == CheckedMode::StrictReturn || mode == CheckedMode::ReturnCheckpoint ||
++                                mode == CheckedMode::DeferredHealthyChild || mode == CheckedMode::GeneratedReturn ||
++                                mode == CheckedMode::LegacyChildRevokedUnchecked;
++        const bool legacy = mode == CheckedMode::LegacyUnmapped;
++        t.Equals(readU32(env.ram.data(), kCheckedCompleted), successful || legacy ? 1u : 0u,
++                 "only observed normal return may complete a checked guest call");
++        t.Equals(readU32(env.ram.data(), kCheckedCancelled), successful || legacy ? 0u : 1u,
++                 "failed checked call must cancel exactly once");
++        t.Equals(readU32(env.ram.data(), kCheckedReply), successful ? kCheckedReplyValue
++                                                                  : legacy ? 0xCE11u : kCheckedReplyCanary,
++                 "failed checked callback must leave reply bytes intact");
++        const bool expectedThrow = mode == CheckedMode::CppFault || mode == CheckedMode::DeferredFault ||
++            mode == CheckedMode::ChildCompletionFault || mode == CheckedMode::NestedCancelFault ||
++            mode == CheckedMode::ValidityFault || mode == CheckedMode::AncestorThrowWait;
++        t.Equals(threw, expectedThrow, "callback faults must propagate without cancellation masking them");
++        if (!threw)
++            t.Equals(readU32(env.ram.data(), kCheckedParentIntact), 1u,
++                     "callback must preserve the complete parent CPU continuation");
++        if (threw)
++            t.Equals(std::memcmp(&env.runtime.cpu(), &gCheckedParent, sizeof(gCheckedParent)), 0,
++                     "C++ fault cleanup must expose the complete unchanged parent continuation");
++        t.Equals(readU64(env.ram.data(), kParentSavedReturn), kParentCanary,
++                 "checked callback must preserve live parent frame memory");
++        if (mode == CheckedMode::YieldReturn)
++            t.Equals(readU32(env.ram.data(), kWakeRunsAddress), 1u,
++                     "real second EE thread must wake and resume the checked handler");
++        if (mode == CheckedMode::DeferredFault || mode == CheckedMode::FailureThenWait)
++        {
++            t.Equals(readU32(env.ram.data(), kWakeRunsAddress), 1u, "real EE worker must complete the external wait");
++            t.Equals(readU32(env.ram.data(), kCheckedDeferredRuns), mode == CheckedMode::DeferredFault ? 1u : 0u,
++                     "cancelled wait completion must never run against its parent");
++            t.IsFalse(bool(env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId)->resumeCompletion),
++                      "deferred completion resources must be retired");
++        }
++        if (mode == CheckedMode::DeferredFailedChild || mode == CheckedMode::DeferredFailedSequence ||
++            mode == CheckedMode::DeferredHealthyChild || mode == CheckedMode::DeferredInvalidChild)
++        {
++            const bool healthy = mode == CheckedMode::DeferredHealthyChild;
++            t.Equals(readU32(env.ram.data(), kWakeRunsAddress), 1u, "real external wake must reach deferred child attachment");
++            t.Equals(readU32(env.ram.data(), kCheckedDeferredRuns), 1u, "deferred child attachment must run exactly once");
++            t.Equals(readU32(env.ram.data(), kCheckedChildRuns), healthy ? 1u : 0u,
++                     "dispatcher must validate the newly active child before guest effects");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), healthy ? 1u : 0u,
++                     "only healthy deferred child may complete");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), healthy ? 0u :
++                mode == CheckedMode::DeferredFailedSequence ? 2u : 1u,
++                "every invalid or failed deferred child must cancel exactly once");
++        }
++        if (mode == CheckedMode::AncestorRevokedWait || mode == CheckedMode::AncestorThrowWait ||
++            mode == CheckedMode::AncestorRevokedCompletion || mode == CheckedMode::UncheckedAncestorRevoke)
++        {
++            const bool unchecked = mode == CheckedMode::UncheckedAncestorRevoke;
++            t.Equals(readU32(env.ram.data(), kWakeRunsAddress), 1u, "second EE worker must revoke the ancestor and wake the child");
++            t.Equals(readU32(env.ram.data(), kCheckedChildRuns), 1u, "healthy child entry must run before revocation");
++            t.Equals(readU32(env.ram.data(), kCheckedChildResumed), unchecked ? 1u : 0u,
++                     "revoked checked ancestor must suppress resumed descendant guest effects");
++            t.Equals(readU32(env.ram.data(), kCheckedDeferredRuns), unchecked ? 1u : 0u,
++                     "revoked checked ancestor must suppress descendant deferred callbacks");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), unchecked ? 1u : 0u,
++                     "revocation must precede descendant completion notification");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), unchecked ? 0u : 1u,
++                     "revoked checked ownership must cancel each descendant exactly once");
++        }
++        if (mode == CheckedMode::LegacyChildRevokedChecked || mode == CheckedMode::LegacyChildRevokedUnchecked)
++        {
++            t.Equals(readU32(env.ram.data(), kCheckedChildRuns), 0u, "revoked legacy child must not execute");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), 0u, "revoked legacy child must not complete");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), 1u, "revoked legacy child must cancel exactly once");
++        }
++        if (mode == CheckedMode::ChildCompletionFault)
++        {
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), 1u, "child completion must throw exactly once");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), 0u, "completed child cannot also cancel");
++        }
++        if (mode == CheckedMode::NestedCancelFault || mode == CheckedMode::FailureThenLegacyChild ||
++            mode == CheckedMode::FailureThenCheckedChild || mode == CheckedMode::FailureThenSequence)
++        {
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), 0u, "failed descendants cannot complete");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), mode == CheckedMode::FailureThenSequence ? 2u : 1u,
++                     "each failed descendant must cancel once");
++            t.Equals(readU32(env.ram.data(), kCheckedChildRuns), mode == CheckedMode::NestedCancelFault ? 1u : 0u,
++                     "new descendants beneath a failed owner must not execute");
++        }
++        if (mode == CheckedMode::NestedMissing || mode == CheckedMode::NestedNoReturn)
++        {
++            t.Equals(readU32(env.ram.data(), kCheckedChildCompleted), 0u,
++                     "nested legacy failure cannot authorize completion beneath a checked owner");
++            t.Equals(readU32(env.ram.data(), kCheckedChildCancelled), 1u,
++                     "nested failed frame must cancel exactly once");
++        }
++    }
++
+     bool storeIsOutsideParentFrame(uint32_t stackPointer)
+     {
+         const uint64_t first = static_cast<uint64_t>(stackPointer) - kStoreOffset;
+@@ -358,6 +809,42 @@ void register_ps2_invocation_stack_tests()
+ {
+     MiniTest::Case("PS2InvocationStack", [](TestCase &tc)
+     {
++        tc.Run("checked invocation Return", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::Return); });
++        tc.Run("checked invocation YieldReturn", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::YieldReturn); });
++        tc.Run("checked invocation UnmappedEntry", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::UnmappedEntry); });
++        tc.Run("checked invocation MissingCall", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::MissingCall); });
++        tc.Run("checked invocation MissingIndirect", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::MissingIndirect); });
++        tc.Run("checked invocation SkipMissingCall", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::SkipMissingCall); });
++        tc.Run("checked invocation JumpZero", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::JumpZero); });
++        tc.Run("checked invocation NoReturnWitness", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::NoReturnWitness); });
++        tc.Run("checked invocation NestedMissing", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::NestedMissing); });
++        tc.Run("checked invocation HardwareFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::HardwareFault); });
++        tc.Run("checked invocation CppFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::CppFault); });
++        tc.Run("checked invocation LegacyUnmapped", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::LegacyUnmapped); });
++        tc.Run("checked invocation NestedNoReturn", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::NestedNoReturn); });
++        tc.Run("checked invocation StrictReturn", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::StrictReturn); });
++        tc.Run("checked invocation DeferredFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::DeferredFault); });
++        tc.Run("checked invocation ChildCompletionFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::ChildCompletionFault); });
++        tc.Run("checked invocation FailureThenWait", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::FailureThenWait); });
++        tc.Run("checked invocation FailureThenLegacyChild", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::FailureThenLegacyChild); });
++        tc.Run("checked invocation FailureThenCheckedChild", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::FailureThenCheckedChild); });
++        tc.Run("checked invocation NestedCancelFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::NestedCancelFault); });
++        tc.Run("checked invocation ValidityFault", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::ValidityFault); });
++        tc.Run("checked invocation ColdDiscardWait", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::ColdDiscardWait); });
++        tc.Run("checked invocation FailureThenSequence", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::FailureThenSequence); });
++        tc.Run("checked invocation ReturnCheckpoint", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::ReturnCheckpoint); });
++        tc.Run("checked invocation GeneratedReturn", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::GeneratedReturn); });
++        tc.Run("checked invocation LegacyChildRevokedUnchecked", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::LegacyChildRevokedUnchecked); });
++        tc.Run("checked invocation LegacyChildRevokedChecked", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::LegacyChildRevokedChecked); });
++        tc.Run("checked invocation UncheckedAncestorRevoke", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::UncheckedAncestorRevoke); });
++        tc.Run("checked invocation AncestorRevokedCompletion", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::AncestorRevokedCompletion); });
++        tc.Run("checked invocation AncestorThrowWait", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::AncestorThrowWait); });
++        tc.Run("checked invocation AncestorRevokedWait", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::AncestorRevokedWait); });
++        tc.Run("checked invocation DeferredInvalidChild", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::DeferredInvalidChild); });
++        tc.Run("checked invocation DeferredHealthyChild", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::DeferredHealthyChild); });
++        tc.Run("checked invocation DeferredFailedSequence", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::DeferredFailedSequence); });
++        tc.Run("checked invocation DeferredFailedChild", [](TestCase &t) { runCheckedInvocation(t, CheckedMode::DeferredFailedChild); });
++
+         tc.Run("native callback and queued IRQ frames preserve the live parent frame", [](TestCase &t)
+         {
+             TestEnv env;

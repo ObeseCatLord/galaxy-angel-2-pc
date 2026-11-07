@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "source_base_commit": "db244f0",
+  "runtime_patch_prefix": 15,
+  "patch_sha256": "1fe0208aa213425b83ccc68a39bd4a764b76cc5f5b5fca9c70b57c231346acee",
+  "production_changes": true,
+  "astra_model": "gpt-6-astra",
+  "astra_effort": "ultra",
+  "source_correctness_review": "No introduced production defect; guarded STC payload and split-image-tag requests accepted and signed off",
+  "runtime_tests": {
+    "passed": 483,
+    "failed": 0
+  },
+  "patch_reproduction": {
+    "four_files_equal_to_prefix14_plus_delta": true,
+    "idempotent_prefix": 15,
+    "all_modified_source_files_reproduced": 71
+  },
+  "native_diagnostic": {
+    "capture": "captures/native-zettai/20261009-101522",
+    "trace_sha256": "7fe7010b2d1ece43179757526fa6af13aeb22d42b3b74c3584908e8e0b2a1bde",
+    "binary_sha256": "46afc1b6251bb6974e24702e4133af124dcd7ac8dd2c9e4e4a4020852928f758",
+    "binary_identity_recorded_after_capture": true,
+    "observer_source_sha256_recorded_after_capture": "642754587cf83183dbce631b5c9307f1c518b72c15a8ecde236726ac60a8a1fe",
+    "entries": 64,
+    "matched_returns": 64,
+    "errors": 0,
+    "pending_returns": [],
+    "first_phase4": {
+      "seconds": 40.00432198995259,
+      "geometry_header": [
+        92,
+        0,
+        0,
+        5
+      ],
+      "dispatch_qword": [
+        550,
+        37,
+        0,
+        0
+      ],
+      "phase": 4,
+      "substate": 0
+    },
+    "phase4_returns": 60,
+    "phase4_cycle_delta_min": 247,
+    "phase4_cycle_delta_max": 8695,
+    "phase4_full_budget_returns": 0,
+    "limits": [
+      "bounded debugger observations with concurrent native build; no ordinary FPS benchmark",
+      "no final screenshot after debugger stop",
+      "VIF bytes attributed through caller DWARF, not true ABI entry",
+      "source and binary hashes recorded after terminal capture; observer source unchanged since that run",
+      "absence of budget exhaustion applies only to sampled calls; no full-scene claim"
+    ],
+    "dispatch_qword_at_all_60_phase4_entries": [
+      550,
+      37,
+      0,
+      0
+    ],
+    "astra_evidence_review": "64uniquelymatchedreturns and60phase4budgetpattern/header/identicalstream verified; title rendering only independently viewed; source/binaryprovenance limits accepted"
+  },
+  "native_scene_accepted": false,
+  "native_audio_accepted": false,
+  "full_trilogy_accepted": false,
+  "native_title_visual": {
+    "capture": "captures/native-zettai/20261009-101623",
+    "frame": "frame-60.4s.png",
+    "sha256": "4ccb38771efc9037d3b9b9fd33ba07f782156e64a9e224d4de71033f673b8e76",
+    "observed": "Zettai title logo and starfield, no visible menu options in this frame",
+    "verified_by": "main visual inspection",
+    "debugger": false,
+    "ordinary_fps_verified": false,
+    "limits": "concurrent build; delayed input20/24; final frame only for title; no menu/audio/gameplay acceptance"
+  },
+  "all_five_native_builds": "passed",
+  "native_builds": [
+    {
+      "disc_id": "eigou-1",
+      "binary_size": 402713088,
+      "binary_sha256": "035da22a2d517c27d45d30088170880f4d2b013ebbd701cd5bdfbc5d18d2646f"
+    },
+    {
+      "disc_id": "eigou-2",
+      "binary_size": 390381944,
+      "binary_sha256": "79ccdbaeafd86175c33b95023db73561b84de1df29e6f1cbccae741878a78d53"
+    },
+    {
+      "disc_id": "mugen-1",
+      "binary_size": 389741080,
+      "binary_sha256": "c6f1c7bf1ff9a3ab4d4e78cea15dc19149d2fdd1f622bc7f161022fa60e59012"
+    },
+    {
+      "disc_id": "mugen-2",
+      "binary_size": 365208224,
+      "binary_sha256": "55f31a87faef3bbdebec581c7d55412d6101cf554a8c2a658ab96daf6e2e8a9d"
+    },
+    {
+      "disc_id": "zettai",
+      "binary_size": 364221616,
+      "binary_sha256": "46afc1b6251bb6974e24702e4133af124dcd7ac8dd2c9e4e4a4020852928f758"
+    }
+  ],
+  "later_start_input_capture": {
+    "capture": "captures/native-zettai/20261009-101924",
+    "seconds": 120.497,
+    "private_harness_max_seconds": 180,
+    "public_capture_harness_unchanged": true,
+    "input_seconds": [
+      20,
+      24,
+      80,
+      100
+    ],
+    "observed": "finalblackframe; reached missing1DDCE0 from1054B4",
+    "title_menu_operation_verified": false,
+    "opening_story_verified": false,
+    "missing_entry_causes_black_frame_verified": false
+  }
+}

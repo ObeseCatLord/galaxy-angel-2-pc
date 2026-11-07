@@ -1,0 +1,823 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index a79e05b..a374bdd 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -76,6 +76,10 @@ if(PS2X_IOP_BUILD_TESTS)
+     add_test(NAME ps2_iop_module_start_tests COMMAND ps2_iop_module_start_tests)
+ 
+     add_executable(ps2_iop_ioman_tests tests/iop_ioman_tests.cpp)
++    # Compile the real emulator once directly for private boundary-test access.
++    # Ordinary static archive extraction then leaves its emulator object unused.
++    target_sources(ps2_iop_ioman_tests PRIVATE src/emulator/iop_emulator.cpp)
++    target_compile_definitions(ps2_iop_ioman_tests PRIVATE PS2X_IOP_TEST_BOUNDARIES=1)
+     target_link_libraries(ps2_iop_ioman_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_ioman_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_ioman_tests COMMAND ps2_iop_ioman_tests)
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 45e3dd5..0d3514e 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cctype>
+ #include <limits>
+ #include <string_view>
+@@ -27,6 +28,8 @@ namespace ps2x::iop::detail
+         constexpr int32_t kErrorReadOnly = -30;
+         constexpr int32_t kErrorUnsupported = -48;
+         constexpr int32_t kErrorNoEntry = -2;
++        constexpr int32_t kErrorNoDevice = -19;
++        constexpr int32_t kErrorNoMemory = -12;
+ 
+         constexpr uint32_t kOpenReadOnly = 0x0001u;
+         constexpr uint32_t kOpenWriteOnly = 0x0002u;
+@@ -72,6 +75,75 @@ namespace ps2x::iop::detail
+                 m_host.closeHostFile(descriptor.hostHandle);
+         m_descriptors.clear();
+         m_devices.clear();
++        if (m_devctlScratch != 0u) (void)m_memory.freeAllocation(m_devctlScratch);
++        m_devctlScratch = 0u;
++        m_devctlScratchInUse.fill(false);
++    }
++
++    int32_t IopIoman::devctl(IopCpuState &cpu, IopGuestExecutor &executor)
++    {
++        const uint32_t nameAddress = cpu.gpr[4];
++        std::string path;
++        if (!readGuestPath(nameAddress, path)) return kErrorFault;
++        const size_t colon = path.find(':');
++        if (colon == std::string::npos || colon == 0u) return kErrorNoDevice;
++        size_t unitStart = colon;
++        while (unitStart != 0u && std::isdigit(static_cast<unsigned char>(path[unitStart - 1u]))) --unitStart;
++        uint32_t unit = 0u;
++        for (size_t index = unitStart; index < colon; ++index)
++        {
++            const uint32_t digit = uint32_t(path[index] - '0');
++            if (unit > (uint32_t(INT32_MAX) - digit) / 10u) return kErrorInvalid;
++            unit = unit * 10u + digit;
++        }
++        const std::string_view deviceName = std::string_view(path).substr(0u, unitStart);
++        const auto device = std::find_if(m_devices.begin(), m_devices.end(), [&](const Device &candidate)
++            { return candidate.name == deviceName; });
++        if (device == m_devices.end()) return kErrorNoDevice;
++        // Copy identities before invoking guest code, which may mutate the registry.
++        const uint32_t address = device->address, gp = device->gp;
++        if (!m_memory.ownsRamRange(address, 20u)) return kErrorFault;
++        if ((m_memory.read32(address + 4u) & 0xF0000000u) != 0x10000000u) return kErrorUnsupported;
++        const uint32_t operations = m_memory.read32(address + 16u);
++        if (operations == 0u || !m_memory.ownsRamRange(operations, 24u * 4u)) return kErrorFault;
++        const uint32_t function = m_memory.read32(operations + 23u * 4u);
++        if (function == 0u) return kErrorUnsupported;
++        if ((function & 3u) != 0u || !m_memory.ownsRamRange(function, 4u)) return kErrorFault;
++        const uint32_t sp = cpu.gpr[29];
++        if (sp > UINT32_MAX - 24u || !m_memory.ownsRamRange(sp + 16u, 8u)) return kErrorFault;
++        const uint32_t output = m_memory.read32(sp + 16u), outputSize = m_memory.read32(sp + 20u);
++        const uint32_t argument = cpu.gpr[6], argumentSize = cpu.gpr[7];
++        if ((argumentSize != 0u && (argument == 0u || !m_memory.ownsRamRange(argument, argumentSize))) ||
++            (outputSize != 0u && (output == 0u || !m_memory.ownsRamRange(output, outputSize)))) return kErrorFault;
++        const auto freeSlot = std::find(m_devctlScratchInUse.begin(), m_devctlScratchInUse.end(), false);
++        if (freeSlot == m_devctlScratchInUse.end()) return kErrorNoMemory;
++        if (m_devctlScratch == 0u)
++        {
++            m_devctlScratch = m_memory.allocate(uint32_t(m_devctlScratchInUse.size()) * 16u, 16u);
++            if (m_devctlScratch == 0u) return kErrorNoMemory;
++        }
++        const size_t slot = size_t(freeSlot - m_devctlScratchInUse.begin());
++        const uint32_t file = m_devctlScratch + uint32_t(slot) * 16u;
++        const std::array<uint32_t, 4> fields{0u, unit, address, 0u};
++        if (!m_memory.writeRam(file, fields.data(), sizeof(fields))) return kErrorFault;
++        m_devctlScratchInUse[slot] = true;
++        const std::array<uint32_t, 3> stackArguments{argumentSize, output, outputSize};
++        uint32_t result = uint32_t(kErrorIo);
++        const IopGuestCallStatus status = executor.executeGuestFunctionWithStackArgumentsChecked(
++            function, file, nameAddress + uint32_t(colon) + 1u, cpu.gpr[5], argument,
++            gp, stackArguments, 2000000u, result);
++        if (status == IopGuestCallStatus::ResetRequired)
++        {
++            // The executor has halted guest execution. Keep this scratch slot
++            // quarantined with any references until the whole IOP is reset.
++            cpu.stopped = true;
++            cpu.executionFault = true;
++            return kErrorIo;
++        }
++        m_devctlScratchInUse[slot] = false;
++        if (status == IopGuestCallStatus::Rejected)
++            return int32_t(result) < 0 ? int32_t(result) : kErrorIo;
++        return int32_t(result);
+     }
+ 
+     bool IopIoman::readGuestPath(uint32_t address, std::string &path) const
+@@ -335,6 +407,9 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         }
++        case 31: // Extended IOMAN devctl: preserve the original registered driver.
++            setV0(uint32_t(devctl(cpu, executor)));
++            return true;
+         default:
+             return false;
+         }
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.h b/ps2xIOP/src/emulator/imports/iop_ioman.h
+index dbe83d1..6684d13 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.h
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.h
+@@ -3,6 +3,7 @@
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <cstdint>
++#include <array>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -26,6 +27,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+ 
+     private:
++        friend bool testIopDeviceCallbackBoundaries();
+         struct Device
+         {
+             uint32_t address = 0u;
+@@ -42,10 +44,13 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] bool readGuestPath(uint32_t address, std::string &path) const;
+         [[nodiscard]] bool hasRegisteredDevice(std::string_view deviceName) const;
++        [[nodiscard]] int32_t devctl(IopCpuState &cpu, IopGuestExecutor &executor);
+ 
+         IopHost &m_host;
+         IopMemory &m_memory;
+         std::vector<Device> m_devices;
+         std::vector<Descriptor> m_descriptors;
++        uint32_t m_devctlScratch = 0u;
++        std::array<bool, 4> m_devctlScratchInUse{};
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 0432657..251cb13 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -124,6 +124,7 @@ namespace ps2x::iop::detail
+             // while allocation ownership still refers to the previous epoch.
+             cdvd.reset();
+             loadcore.reset();
++            ioman.reset();
+             memory.reset();
+             kernel.reset();
+             modules.clear();
+@@ -131,7 +132,6 @@ namespace ps2x::iop::detail
+             rpc.reset();
+             intrman.reset();
+             timrman.reset();
+-            ioman.reset();
+             pendingDmaInterrupts.clear();
+             pendingGuestCallbacks.clear();
+             nextModuleId = 1;
+@@ -144,6 +144,7 @@ namespace ps2x::iop::detail
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+             callDepth = 0u;
++            resetRequired = false;
+             secrMcCommandHandler = {};
+             secrMcDevIdHandler = {};
+             checkKelfPathCallback = {};
+@@ -406,6 +407,7 @@ namespace ps2x::iop::detail
+ 
+         bool step(CpuState &cpu)
+         {
++            if (resetRequired) { cpu.stopped = true; cpu.executionFault = true; return false; }
+             if (cpu.stopped)
+                 return false;
+             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
+@@ -457,12 +459,14 @@ namespace ps2x::iop::detail
+             const ActiveCpuGuard activeGuard{activeCpu, previous};
+             activeCpu = &cpu;
+             const uint64_t start = totalInstructions;
+-            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
++            while (!resetRequired && !cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+             {
+                 if (!step(cpu))
+                     break;
++                if (resetRequired) break;
+                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                     servicePendingDmaInterrupts();
++                if (resetRequired) break;
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                     servicePendingGuestCallbacks();
+             }
+@@ -476,8 +480,16 @@ namespace ps2x::iop::detail
+                               uint32_t a3,
+                               uint32_t gp,
+                               uint32_t budget = kMaxCallInstructions,
+-                              bool *returned = nullptr)
++                              bool *returned = nullptr,
++                              std::span<const uint32_t> stackArguments = {},
++                              bool *started = nullptr)
+         {
++            if (returned) *returned = false;
++            if (started) *started = false;
++            if (resetRequired || (started && budget == 0u)) return uint32_t(-5);
++            if (stackArguments.size() > 4u ||
++                (!stackArguments.empty() && callDepth >= kCallStackCapacity))
++                return uint32_t(-5);
+             struct CallDepthGuard
+             {
+                 uint32_t &depth;
+@@ -510,8 +522,14 @@ namespace ps2x::iop::detail
+                 cpu.gpr[29] = kCallStackBase - 32u;
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
++            // The existing private call frame reserves 32 bytes above SP;
++            // o32 stack arguments occupy its final sixteen bytes.
++            if (!stackArguments.empty() &&
++                !memory.writeRam(cpu.gpr[29] + 16u, stackArguments.data(), stackArguments.size_bytes()))
++                return uint32_t(-14);
++            if (started) *started = true;
+             runCpu(cpu, budget);
+-            if (returned) *returned = cpu.pc == kCallReturnSentinel && !cpu.missingImport && !cpu.executionFault;
++            if (returned) *returned = !resetRequired && cpu.pc == kCallReturnSentinel && !cpu.yielded && !cpu.missingImport && !cpu.executionFault;
+             return cpu.gpr[2];
+         }
+ 
+@@ -525,6 +543,26 @@ namespace ps2x::iop::detail
+             return callFunction(address, a0, a1, a2, a3, gp);
+         }
+ 
++        IopGuestCallStatus executeGuestFunctionWithStackArgumentsChecked(
++            uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++            uint32_t gp, std::span<const uint32_t> stackArguments,
++            uint32_t budget, uint32_t &result) override
++        {
++            if (resetRequired) { result = uint32_t(-5); return IopGuestCallStatus::ResetRequired; }
++            if (callDepth >= kCallStackCapacity)
++            { result = uint32_t(-5); return IopGuestCallStatus::Rejected; }
++            bool returned = false;
++            bool started = false;
++            try { result = callFunction(address, a0, a1, a2, a3, gp, budget, &returned, stackArguments, &started); }
++            catch (...) { result = uint32_t(-5); }
++            if (resetRequired) return IopGuestCallStatus::ResetRequired;
++            if (returned) return IopGuestCallStatus::Completed;
++            if (!started) return IopGuestCallStatus::Rejected;
++            resetRequired = true;
++            log(LogLevel::Error, "[IOP] synchronous device callback incomplete; reset required before guest execution");
++            return IopGuestCallStatus::ResetRequired;
++        }
++
+         bool executeGuestFunctionChecked(uint32_t address,
+                                       uint32_t a0,
+                                       uint32_t a1,
+@@ -553,7 +591,7 @@ namespace ps2x::iop::detail
+         // Not that good to use exception handling for control flow but will do for now
+         void servicePendingDmaInterrupts()
+         {
+-            if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
++            if (resetRequired || servicingDmaInterrupts || pendingDmaInterrupts.empty())
+                 return;
+ 
+             servicingDmaInterrupts = true;
+@@ -572,7 +610,10 @@ namespace ps2x::iop::detail
+             try
+             {
+                 for (const int irq : completed)
++                {
++                    if (resetRequired) break;
+                     (void)intrman.dispatchInterrupt(irq, *this);
++                }
+             }
+             catch (...)
+             {
+@@ -584,7 +625,7 @@ namespace ps2x::iop::detail
+ 
+         void servicePendingGuestCallbacks()
+         {
+-            if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
++            if (resetRequired || servicingGuestCallbacks || pendingGuestCallbacks.empty())
+                 return;
+ 
+             std::vector<ScheduledGuestCallback> callbacks;
+@@ -603,6 +644,7 @@ namespace ps2x::iop::detail
+             {
+                 for (const ScheduledGuestCallback &callback : callbacks)
+                 {
++                    if (resetRequired) break;
+                     if (callback.function != 0u)
+                     {
+                         (void)callFunction(callback.function,
+@@ -625,14 +667,18 @@ namespace ps2x::iop::detail
+ 
+         void runCycles(uint64_t cycles) noexcept
+         {
++            if (resetRequired) return;
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+-                while (totalCycles < target)
++                while (totalCycles < target && !resetRequired)
+                 {
+                     servicePendingDmaInterrupts();
++                    if (resetRequired) break;
+                     servicePendingGuestCallbacks();
++                    if (resetRequired) break;
+                     timrman.serviceDue(totalCycles, *this);
++                    if (resetRequired) break;
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+@@ -675,6 +721,7 @@ namespace ps2x::iop::detail
+ 
+         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
+         {
++            if (resetRequired) return {true, -200, -1};
+             ModuleLoadResult result{true, -201, -1};
+             if ((argumentSize != 0u && arguments == nullptr) || argumentSize > IopMemory::RamSize || nextModuleId > 0xFFFF)
+                 return result;
+@@ -867,6 +914,7 @@ namespace ps2x::iop::detail
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
++        bool resetRequired = false;
+         GuestCallback secrMcCommandHandler;
+         GuestCallback secrMcDevIdHandler;
+         GuestCallback checkKelfPathCallback;
+@@ -1008,3 +1056,7 @@ namespace ps2x::iop::detail
+     }
+ 
+ }
++
++#ifdef PS2X_IOP_TEST_BOUNDARIES
++#include "../../tests/iop_device_callback_boundaries.inc"
++#endif
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 9b4385e..430623a 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -48,6 +48,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+ 
+     private:
++        // Defined only in the boundary-test translation unit; no runtime API.
++        friend bool testIopDeviceCallbackBoundaries();
+         class Impl;
+         std::unique_ptr<Impl> m_impl;
+     };
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index e9ab065..ed60088 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -4,6 +4,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <span>
+ #include <unordered_map>
+ 
+ namespace ps2x::iop
+@@ -17,11 +18,23 @@ namespace ps2x::iop::detail
+     class IopKernel;
+     class IopMemory;
+ 
++    enum class IopGuestCallStatus { Rejected, Completed, ResetRequired };
++
+     class IopGuestExecutor
+     {
+     public:
+         virtual ~IopGuestExecutor() = default;
+ 
++        // Checked synchronous o32 call with arguments beyond a0..a3. Executors
++        // without this ABI must fail rather than report callback completion.
++        [[nodiscard]] virtual IopGuestCallStatus executeGuestFunctionWithStackArgumentsChecked(
++            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++            std::span<const uint32_t>, uint32_t, uint32_t &result)
++        {
++            result = uint32_t(-48);
++            return IopGuestCallStatus::Rejected;
++        }
++
+         // Callback completion must be attributed to this invocation.
+         // Executors without that observation cannot report callback success.
+         [[nodiscard]] virtual bool executeGuestFunctionChecked(uint32_t, uint32_t, uint32_t,
+diff --git a/ps2xIOP/tests/iop_device_callback_boundaries.inc b/ps2xIOP/tests/iop_device_callback_boundaries.inc
+new file mode 100644
+index 0000000..b154b66
+--- /dev/null
++++ b/ps2xIOP/tests/iop_device_callback_boundaries.inc
+@@ -0,0 +1,125 @@
++// Included after the real Impl definition only by the IOMAN test target.
++#include "iop_compat_test_support.h"
++
++namespace ps2x::iop::detail
++{
++    bool testIopDeviceCallbackBoundaries()
++    {
++        const auto check = [](bool value, const char *message)
++        {
++            if (!value) std::cerr << "FAIL: " << message << '\n';
++            return value;
++        };
++        // Outer driver returns immediately. A due guest callback tail-calls
++        // devctl on the inner driver, which exhausts its instruction budget.
++        // The failure therefore comes from real nested guest execution.
++        const auto prepare = [&](IopEmulator::Impl &state)
++        {
++            auto &memory = state.memory;
++            if (!memory.zeroRam(0x10000u, 0x5000u)) return false;
++            const auto words = [&](uint32_t address, std::initializer_list<uint32_t> values)
++            {
++                for (uint32_t value : values) { memory.write32(address, value); address += 4u; }
++            };
++            if (!memory.writeRam(0x13080u, "outer", 6u) ||
++                !memory.writeRam(0x13090u, "inner", 6u) ||
++                !memory.writeRam(0x130A0u, "outer0:", 8u) ||
++                !memory.writeRam(0x130B0u, "inner0:", 8u)) return false;
++            words(0x13000u, {0x13080u, 0x10000000u, 1u, 0u, 0x13100u});
++            words(0x13020u, {0x13090u, 0x10000000u, 1u, 0u, 0x13200u});
++            memory.write32(0x1315Cu, 0x11000u);
++            memory.write32(0x1325Cu, 0x11100u);
++            IopCpuState add{};
++            for (uint32_t device : {0x13000u, 0x13020u})
++            {
++                add.gpr[4] = device;
++                if (!state.ioman.dispatchImport(20u, add, state) || add.gpr[2] != 0u) return false;
++            }
++            // Decoder recognizes a real ioman import table and ordinal stub.
++            words(0x12000u, {0x41E00000u, 0u, 0x0104u});
++            if (!memory.writeRam(0x1200Cu, "ioman", 6u)) return false;
++            for (uint32_t ordinal = 0u; ordinal <= 31u; ++ordinal)
++                words(0x12014u + ordinal * 8u, {0x03E00008u, 0x24000000u | ordinal});
++            words(0x11000u, {0x03E00008u, 0u});
++            words(0x11100u, {0x08004440u, 0u}); // J 11100; NOP
++            words(0x11200u, {
++                0x3C040001u, 0x348430B0u, 0x34054391u, 0x00003021u, 0x00003821u,
++                0xAFA00010u, 0xAFA00014u,
++                0x08000000u | ((0x12014u + 31u * 8u) >> 2u), 0u,
++            });
++            return true;
++        };
++
++        // Establish the crucial otherwise-complete CPU state at the budget
++        // boundary: service runs after the JR delay slot has reached sentinel.
++        iop_test::Host firstHost;
++        IopEmulator::Impl first(firstHost);
++        if (!check(prepare(first), "could not prepare nested boundary fixture")) return false;
++        first.pendingGuestCallbacks.emplace(2u, IopEmulator::Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++        IopCpuState outer{};
++        outer.pc = 0x11000u;
++        outer.gpr[29] = 0x13FE0u;
++        outer.gpr[31] = kCallReturnSentinel;
++        first.runCpu(outer, 2000000u);
++        if (!check(first.resetRequired && first.totalInstructions >= 2000000u,
++                   "nested callback did not latch failure at the outer budget boundary") ||
++            !check(outer.pc == kCallReturnSentinel && !outer.yielded && !outer.missingImport && !outer.executionFault,
++                   "outer CPU failed for a reason other than the nested fault latch")) return false;
++
++        // The actual outer devctl must propagate that latch, preserving both
++        // file slots. A local return sentinel cannot release outer scratch.
++        iop_test::Host secondHost;
++        IopEmulator::Impl second(secondHost);
++        if (!check(prepare(second), "could not prepare outer devctl fixture")) return false;
++        second.pendingGuestCallbacks.emplace(2u, IopEmulator::Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++        IopCpuState caller{};
++        caller.gpr[4] = 0x130A0u;
++        caller.gpr[5] = 0x4391u;
++        caller.gpr[29] = 0x13FE0u;
++        if (!check(second.ioman.dispatchImport(31u, caller, second) && second.resetRequired && caller.executionFault,
++                   "outer devctl falsely completed after nested callback failure") ||
++            !check(second.ioman.m_devctlScratchInUse[0] && second.ioman.m_devctlScratchInUse[1],
++                   "nested failure released quarantined outer or inner scratch")) return false;
++        uint32_t result = 0u;
++        if (!check(second.executeGuestFunctionWithStackArgumentsChecked(
++                       0x11000u, 0u, 0u, 0u, 0u, 0u, {}, 2u, result) == IopGuestCallStatus::ResetRequired,
++                   "checked executor did not give global fault precedence")) return false;
++
++        // A due callback fails before normal ready-thread selection. Capture a
++        // real ready thread and verify neither its state nor CPU is consumed.
++        iop_test::Host thirdHost;
++        IopEmulator::Impl third(thirdHost);
++        if (!check(prepare(third), "could not prepare scheduling boundary fixture")) return false;
++        third.memory.write32(0x13308u, 0x11300u);
++        third.memory.write32(0x1330Cu, 0x400u);
++        third.memory.write32(0x13310u, 10u);
++        third.memory.write32(0x11300u, 0x3C080001u);
++        third.memory.write32(0x11304u, 0xAD084000u); // observable marker at 14000
++        third.memory.write32(0x11308u, 0x03E00008u);
++        IopCpuState create{};
++        create.gpr[4] = 0x13300u;
++        if (!third.kernel.dispatchThreadImport(4u, create, 0u) || int32_t(create.gpr[2]) <= 0) return false;
++        create.gpr[4] = create.gpr[2];
++        if (!third.kernel.dispatchThreadImport(6u, create, 0u) || create.gpr[2] != 0u) return false;
++        IopThread *ready = third.kernel.beginNextReady(0u);
++        if (!check(ready != nullptr, "fixture thread was not ready")) return false;
++        third.kernel.endTimeslice(*ready, kThreadReturnSentinel);
++        const IopCpuState before = ready->cpu;
++        const auto stateBefore = ready->state;
++        third.pendingGuestCallbacks.emplace(0u, IopEmulator::Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++        third.runCycles(1000u);
++        return check(third.resetRequired && stateBefore == IopThreadState::Ready && ready->state == stateBefore,
++                     "service failure selected or changed an unrelated ready thread") &&
++               check(ready->cpu.gpr == before.gpr && ready->cpu.pc == before.pc &&
++                         ready->cpu.hi == before.hi && ready->cpu.lo == before.lo && ready->cpu.cop0 == before.cop0 &&
++                         ready->cpu.pendingLoadReg == before.pendingLoadReg &&
++                         ready->cpu.pendingLoadValue == before.pendingLoadValue && ready->cpu.pendingLoad == before.pendingLoad &&
++                         ready->cpu.branchPending == before.branchPending && ready->cpu.branchTarget == before.branchTarget &&
++                         ready->cpu.yielded == before.yielded && ready->cpu.stopped == before.stopped &&
++                         ready->cpu.exception == before.exception &&
++                         ready->cpu.missingImport == before.missingImport && ready->cpu.executionFault == before.executionFault,
++                     "service failure changed the unrelated thread CPU") &&
++               check(third.memory.read32(0x14000u) == 0u,
++                     "unrelated ready thread executed after service failure");
++    }
++}
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index 71563b6..17c9aba 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -1,9 +1,13 @@
++#include "iop_compat_test_support.h"
++
+ #include "emulator/core/iop_cpu.h"
+ #include "emulator/core/iop_memory.h"
++#include "emulator/iop_emulator.h"
+ #include "emulator/imports/iop_ioman.h"
+ #include "emulator/services/iop_rpc.h"
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <array>
+ #include <cstdint>
+ #include <cstring>
+ #include <iostream>
+@@ -13,6 +17,8 @@
+ #include <utility>
+ #include <vector>
+ 
++namespace ps2x::iop::detail { bool testIopDeviceCallbackBoundaries(); }
++
+ namespace
+ {
+     using namespace ps2x::iop;
+@@ -321,6 +327,254 @@ namespace
+                expect(host.translateCalls == translationsBefore, "registered device consulted host path translation");
+     }
+ 
++    uint32_t jal(uint32_t address)
++    {
++        return 0x0C000000u | (address >> 2u);
++    }
++
++    void writeIrxString(iop_test::Irx &image, uint32_t offset, std::string_view value)
++    {
++        const size_t begin = 0x100u + offset;
++        if (begin + value.size() >= image.bytes.size())
++            throw std::runtime_error("synthetic IRX string overflow");
++        std::memcpy(image.bytes.data() + begin, value.data(), value.size());
++        image.bytes[begin + value.size()] = 0u;
++    }
++
++    iop_test::Irx devctlIrx()
++    {
++        constexpr uint32_t base = 0x10000u;
++        constexpr uint32_t imports = base + 0x100u;
++        constexpr uint32_t driver = base + 0x250u;
++        constexpr uint32_t operations = base + 0x280u;
++        constexpr uint32_t deviceName = base + 0x2F0u;
++        constexpr uint32_t path = base + 0x300u;
++        constexpr uint32_t argument = base + 0x320u;
++        constexpr uint32_t buffer = base + 0x330u;
++        constexpr uint32_t results = base + 0x340u;
++        constexpr uint32_t handler = base + 0x400u;
++        constexpr uint32_t capture = base + 0x500u;
++        constexpr uint32_t addDriver = imports + 20u + 20u * 8u;
++        constexpr uint32_t devctl = imports + 20u + 31u * 8u;
++
++        iop_test::Irx image(base, 0x600u);
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C1C1234u, 0x379C5678u,
++            0x3C040001u, 0x34840250u, jal(addDriver), 0u,
++            0x3C1C5E6Fu, 0x379C7081u,
++            0x3C040001u, 0x34840300u,
++            0x34054391u,
++            0x3C060001u, 0x34C60320u,
++            0x24070005u,
++            0x3C080001u, 0x35080330u, 0xAFA80010u,
++            0x24080004u, 0xAFA80014u,
++            jal(devctl), 0u, 0x3C080001u, 0x35080340u, 0xAD020000u,
++            jal(devctl), 0u, 0xAD020004u,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x24020000u,
++        });
++        image.words(0x100u, {0x41E00000u, 0u, 0x0104u});
++        writeIrxString(image, 0x10Cu, "ioman");
++        for (uint32_t ordinal = 0u; ordinal <= 31u; ++ordinal)
++            image.words(0x114u + ordinal * 8u, {0x03E00008u, 0x24000000u | ordinal});
++
++        image.words(0x250u, {deviceName, 0x10000010u, 1u, 0u, operations});
++        image.words(0x280u + 23u * 4u, {handler});
++        writeIrxString(image, 0x2F0u, "dev");
++        writeIrxString(image, 0x300u, "dev2:/leaf");
++        writeIrxString(image, 0x320u, "args");
++
++        image.words(0x400u, {
++            0x3C080001u, 0x35080500u,
++            0xAD040000u, 0xAD050004u, 0xAD060008u, 0xAD07000Cu,
++            0x8FA90010u, 0u, 0xAD090010u,
++            0x8FA90014u, 0u, 0xAD090014u,
++            0x8FA90018u, 0u, 0xAD090018u,
++            0xAD1C001Cu,
++            0x8C890000u, 0u, 0xAD090020u,
++            0x8C890004u, 0u, 0xAD090024u,
++            0x8C890008u, 0u, 0xAD090028u,
++            0x8C89000Cu, 0u, 0xAD09002Cu,
++            0x8D090030u, 0x250A0034u, 0x00095880u, 0x014B5021u, 0xAD440000u,
++            0x25290001u, 0xAD090030u,
++            0x8FA90014u, 0x340A4B4Fu, 0xAD2A0000u,
++            0x2402FFDBu, 0x03E00008u, 0u,
++        });
++        return image;
++    }
++
++    bool testDevctlGuestAbiAndScratchReuse()
++    {
++        constexpr uint32_t base = 0x10000u;
++        constexpr uint32_t driver = base + 0x250u;
++        constexpr uint32_t path = base + 0x300u;
++        constexpr uint32_t argument = base + 0x320u;
++        constexpr uint32_t buffer = base + 0x330u;
++        constexpr uint32_t results = base + 0x340u;
++        constexpr uint32_t capture = base + 0x500u;
++        constexpr uint32_t registeredGp = 0x12345678u;
++
++        iop_test::Host host;
++        IopEmulator emulator(host);
++        const iop_test::Irx image = devctlIrx();
++        const ModuleLoadResult loaded = emulator.loadModuleImage("host0:devctl-test.irx", image.bytes);
++        if (!expect(loaded.moduleId > 0 && loaded.startResult == 0, "synthetic devctl module did not start"))
++            return false;
++
++        std::array<uint32_t, 15> observed{};
++        if (!expect(emulator.readMemory(capture, observed.data(), sizeof(observed)), "missing devctl capture") ||
++            !expect(observed[0] != 0u, "devctl did not receive iop_file_t") ||
++            !expect(observed[1] == path + 5u, "devctl suffix did not exclude device and unit") ||
++            !expect(observed[2] == 0x4391u && observed[3] == argument, "devctl register arguments changed") ||
++            !expect(observed[4] == 5u && observed[5] == buffer && observed[6] == 4u,
++                    "devctl o32 stack arguments changed") ||
++            !expect(observed[7] == registeredGp, "devctl did not use the registered driver GP") ||
++            !expect(observed[8] == 0u && observed[9] == 2u && observed[10] == driver && observed[11] == 0u,
++                    "iop_file_t fields differ from the original ABI") ||
++            !expect(observed[12] == 2u && observed[13] != 0u && observed[13] == observed[14],
++                    "devctl did not reuse its completed iop_file_t scratch slot"))
++            return false;
++
++        std::array<uint32_t, 2> returned{};
++        std::array<char, 4> written{};
++        return expect(emulator.readMemory(results, returned.data(), sizeof(returned)) &&
++                          static_cast<int32_t>(returned[0]) == -37 && static_cast<int32_t>(returned[1]) == -37,
++                      "devctl did not preserve the signed handler result") &&
++               expect(emulator.readMemory(buffer, written.data(), written.size()) && written[0] == 'O' && written[1] == 'K',
++                      "devctl handler did not receive the caller buffer");
++    }
++
++    bool testDevctlIncompleteRequiresReset()
++    {
++        // Tail-calling a yielding import returns PC to the call sentinel while
++        // the callback is incomplete. Missing imports and budget exhaustion
++        // likewise must quarantine side effects and prevent subsequent code.
++        for (uint32_t failure = 0u; failure < 3u; ++failure)
++        {
++            iop_test::Host host;
++            IopEmulator emulator(host);
++            iop_test::Irx image = devctlIrx();
++            const uint32_t importOrdinal = failure == 0u ? 16u : 4u;
++            image.words(0x560u, {0x41E00000u, 0u, 0x0101u});
++            writeIrxString(image, 0x56Cu, failure == 0u ? "thbase" : "nosvc");
++            for (uint32_t ordinal = 0u; ordinal <= importOrdinal; ++ordinal)
++                image.words(0x574u + ordinal * 8u, {0x03E00008u, 0x24000000u | ordinal});
++            const uint32_t target = failure == 2u ? 0x10410u : 0x10574u + importOrdinal * 8u;
++            image.words(0x400u, {
++                0x3C080001u, 0x35080500u, 0x24090001u, 0xAD090000u,
++                0x08000000u | (target >> 2u), 0u,
++            });
++            const ModuleLoadResult failed = emulator.loadModuleImage("host0:incomplete-devctl.irx", image.bytes);
++            uint32_t marker = 0u;
++            if (!expect(failed.moduleId < 0, "incomplete callback reported successful startup") ||
++                !expect(emulator.readMemory(0x10500u, &marker, 4u) && marker == 1u,
++                        "failure fixture did not execute its side effect before interruption")) return false;
++            const uint64_t before = emulator.instructions();
++            emulator.runEeCycles(1000000u);
++            const iop_test::Irx complete = devctlIrx();
++            const ModuleLoadResult blocked = emulator.loadModuleImage("host0:blocked-after-failure.irx", complete.bytes);
++            if (!expect(emulator.instructions() == before && blocked.moduleId < 0,
++                        "reset-required emulator executed more guest instructions") ||
++                !expect(emulator.readMemory(0x10500u, &marker, 4u) && marker == 1u,
++                        "reset-required load replaced quarantined callback backing")) return false;
++            emulator.reset();
++            const ModuleLoadResult recovered = emulator.loadModuleImage("host0:after-reset.irx", complete.bytes);
++            if (!expect(recovered.moduleId > 0 && recovered.startResult == 0,
++                        "reset did not retire quarantine and restore guest execution")) return false;
++        }
++        return true;
++    }
++
++    class RejectedStackExecutor final : public IopGuestExecutor
++    {
++    public:
++        IopGuestCallStatus executeGuestFunctionWithStackArgumentsChecked(
++            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++            std::span<const uint32_t>, uint32_t, uint32_t &result) override
++        {
++            ++stackCalls;
++            result = uint32_t(kErrorUnsupported);
++            return IopGuestCallStatus::Rejected;
++        }
++
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++        {
++            return 0u;
++        }
++
++        uint32_t stackCalls = 0u;
++    };
++
++    int32_t callDevctl(IopIoman &ioman, RejectedStackExecutor &executor, uint32_t name,
++                        uint32_t argument, uint32_t stackPointer)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = name;
++        cpu.gpr[5] = 0x4391u;
++        cpu.gpr[6] = argument;
++        cpu.gpr[7] = 4u;
++        cpu.gpr[29] = stackPointer;
++        return ioman.dispatchImport(31u, cpu, executor) ? result(cpu) : kErrorInvalid;
++    }
++
++    bool testDevctlRejectsInvalidCallsBeforeCallback()
++    {
++        Host host;
++        IopMemory memory;
++        IopIoman ioman(host, memory);
++        RejectedStackExecutor executor;
++        constexpr uint32_t driver = 0x1000u;
++        constexpr uint32_t operations = 0x1100u;
++        constexpr uint32_t device = 0x1200u;
++        constexpr uint32_t name = 0x1300u;
++        constexpr uint32_t argument = 0x1400u;
++        constexpr uint32_t buffer = 0x1500u;
++        constexpr uint32_t stack = 0x1600u;
++        constexpr uint32_t handler = 0x1800u;
++        if (!memory.zeroRam(driver, 20u) || !memory.zeroRam(operations, 96u) ||
++            !memory.zeroRam(device, 4u) || !memory.zeroRam(name, 32u) ||
++            !memory.zeroRam(argument, 4u) || !memory.zeroRam(buffer, 4u) || !memory.zeroRam(stack, 24u) ||
++            !memory.zeroRam(handler, 4u) || !writeString(memory, device, "dev") ||
++            !writeString(memory, name, "dev3:/leaf") || !writeString(memory, name + 16u, "bad:/leaf"))
++            return false;
++        memory.write32(driver, device);
++        memory.write32(driver + 4u, 0x10000010u);
++        memory.write32(driver + 16u, operations);
++        memory.write32(operations + 23u * 4u, handler);
++        memory.write32(stack + 16u, buffer);
++        memory.write32(stack + 20u, 4u);
++        IopCpuState add{};
++        add.gpr[4] = driver;
++        add.gpr[28] = 0x11112222u;
++        if (!expect(ioman.dispatchImport(20u, add, executor) && result(add) == 0, "devctl test driver did not register"))
++            return false;
++
++        if (!expect(callDevctl(ioman, executor, name + 16u, argument, stack) < 0 && executor.stackCalls == 0u,
++                    "malformed device entered devctl callback") ||
++            !expect(callDevctl(ioman, executor, name, argument, IopMemory::RamSize - 16u) < 0 && executor.stackCalls == 0u,
++                    "unowned caller stack entered devctl callback"))
++            return false;
++        memory.write32(stack + 16u, IopMemory::RamSize - 1u);
++        if (
++            !expect(callDevctl(ioman, executor, name, argument, stack) < 0 && executor.stackCalls == 0u,
++                    "unowned callback buffer entered devctl callback"))
++            return false;
++
++        memory.write32(stack + 16u, buffer);
++        memory.write32(driver + 4u, 0x30000010u);
++        if (!expect(callDevctl(ioman, executor, name, argument, stack) < 0 && executor.stackCalls == 0u,
++                    "non-FSEXT device entered devctl callback"))
++            return false;
++        memory.write32(driver + 4u, 0x10000010u);
++        memory.write32(operations + 23u * 4u, 0u);
++        if (!expect(callDevctl(ioman, executor, name, argument, stack) < 0 && executor.stackCalls == 0u,
++                    "missing devctl handler entered callback"))
++            return false;
++        memory.write32(operations + 23u * 4u, handler);
++        return expect(callDevctl(ioman, executor, name, argument, stack) == kErrorUnsupported && executor.stackCalls == 1u,
++                      "default checked executor did not reject a valid devctl before execution");
++    }
++
+     bool testDestructorRevokesHostHandle()
+     {
+         Host host;
+@@ -347,6 +601,10 @@ int main()
+                    testShortAndFailedReadPoison() &&
+                    testInvalidInputsAndHandleRevocation() &&
+                    testMissingAndRegisteredDeviceRoute() &&
++                   testDevctlGuestAbiAndScratchReuse() &&
++                   testDevctlIncompleteRequiresReset() &&
++                   testIopDeviceCallbackBoundaries() &&
++                   testDevctlRejectsInvalidCallsBeforeCallback() &&
+                    testDestructorRevokesHostHandle()
+                ? 0
+                : 1;

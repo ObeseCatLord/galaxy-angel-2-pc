@@ -1,0 +1,5 @@
+{
+  "elf_sha256": "b895cdb1c3195391bfd2bb85ec2c82ae0997ba85e243d9d5a6a7b291b53c4ab9",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "processor": "r5900:LE:32:default"
+}

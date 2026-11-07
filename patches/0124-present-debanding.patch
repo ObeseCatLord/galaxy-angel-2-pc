@@ -1,0 +1,471 @@
+From 85d3e40533e2c483d22c97a8aea94d4779615a19 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:45:03 -0500
+Subject: [PATCH] present: debanding option (off/low/high), 2D and 3D scenes
+
+Smooths the colour steps of the PS2's 16-bit gradients with a sparse
+edge-preserving average at the picture's own resolution (after the 2D filter),
+then draws the float result with a +-0.45 LSB dither at window resolution so
+it does not re-band at 8 bits. GA2_DEBAND=off|low|high, live from the F2 menu
+and the launcher (new "Debanding" entry after PS2 dithering). Nothing runs
+when off. Developer aids: GA2_DEBAND_STATS (GPU timer query),
+GA2_DEBAND_SPLIT, GA2_DEBAND_DUMP. ga2_mpv::Chain::release() frees GL objects
+(also used when the 2D filter changes).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_options.h |   4 +
+ ps2xRuntime/src/lib/ga2_mpv_shader.cpp    |  24 +++
+ ps2xRuntime/src/lib/ga2_mpv_shader.h      |   3 +
+ ps2xRuntime/src/lib/ga2_present.cpp       | 249 +++++++++++++++++++++-
+ ps2xRuntime/src/lib/ga2_present.h         |   2 +
+ ps2xRuntime/src/lib/ga2_settings_menu.cpp |   2 +
+ 6 files changed, 280 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index b011994..1e762b8 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -33,6 +33,7 @@ namespace ga2_options
+         Filter,
+         Fps,
+         Dither,
++        Deband,
+         Buttons,
+         Vr,
+         OnscreenPad,
+@@ -100,6 +101,9 @@ namespace ga2_options
+              13, 61, 240, 120},
+             {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+              Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
++            {"deband", "Debanding",
++             "Smooths the visible colour steps of the PS2's 16-bit gradients (nebula skies, fades, glows) in 2D and 3D scenes; edges and text stay sharp. High smooths more and costs a little more GPU time.",
++             "GA2_DEBAND", Apply::Live, {{"off", "Off"}, {"low", "Low"}, {"high", "High"}}},
+             {"buttons", "Button prompts", "Which button icons the games show: follows the controller or keyboard you use.",
+              "GA2_BUTTONS", Apply::Live, {{"auto", "Automatic"}, {"playstation", "PlayStation"}, {"xbox", "Xbox"}, {"keyboard", "Keyboard"}}},
+             {"vr", "VR mode", "Plays in a headset through SteamVR or Monado (OpenXR). Hold both grips to recentre the screen.",
+diff --git a/ps2xRuntime/src/lib/ga2_mpv_shader.cpp b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+index 81e7798..02df680 100644
+--- a/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
++++ b/ps2xRuntime/src/lib/ga2_mpv_shader.cpp
+@@ -119,6 +119,30 @@ namespace ga2_mpv
+         // The GL context may already be gone at exit; textures die with it.
+     }
+ 
++    void Chain::release()
++    {
++        for (Pass &pass : m_passes)
++        {
++            if (pass.program)
++                glDeleteProgram(pass.program);
++            pass.program = 0;
++            pass.failed = false;
++        }
++        for (Surface &surface : m_pool)
++        {
++            glDeleteFramebuffers(1, &surface.framebuffer);
++            glDeleteTextures(1, &surface.texture);
++        }
++        m_pool.clear();
++        if (m_vertexArray)
++            glDeleteVertexArrays(1, &m_vertexArray);
++        if (m_vertexBuffer)
++            glDeleteBuffers(1, &m_vertexBuffer);
++        if (m_sampler)
++            glDeleteSamplers(1, &m_sampler);
++        m_vertexArray = m_vertexBuffer = m_sampler = 0;
++    }
++
+     bool Chain::add(const std::string &source, const std::string &name, std::string &error)
+     {
+         std::istringstream in(source);
+diff --git a/ps2xRuntime/src/lib/ga2_mpv_shader.h b/ps2xRuntime/src/lib/ga2_mpv_shader.h
+index 23fe0b7..78c2fd4 100644
+--- a/ps2xRuntime/src/lib/ga2_mpv_shader.h
++++ b/ps2xRuntime/src/lib/ga2_mpv_shader.h
+@@ -24,6 +24,9 @@ namespace ga2_mpv
+         // message) when it cannot be parsed.
+         bool add(const std::string &source, const std::string &name, std::string &error);
+         bool empty() const { return m_passes.empty(); }
++        // Frees the GL objects (programs, intermediate textures) while the context is current; the chain compiles
++        // and allocates them again when it next runs.
++        void release();
+ 
+         // Runs every pass on `input` (an RGBA texture, `width` x `height`,
+         // first row at t = 0). outputWidth/outputHeight are the size it will
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index cf77350..c347fe6 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -18,6 +18,7 @@
+ #include <fstream>
+ #include <memory>
+ #include <sstream>
++#include <vector>
+ 
+ namespace ga2_present
+ {
+@@ -42,6 +43,7 @@ namespace ga2_present
+             std::string skybox;
+             bool english = false;
+             bool integer2d = false; // 2D scenes at whole multiples of 640x448
++            int deband = 0;         // 0 off, 1 low, 2 high
+         };
+ 
+         Filter filterFor(const std::string &filter)
+@@ -65,6 +67,7 @@ namespace ga2_present
+             s.filter = filterFor(ga2_settings::value(ga2_options::Filter));
+             s.english = std::string(ga2_settings::value(ga2_options::Language)) == "en";
+             s.integer2d = std::string(ga2_settings::value(ga2_options::Scale2d)) == "integer";
++            s.deband = ga2_settings::get(ga2_options::Deband);
+             return s;
+         }
+ 
+@@ -98,6 +101,10 @@ namespace ga2_present
+ 
+         bool g_wide = false;
+         std::unique_ptr<ga2_mpv::Chain> g_chain; // smooth / Anime4K
++        std::unique_ptr<ga2_mpv::Chain> g_deband; // the debanding pass (after the 2D filter)
++        int g_debandLevel = 0;                    // the level g_deband was built for
++        Shader g_dither{};                        // plain bilinear draw + the final dither of a debanded picture
++        bool g_ditherLoaded = false;
+         Shader g_sharp{};
+         bool g_sharpLoaded = false;
+         RenderTexture2D g_blur[3]{};
+@@ -135,6 +142,8 @@ uniform sampler2D texture0;
+ uniform vec4 colDiffuse;
+ uniform vec2 sourceSize;
+ uniform vec2 scale;
++uniform float ditherAmount;
++uniform int ditherSeed;
+ out vec4 finalColor;
+ void main() {
+     vec2 texel = fragTexCoord * sourceSize;
+@@ -142,9 +151,95 @@ void main() {
+     vec2 center = fract(texel) - 0.5;
+     vec2 f = (center - clamp(center, -region, region)) * max(scale, vec2(1.0)) + 0.5;
+     finalColor = texture(texture0, (floor(texel) + f) / sourceSize) * fragColor * colDiffuse;
++    if (ditherAmount > 0.0) {
++        uint q = uint(gl_FragCoord.x) * 1973u + uint(gl_FragCoord.y) * 9277u + uint(ditherSeed) * 26699u;
++        q = (q ^ (q >> 15u)) * 2246822519u; q = (q ^ (q >> 13u)) * 3266489917u; q ^= q >> 16u;
++        finalColor.rgb += (float(q) * (1.0 / 4294967296.0) - 0.5) * ditherAmount / 255.0;
++    }
+ }
+ )";
+ 
++        // A debanded picture is a float image: drawing it to the 8-bit window re-quantizes it, and the smooth
++        // ramps would band again. Noise of +-0.45 of an 8-bit step added at the window's own pixels (before the
++        // rounding) breaks the steps up; a pixel the pass left alone is an exact 8-bit value and stays unchanged.
++        const char *kDither = R"(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec4 colDiffuse;
++uniform float ditherAmount;
++uniform int ditherSeed;
++out vec4 finalColor;
++void main() {
++    finalColor = texture(texture0, fragTexCoord) * fragColor * colDiffuse;
++    uint q = uint(gl_FragCoord.x) * 1973u + uint(gl_FragCoord.y) * 9277u + uint(ditherSeed) * 26699u;
++    q = (q ^ (q >> 15u)) * 2246822519u; q = (q ^ (q >> 13u)) * 3266489917u; q ^= q >> 16u;
++    finalColor.rgb += (float(q) * (1.0 / 4294967296.0) - 0.5) * ditherAmount / 255.0;
++}
++)";
++
++        // Debanding, an mpv-style user shader run on the picture at its own resolution (before the window scales
++        // it). A sparse edge-preserving average: every pixel looks at a few neighbours at random angles and
++        // distances (and the ones 90 degrees round from them), and averages with those that are within the
++        // threshold of its own colour in every channel. The steps of 16-bit colour (8/255 per channel) are within
++        // the threshold, so a band edge is averaged with the next band over about the radius; a real edge (text,
++        // lines, sprites, texture detail) is far above it and is never mixed. The radius is given for a 448-line
++        // picture and grows with the picture's height, so 4x internal resolution smooths as wide as native. The
++        // taps are fixed per pixel (no shimmer); texelFetch keeps them to real pixels (no bilinear blur).
++        struct DebandLevel
++        {
++            float threshold; // per channel, 0..1 (one 5-bit colour step is 0.031)
++            float radius;    // pixels at 448 lines
++            int iterations;  // random distances; four taps each
++        };
++        const DebandLevel kDebandLevels[2] = {{0.036f, 20.0f, 2}, {0.045f, 40.0f, 4}};
++
++        const char *kDebandBody = R"(
++uint pcg(uint v) {
++    uint s = v * 747796405u + 2891336277u;
++    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
++    return (w >> 22u) ^ w;
++}
++float rnd(inout uint state) {
++    state = pcg(state);
++    return float(state) * (1.0 / 4294967296.0);
++}
++vec4 hook() {
++    ivec2 size = ivec2(HOOKED_size);
++    ivec2 p = min(ivec2(HOOKED_pos * HOOKED_size), size - 1);
++    vec4 c0 = texelFetch(HOOKED_raw, p, 0);
++    float radius = DB_RADIUS * HOOKED_size.y * (1.0 / 448.0);
++    uint state = pcg(uint(p.x) + pcg(uint(p.y)));
++    vec3 sum = c0.rgb;
++    float count = 1.0;
++    for (int i = 0; i < DB_ITER; ++i) {
++        float d = max(1.0, radius * (float(i) + rnd(state)) / float(DB_ITER));
++        float a = rnd(state) * 6.2831853;
++        ivec2 o = ivec2(round(d * vec2(cos(a), sin(a))));
++        ivec2 q = ivec2(-o.y, o.x);
++        ivec2 taps[4] = ivec2[4](p + o, p - o, p + q, p - q);
++        for (int k = 0; k < 4; ++k) {
++            vec3 t = texelFetch(HOOKED_raw, clamp(taps[k], ivec2(0), size - 1), 0).rgb;
++            vec3 df = abs(t - c0.rgb);
++            if (max(df.r, max(df.g, df.b)) < DB_THRESHOLD) {
++                sum += t;
++                count += 1.0;
++            }
++        }
++    }
++    return vec4(sum / count, c0.a);
++}
++)";
++
++        std::string debandShader(int level)
++        {
++            const DebandLevel &l = kDebandLevels[std::max(1, std::min(level, 2)) - 1];
++            char defines[200];
++            std::snprintf(defines, sizeof(defines), "#define DB_THRESHOLD %.4f\n#define DB_RADIUS %.2f\n#define DB_ITER %d\n",
++                          l.threshold, l.radius, l.iterations);
++            return std::string("//!DESC GA2 deband\n//!HOOK MAIN\n//!BIND HOOKED\n") + defines + kDebandBody;
++        }
++
+         std::string readFile(const std::filesystem::path &path)
+         {
+             std::ifstream in(path, std::ios::binary);
+@@ -315,6 +410,8 @@ namespace ga2_present
+         // Builds what `filter` needs and drops what the old one used (main thread, GL context current).
+         void loadFilter(Filter filter)
+         {
++            if (g_chain)
++                g_chain->release();
+             g_chain.reset();
+             if (g_sharpLoaded)
+             {
+@@ -357,6 +454,61 @@ namespace ga2_present
+             std::fprintf(stderr, "[present] 2D filter: %s\n", filterName());
+         }
+ 
++        // GA2_DEBAND_DUMP=<dir> (a developer aid): every 300th presented frame, the picture before and after the
++        // debanding pass is written as <dir>/plain-<n>.ppm and deband-<n>.ppm (8-bit, at the picture's resolution).
++        void dumpPicture(unsigned texture, int width, int height, const std::string &path)
++        {
++            std::vector<float> pixels(size_t(width) * size_t(height) * 4u);
++            glBindTexture(GL_TEXTURE_2D, texture);
++            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, pixels.data());
++            std::vector<unsigned char> rgb(size_t(width) * size_t(height) * 3u);
++            for (size_t i = 0; i < size_t(width) * size_t(height); ++i)
++                for (size_t c = 0; c < 3; ++c)
++                    rgb[i * 3 + c] = (unsigned char)std::lround(std::clamp(pixels[i * 4 + c], 0.0f, 1.0f) * 255.0f);
++            if (std::FILE *f = std::fopen(path.c_str(), "wb"))
++            {
++                std::fprintf(f, "P6\n%d %d\n255\n", width, height);
++                std::fwrite(rgb.data(), 1, rgb.size(), f);
++                std::fclose(f);
++            }
++        }
++
++        // Builds (or drops) the debanding pass for a level; the GL objects of the old one are freed first.
++        void loadDeband(int level)
++        {
++            if (g_deband)
++                g_deband->release();
++            g_deband.reset();
++            g_debandLevel = level;
++            if (level > 0)
++            {
++                g_deband = std::make_unique<ga2_mpv::Chain>();
++                std::string error;
++                if (!g_deband->add(debandShader(level), "deband", error))
++                {
++                    std::fprintf(stderr, "[present] deband: %s\n", error.c_str());
++                    g_deband.reset();
++                }
++            }
++            if (level > 0 && !g_ditherLoaded)
++            {
++                g_dither = LoadShaderFromMemory(nullptr, kDither);
++                g_ditherLoaded = IsShaderValid(g_dither);
++            }
++            std::fprintf(stderr, "[present] debanding: %s\n", level == 0 ? "off" : level == 1 ? "low" : "high");
++        }
++
++        // GA2_DEBAND_STATS=1: GPU time of the debanding pass (a timer query around it), printed every 240 runs.
++        struct DebandStats
++        {
++            unsigned queries[2] = {0, 0};
++            int next = 0;
++            bool pending[2] = {false, false};
++            double totalMs = 0.0;
++            int runs = 0;
++            int width = 0, height = 0;
++        };
++
+         void loadSkybox(Settings &s)
+         {
+             g_skyboxTried = true;
+@@ -397,6 +549,8 @@ namespace ga2_present
+         refresh(s);
+         if (g_ready && s.filter != g_loadedFilter)
+             loadFilter(s.filter);
++        if (g_ready && s.deband != g_debandLevel)
++            loadDeband(s.deband);
+         if (g_ready && s.sides == Sides::Skybox && !g_skyboxTried)
+             loadSkybox(s);
+         // Upscalers, smoothing and integer scaling are made for 2D art: 3D
+@@ -423,7 +577,8 @@ namespace ga2_present
+ 
+         Texture2D shown = frame;
+         Rectangle source{0.0f, 0.0f, srcWidth, srcHeight};
+-        if (g_ready && g_chain && !scene3d && frame.width == int(srcWidth) && frame.height == int(srcHeight))
++        const bool sizesMatch = frame.width == int(srcWidth) && frame.height == int(srcHeight);
++        if (g_ready && g_chain && !scene3d && sizesMatch)
+         {
+             rlDrawRenderBatchActive();
+             int w = 0, h = 0;
+@@ -439,6 +594,67 @@ namespace ga2_present
+         else
+             SetTextureFilter(frame, s.filter == Filter::Nearest && !scene3d ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+ 
++        const Texture2D plainShown = shown;
++        const Rectangle plainSource = source;
++        // Debanding: on the picture at its own resolution, after the 2D filter, in 2D and 3D scenes alike.
++        bool debanded = false;
++        if (g_ready && g_deband && sizesMatch)
++        {
++            rlDrawRenderBatchActive();
++            static const bool stats = std::getenv("GA2_DEBAND_STATS") != nullptr;
++            static DebandStats timing;
++            if (stats && timing.queries[0] == 0)
++                glGenQueries(2, timing.queries);
++            if (stats)
++                glBeginQuery(GL_TIME_ELAPSED, timing.queries[timing.next]);
++            int w = 0, h = 0;
++            const uint32_t result =
++                g_deband->run(shown.id, shown.width, shown.height, int(picture.width), int(picture.height), w, h);
++            if (stats)
++            {
++                glEndQuery(GL_TIME_ELAPSED);
++                timing.pending[timing.next] = true;
++                timing.next ^= 1;
++                // Read the other query, issued a frame ago (so nothing stalls).
++                if (timing.pending[timing.next])
++                {
++                    GLuint available = 0;
++                    glGetQueryObjectuiv(timing.queries[timing.next], GL_QUERY_RESULT_AVAILABLE, &available);
++                    if (available)
++                    {
++                        GLuint64 ns = 0;
++                        glGetQueryObjectui64v(timing.queries[timing.next], GL_QUERY_RESULT, &ns);
++                        timing.pending[timing.next] = false;
++                        timing.totalMs += double(ns) * 1e-6;
++                        timing.width = w;
++                        timing.height = h;
++                        if (++timing.runs == 240)
++                        {
++                            std::fprintf(stderr, "[deband] %s on %dx%d: %.3f ms GPU per frame (mean of %d)\n",
++                                         g_debandLevel == 1 ? "low" : "high", w, h, timing.totalMs / timing.runs, timing.runs);
++                            timing.totalMs = 0.0;
++                            timing.runs = 0;
++                        }
++                    }
++                }
++            }
++            glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++            if (result)
++            {
++                static const char *dumpDir = std::getenv("GA2_DEBAND_DUMP");
++                static int presented = 0;
++                if (dumpDir && *dumpDir && ++presented % 300 == 0)
++                {
++                    const std::string base = std::string(dumpDir) + "/";
++                    dumpPicture(shown.id, shown.width, shown.height, base + "plain-" + std::to_string(presented) + ".ppm");
++                    dumpPicture(result, w, h, base + "deband-" + std::to_string(presented) + ".ppm");
++                }
++                shown = Texture2D{result, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16};
++                source = Rectangle{0.0f, 0.0f, float(w), float(h)};
++                debanded = true;
++            }
++        }
++
+         if (!g_wide && (picture.width < area.width || picture.height < area.height))
+         {
+             if (s.sides == Sides::Blur)
+@@ -448,16 +664,41 @@ namespace ga2_present
+         }
+ 
+         const Rectangle dst{picture.x, picture.y, picture.width, picture.height};
+-        if (g_sharpLoaded && !scene3d && shown.id == frame.id)
++        // The dither of a debanded picture: +-0.45 of an 8-bit step, new noise every presented frame.
++        static int ditherSeed = 0;
++        ++ditherSeed;
++        const float ditherAmount = debanded ? 0.9f : 0.0f;
++        if (g_sharpLoaded && !scene3d && !g_chain)
+         {
+-            const float sourceSize[2] = {srcWidth, srcHeight};
+-            const float scale[2] = {picture.width / srcWidth, picture.height / srcHeight};
++            const float sourceSize[2] = {float(shown.width), float(shown.height)};
++            const float scale[2] = {picture.width / float(shown.width), picture.height / float(shown.height)};
+             SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "sourceSize"), sourceSize, SHADER_UNIFORM_VEC2);
+             SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "scale"), scale, SHADER_UNIFORM_VEC2);
++            SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "ditherAmount"), &ditherAmount, SHADER_UNIFORM_FLOAT);
++            SetShaderValue(g_sharp, GetShaderLocation(g_sharp, "ditherSeed"), &ditherSeed, SHADER_UNIFORM_INT);
+             BeginShaderMode(g_sharp);
+             DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
+             EndShaderMode();
+         }
++        else if (debanded && g_ditherLoaded)
++        {
++            // GA2_DEBAND_SPLIT=1 (a developer aid for comparisons): the left half of the picture stays as it was.
++            static const bool split = std::getenv("GA2_DEBAND_SPLIT") != nullptr;
++            Rectangle dstShown = dst, srcShown = source;
++            if (split)
++            {
++                const Rectangle leftDst{dst.x, dst.y, dst.width * 0.5f, dst.height};
++                const Rectangle leftSrc{plainSource.x, plainSource.y, plainSource.width * 0.5f, plainSource.height};
++                DrawTexturePro(plainShown, leftSrc, leftDst, Vector2{0, 0}, 0.0f, WHITE);
++                dstShown = Rectangle{dst.x + dst.width * 0.5f, dst.y, dst.width * 0.5f, dst.height};
++                srcShown = Rectangle{source.x + source.width * 0.5f, source.y, source.width * 0.5f, source.height};
++            }
++            SetShaderValue(g_dither, GetShaderLocation(g_dither, "ditherAmount"), &ditherAmount, SHADER_UNIFORM_FLOAT);
++            SetShaderValue(g_dither, GetShaderLocation(g_dither, "ditherSeed"), &ditherSeed, SHADER_UNIFORM_INT);
++            BeginShaderMode(g_dither);
++            DrawTexturePro(shown, srcShown, dstShown, Vector2{0, 0}, 0.0f, WHITE);
++            EndShaderMode();
++        }
+         else
+             DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
+         return picture;
+diff --git a/ps2xRuntime/src/lib/ga2_present.h b/ps2xRuntime/src/lib/ga2_present.h
+index 3f6dcfa..eba9191 100644
+--- a/ps2xRuntime/src/lib/ga2_present.h
++++ b/ps2xRuntime/src/lib/ga2_present.h
+@@ -14,6 +14,8 @@ struct Texture;
+ //               (a folder holds <program>.png per game; also used by VR)
+ //   GA2_FILTER  nearest | bilinear | sharp | smooth | anime4k | anime4k-hq
+ //               (2D scenes only: 3D scenes, which run VU1, stay bilinear)
++//   GA2_DEBAND  off | low | high          smooths the colour banding of 16-bit gradients, 2D and 3D scenes
++//               (after the 2D filter, at the picture's own resolution; GA2_DEBAND_STATS=1 prints its GPU time)
+ //   GA2_SCALE_2D fill | integer           2D scenes: fill, or whole multiples
+ //               of 640x448 (3D scenes always fill)
+ //   GA2_LANG    ja | en                   window title language
+diff --git a/ps2xRuntime/src/lib/ga2_settings_menu.cpp b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+index 5a7bd6b..5ebd171 100644
+--- a/ps2xRuntime/src/lib/ga2_settings_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_settings_menu.cpp
+@@ -205,6 +205,8 @@ namespace ga2_settings_menu
+                 return "";
+             case ga2_options::Filter:
+                 return ga2_activity::scene3d() ? "This is a 3D scene: the filter shows in 2D scenes." : "";
++            case ga2_options::Deband:
++                return ga2_vr::headsetRunning() ? "The window's picture is debanded; the headset's images are not." : "";
+             case ga2_options::DumpTextures:
+                 return "Textures the game loads from now on go to the dump folder.";
+             case ga2_options::Vr:
+-- 
+2.56.0
+

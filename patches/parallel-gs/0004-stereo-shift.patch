@@ -1,0 +1,92 @@
+From a1780e615dc9c8893be842e7e4434f0024663286 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:18:09 -0500
+Subject: [PATCH] Hacks: stereo_shift_q / stereo_shift_flat (single-pass stereo
+ parallax)
+
+Every vertex X moves by stereo_shift_q * Q pixels when Q != 1 (perspective:
+Q = 1/view z, the exact parallax of an eye moved along the camera x axis),
+else by stereo_shift_flat.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 17 +++++++++++++++--
+ gs/gs_interface.hpp |  7 +++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 021a809..fba0f10 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "page_tracker.hpp"
+ #include "gs_interface.hpp"
++#include <algorithm>
++#include <cmath>
+ #include "gs_util.hpp"
+ #include "shaders/swizzle_utils.h"
+ #include "muglm/muglm_impl.hpp"
+@@ -855,13 +857,24 @@ void GSInterface::shift_vertex_queue()
+ 	}
+ }
+ 
++// [stereo] see Hacks::stereo_shift_q. X is 12.4 fixed point.
++int GSInterface::stereo_x(int x) const
++{
++	if (hacks.stereo_shift_q == 0.0f && hacks.stereo_shift_flat == 0.0f)
++		return x;
++	const float q = registers.rgbaq.desc.Q;
++	const bool uv_sprite = registers.prim.desc.TME && registers.prim.desc.FST;
++	const float shift = (!uv_sprite && q != 1.0f && q > 0.0f) ? hacks.stereo_shift_q * q : hacks.stereo_shift_flat;
++	return std::min(std::max(x + int(std::lround(shift * 16.0f)), 0), 0xffff);
++}
++
+ void GSInterface::vertex_kick_xyz(Reg64<XYZBits> xyz)
+ {
+ 	shift_vertex_queue();
+ 	auto &pos = vertex_queue.pos[vertex_queue.count];
+ 	auto &attr = vertex_queue.attr[vertex_queue.count];
+ 
+-	pos.pos.x = int(xyz.desc.X) - render_pass.ofx;
++	pos.pos.x = stereo_x(int(xyz.desc.X)) - render_pass.ofx;
+ 	pos.pos.y = int(xyz.desc.Y) - render_pass.ofy;
+ 	pos.z = xyz.desc.Z;
+ 
+@@ -883,7 +896,7 @@ void GSInterface::vertex_kick_xyzf(Reg64<XYZFBits> xyzf)
+ 	auto &pos = vertex_queue.pos[vertex_queue.count];
+ 	auto &attr = vertex_queue.attr[vertex_queue.count];
+ 
+-	pos.pos.x = int(xyzf.desc.X) - render_pass.ofx;
++	pos.pos.x = stereo_x(int(xyzf.desc.X)) - render_pass.ofx;
+ 	pos.pos.y = int(xyzf.desc.Y) - render_pass.ofy;
+ 	pos.z = xyzf.desc.Z;
+ 
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index 76ed6e1..007bcb2 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -220,6 +220,12 @@ struct Hacks
+ 	// buffers then show their colour steps instead of the checkerboard).
+ 	bool disable_dither = false;
+ 
++	// [stereo] Single-pass stereo: one GS instance per eye fed the same packets. Every vertex X moves by
++	// stereo_shift_q * Q pixels when Q != 1 (perspective vertices: Q = 1/view z, so this is exactly the
++	// parallax of an eye moved along the camera x axis), else by stereo_shift_flat pixels (2D, UV sprites).
++	float stereo_shift_q = 0.0f;
++	float stereo_shift_flat = 0.0f;
++
+ 	// Replacement images cover exactly the cached region (TextureDescriptor::rect) instead of the whole PS2 texture.
+ 	// Textures are often declared larger than their art, so the region is what a host can identify stably.
+ 	bool replacements_cover_rect = false;
+@@ -506,6 +512,7 @@ private:
+ 
+ 	void shift_vertex_queue();
+ 	void vertex_kick_xyz(Reg64<XYZBits> xyz);
++	int stereo_x(int x) const;
+ 	void vertex_kick_xyzf(Reg64<XYZFBits> xyzf);
+ 	template <bool ADC> void packed_XYZF(const void *words);
+ 	template <bool ADC> void packed_XYZ(const void *words);
+-- 
+2.55.0
+

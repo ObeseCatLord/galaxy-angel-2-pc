@@ -1,0 +1,42 @@
+From f826025022eea3f30fd29a2fe7b47774b68e9269 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:44:41 -0500
+Subject: [PATCH] open the ELF and compute its CRC through path objects
+ (non-ASCII Windows paths)
+
+The UTF-8 command line reaches loadELF as a narrow string; opening a stream
+from it fails on Windows for names outside the ANSI code page. Found by
+running the engine from a data folder with Japanese characters under Wine.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a61e30e..156d160 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -134,7 +134,7 @@ namespace
+ 
+     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+     {
+-        std::ifstream file(path, std::ios::binary);
++        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+         if (!file.is_open())
+         {
+             return false;
+@@ -1017,7 +1017,9 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     }
+     configureIoPathsFromElf(elfPath);
+ 
+-    std::ifstream file(elfPath, std::ios::binary);
++    // A path object, not the narrow string: on Windows the string is UTF-8 and
++    // only the path opens a file whose name has characters outside the ANSI code page.
++    std::ifstream file(std::filesystem::path(elfPath), std::ios::binary);
+     if (!file)
+     {
+         std::cerr << "Failed to open ELF file: " << elfPath << std::endl;
+-- 
+2.55.0
+

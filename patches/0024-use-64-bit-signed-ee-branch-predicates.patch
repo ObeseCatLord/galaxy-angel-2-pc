@@ -1,0 +1,205 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -407,10 +407,10 @@
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -418,12 +418,12 @@
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -8,6 +8,7 @@
+ include(CTest)
+ find_package(OpenSSL QUIET COMPONENTS Crypto)
+ if(BUILD_TESTING)
++    add_subdirectory(branch_scalar)
+     add_subdirectory(gs_cache)
+ endif()
+ 
+diff --git a/ps2xTest/branch_scalar/CMakeLists.txt b/ps2xTest/branch_scalar/CMakeLists.txt
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_scalar/CMakeLists.txt
+@@ -0,0 +1,27 @@
++# Run generated branch snippets without game data or runtime initialization.
++# This fixture currently exercises the native x86-64 SIMD context.
++# Cross builds cannot execute the build-time generator.
++if(CMAKE_CROSSCOMPILING OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++    return()
++endif()
++
++add_executable(ps2_ee_branch_fixture_generator emit_fixtures.cpp)
++target_link_libraries(ps2_ee_branch_fixture_generator PRIVATE ps2_recomp_lib)
++
++set(branch_fixture_source "${CMAKE_CURRENT_BINARY_DIR}/branch_fixture_generated.cpp")
++add_custom_command(
++    OUTPUT "${branch_fixture_source}"
++    COMMAND $<TARGET_FILE:ps2_ee_branch_fixture_generator> "${branch_fixture_source}"
++    DEPENDS ps2_ee_branch_fixture_generator
++    VERBATIM
++)
++add_executable(ps2_ee_branch_scalar_tests execute_fixtures.cpp "${branch_fixture_source}")
++target_include_directories(ps2_ee_branch_scalar_tests PRIVATE
++    "${CMAKE_SOURCE_DIR}/ps2xRuntime/include"
++    "${CMAKE_SOURCE_DIR}/ps2xIOP/include"
++)
++if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
++    target_compile_options(ps2_ee_branch_scalar_tests PRIVATE -msse4.1)
++endif()
++add_test(NAME codegen.ee_signed_branch_width COMMAND ps2_ee_branch_scalar_tests)
++set_tests_properties(codegen.ee_signed_branch_width PROPERTIES LABELS "codegen;ee" TIMEOUT 30)
+diff --git a/ps2xTest/branch_scalar/emit_fixtures.cpp b/ps2xTest/branch_scalar/emit_fixtures.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_scalar/emit_fixtures.cpp
+@@ -0,0 +1,38 @@
++#include "ps2recomp/code_generator.h"
++#include "ps2recomp/r5900_decoder.h"
++#include <fstream>
++#include <iostream>
++#include <vector>
++using namespace ps2recomp;
++int main(int argc, char **argv) {
++  if (argc != 2)
++    return 2;
++  std::vector<Symbol> syms;
++  std::vector<Section> sections;
++  CodeGenerator gen(syms, sections);
++  R5900Decoder decoder;
++  // Every opcode is an authored EE branch on s1, offset7; delay slot increments
++  // s2.
++  const uint32_t ops[] = {0x1a200007, 0x5a200007, 0x1e200007, 0x5e200007,
++                          0x06200007, 0x06220007, 0x06210007, 0x06230007};
++  std::ofstream out(argv[1]);
++  if (!out)
++    return 4;
++  out << "#include \"ps2_runtime_macros.h\"\n";
++  for (unsigned i = 0; i < 8; i++) {
++    auto branch = decoder.decodeInstruction(0x1000, ops[i], false);
++    auto delay = decoder.decodeInstruction(0x1004, 0x26520001, false);
++    if (!branch.isBranch || branch.rs != 17 || branch.simmediate != 7 ||
++        delay.rt != 18)
++      return 3;
++    Function f{};
++    f.name = "branch_fixture";
++    f.start = 0x1000;
++    f.end = 0x1008;
++    f.isRecompiled = true;
++    CodeGenerator::AnalysisResult analysis{};
++    out << "void branch_" << i << "(R5900Context*ctx){\n"
++        << gen.handleBranchDelaySlots(branch, delay, f, analysis) << "}\n";
++  }
++  return out ? 0 : 5;
++}
+diff --git a/ps2xTest/branch_scalar/execute_fixtures.cpp b/ps2xTest/branch_scalar/execute_fixtures.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/branch_scalar/execute_fixtures.cpp
+@@ -0,0 +1,83 @@
++#include "ps2_runtime_macros.h"
++#include <array>
++#include <cstring>
++#include <iomanip>
++#include <iostream>
++void branch_0(R5900Context *);
++void branch_1(R5900Context *);
++void branch_2(R5900Context *);
++void branch_3(R5900Context *);
++void branch_4(R5900Context *);
++void branch_5(R5900Context *);
++void branch_6(R5900Context *);
++void branch_7(R5900Context *);
++int main() {
++  const std::array<void (*)(R5900Context *), 8> functions = {
++      branch_0, branch_1, branch_2, branch_3,
++      branch_4, branch_5, branch_6, branch_7};
++  const std::array<uint64_t, 12> values = {0,
++                                           1,
++                                           0xffffffffull,
++                                           0x80000000ull,
++                                           0x100000000ull,
++                                           0x8000000000000000ull,
++                                           0x8000000040000008ull,
++                                           0x7fffffff80000000ull,
++                                           0xffffffffffffffffull,
++                                           0xffffffff80000000ull,
++                                           0x7fffffffffffffffull,
++                                           0x40000008ull};
++  unsigned count = 0, failed = 0;
++  for (unsigned opcode = 0; opcode < 8; opcode++)
++    for (uint64_t bits : values)
++      for (unsigned high = 0; high < 2; high++) {
++        R5900Context ctx{};
++        for (unsigned i = 1; i < 32; i++)
++          ctx.r[i] = _mm_set_epi64x(0x7654321012345678ll, 0x12340000 + i);
++        ctx.r[0] = _mm_setzero_si128();
++        ctx.r[17] = _mm_set_epi64x(high ? 0xffffffffffffffffull : 0, bits);
++        ctx.r[18] = _mm_set_epi64x(0x6655443322110099ll, 7);
++        const auto before = ctx;
++        // Architectural oracle from the pinned PCSX2 EE interpreter: signed
++        // scalar low64; high64 ignored.
++        const bool negative = (bits >> 63) != 0, zero = bits == 0;
++        bool taken = false;
++        switch (opcode / 2) {
++        case 0:
++          taken = negative || zero;
++          break;
++        case 1:
++          taken = !negative && !zero;
++          break;
++        case 2:
++          taken = negative;
++          break;
++        case 3:
++          taken = !negative;
++          break;
++        }
++        const bool slot = !(opcode & 1) || taken;
++        functions[opcode](&ctx);
++        ++count;
++        bool ok = ctx.pc == (taken ? 0x1020u : 0x1008u) &&
++                  static_cast<uint64_t>(_mm_cvtsi128_si64(ctx.r[18])) ==
++                      (slot ? 8 : 7) &&
++                  !ctx.in_delay_slot;
++        for (unsigned i = 0; i < 32; i++)
++          if (i != 18)
++            ok = ok && std::memcmp(&ctx.r[i], &before.r[i], 16) == 0;
++        ok = ok && _mm_extract_epi64(ctx.r[18], 1) ==
++                       _mm_extract_epi64(before.r[18], 1);
++        if (!ok) {
++          ++failed;
++          if (failed <= 8)
++            std::cout << "failure opcode=" << opcode << " bits=0x" << std::hex
++                      << bits << " observed_pc=0x" << ctx.pc << std::dec
++                      << " expected_taken=" << taken << " observed_slot="
++                      << static_cast<uint64_t>(_mm_cvtsi128_si64(ctx.r[18]))
++                      << '\n';
++        }
++      }
++  std::cout << "cases=" << count << " failures=" << failed << '\n';
++  return failed ? 1 : 0;
++}

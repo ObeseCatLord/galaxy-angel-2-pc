@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "kind": "sif-synchronous-other-data-verification",
+  "scope": "Observed Zettai mode-0 EE-to-IOP sound-bank receives; no voice/battle/full-bank acceptance",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "source_base_commit": "c48a5cc",
+  "runtime_patch_prefix": 16,
+  "patch": {
+    "file": "0016-sif-synchronous-other-data.patch",
+    "sha256": "e9f9ad75dc281bc2972d8457b12490dca8b7c5f2437b1c8710696e2d2cb96f9b"
+  },
+  "original_elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "production_source_sha256": "460b76e1658c500f2758294b6f707ce82e03f64ccc555aa45bb043a94727462c",
+  "test_source_sha256": "52c79583f3deef8df053537e243096011a86da3d308606b5639c7fa84ceda04c",
+  "baseline": {
+    "capture": "captures/native-zettai/20261009-125409",
+    "event_sha256": "0e6d7504dc717a15897408258e6ee19a40f27cb681482bef5dfc2bababa4fe4b",
+    "effect": "32-byte valid EE header starts3; IOP destination starts1 and remains identical after returned0; original SCREAM error84 follows",
+    "observer_sha256": "a7d514889c4cdd5d49b62595142f3285708504355df26512e33ea887cb1911b9"
+  },
+  "after": {
+    "capture": "captures/native-zettai/20261009-130226",
+    "event_sha256": "4922878040f2359dacc3b3b673b281828a92f024b32c86bfa493ddf8b35229fb",
+    "actual_seconds": 171.507,
+    "completed_receives": 5,
+    "requested_bytes": [
+      32,
+      16,
+      1120,
+      47296,
+      47296
+    ],
+    "source_prefix_bytes": [
+      32,
+      16,
+      1120,
+      4096,
+      4096
+    ],
+    "all_prefixes_equal_after": true,
+    "results": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pending": 0,
+    "observer_errors": [],
+    "caps": {},
+    "first_header_sha256": "6c76660a28854f133af4d69a489474f9cd3fd144f592caadb879945e2d3042cb",
+    "later_scream_causes": [
+      25,
+      18
+    ],
+    "observer_sha256": "4b2898899dc2b4d5d9fd0cd81f987711e4d4d0fbfa205d12f806f6b9e2b39dc1",
+    "exercised_return_offsets": [
+      "0x72dc",
+      "0x7274",
+      "0x72dc",
+      "0x72dc",
+      "0x72dc"
+    ],
+    "tail_return_observed": false,
+    "dma_observation": {
+      "madr": 1984320,
+      "chcr": 16777729,
+      "bcr_low_half": 16,
+      "bcr_high_half_captured": false,
+      "scope": "DMA start-register write only; full transfer length/payload equality/completion/callback remain unverified"
+    }
+  },
+  "tests": {
+    "iop_suites_passed": 9,
+    "runtime_cases_passed": 483,
+    "tooling_cases_passed": 27,
+    "staging_mutations_rejected": [
+      "leaked-partial-read",
+      "premature-completion"
+    ]
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_settings_verified": "parent targeted read-only model metadata",
+    "status": "accepted: final production source, regression sensitivity, packaged patch, observer and bounded native effects; full-bank/audio/gameplay limits remain open"
+  },
+  "next_boundary": "Actual SPU DMA start-register write observed; full BCR not captured. Original SCREAM busy flag causes25/18. Verify completion and callback against stock before changing sound device behavior.",
+  "limits": [
+    "Public artifact contains identities/evidence summaries only. Original modules/header bytes/game source/audio/captures remain private.",
+    "Diagnostic executable rebuilds three original IOP units O0, with separate archive; not ordinary timing/audio acceptance.",
+    "47,296-byte transfer records sample only first4KiB, not complete payload equality.",
+    "Onlymode0supported; othermodes returnnegative-2withoutfakedcompletion.",
+    "Inherited host EE translation/mirroring retained; no strict EE physical-range validation claim.",
+    "Completed receive convention clears pkt_addr and sets sema_id=-1 while preserving other fields; no original packet/semaphore identity parity claim."
+  ],
+  "ordinary_after": {
+    "capture": "captures/native-zettai/20261009-130633",
+    "actual_seconds": 175.678,
+    "debugger": false,
+    "terminal_frame": "Japanese title menu with Start/Continue/Options and Start highlight; main visually inspected",
+    "owned_stream_checks": 167,
+    "recorded_stereo_frames": 8398647,
+    "sample_rate": 48000,
+    "all_recorded_samples_zero": true,
+    "wav_sha256": "4514f1c2603451f1d575eeae10d845856827c00ae927643eb43961b278b39a07",
+    "limits": "Title menu shown; this timed-input capture does not advance to opening. Not matched guest phase with earlier runs. Sink-monitor silence only; no producer PCM or voice acceptance."
+  },
+  "patch_reproduction": {
+    "source_files": 71,
+    "all_source_bytes_equal": true,
+    "idempotent": true
+  }
+}

@@ -1,0 +1,227 @@
+From e0925c8889215c78819cd29d9b278cea82416ae7 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:33:18 -0500
+Subject: [PATCH] framerate: runtime rate (frame clock retune) for the
+ game-side governor; IOP scheduler single pass
+
+ga2_framepace::rate() / setRate(): GA2_FPS is the maximum, the game side's governor (native/compat)
+lowers the rate when the host cannot keep the guest at real time and raises it again. step(), hz(),
+the frame clock and the perf report follow rate(). EeScheduler::retuneFrameClock moves the tick
+origin (m_frameBase) so ticks keep counting and the next ones follow the new rate.
+
+IopKernel::beginNextReady scanned the thread list twice per call (9 % of the game thread in
+IOP-heavy phases of the Zettai cockpit/movie): one pass now, the second scan only when a delay
+expired. IOP emulator and compatibility tests pass.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_kernel.cpp    | 35 +++++++++++++++------
+ ps2xRuntime/include/runtime/ee_scheduler.h  |  5 ++-
+ ps2xRuntime/include/runtime/ga2_framepace.h | 10 ++++--
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp  | 23 ++++++++++++--
+ ps2xRuntime/src/lib/ga2_framepace.cpp       | 33 ++++++++++++++++---
+ 5 files changed, 87 insertions(+), 19 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4ea261b..162b0f4 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -951,20 +951,35 @@ namespace ps2x::iop::detail
+         // Expired delays become ready in (wake time, id) order, behind the
+         // threads that are already queued. The next thread is the head of the
+         // best priority's FIFO queue: lowest (priority, readySerial).
++        // One pass finds both the expired delays and the best ready thread; only when a delay expired (it queues behind
++        // the ready ones, so the answer can change) is the ready set scanned again.
+         std::vector<IopThread *> expired;
+-        for (IopThread *thread : m_threadList)
+-            if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
+-                expired.push_back(thread);
+-        std::stable_sort(expired.begin(), expired.end(),
+-                         [](const IopThread *a, const IopThread *b) { return a->wakeCycle < b->wakeCycle; });
+-        for (IopThread *thread : expired)
+-            makeReady(*thread);
+         IopThread *next = nullptr;
+         for (IopThread *thread : m_threadList)
+-            if (thread->state == IopThreadState::Ready &&
+-                (next == nullptr || thread->priority < next->priority ||
+-                 (thread->priority == next->priority && thread->readySerial < next->readySerial)))
++        {
++            if (thread->state == IopThreadState::Delay)
++            {
++                if (thread->wakeCycle <= currentCycle)
++                    expired.push_back(thread);
++            }
++            else if (thread->state == IopThreadState::Ready &&
++                     (next == nullptr || thread->priority < next->priority ||
++                      (thread->priority == next->priority && thread->readySerial < next->readySerial)))
+                 next = thread;
++        }
++        if (!expired.empty())
++        {
++            std::stable_sort(expired.begin(), expired.end(),
++                             [](const IopThread *a, const IopThread *b) { return a->wakeCycle < b->wakeCycle; });
++            for (IopThread *thread : expired)
++                makeReady(*thread);
++            next = nullptr;
++            for (IopThread *thread : m_threadList)
++                if (thread->state == IopThreadState::Ready &&
++                    (next == nullptr || thread->priority < next->priority ||
++                     (thread->priority == next->priority && thread->readySerial < next->readySerial)))
++                    next = thread;
++        }
+         if (next == nullptr)
+             return nullptr;
+ 
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index a7610dc..3273151 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -411,6 +411,8 @@ public:
+     // guest thread sleeps until its `interval`-th tick after the one it last
+     // woke at. Ticks count from the first wait.
+     void configureFrameClock(uint32_t fps) noexcept { m_frameFps = fps; }
++    // Change the tick rate while the clock runs (the rate governor): ticks keep counting, the next ones follow the new rate.
++    void retuneFrameClock(uint32_t fps) noexcept;
+     [[nodiscard]] uint32_t frameClockFps() const noexcept { return m_frameFps; }
+     [[noreturn]] void waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion);
+     [[nodiscard]] uint64_t frameTicks() const noexcept { return m_frameTicks; }
+@@ -558,7 +560,8 @@ private:
+     uint64_t m_frameWaitTarget = 0;  // tick the waiting game thread wants
+     uint64_t m_frameLastWaitTick = 0;
+     bool m_frameWaiting = false;
+-    uint64_t m_frameCycle0 = 0;      // EE cycle of tick 0
++    uint64_t m_frameBase = 0;        // tick index the cycle/host origins below belong to
++    uint64_t m_frameCycle0 = 0;      // EE cycle of tick m_frameBase
+     std::chrono::steady_clock::time_point m_frameHost0{};
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+     uint32_t m_invocationStackArenaBegin = 0u;
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index 8745f80..f824eec 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -25,10 +25,16 @@ namespace ga2_framepace
+     // software GS). Read once.
+     int fps();
+     inline bool enabled() { return fps() > 0; }
+-    // Seconds per frame at fps(): 1001 / (1000 * fps) (the NTSC-style
++    // The rate the game runs at now: fps() is the maximum, the game side's governor lowers it (down to 60, the
++    // native cadence) when the host cannot keep up and raises it again. 0 when not enabled.
++    int rate();
++    // Game thread, at an iteration boundary: run at `rate` frames per second from now (clamped to 60..fps()); retunes
++    // the frame clock. Returns the previous rate.
++    int setRate(PS2Runtime &runtime, int rate);
++    // Seconds per frame at rate(): 1001 / (1000 * rate) (the NTSC-style
+     // N*1000/1001 rate, so 120 is exactly twice the 59.94 Hz VBLANK).
+     float step();
+-    // Frames per second at fps(): fps * 1000 / 1001.
++    // Frames per second at rate(): rate * 1000 / 1001.
+     double hz();
+ 
+     // Game thread: sleep until the `interval`-th next frame tick (counted from
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index d4ec891..64ae806 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1944,6 +1944,23 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
+     blockCurrent(std::move(wait));
+ }
+ 
++void EeScheduler::retuneFrameClock(uint32_t fps) noexcept
++{
++    fps = std::max<uint32_t>(1u, fps);
++    if (!m_frameClockOn)
++    {
++        m_frameFps = fps;
++        return;
++    }
++    if (fps == m_frameFps)
++        return;
++    // The tick already queued fires on the old schedule; the ones after it follow the new rate from here.
++    m_frameFps = fps;
++    m_frameBase = m_frameTicks;
++    m_frameCycle0 = m_eeCycle;
++    m_frameHost0 = std::chrono::steady_clock::now();
++}
++
+ bool EeScheduler::frameDriven() const noexcept
+ {
+     // The game runs a scene at the native rate (ga2_framepace::setNative): the real VBLANK drives the display.
+@@ -1959,6 +1976,7 @@ bool EeScheduler::frameDriven() const noexcept
+         // The clock starts at the first wait; ticks fire from then on.
+         m_frameClockOn = true;
+         m_frameTicks = 0;
++        m_frameBase = 0;
+         m_frameLastWake = 0;
+         m_frameCycle0 = m_eeCycle;
+         m_frameHost0 = std::chrono::steady_clock::now();
+@@ -2477,8 +2495,9 @@ void EeScheduler::processDueDeadlines()
+                 const auto late = std::chrono::steady_clock::now() - scheduled.hostDeadline;
+                 if (late > std::chrono::milliseconds(50))
+                     m_frameHost0 += late;
+-                scheduleEvent(m_frameCycle0 + next * kFrameCycleNumerator / fps,
+-                              m_frameHost0 + std::chrono::nanoseconds(next * kFrameNanosecondNumerator / fps),
++                const uint64_t since = next > m_frameBase ? next - m_frameBase : 1u;
++                scheduleEvent(m_frameCycle0 + since * kFrameCycleNumerator / fps,
++                              m_frameHost0 + std::chrono::nanoseconds(since * kFrameNanosecondNumerator / fps),
+                               EeEvent{EeEventType::FrameTick, 0, next});
+             }
+             processEvent(scheduled.event);
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index 6464fd8..c252a4a 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -101,14 +101,39 @@ namespace ga2_framepace
+         return value;
+     }
+ 
+-    float step() { return fps() > 0 ? float(1001.0 / (1000.0 * fps())) : float(1001.0 / 60000.0); }
++    namespace
++    {
++        std::atomic<int> g_rate{0};
++    }
++
++    int rate()
++    {
++        const int r = g_rate.load(std::memory_order_relaxed);
++        return r > 0 ? r : fps();
++    }
++
++    int setRate(PS2Runtime &runtime, int value)
++    {
++        const int previous = rate();
++        if (fps() <= 0)
++            return previous;
++        value = std::clamp(value, 60, fps());
++        if (value != previous)
++        {
++            g_rate.store(value, std::memory_order_relaxed);
++            runtime.eeScheduler().retuneFrameClock(uint32_t(value));
++        }
++        return previous;
++    }
++
++    float step() { return rate() > 0 ? float(1001.0 / (1000.0 * rate())) : float(1001.0 / 60000.0); }
+ 
+-    double hz() { return fps() > 0 ? fps() * 1000.0 / 1001.0 : 60000.0 / 1001.0; }
++    double hz() { return rate() > 0 ? rate() * 1000.0 / 1001.0 : 60000.0 / 1001.0; }
+ 
+     [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc)
+     {
+         EeScheduler &scheduler = runtime.eeScheduler();
+-        scheduler.configureFrameClock(uint32_t(fps()));
++        scheduler.configureFrameClock(uint32_t(rate()));
+         scheduler.waitFrameTick(interval, [resumePc](R5900Context &context) { context.pc = resumePc; });
+     }
+ 
+@@ -174,7 +199,7 @@ namespace ga2_framepace
+                      double(f - g_stats.flips) / seconds, double(g_stats.scans) / seconds,
+                      double(g_presented.load(std::memory_order_relaxed) - g_stats.presented) / seconds,
+                      double(vsyncTick - g_stats.vsync) / seconds,
+-                     100.0 * double(f - g_stats.flips) / seconds / hz(), fps() > 0 ? fps() : 60);
++                     100.0 * double(f - g_stats.flips) / seconds / hz(), rate() > 0 ? rate() : 60);
+         // Where the host's time goes: busiest threads, as a share of one core.
+         {
+             const auto now = threadCpu();
+-- 
+2.55.0
+

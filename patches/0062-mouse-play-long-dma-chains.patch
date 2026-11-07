@@ -1,0 +1,794 @@
+From a9b5107af4d802627a5fede7215161c5ac725bec Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 02:43:59 -0500
+Subject: [PATCH] ga2: mouse play, long DMA chains, stall diagnostics
+
+- Mouse (ps2_mouse, ps2_mouse_menus): left click = Circle, right = Cross,
+  middle = Select, wheel = Up/Down; an on-screen pad (D-pad, face buttons,
+  L1/L2/R1/R2, Select, Start) appears in the side bars while the mouse moves
+  (over the picture edges only near them when there are no bars). Known menus
+  follow the pointer: hovering an item moves the game's cursor there with
+  D-pad presses, clicking also confirms. Zettai and Mugen title menus are
+  mapped (menu object found by its type word, cursor byte, item rects).
+- Without a gamepad the D-pad also tilts the left stick fully (the ship map
+  scrolls only with the stick).
+- The game window opens 16:9 so the 4:3 picture leaves bars for the pad.
+- DMA chains may run to 2^20 tags: Mugen's tutorial battle sends 4000+ tag
+  VIF1 chains; the 4096 cap left the chain unfinished and the game waiting
+  forever for its completion. A cut chain is now reported.
+- Diagnostics: GA2_PERF also prints each guest thread's resume pc/ra and the
+  VIF1/GIF/D_STAT state; GA2_RAM_DUMP_DIR + F12 writes EE RAM;
+  GA2_VU1CAP_ONLY=<hash,...> samples only those code images.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                 |   2 +
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp |  16 ++
+ ps2xRuntime/src/lib/ps2_memory.cpp         |  14 +-
+ ps2xRuntime/src/lib/ps2_mouse.cpp          | 221 +++++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_mouse.h            |  30 +++
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp    | 208 +++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_mouse_menus.h      |  19 ++
+ ps2xRuntime/src/lib/ps2_pad.cpp            |  43 +---
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  27 ++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_capture.cpp |  13 ++
+ 10 files changed, 559 insertions(+), 34 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ps2_mouse.cpp
+ create mode 100644 ps2xRuntime/src/lib/ps2_mouse.h
+ create mode 100644 ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+ create mode 100644 ps2xRuntime/src/lib/ps2_mouse_menus.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index eb730c6..ad76ef2 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -394,6 +394,8 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_ipu.cpp
+     src/lib/gs/gs_pgs.cpp
+     src/lib/ps2_pad.cpp
++    src/lib/ps2_mouse.cpp
++    src/lib/ps2_mouse_menus.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 53f8be1..482f27f 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2433,6 +2433,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+                                  double(vu1.runs) / seconds, double(vu1.cycles) / seconds / 1e6,
+                                  double(vu1.nanos) / seconds / 1e6,
+                                  vu1.cycles ? double(vu1.nanos) / double(vu1.cycles) : 0.0);
++                    // Where each live guest thread is (status, resume pc, ra).
++                    std::fprintf(stderr, "[ga2 perf] threads:");
++                    for (const auto &[id, thread] : m_threads)
++                    {
++                        if (id <= 0 || thread.status == EeThreadStatus::Dormant) continue;
++                        const R5900Context &c = thread.activeContext();
++                        std::fprintf(stderr, " %d/%d@%x<%x", id, static_cast<int>(thread.status), c.pc,
++                                     static_cast<uint32_t>(_mm_cvtsi128_si32(c.r[31])));
++                    }
++                    // DMA state a stall usually involves (CHCR is not read: reading it
++                    // clears STR in this model).
++                    PS2Memory &mem = m_runtime.memory();
++                    std::fprintf(stderr, " | vif1 qwc=%x madr=%x tadr=%x stat=%x gif qwc=%x d_stat=%x\n",
++                                 mem.readIORegister(0x10009020u) & 0xFFFFu, mem.readIORegister(0x10009010u),
++                                 mem.readIORegister(0x10009030u), mem.readIORegister(0x10003C00u),
++                                 mem.readIORegister(0x1000A020u) & 0xFFFFu, mem.readIORegister(0x1000E010u));
+                     last = now;
+                     lastTick = m_vsyncTick;
+                 }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 886bca4..9cb045b 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1481,7 +1481,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Only guards against looping on a malformed chain: GA2 battle scenes send
++                    // chains of 4000+ tags (Mugen tutorial), and a cut chain never completes.
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1658,6 +1660,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (tagsProcessed >= kMaxChainTags)
++                        std::fprintf(stderr, "[dma] chain on %08x cut at %d tags (tadr=%08x)\n", channelBase,
++                                     tagsProcessed, tagAddr);
++                    {
++                        static const bool chainTrace = std::getenv("GA2_DMA_TRACE") != nullptr;
++                        if (chainTrace && channelBase == 0x10009000u)
++                            std::fprintf(stderr, "[dma] vif1 chain end: %d tags, last id=%u irq=%u tie=%d tadr=%08x\n",
++                                         tagsProcessed, (lastTagUpper >> 12) & 7u, (lastTagUpper >> 15) & 1u,
++                                         tieEnabled ? 1 : 0, tagAddr);
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.cpp b/ps2xRuntime/src/lib/ps2_mouse.cpp
+new file mode 100644
+index 0000000..797d1a0
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_mouse.cpp
+@@ -0,0 +1,221 @@
++#include "ps2_mouse.h"
++#include "ps2_mouse_menus.h"
++#include "ps2_host_backend.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace ps2_mouse
++{
++    namespace
++    {
++        // PS2 pad button bits (active-high here; the pad reports them inverted).
++        constexpr uint16_t kSelect = 0x0001u, kStart = 0x0008u, kUp = 0x0010u, kRight = 0x0020u;
++        constexpr uint16_t kDown = 0x0040u, kLeft = 0x0080u, kL2 = 0x0100u, kR2 = 0x0200u;
++        constexpr uint16_t kL1 = 0x0400u, kR1 = 0x0800u, kTriangle = 0x1000u, kCircle = 0x2000u;
++        constexpr uint16_t kCross = 0x4000u, kSquare = 0x8000u;
++
++        enum class Shape { Arrow, Triangle, Circle, Cross, Square, Label };
++        struct Button
++        {
++            uint16_t bits = 0;
++            Shape shape = Shape::Label;
++            const char *label = "";
++            float cx = 0, cy = 0, r = 0; // round hit area
++            float angle = 0;             // arrows: direction in degrees
++        };
++
++        Rect g_game;
++        float g_sourceWidth = 640.0f, g_sourceHeight = 448.0f;
++        std::array<Button, 14> g_buttons{};
++        double g_lastMove = -10.0;
++        uint16_t g_held = 0;
++        bool g_overPad = false, g_clickedGame = false;
++        int g_wheelNotches = 0, g_wheelPhase = 0;
++        uint16_t g_wheelDirection = 0;
++
++        bool inside(Vector2 p, const Rect &r)
++        {
++            return p.x >= r.x && p.y >= r.y && p.x < r.x + r.width && p.y < r.y + r.height;
++        }
++
++        bool g_inBars = true;
++
++        // In the side bars the pad shows whenever the mouse moved recently;
++        // over the image (no bars) only while the pointer is near its edges,
++        // so it does not cover menus being pointed at.
++        bool padVisible()
++        {
++            if (g_overPad)
++                return true;
++            if (GetTime() - g_lastMove >= 2.5)
++                return false;
++            if (g_inBars)
++                return true;
++            const float x = GetMousePosition().x, w = static_cast<float>(GetScreenWidth());
++            return x < w * 0.14f || x > w * 0.86f;
++        }
++
++        void layout()
++        {
++            const float w = static_cast<float>(GetScreenWidth());
++            const float h = static_cast<float>(GetScreenHeight());
++            const float bar = g_game.x; // pillarbox width each side
++            g_inBars = bar >= 60.0f;
++            // Button radius scale: fits the bar when there is one.
++            float u = std::clamp(h / 14.0f, 22.0f, 64.0f);
++            if (g_inBars)
++                u = std::min(u, bar / 2.8f);
++            const float leftX = g_inBars ? bar * 0.5f : 2.0f * u;
++            const float rightX = g_inBars ? w - bar * 0.5f : w - 2.0f * u;
++            const float midY = h * 0.55f;
++            const float s = u * 0.62f;
++            size_t i = 0;
++            auto add = [&](uint16_t bits, Shape shape, const char *label, float cx, float cy, float r, float angle = 0)
++            { g_buttons[i++] = Button{bits, shape, label, cx, cy, r, angle}; };
++            add(kUp, Shape::Arrow, "", leftX, midY - 1.15f * u, s, 270);
++            add(kDown, Shape::Arrow, "", leftX, midY + 1.15f * u, s, 90);
++            add(kLeft, Shape::Arrow, "", leftX - 1.15f * u, midY, s, 180);
++            add(kRight, Shape::Arrow, "", leftX + 1.15f * u, midY, s, 0);
++            add(kTriangle, Shape::Triangle, "", rightX, midY - 1.15f * u, s);
++            add(kCross, Shape::Cross, "", rightX, midY + 1.15f * u, s);
++            add(kSquare, Shape::Square, "", rightX - 1.15f * u, midY, s);
++            add(kCircle, Shape::Circle, "", rightX + 1.15f * u, midY, s);
++            add(kL1, Shape::Label, "L1", leftX - 0.7f * u, midY - 3.0f * u, s);
++            add(kL2, Shape::Label, "L2", leftX + 0.7f * u, midY - 3.0f * u, s);
++            add(kR1, Shape::Label, "R1", rightX - 0.7f * u, midY - 3.0f * u, s);
++            add(kR2, Shape::Label, "R2", rightX + 0.7f * u, midY - 3.0f * u, s);
++            add(kSelect, Shape::Label, "SEL", leftX, midY + 3.0f * u, s);
++            add(kStart, Shape::Label, "START", rightX, midY + 3.0f * u, s);
++        }
++
++        const Button *buttonAt(Vector2 p)
++        {
++            for (const Button &b : g_buttons)
++                if ((p.x - b.cx) * (p.x - b.cx) + (p.y - b.cy) * (p.y - b.cy) <= b.r * b.r * 1.3f)
++                    return &b;
++            return nullptr;
++        }
++    }
++
++    void beginFrame(Rect game, float sourceWidth, float sourceHeight)
++    {
++        g_game = game;
++        g_sourceWidth = sourceWidth > 0 ? sourceWidth : 640.0f;
++        g_sourceHeight = sourceHeight > 0 ? sourceHeight : 448.0f;
++        layout();
++
++        const Vector2 mouse = GetMousePosition();
++        const Vector2 delta = GetMouseDelta();
++        const bool inWindow = mouse.x >= 0 && mouse.y >= 0 && mouse.x < GetScreenWidth() && mouse.y < GetScreenHeight();
++        if (delta.x != 0.0f || delta.y != 0.0f || IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++            g_lastMove = GetTime();
++
++        g_held = 0;
++        g_clickedGame = false;
++        const Button *pad = inWindow && padVisible() ? buttonAt(mouse) : nullptr;
++        g_overPad = pad != nullptr;
++        if (!inWindow)
++            return;
++        if (pad && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++            g_held |= pad->bits;
++
++        const bool overGame = inside(mouse, g_game);
++        if (!pad && overGame && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
++            g_clickedGame = true;
++        // A known menu turns pointing and clicking into cursor moves and a
++        // confirm; elsewhere the left button is Circle.
++        const uint16_t menu = ps2_mouse_menus::update();
++        g_held |= menu;
++        if (!pad && overGame && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !ps2_mouse_menus::ownsClick())
++            g_held |= kCircle;
++        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
++            g_held |= kCross;
++        if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
++            g_held |= kSelect;
++
++        // Each wheel notch is a 3-frame press then a 3-frame release, long
++        // enough for games that poll the pad every other frame.
++        const float wheel = GetMouseWheelMove();
++        if (wheel != 0.0f)
++            g_wheelNotches = std::clamp(g_wheelNotches + (wheel > 0.0f ? -1 : 1), -8, 8);
++        if (g_wheelPhase == 0 && g_wheelNotches != 0)
++        {
++            g_wheelDirection = g_wheelNotches < 0 ? kUp : kDown;
++            g_wheelNotches += g_wheelNotches < 0 ? 1 : -1;
++            g_wheelPhase = 6;
++        }
++        if (g_wheelPhase != 0)
++        {
++            if (g_wheelPhase > 3)
++                g_held |= g_wheelDirection;
++            --g_wheelPhase;
++        }
++    }
++
++    void draw()
++    {
++        if (!padVisible())
++            return;
++        const Vector2 mouse = GetMousePosition();
++        const Color fill{20, 26, 48, 170}, edge{200, 210, 235, 220}, hot{120, 180, 255, 230};
++        for (const Button &b : g_buttons)
++        {
++            const bool pressed = (g_held & b.bits) != 0;
++            const bool hover = (mouse.x - b.cx) * (mouse.x - b.cx) + (mouse.y - b.cy) * (mouse.y - b.cy) <= b.r * b.r * 1.3f;
++            DrawCircleV(Vector2{b.cx, b.cy}, b.r, pressed ? hot : fill);
++            DrawCircleLinesV(Vector2{b.cx, b.cy}, b.r, hover ? hot : edge);
++            const float k = b.r * 0.5f;
++            const Vector2 c{b.cx, b.cy};
++            switch (b.shape)
++            {
++            case Shape::Arrow:
++            {
++                const float a = b.angle * DEG2RAD;
++                const Vector2 tip{c.x + std::cos(a) * k, c.y + std::sin(a) * k};
++                const Vector2 l{c.x + std::cos(a + 2.4f) * k, c.y + std::sin(a + 2.4f) * k};
++                const Vector2 r{c.x + std::cos(a - 2.4f) * k, c.y + std::sin(a - 2.4f) * k};
++                DrawTriangle(tip, r, l, edge);
++                DrawTriangle(tip, l, r, edge);
++                break;
++            }
++            case Shape::Triangle:
++                DrawTriangleLines(Vector2{c.x, c.y - k}, Vector2{c.x - k, c.y + k * 0.75f}, Vector2{c.x + k, c.y + k * 0.75f},
++                                  Color{90, 220, 170, 255});
++                break;
++            case Shape::Circle:
++                DrawCircleLinesV(c, k, Color{255, 110, 120, 255});
++                break;
++            case Shape::Cross:
++                DrawLineEx(Vector2{c.x - k, c.y - k}, Vector2{c.x + k, c.y + k}, 2.0f, Color{120, 170, 255, 255});
++                DrawLineEx(Vector2{c.x + k, c.y - k}, Vector2{c.x - k, c.y + k}, 2.0f, Color{120, 170, 255, 255});
++                break;
++            case Shape::Square:
++                DrawRectangleLinesEx(Rectangle{c.x - k * 0.8f, c.y - k * 0.8f, k * 1.6f, k * 1.6f}, 2.0f,
++                                     Color{240, 130, 220, 255});
++                break;
++            case Shape::Label:
++            {
++                const int size = static_cast<int>(b.r * 0.55f);
++                const int width = MeasureText(b.label, size);
++                DrawText(b.label, static_cast<int>(c.x) - width / 2, static_cast<int>(c.y) - size / 2, size, edge);
++                break;
++            }
++            }
++        }
++    }
++
++    uint16_t heldButtons() { return g_held; }
++    bool clickedGame() { return g_clickedGame; }
++
++    bool pointer(float &x, float &y)
++    {
++        const Vector2 mouse = GetMousePosition();
++        if (!inside(mouse, g_game) || g_overPad || g_game.width <= 0 || g_game.height <= 0)
++            return false;
++        x = (mouse.x - g_game.x) * g_sourceWidth / g_game.width;
++        y = (mouse.y - g_game.y) * g_sourceHeight / g_game.height;
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_mouse.h b/ps2xRuntime/src/lib/ps2_mouse.h
+new file mode 100644
+index 0000000..4324f29
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_mouse.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <cstdint>
++
++// Mouse play (main thread only). Over the game image: left click = Circle,
++// right click = Cross, middle click = Select, wheel = D-pad up/down, and
++// menus the game is known to show (ps2_mouse_menus) follow the pointer. An
++// on-screen pad (D-pad, face buttons, shoulders, Select, Start) appears in the
++// side bars while the mouse moves, so every part of a game can be played with
++// the mouse alone.
++namespace ps2_mouse
++{
++    struct Rect
++    {
++        float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
++    };
++
++    // Where the PS2 image is drawn this frame (window pixels) and its source
++    // size; call after input was polled, before draw().
++    void beginFrame(Rect game, float sourceWidth, float sourceHeight);
++    // Draws the on-screen pad (inside BeginDrawing/EndDrawing).
++    void draw();
++    // PS2 pad bits (active-high, the pad's button layout) the mouse holds now.
++    uint16_t heldButtons();
++
++    // Pointer over the game image, in PS2 frame coordinates.
++    bool pointer(float &x, float &y);
++    // Left button went down this frame over the game image (not on the pad).
++    bool clickedGame();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+new file mode 100644
+index 0000000..9de90ae
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -0,0 +1,208 @@
++#include "ps2_mouse_menus.h"
++#include "ps2_mouse.h"
++#include "ps2_host_backend.h"
++
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace ps2_mouse_menus
++{
++    namespace
++    {
++        constexpr uint16_t kUp = 0x0010u, kDown = 0x0040u, kCircle = 0x2000u;
++        constexpr uint16_t kLeft = 0x0080u, kRight = 0x0020u;
++        constexpr uint32_t kRamSize = 32u * 1024u * 1024u;
++
++        struct Item
++        {
++            float x0, y0, x1, y1; // PS2 frame coordinates (640x448)
++        };
++
++        // An item outside the Up/Down list, reached with `enter` from the
++        // list and left with `exit` (which lands on list item `exitTo`).
++        struct Extra
++        {
++            Item item;
++            uint16_t enter, exit;
++            int exitTo;
++        };
++
++        // A menu object: `anchor` is a word at anchorOffset before the cursor
++        // byte (the object's type), `count` the word right after the cursor.
++        // Up/Down cycle the list items; extras follow them in cursor order.
++        struct MenuDef
++        {
++            const char *program;
++            uint32_t anchor;
++            uint32_t anchorOffset; // cursor = anchor address + anchorOffset
++            uint32_t count;
++            std::vector<Item> items;
++            std::vector<Extra> extras;
++        };
++
++        // Found from RAM snapshots across cursor moves (GA2_RAM_DUMP_DIR + F12).
++        const std::vector<MenuDef> &menus()
++        {
++            static const std::vector<MenuDef> table = {
++                // Zettai title: はじめから / つづきから / オプション.
++                {"SLPM_662.43", 0x002D4398u, 0x54u, 3u,
++                 {{212, 290, 428, 317}, {212, 328, 428, 355}, {212, 366, 428, 393}}, {}},
++                // Mugen title: はじめから / つづきから / オプション / チュートリアル, and the
++                // 絶対領域の扉 button (Right from the list, Left back to チュートリアル).
++                {"SLPM_667.79", 0x002F0998u, 0x90u, 5u,
++                 {{32, 270, 256, 297}, {48, 306, 272, 332}, {64, 341, 288, 368}, {80, 376, 304, 403}},
++                 {{{388, 369, 612, 396}, kRight, kLeft, 3}}},
++            };
++            return table;
++        }
++
++        const uint8_t *g_ram = nullptr;
++        std::string g_program;
++        std::vector<const MenuDef *> g_candidates;
++
++        const MenuDef *g_menu = nullptr; // menu on screen, or null
++        uint32_t g_object = 0;           // its object address
++        int g_scanDelay = 0;
++        int g_target = -1, g_moves = 0, g_phase = 0;
++        bool g_confirm = false, g_owns = false;
++        uint16_t g_pulse = 0;
++        float g_lastX = -1, g_lastY = -1;
++
++        uint32_t word(uint32_t address)
++        {
++            uint32_t value = 0;
++            if (address + 4u <= kRamSize)
++                std::memcpy(&value, g_ram + address, 4);
++            return value;
++        }
++
++        bool valid(const MenuDef &menu, uint32_t object)
++        {
++            return object != 0u && word(object) == menu.anchor &&
++                   word(object + menu.anchorOffset + 4u) == menu.count &&
++                   g_ram[object + menu.anchorOffset] < menu.count;
++        }
++
++        // Keeps g_menu/g_object pointing at a live menu object; rescans RAM
++        // for one (a few ms) at most every 20 frames while none is on screen.
++        void locate()
++        {
++            if (g_menu && valid(*g_menu, g_object))
++                return;
++            g_menu = nullptr;
++            if (g_candidates.empty() || g_scanDelay-- > 0)
++                return;
++            g_scanDelay = 20;
++            for (uint32_t address = 0x100000u; address + 64u < kRamSize; address += 4u)
++            {
++                uint32_t value;
++                std::memcpy(&value, g_ram + address, 4);
++                for (const MenuDef *menu : g_candidates)
++                    if (value == menu->anchor && valid(*menu, address))
++                    {
++                        g_menu = menu;
++                        g_object = address;
++                        return;
++                    }
++            }
++        }
++
++        int itemAt(float x, float y)
++        {
++            if (!g_menu)
++                return -1;
++            const auto hit = [x, y](const Item &it) { return x >= it.x0 && x < it.x1 && y >= it.y0 && y < it.y1; };
++            for (size_t i = 0; i < g_menu->items.size(); ++i)
++                if (hit(g_menu->items[i]))
++                    return static_cast<int>(i);
++            for (size_t i = 0; i < g_menu->extras.size(); ++i)
++                if (hit(g_menu->extras[i].item))
++                    return static_cast<int>(g_menu->items.size() + i);
++            return -1;
++        }
++    }
++
++    void attach(const uint8_t *rdram, std::string_view program)
++    {
++        g_ram = rdram;
++        g_program = std::string(program);
++        g_candidates.clear();
++        for (const MenuDef &menu : menus())
++            if (g_program == menu.program)
++                g_candidates.push_back(&menu);
++    }
++
++    uint16_t update()
++    {
++        g_owns = false;
++        if (!g_ram)
++            return 0;
++        locate();
++        if (!g_menu)
++        {
++            g_target = -1;
++            g_confirm = false;
++            g_phase = 0;
++            return 0;
++        }
++
++        float x = 0, y = 0;
++        const bool on = ps2_mouse::pointer(x, y);
++        const int hovered = on ? itemAt(x, y) : -1;
++        g_owns = hovered >= 0;
++        const bool moved = on && (x != g_lastX || y != g_lastY);
++        if (on) { g_lastX = x; g_lastY = y; }
++        if (hovered >= 0 && (moved || ps2_mouse::clickedGame()) && hovered != g_target)
++        {
++            g_target = hovered;
++            g_moves = 0;
++        }
++        if (hovered >= 0 && ps2_mouse::clickedGame())
++            g_confirm = true;
++
++        // One press is held for 3 frames and released for 3, so the game sees
++        // each as a separate press.
++        if (g_phase > 0)
++        {
++            --g_phase;
++            return g_phase >= 3 ? g_pulse : 0;
++        }
++        if (g_target < 0)
++            return 0;
++        const int cursor = g_ram[g_object + g_menu->anchorOffset];
++        const int count = static_cast<int>(g_menu->count);
++        const int list = static_cast<int>(g_menu->items.size());
++        if (cursor != g_target && g_moves < 2 * count)
++        {
++            if (cursor >= list)                       // on an extra: back to the list
++                g_pulse = g_menu->extras[size_t(cursor - list)].exit;
++            else if (g_target >= list)                // to an extra
++                g_pulse = g_menu->extras[size_t(g_target - list)].enter;
++            else
++            {
++                const int down = (g_target - cursor + list) % list;
++                g_pulse = down <= list - down ? kDown : kUp;
++            }
++            ++g_moves;
++            g_phase = 6;
++            return g_pulse;
++        }
++        if (cursor == g_target && g_confirm)
++        {
++            g_confirm = false;
++            g_target = -1;
++            g_pulse = kCircle;
++            g_phase = 6;
++            return g_pulse;
++        }
++        if (cursor == g_target || g_moves >= 2 * count)
++        {
++            g_target = -1;
++            g_confirm = false;
++        }
++        return 0;
++    }
++
++    bool ownsClick() { return g_owns; }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.h b/ps2xRuntime/src/lib/ps2_mouse_menus.h
+new file mode 100644
+index 0000000..8c9efd5
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <cstdint>
++#include <string_view>
++
++// Menus the mouse can point at directly (main thread only). For each known
++// menu: the game object that shows it (found by its type word), the cursor
++// byte inside it and the item rectangles on screen. Hovering an item moves the
++// game's own cursor there with D-pad presses; clicking it also confirms.
++namespace ps2_mouse_menus
++{
++    // The guest RAM and the running program ("SLPM_662.43").
++    void attach(const uint8_t *rdram, std::string_view program);
++    // Per frame, after ps2_mouse has the pointer: pad bits to hold now.
++    uint16_t update();
++    // The pointer is on an item of a menu on screen; the left button belongs
++    // to the menu (it is not also Circle).
++    bool ownsClick();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 6e53a0e..066eb96 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_input.h"
++#include "ps2_mouse.h"
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -36,10 +37,6 @@ namespace
+     std::mutex g_hostPadMutex;
+     std::array<uint8_t, 32> g_hostPad{};
+     bool g_hostPadSampled = false;
+-    // Main-thread mouse-wheel state (sampleHostPad only).
+-    int g_wheelNotches = 0; // pending, negative = up
+-    int g_wheelPhase = 0;
+-    uint16_t g_wheelDirection = 0;
+ 
+     void neutralPad(uint8_t *data)
+     {
+@@ -137,35 +134,17 @@ namespace
+                 clearBit(PAD_SELECT);
+         }
+ 
+-        // Mouse, with either device: left = Circle (confirm, advance text),
+-        // right = Cross (cancel), middle = Select (system menu), wheel = D-pad
+-        // up/down for the frame it turns. Only inside the window.
+-        const Vector2 mouse = GetMousePosition();
+-        if (mouse.x >= 0.0f && mouse.y >= 0.0f && mouse.x < GetScreenWidth() && mouse.y < GetScreenHeight())
+-        {
+-            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+-                clearBit(PAD_CIRCLE);
+-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+-                clearBit(PAD_CROSS);
+-            if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
+-                clearBit(PAD_SELECT);
+-            // Each notch is a 3-frame press then a 3-frame release, long
+-            // enough for games that poll the pad every other frame.
+-            const float wheel = GetMouseWheelMove();
+-            if (wheel != 0.0f)
+-                g_wheelNotches = std::clamp(g_wheelNotches + (wheel > 0.0f ? -1 : 1), -8, 8);
+-        }
+-        if (g_wheelPhase == 0 && g_wheelNotches != 0)
+-        {
+-            g_wheelDirection = g_wheelNotches < 0 ? PAD_UP : PAD_DOWN;
+-            g_wheelNotches += g_wheelNotches < 0 ? 1 : -1;
+-            g_wheelPhase = 6;
+-        }
+-        if (g_wheelPhase != 0)
++        // Mouse (ps2_mouse): clicks, wheel, known menus and the on-screen pad.
++        btns &= static_cast<uint16_t>(~ps2_mouse::heldButtons());
++
++        // Without a gamepad the D-pad (keys or on-screen) also tilts the left
++        // stick fully: some screens (the ship map) scroll only with the stick.
++        if (!useGamepad)
+         {
+-            if (g_wheelPhase > 3)
+-                clearBit(g_wheelDirection);
+-            --g_wheelPhase;
++            if ((btns & PAD_LEFT) == 0u) data[6] = 0x00;
++            if ((btns & PAD_RIGHT) == 0u) data[6] = 0xFF;
++            if ((btns & PAD_UP) == 0u) data[7] = 0x00;
++            if ((btns & PAD_DOWN) == 0u) data[7] = 0xFF;
+         }
+ 
+         data[2] = static_cast<uint8_t>(btns & 0xFF);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b06270f..4190d9e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2,6 +2,8 @@
+ #include "ps2_runtime.h"
+ #include "ps2_disc_mount.h"
+ #include "ps2_pad_input.h"
++#include "ps2_mouse.h"
++#include "ps2_mouse_menus.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -908,7 +910,9 @@ bool PS2Runtime::initialize(const char *title)
+         int windowScale = 1;
+         if (const char *scale = std::getenv("GA2_WINDOW_SCALE"))
+             windowScale = std::clamp(std::atoi(scale), 1, 8);
+-        InitWindow(HOST_WINDOW_WIDTH * windowScale, HOST_WINDOW_HEIGHT * windowScale, title);
++        // 16:9 so the 4:3 picture leaves side bars for the mouse pad.
++        const int windowHeight = HOST_WINDOW_HEIGHT * windowScale;
++        InitWindow(windowHeight * 16 / 9, windowHeight, title);
+         if (const char *full = std::getenv("GA2_FULLSCREEN"); full && *full == '1')
+             ToggleBorderlessWindowed();
+         InitAudioDevice();
+@@ -937,8 +941,11 @@ bool PS2Runtime::initialize(const char *title)
+     return false;
+ }
+ 
++static std::string g_programName; // e.g. "SLPM_662.43", for mouse menus
++
+ bool PS2Runtime::loadELF(const std::string &elfPath)
+ {
++    g_programName = std::filesystem::path(elfPath).filename().string();
+     if (m_eeScheduler->isRunning())
+     {
+         std::cerr << "Cannot load ELF while the EE dispatcher is running." << std::endl;
+@@ -2817,6 +2824,7 @@ void PS2Runtime::run()
+     ps2_stubs::resetAudioStubState();
+     ps2_stubs::resetMpegStubState();
+     initializeEeKernelState(m_memory.getRDRAM());
++    ps2_mouse_menus::attach(m_memory.getRDRAM(), g_programName);
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
+@@ -2972,8 +2980,25 @@ void PS2Runtime::run()
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
++        ps2_mouse::draw();
+         EndDrawing();
++        // Input was polled in EndDrawing: mouse first (menus, on-screen pad), then the pad.
++        ps2_mouse::beginFrame(ps2_mouse::Rect{dstRect.x, dstRect.y, dstRect.width, dstRect.height},
++                              static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+         ps2PadSampleHostInput();
++        // Developer aid: GA2_RAM_DUMP_DIR + F12 writes EE RAM to ram-<vsync>.bin.
++        if (IsKeyPressed(KEY_F12))
++            if (const char *dir = std::getenv("GA2_RAM_DUMP_DIR"); dir && *dir)
++            {
++                const auto path = std::filesystem::path(dir) /
++                                  ("ram-" + std::to_string(m_memory.gs().vsyncTick.load()) + ".bin");
++                if (std::FILE *f = std::fopen(path.string().c_str(), "wb"))
++                {
++                    std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
++                    std::fclose(f);
++                    std::cerr << "[ram] " << path.string() << std::endl;
++                }
++            }
+         if (IsKeyPressed(KEY_F11) ||
+             (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))))
+             ToggleBorderlessWindowed();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_capture.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_capture.cpp
+index 8ac845a..5b9d5a5 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_capture.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_capture.cpp
+@@ -32,6 +32,7 @@ namespace
+         uint64_t calls = 0;
+         uint64_t written = 0;
+         std::unordered_set<uint64_t> codes;
++        std::unordered_set<uint64_t> only; // GA2_VU1CAP_ONLY: code images to sample
+     };
+ 
+     CaptureFile *captureFile()
+@@ -53,6 +54,16 @@ namespace
+                 c->every = std::max<uint64_t>(1, std::strtoull(v, nullptr, 0));
+             if (const char *v = std::getenv("GA2_VU1CAP_MAX"))
+                 c->max = std::strtoull(v, nullptr, 0);
++            // Comma-separated code-image hashes (hex); others are not sampled.
++            if (const char *v = std::getenv("GA2_VU1CAP_ONLY"))
++                for (const char *p = v; *p;)
++                {
++                    char *end = nullptr;
++                    const uint64_t hash = std::strtoull(p, &end, 16);
++                    if (end == p) break;
++                    c->only.insert(hash);
++                    p = *end == ',' ? end + 1 : end;
++                }
+             std::fprintf(stderr, "[vu1cap] capturing every %llu run(s), at most %llu, to %s\n",
+                          static_cast<unsigned long long>(c->every), static_cast<unsigned long long>(c->max), path);
+             return c;
+@@ -127,6 +138,8 @@ void VU1Interpreter::captureBegin(uint32_t kind, const uint8_t *vuCode, uint32_t
+         return;
+ 
+     const uint64_t codeHash = digestBytes(vuCode, codeSize);
++    if (!file->only.empty() && !file->only.count(codeHash))
++        return;
+     if (file->codes.insert(codeHash).second)
+     {
+         std::vector<uint8_t> code;
+-- 
+2.55.0
+

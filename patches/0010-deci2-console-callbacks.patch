@@ -1,0 +1,1111 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index d5b48da..d74bf84 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -103,6 +103,7 @@ struct GuestInvocation
+     // Checked at dispatcher boundaries before callback dispatch/completion.
+     // Running or blocked revocable callbacks prevent whole-IOP reset.
+     std::function<bool()> isValid;
++    bool iopResetSensitive = true; // EE-owned callbacks can opt out of IOP teardown guards.
+     std::function<void()> onCancel;
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 7fc3f87..fede064 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1114,7 +1114,7 @@ bool EeScheduler::hasResetSensitiveInvocations() const
+ {
+     for (const auto &[id, owner] : m_threads)
+         for (const auto &invocation : owner.invocations)
+-            if (invocation.isValid) return true;
++            if (invocation.isValid && invocation.iopResetSensitive) return true;
+     return false;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp
+index 039da2f..a8e6859 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp
+@@ -1,235 +1,254 @@
+ #include "System.h"
+ #include "Common.h"
+ #include "ps2_runtime.h"
++#include <array>
++#include <limits>
+ 
+ namespace
+ {
++    constexpr int Invalid = -1, InvalidSocket = -2, AlreadyUsed = -3, TooMany = -4;
++    constexpr int InvalidAddress = -5, PacketSize = -6, WouldBlock = -7;
++    constexpr int AlreadyLocked = -8, NotLocked = -9, NoRoute = -10, InvalidHeader = -12;
++    constexpr uint16_t TtyProtocol = 0x0210;
++    constexpr uint64_t CallbackTag = 0xDEC1200000000000ull;
++    enum class SendPhase { Idle, Pending, Writing, Completing };
+     struct Deci2Session
+     {
++        PS2Runtime *owner = nullptr;
+         uint16_t protocol = 0;
+-        uint32_t opt = 0;
+-        uint32_t handler = 0;
+-        uint32_t userArea = 0;
++        uint32_t opt = 0, handler = 0, userArea = 0, gp = 0;
+         bool locked = false;
++        SendPhase phase = SendPhase::Idle;
++        uint64_t request = 0;
++        int error = 0;
++        std::vector<uint8_t> packet;
+     };
+-
+     std::mutex g_deci2Mutex;
+     std::unordered_map<int32_t, Deci2Session> g_deci2Sessions;
+-    int32_t g_nextDeci2Socket = 1;
++    int64_t g_nextDeci2Socket = 1; // Never reuse an ID while stale callbacks may exist.
+     std::atomic<uint32_t> g_deci2LogCount{0};
+ 
+-    static bool readDeci2U32(uint8_t *rdram, uint32_t guestAddr, uint32_t &value)
++    bool guestBytes(uint8_t *rdram, uint32_t address, size_t size, const uint8_t *&bytes)
+     {
+-        value = 0;
+-
+-        const uint8_t *ptr = getConstMemPtr(rdram, guestAddr);
+-        if (!ptr)
+-        {
+-            return false;
+-        }
+-
+-        std::memcpy(&value, ptr, sizeof(value));
++        uint32_t offset = 0;
++        bool scratch = false;
++        if (!rdram || !resolveEeGuestRange(address,size,offset,scratch)) return false;
++        const uint8_t *base = scratch ? ps2GetScratchpadHostPtr() : rdram;
++        if (!base) return false;
++        bytes = base + offset;
+         return true;
+     }
+-
+-    static void readDeci2Args(uint8_t *rdram, uint32_t argsAddr, uint32_t args[4])
++    bool readArgs(uint8_t *rdram, uint32_t address, size_t count, std::array<uint32_t,4> &args)
+     {
+-        for (uint32_t argIndex = 0; argIndex < 4; argIndex++)
+-        {
+-            uint32_t value = 0;
+-            readDeci2U32(rdram, argsAddr + (argIndex * sizeof(uint32_t)), value);
+-            args[argIndex] = value;
+-        }
++        const uint8_t *bytes = nullptr;
++        if ((address & 3u) || !guestBytes(rdram,address,count*4u,bytes)) return false;
++        std::memcpy(args.data(),bytes,count*4u);
++        return true;
+     }
+-
+-    static std::string sanitizeDeci2Text(std::string text)
++    Deci2Session *sessionLocked(PS2Runtime *runtime,int32_t socket)
+     {
+-        for (char &ch : text)
+-        {
+-            const unsigned char value = static_cast<unsigned char>(ch);
+-            if (ch == '\r')
+-            {
+-                ch = '\n';
+-                continue;
+-            }
+-
+-            if (ch != '\n' && ch != '\t' && !std::isprint(value))
+-            {
+-                ch = '.';
+-            }
+-        }
+-
+-        return text;
++        auto it = g_deci2Sessions.find(socket);
++        return it != g_deci2Sessions.end() && it->second.owner == runtime ? &it->second : nullptr;
+     }
+-
+-    static void logDeci2Text(const char *prefix, const std::string &text)
++    bool requestCurrent(PS2Runtime *runtime,int32_t socket,uint64_t request)
+     {
+-        constexpr uint32_t kMaxDeci2TextLogs = 256u;
+-        const uint32_t logIndex = g_deci2LogCount.fetch_add(1u, std::memory_order_relaxed);
+-        if (logIndex >= kMaxDeci2TextLogs)
+-        {
+-            return;
+-        }
+-
+-        const std::string safeText = sanitizeDeci2Text(text);
+-        std::cerr << prefix << safeText;
+-        if (safeText.empty() || safeText.back() != '\n')
+-        {
+-            std::cerr << std::endl;
+-        }
++        std::lock_guard lock(g_deci2Mutex);
++        const auto *session = sessionLocked(runtime,socket);
++        return session && session->request == request &&
++            (session->phase == SendPhase::Writing || session->phase == SendPhase::Completing);
+     }
+-
+-    static int32_t allocateDeci2Socket(uint16_t protocol, uint32_t opt, uint32_t handler, uint32_t userArea)
++    void cancelRequest(PS2Runtime *runtime,int32_t socket,uint64_t request)
+     {
+-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+-
+-        if (g_nextDeci2Socket <= 0)
+-        {
+-            g_nextDeci2Socket = 1;
+-        }
+-
+-        const int32_t socket = g_nextDeci2Socket;
+-        Deci2Session session;
+-        session.protocol = protocol;
+-        session.opt = opt;
+-        session.handler = handler;
+-        session.userArea = userArea;
+-        session.locked = false;
+-
+-        g_deci2Sessions[socket] = session;
+-        return socket;
++        std::lock_guard lock(g_deci2Mutex);
++        auto *session = sessionLocked(runtime,socket);
++        if (session && session->request == request)
++        { session->phase = SendPhase::Idle; session->packet.clear(); session->error = Invalid; }
+     }
+-
+-    static bool updateDeci2LockState(int32_t socket, bool locked)
++    void logDeci2Text(const char *prefix,const std::string &text)
+     {
+-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+-
+-        auto sessionIt = g_deci2Sessions.find(socket);
+-        if (sessionIt == g_deci2Sessions.end())
++        if (g_deci2LogCount.fetch_add(1u,std::memory_order_relaxed) >= 256u) return;
++        std::cerr << prefix;
++        for (unsigned char c : text)
+         {
+-            return false;
++            if (c == '\r') std::cerr << '\n';
++            else if (c == '\n' || c == '\t' || c >= 32u) std::cerr << char(c);
++            else std::cerr << '.';
+         }
+-
+-        sessionIt->second.locked = locked;
+-        return true;
++        if (text.empty() || text.back() != '\n') std::cerr << '\n';
+     }
+-
+-    static bool closeDeci2Socket(int32_t socket)
++    uint16_t halfword(const std::vector<uint8_t> &packet,size_t offset)
++    { return uint16_t(packet[offset]) | uint16_t(packet[offset+1]) << 8; }
++    bool completePacket(const Deci2Session &session)
++    {
++        const auto &p = session.packet;
++        return p.size() >= 12u && halfword(p,0) == p.size() && halfword(p,2) == 0u &&
++            halfword(p,4) == session.protocol && p[6] == 'E' && p[7] == 'H';
++    }
++    GuestInvocation callback(PS2Runtime *runtime,const R5900Context &parent,int32_t socket,
++                             const Deci2Session &session,uint32_t event)
+     {
+-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+-        return g_deci2Sessions.erase(socket) != 0;
++        GuestInvocation invocation{};
++        invocation.kind = GuestInvocationKind::HleCall;
++        invocation.tag = CallbackTag | uint32_t(socket);
++        invocation.context = parent;
++        invocation.context.pc = session.handler;
++        SET_GPR_U32(&invocation.context,4,event);
++        SET_GPR_U32(&invocation.context,5,0u);
++        SET_GPR_U32(&invocation.context,6,session.opt);
++        SET_GPR_U32(&invocation.context,7,0u);
++        SET_GPR_U32(&invocation.context,28,session.gp);
++        SET_GPR_U32(&invocation.context,29,0u);
++        SET_GPR_U32(&invocation.context,31,0u);
++        invocation.iopResetSensitive = false; // EE-owned local console, independent of IOP.
++        invocation.isValid = [runtime,socket,request=session.request]
++        { return requestCurrent(runtime,socket,request); };
++        invocation.onCancel = [runtime,socket,request=session.request]
++        { cancelRequest(runtime,socket,request); };
++        return invocation;
+     }
+ }
+ 
+ namespace ps2_syscalls
+ {
+-    void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    void resetDeci2State(PS2Runtime *runtime)
+     {
+-#if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
+-        const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
+-        const uint32_t argsAddr = getRegU32(ctx, 5);
+-
+-        uint32_t args[4] = {};
+-        readDeci2Args(rdram, argsAddr, args);
+-
+-        switch (code)
+-        {
+-        case 1: // sceDeci2Open(protocol, opt, handler)
+-        {
+-            const uint16_t protocol = static_cast<uint16_t>(args[0] & 0xFFFFu);
+-            const uint32_t opt = args[1];
+-            const uint32_t handler = args[2];
+-            const uint32_t userArea = args[3];
+-
+-            const int32_t socket = allocateDeci2Socket(protocol, opt, handler, userArea);
+-            setReturnS32(ctx, socket);
+-            return;
+-        }
+-        case 2: // sceDeci2Close(socket)
+-        {
+-            const int32_t socket = static_cast<int32_t>(args[0]);
+-            setReturnS32(ctx, closeDeci2Socket(socket) ? KE_OK : KE_ERROR);
+-            return;
+-        }
+-        // WE dont need to do thouses
+-        case 3:  // sceDeci2ReqSend(socket, dest)
+-        case 4:  // sceDeci2Poll(socket)
+-        case -7: // sceDeci2ExReqSend(socket, dest)
+-        {
+-            setReturnS32(ctx, KE_OK);
+-            return;
+-        }
+-        case -5: // sceDeci2ExRecv(socket, buf, len)
+-        {
+-            // No host debugger channel is attached, so report "no bytes available".
+-            setReturnS32(ctx, 0);
+-            return;
++        std::lock_guard lock(g_deci2Mutex);
++        std::erase_if(g_deci2Sessions,[runtime](const auto &entry) { return entry.second.owner == runtime; });
++    }
++    void Deci2Call(uint8_t *rdram,R5900Context *ctx,PS2Runtime *runtime)
++    {
++        const int32_t code = int32_t(getRegU32(ctx,4));
++        const uint32_t argsAddress = getRegU32(ctx,5);
++        const size_t count = code == 1 ? 4u : code == -5 || code == -6 ? 3u : code == 3 || code == -7 ? 2u : 1u;
++        std::array<uint32_t,4> args{};
++        if (!runtime || !readArgs(rdram,argsAddress,count,args)) { setReturnS32(ctx,InvalidAddress); return; }
++        const int32_t socket = int32_t(args[0]);
++        if (code == 1)
++        {
++            const uint8_t *bytes = nullptr;
++            // opt is opaque callback context; only validate memory we access.
++            if (!runtime->hasFunction(args[2]) || (args[3] && !guestBytes(rdram,args[3],56u,bytes)))
++            { setReturnS32(ctx,InvalidAddress); return; }
++            if (uint16_t(args[0]) != TtyProtocol) { setReturnS32(ctx,NoRoute); return; }
++            std::lock_guard lock(g_deci2Mutex);
++            size_t owned = 0;
++            for (const auto &[id,session] : g_deci2Sessions)
++            {
++                if (session.owner != runtime) continue;
++                if (session.protocol == uint16_t(args[0])) { setReturnS32(ctx,AlreadyUsed); return; }
++                ++owned;
++            }
++            if (owned >= 64u || g_nextDeci2Socket > std::numeric_limits<int32_t>::max())
++            { setReturnS32(ctx,TooMany); return; }
++            const int32_t allocated = int32_t(g_nextDeci2Socket++);
++            Deci2Session session;
++            session.owner=runtime;session.protocol=uint16_t(args[0]);session.opt=args[1];
++            session.handler=args[2];session.userArea=args[3];session.gp=getRegU32(ctx,28);
++            g_deci2Sessions.emplace(allocated,std::move(session));
++            setReturnS32(ctx,allocated); return;
++        }
++        if (code == 16)
++        {
++            std::string text;
++            for (uint32_t n=0;n<4096u;++n)
++            {
++                const uint8_t *byte = nullptr;
++                if (args[0] > UINT32_MAX-n || !guestBytes(rdram,args[0]+n,1u,byte))
++                { setReturnS32(ctx,InvalidAddress); return; }
++                if (!*byte) { logDeci2Text("[Deci2Call:kputs] ",text); setReturnS32(ctx,int32_t(text.size())); return; }
++                text += char(*byte);
++            }
++            setReturnS32(ctx,PacketSize); return;
+         }
+-        case -6: // sceDeci2ExSend(socket, buf, len)
++        if (code == 4)
+         {
+-            const uint32_t bufferAddr = args[1];
+-            const uint32_t length = args[2] & 0xFFFFu;
+-
+-            if (bufferAddr != 0u && length != 0u)
++            Deci2Session snapshot;
+             {
+-                const uint32_t clampedLength = std::min<uint32_t>(length, 512u);
+-                std::string text;
+-                text.reserve(clampedLength);
+-                for (uint32_t byteIndex = 0; byteIndex < clampedLength; byteIndex++)
++                std::lock_guard lock(g_deci2Mutex);
++                auto *session=sessionLocked(runtime,socket);
++                if (!session) { setReturnS32(ctx,InvalidSocket); return; }
++                if (session->phase != SendPhase::Pending) { setReturnS32(ctx,session->error); return; }
++                if (!runtime->hasFunction(session->handler)) { setReturnS32(ctx,InvalidAddress); return; }
++                session->phase=SendPhase::Writing;snapshot=*session;
++            }
++            if (!runtime->eeScheduler().isExecutingGuest())
++            { cancelRequest(runtime,socket,snapshot.request); setReturnS32(ctx,WouldBlock); return; }
++            setReturnS32(ctx,0);
++            auto write=callback(runtime,*ctx,socket,snapshot,3u);
++            write.onComplete=[runtime,socket,request=snapshot.request](const R5900Context &,R5900Context &parent)
++            {
++                Deci2Session completed;
+                 {
+-                    text.push_back(static_cast<char>(rdram[(bufferAddr + byteIndex) & PS2_RAM_MASK]));
++                    std::lock_guard lock(g_deci2Mutex);
++                    auto *session=sessionLocked(runtime,socket);
++                    if (!session || session->request != request || session->phase != SendPhase::Writing) return;
++                    if (session->error || !completePacket(*session))
++                    {
++                        session->error=session->error ? session->error : PacketSize;
++                        session->phase=SendPhase::Idle;setReturnS32(&parent,session->error);return;
++                    }
++                    session->phase=SendPhase::Completing;completed=*session;
+                 }
+-                logDeci2Text("[Deci2Call:send] ", text);
+-            }
+-
+-            // Treat send as successful and return the amount accepted.
+-            setReturnS32(ctx, static_cast<int32_t>(length));
+-            return;
+-        }
+-        case -8: // sceDeci2ExLock(socket)
+-        {
+-            const int32_t socket = static_cast<int32_t>(args[0]);
+-            setReturnS32(ctx, updateDeci2LockState(socket, true) ? KE_OK : KE_ERROR);
+-            return;
+-        }
+-        case -9: // sceDeci2ExUnLock(socket)
+-        {
+-            const int32_t socket = static_cast<int32_t>(args[0]);
+-            setReturnS32(ctx, updateDeci2LockState(socket, false) ? KE_OK : KE_ERROR);
+-            return;
+-        }
+-        case 16: // kputs(char *s)
++                const std::string text(completed.packet.begin()+12u,completed.packet.end());
++                logDeci2Text("[Deci2Call:send] ",text);
++                auto done=callback(runtime,parent,socket,completed,4u);
++                done.onComplete=[runtime,socket,request](const R5900Context &,R5900Context &base)
++                {
++                    std::lock_guard lock(g_deci2Mutex);
++                    auto *session=sessionLocked(runtime,socket);
++                    if (!session || session->request != request || session->phase != SendPhase::Completing) return;
++                    session->phase=SendPhase::Idle;session->packet.clear();setReturnS32(&base,0);
++                };
++                runtime->eeScheduler().invokeCurrent(std::move(done));
++            };
++            runtime->eeScheduler().invokeCurrent(std::move(write));
++        }
++        std::lock_guard lock(g_deci2Mutex);
++        auto *session=sessionLocked(runtime,socket);
++        if (!session) { setReturnS32(ctx,InvalidSocket); return; }
++        switch (code)
+         {
+-            constexpr size_t kMaxDeci2KputsBytes = 4096u;
+-            const uint32_t textAddr = args[0];
+-            const std::string text = readGuestCStringBounded(rdram, textAddr, kMaxDeci2KputsBytes);
+-
+-            logDeci2Text("[Deci2Call:kputs] ", text);
+-            setReturnS32(ctx, static_cast<int32_t>(text.size()));
+-            return;
+-        }
++        case 2:
++            g_deci2Sessions.erase(socket);setReturnS32(ctx,0);return;
++        case 3: case -7:
++            if (uint8_t(args[1]) != 'H') { setReturnS32(ctx,NoRoute); return; }
++            if (session->phase != SendPhase::Idle) { setReturnS32(ctx,WouldBlock); return; }
++            if (session->request == UINT64_MAX) { setReturnS32(ctx,TooMany); return; }
++            ++session->request;session->phase=SendPhase::Pending;session->packet.clear();session->error=0;
++            setReturnS32(ctx,0);return;
++        case -6:
++        {
++            if (session->phase != SendPhase::Writing || !runtime->eeScheduler().hasInvocation(GuestInvocationKind::HleCall,CallbackTag|uint32_t(socket)))
++            { setReturnS32(ctx,WouldBlock); return; }
++            if (session->error) { setReturnS32(ctx,session->error); return; }
++            const uint32_t length=args[2]&0xffffu;
++            const uint8_t *bytes=nullptr;
++            if (!guestBytes(rdram,args[1],length,bytes))
++            { session->error=InvalidAddress;setReturnS32(ctx,InvalidAddress);return; }
++            if (length == 0u || session->packet.size()+length>65535u)
++            { session->error=PacketSize;setReturnS32(ctx,PacketSize);return; }
++            session->packet.insert(session->packet.end(),bytes,bytes+length);
++            if (session->packet.size()>=8u &&
++                (halfword(session->packet,0)<12u || session->packet.size()>halfword(session->packet,0) ||
++                 halfword(session->packet,2)!=0u || halfword(session->packet,4)!=session->protocol ||
++                 session->packet[6]!='E' || session->packet[7]!='H'))
++            { session->error=InvalidHeader;setReturnS32(ctx,InvalidHeader);return; }
++            setReturnS32(ctx,int32_t(length));return;
++        }
++        case -5:
++        {
++            const uint8_t *bytes=nullptr;
++            if (!guestBytes(rdram,args[1],args[2]&0xffffu,bytes)) { setReturnS32(ctx,InvalidAddress); return; }
++            setReturnS32(ctx,0);return; // No attached debugger produces inbound data.
++        }
++        case -8:
++            if (session->locked) { setReturnS32(ctx,AlreadyLocked);return; }
++            session->locked=true;setReturnS32(ctx,0);return;
++        case -9:
++            if (!session->locked) { setReturnS32(ctx,NotLocked);return; }
++            session->locked=false;setReturnS32(ctx,0);return;
+         default:
+-        {
+-            static std::atomic<uint32_t> s_unknownDeci2Logs{0u};
+-            constexpr uint32_t kMaxUnknownDeci2Logs = 64u;
+-            const uint32_t logIndex = s_unknownDeci2Logs.fetch_add(1u, std::memory_order_relaxed);
+-            if (logIndex < kMaxUnknownDeci2Logs)
+-            {
+-                std::cerr << "[Deci2Call:unknown]"
+-                          << " code=" << code
+-                          << " args=0x" << std::hex << argsAddr
+-                          << " a0=0x" << args[0]
+-                          << " a1=0x" << args[1]
+-                          << " a2=0x" << args[2]
+-                          << " a3=0x" << args[3]
+-                          << " pc=0x" << ctx->pc
+-                          << std::dec << std::endl;
+-            }
+-
+-            setReturnS32(ctx, KE_OK);
+-            return;
+-        }
++            setReturnS32(ctx,Invalid);return;
+         }
+-#endif
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.h b/ps2xRuntime/src/lib/Kernel/Syscalls/System.h
+index c9b9991..5f07ea3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.h
+@@ -30,6 +30,7 @@ namespace ps2_syscalls
+     void GetMemorySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void InitTLB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void FindAddress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void resetDeci2State(PS2Runtime *runtime);
+     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void QueryBootMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void GetThreadTLS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e9ef56b..68b379f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -16,6 +16,7 @@
+ #include "ps2_iop_transport.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ #include "Kernel/Syscalls/RPC.h"
++#include "Kernel/Syscalls/System.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -533,6 +534,7 @@ PS2Runtime::~PS2Runtime()
+     {
+         requestStop();
+         if (m_eeScheduler) m_eeScheduler->discardInvocations();
++        ps2_syscalls::resetDeci2State(this);
+         m_iopSubsystem.reset();
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+@@ -2411,6 +2413,7 @@ void PS2Runtime::run()
+     m_stopRequested.store(false, std::memory_order_relaxed);
+     // Stopped EE callbacks must release ownership before startup retires IOP.
+     m_eeScheduler->discardInvocations();
++    ps2_syscalls::resetDeci2State(this);
+     ps2_stubs::resetSifState();
+     resetIop();
+     ps2_stubs::resetAudioStubState();
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 72d7a53..a5396b0 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(ps2_test_lib STATIC
+     src/elf_analyzer_tests.cpp
+     src/pad_input_tests.cpp
+     src/ps2_runtime_io_tests.cpp
++    src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 373c79b..148dd48 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -7,6 +7,7 @@ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
+ void register_ps2_runtime_io_tests();
++void register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+ void register_ps2_disc_mount_tests();
+ #endif
+@@ -32,6 +33,7 @@ int main()
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
+     register_ps2_runtime_io_tests();
++    register_ps2_deci2_tests();
+ #ifdef PS2X_TEST_DISC_SHA256
+     register_ps2_disc_mount_tests();
+ #endif
+diff --git a/ps2xTest/src/ps2_deci2_tests.cpp b/ps2xTest/src/ps2_deci2_tests.cpp
+new file mode 100644
+index 0000000..6a0c7f3
+--- /dev/null
++++ b/ps2xTest/src/ps2_deci2_tests.cpp
+@@ -0,0 +1,561 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "Kernel/Syscalls/System.h"
++#include "Kernel/Stubs/SIF.h"
++#include "runtime/ee_scheduler.h"
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <initializer_list>
++#include <vector>
++
++namespace
++{
++    constexpr int32_t kInvalid = -1;
++    constexpr int32_t kInvalidSocket = -2;
++    constexpr int32_t kAlreadyUsed = -3;
++    constexpr int32_t kInvalidAddress = -5;
++    constexpr int32_t kAlreadyLocked = -8;
++    constexpr int32_t kNotLocked = -9;
++    constexpr int32_t kNoRoute = -10;
++    constexpr uint16_t kTtyProtocol = 0x0210u;
++
++    constexpr uint32_t kMainPc = 0x00118000u;
++    constexpr uint32_t kResumePc = 0x00118010u;
++    constexpr uint32_t kHandlerPc = 0x00118020u;
++    constexpr uint32_t kArgsAddr = 0x00004000u;
++    constexpr uint32_t kPacketAddr = 0x00004100u;
++    constexpr uint32_t kOptAddr = 0x00004200u;
++    constexpr uint32_t kUserAreaAddr = 0x00004300u;
++    constexpr uint32_t kCallbackGp = 0x13579BDFu;
++    constexpr uint32_t kParentGpAfterOpen = 0x2468ACE0u;
++    constexpr uint32_t kCloseMainPc = 0x00118100u;
++    constexpr uint32_t kCloseParentResumePc = 0x00118110u;
++    constexpr uint32_t kBlockedHandlerPc = 0x00118120u;
++    constexpr uint32_t kBlockedHandlerResumePc = 0x00118130u;
++    constexpr uint32_t kCloseDriverPc = 0x00118140u;
++    constexpr uint32_t kCloseDriverResumePc = 0x00118150u;
++    constexpr uint32_t kReplacementHandlerPc = 0x00118160u;
++
++    struct Fixture
++    {
++        std::vector<uint8_t> ram;
++        PS2Runtime runtime;
++        R5900Context direct{};
++
++        Fixture() : ram(PS2_RAM_SIZE, 0u)
++        {
++            ps2_syscalls::resetDeci2State(&runtime);
++        }
++    };
++
++    struct CallbackState
++    {
++        int32_t socket = 0;
++        bool invalidWriteRange = false;
++        bool resetIopWhileWriting = false;
++        bool busy = false;
++        bool parentResumed = false;
++        bool writeSawBusy = false;
++        bool doneClearedBusy = false;
++        uint32_t writeGp = 0;
++        uint32_t doneGp = 0;
++        uint32_t writeOpt = 0;
++        uint32_t registeredOpt = kOptAddr;
++        uint32_t parentGp = 0;
++        bool nestedPollSawOnlyWrite = false;
++        bool nestedPollSawBusy = false;
++        int32_t nestedPollResult = 0;
++        int32_t firstSendResult = 0;
++        int32_t secondSendResult = 0;
++        int32_t resetResult = 0;
++        int32_t pollResult = 0;
++        std::vector<uint32_t> events;
++    };
++
++    CallbackState g_callback;
++
++    // Scheduler-only liveness fixture: the old WRITE callback blocks while a
++    // second EE thread closes it and queues a replacement DECI2 request.
++    struct CloseReplaceState
++    {
++        int32_t oldSocket = 0;
++        int32_t replacementSocket = 0;
++        int semaphore = 0;
++        int32_t closeResult = 0;
++        int32_t replacementOpenResult = 0;
++        int32_t replacementPollResult = 0;
++        int32_t oldPollResult = 0;
++        uint32_t oldWriteCount = 0;
++        uint32_t oldResumeCount = 0;
++        uint32_t oldDoneCount = 0;
++        bool parentResumed = false;
++        bool replacementPendingAtCancellation = false;
++        std::vector<uint32_t> replacementEvents;
++    };
++
++    CloseReplaceState g_closeReplace;
++
++    void setRegU32(R5900Context &ctx, int reg, uint32_t value)
++    {
++        SET_GPR_U32(&ctx, reg, value);
++    }
++
++    int32_t result(const R5900Context &ctx)
++    {
++        return static_cast<int32_t>(::getRegU32(&ctx, 2));
++    }
++
++    void writeWords(uint8_t *ram, uint32_t address, std::initializer_list<uint32_t> words)
++    {
++        uint32_t offset = 0u;
++        for (uint32_t word : words)
++        {
++            std::memcpy(ram + address + offset, &word, sizeof(word));
++            offset += sizeof(word);
++        }
++    }
++
++    int32_t deciCall(Fixture &fixture, R5900Context &ctx, int32_t code, std::initializer_list<uint32_t> args)
++    {
++        writeWords(fixture.ram.data(), kArgsAddr, args);
++        setRegU32(ctx, 4, static_cast<uint32_t>(code));
++        setRegU32(ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(fixture.ram.data(), &ctx, &fixture.runtime);
++        return result(ctx);
++    }
++
++    int32_t openTty(Fixture &fixture, R5900Context &ctx, uint32_t handler = kHandlerPc,
++                    uint32_t opt = kOptAddr, uint32_t userArea = kUserAreaAddr)
++    {
++        return deciCall(fixture, ctx, 1, {kTtyProtocol, opt, handler, userArea});
++    }
++
++    void writeValidPacket(Fixture &fixture)
++    {
++        // DECI2 header: total length, reserved, protocol, source, destination;
++        // followed by the four-byte bounded local-TTY payload.
++        const std::array<uint8_t, 12> packet = {
++            12u, 0u, 0u, 0u, 0x10u, 0x02u, 'E', 'H', 't', 'e', 's', 't'};
++        std::memcpy(fixture.ram.data() + kPacketAddr, packet.data(), packet.size());
++    }
++
++    void deciCallback(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t event = ::getRegU32(ctx, 4);
++        g_callback.events.push_back(event);
++        if (event == 3u)
++        {
++            g_callback.writeSawBusy = g_callback.busy;
++            g_callback.writeGp = ::getRegU32(ctx, 28);
++            g_callback.writeOpt = ::getRegU32(ctx, 6);
++
++            const uint32_t args[3] = {static_cast<uint32_t>(g_callback.socket),
++                                      g_callback.invalidWriteRange ? PS2_RAM_SIZE - 2u : kPacketAddr,
++                                      g_callback.invalidWriteRange ? 4u : 8u};
++            std::memcpy(ram + kArgsAddr, args, sizeof(args));
++            setRegU32(*ctx, 4, static_cast<uint32_t>(-6));
++            setRegU32(*ctx, 5, kArgsAddr);
++            ps2_syscalls::Deci2Call(ram, ctx, runtime);
++            g_callback.firstSendResult = result(*ctx);
++
++            if (g_callback.invalidWriteRange)
++            {
++                const uint32_t valid[3] = {static_cast<uint32_t>(g_callback.socket), kPacketAddr, 12u};
++                std::memcpy(ram + kArgsAddr, valid, sizeof(valid));
++                setRegU32(*ctx, 4, static_cast<uint32_t>(-6));
++                setRegU32(*ctx, 5, kArgsAddr);
++                ps2_syscalls::Deci2Call(ram, ctx, runtime);
++                g_callback.secondSendResult = result(*ctx);
++            }
++            else
++            {
++                writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_callback.socket)});
++                setRegU32(*ctx, 4, 4u);
++                setRegU32(*ctx, 5, kArgsAddr);
++                ps2_syscalls::Deci2Call(ram, ctx, runtime);
++                g_callback.nestedPollResult = result(*ctx);
++                g_callback.nestedPollSawOnlyWrite = g_callback.events.size() == 1u;
++                g_callback.nestedPollSawBusy = g_callback.busy;
++
++                const uint32_t tail[3] = {static_cast<uint32_t>(g_callback.socket), kPacketAddr + 8u, 4u};
++                std::memcpy(ram + kArgsAddr, tail, sizeof(tail));
++                setRegU32(*ctx, 4, static_cast<uint32_t>(-6));
++                setRegU32(*ctx, 5, kArgsAddr);
++                ps2_syscalls::Deci2Call(ram, ctx, runtime);
++                g_callback.secondSendResult = result(*ctx);
++                if (g_callback.resetIopWhileWriting)
++                {
++                    ps2_stubs::sceSifResetIop(ram, ctx, runtime);
++                    g_callback.resetResult = result(*ctx);
++                }
++            }
++        }
++        else if (event == 4u)
++        {
++            g_callback.doneGp = ::getRegU32(ctx, 28);
++            g_callback.busy = false;
++            g_callback.doneClearedBusy = true;
++        }
++        ctx->pc = 0u;
++    }
++
++    void schedulerMain(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeWords(ram, kArgsAddr, {kTtyProtocol, g_callback.registeredOpt, kHandlerPc, kUserAreaAddr});
++        setRegU32(*ctx, 4, 1u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++        g_callback.socket = result(*ctx);
++
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_callback.socket), static_cast<uint32_t>('H')});
++        setRegU32(*ctx, 4, 3u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++
++        g_callback.busy = true;
++        setRegU32(*ctx, 28, kParentGpAfterOpen);
++        ctx->pc = kResumePc;
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_callback.socket)});
++        setRegU32(*ctx, 4, 4u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++    }
++
++    void schedulerResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_callback.pollResult = result(*ctx);
++        g_callback.parentGp = ::getRegU32(ctx, 28);
++        g_callback.parentResumed = true;
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void blockedWriteHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (::getRegU32(ctx, 4) == 3u)
++        {
++            ++g_closeReplace.oldWriteCount;
++            ctx->pc = kBlockedHandlerResumePc;
++            runtime->eeScheduler().waitSemaphore(g_closeReplace.semaphore);
++            return;
++        }
++        ++g_closeReplace.oldDoneCount;
++        ctx->pc = 0u;
++    }
++
++    void blockedWriteResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        ++g_closeReplace.oldResumeCount;
++        ctx->pc = 0u;
++    }
++
++    void replacementHandler(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t event = ::getRegU32(ctx, 4);
++        g_closeReplace.replacementEvents.push_back(event);
++        if (event == 3u)
++        {
++            const uint32_t args[3] = {static_cast<uint32_t>(g_closeReplace.replacementSocket), kPacketAddr, 12u};
++            std::memcpy(ram + kArgsAddr, args, sizeof(args));
++            setRegU32(*ctx, 4, static_cast<uint32_t>(-6));
++            setRegU32(*ctx, 5, kArgsAddr);
++            ps2_syscalls::Deci2Call(ram, ctx, runtime);
++        }
++        ctx->pc = 0u;
++    }
++
++    void closeDriver(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_closeReplace.oldSocket)});
++        setRegU32(*ctx, 4, 2u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++        g_closeReplace.closeResult = result(*ctx);
++
++        writeWords(ram, kArgsAddr, {kTtyProtocol, kOptAddr, kReplacementHandlerPc, kUserAreaAddr});
++        setRegU32(*ctx, 4, 1u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++        g_closeReplace.replacementSocket = result(*ctx);
++        g_closeReplace.replacementOpenResult = result(*ctx);
++
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_closeReplace.replacementSocket), static_cast<uint32_t>('H')});
++        setRegU32(*ctx, 4, 3u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++
++        // Cancel the old invocation while the replacement remains Pending.
++        runtime->eeScheduler().signalSemaphore(g_closeReplace.semaphore, false);
++        ctx->pc = 0u;
++    }
++
++    void closeDriverResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_closeReplace.replacementPollResult = result(*ctx);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void closeReplaceMain(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &scheduler = runtime->eeScheduler();
++        g_closeReplace.semaphore = scheduler.createSemaphore(0, 1, 0, 0);
++        EeThreadCreateParams driver{};
++        driver.entry = kCloseDriverPc;
++        driver.stack = 0x00018000u;
++        driver.stackSize = 0x1000u;
++        driver.priority = 10;
++        const int driverId = scheduler.createThread(driver);
++        scheduler.startThread(driverId, 0u, *ctx, false);
++
++        writeWords(ram, kArgsAddr, {kTtyProtocol, kOptAddr, kBlockedHandlerPc, kUserAreaAddr});
++        setRegU32(*ctx, 4, 1u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++        g_closeReplace.oldSocket = result(*ctx);
++
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_closeReplace.oldSocket), static_cast<uint32_t>('H')});
++        setRegU32(*ctx, 4, 3u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++
++        ctx->pc = kCloseParentResumePc;
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_closeReplace.oldSocket)});
++        setRegU32(*ctx, 4, 4u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++    }
++
++    void closeReplaceParentResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_closeReplace.oldPollResult = result(*ctx);
++        g_closeReplace.parentResumed = true;
++        g_closeReplace.replacementPendingAtCancellation = g_closeReplace.replacementEvents.empty();
++        ctx->pc = kCloseDriverResumePc;
++        writeWords(ram, kArgsAddr, {static_cast<uint32_t>(g_closeReplace.replacementSocket)});
++        setRegU32(*ctx, 4, 4u);
++        setRegU32(*ctx, 5, kArgsAddr);
++        ps2_syscalls::Deci2Call(ram, ctx, runtime);
++    }
++
++    void resetCallbackState()
++    {
++        g_callback = {};
++    }
++
++    void resetCloseReplaceState()
++    {
++        g_closeReplace = {};
++    }
++
++    void registerSchedulerFixture(Fixture &fixture)
++    {
++        fixture.runtime.registerFunction(kMainPc, schedulerMain);
++        fixture.runtime.registerFunction(kResumePc, schedulerResume);
++        fixture.runtime.registerFunction(kHandlerPc, deciCallback);
++        writeValidPacket(fixture);
++    }
++
++    void registerCloseReplaceFixture(Fixture &fixture)
++    {
++        fixture.runtime.registerFunction(kCloseMainPc, closeReplaceMain);
++        fixture.runtime.registerFunction(kCloseParentResumePc, closeReplaceParentResume);
++        fixture.runtime.registerFunction(kBlockedHandlerPc, blockedWriteHandler);
++        fixture.runtime.registerFunction(kBlockedHandlerResumePc, blockedWriteResume);
++        fixture.runtime.registerFunction(kCloseDriverPc, closeDriver);
++        fixture.runtime.registerFunction(kCloseDriverResumePc, closeDriverResume);
++        fixture.runtime.registerFunction(kReplacementHandlerPc, replacementHandler);
++        writeValidPacket(fixture);
++    }
++}
++
++void register_ps2_deci2_tests()
++{
++    MiniTest::Case("PS2Deci2", [](TestCase &tc)
++    {
++        tc.Run("scheduler drives DECI2 WRITE through ExSend before guest WRITE_DONE", [](TestCase &t)
++        {
++            Fixture fixture;
++            resetCallbackState();
++            g_callback.registeredOpt = PS2_RAM_SIZE - 2u;
++            registerSchedulerFixture(fixture);
++
++            R5900Context main{};
++            setRegU32(main, 28, kCallbackGp);
++            main.pc = kMainPc;
++            fixture.runtime.eeScheduler().reset(fixture.ram.data(), main);
++            fixture.runtime.eeScheduler().run();
++
++            t.IsTrue(g_callback.parentResumed, "parent must resume after the callback sequence");
++            t.Equals(g_callback.pollResult, 0, "complete checked DECI2 packet should finish successfully");
++            t.Equals(g_callback.events.size(), size_t{2}, "only WRITE and WRITE_DONE callbacks should execute");
++            if (g_callback.events.size() == 2u)
++            {
++                t.Equals(g_callback.events[0], 3u, "first callback should be WRITE");
++                t.Equals(g_callback.events[1], 4u, "second callback should be WRITE_DONE");
++            }
++            t.IsTrue(g_callback.writeSawBusy, "WRITE_DONE must not precede guest completion");
++            t.IsTrue(g_callback.doneClearedBusy && !g_callback.busy,
++                     "the guest WRITE_DONE handler must clear its own busy fixture");
++            t.Equals(g_callback.writeGp, kCallbackGp, "WRITE callback must restore the registration GP");
++            t.Equals(g_callback.doneGp, kCallbackGp, "WRITE_DONE callback must retain the registration GP");
++            t.Equals(g_callback.writeOpt, PS2_RAM_SIZE - 2u,
++                     "WRITE callback must preserve an opaque opt value in a2 without dereferencing it");
++            t.Equals(g_callback.parentGp, kParentGpAfterOpen,
++                     "parent GP changed after open must be restored after both callbacks");
++            t.IsTrue(g_callback.nestedPollSawOnlyWrite && g_callback.nestedPollSawBusy,
++                     "nested Poll during WRITE must not create a second callback or premature completion");
++            t.Equals(g_callback.firstSendResult, 8, "first ExSend chunk should be accepted");
++            t.Equals(g_callback.secondSendResult, 4, "second ExSend chunk should complete the actual packet");
++        });
++
++        tc.Run("DECI2 rejects an invalid callback send range without WRITE_DONE", [](TestCase &t)
++        {
++            Fixture fixture;
++            resetCallbackState();
++            g_callback.invalidWriteRange = true;
++            registerSchedulerFixture(fixture);
++
++            R5900Context main{};
++            main.pc = kMainPc;
++            fixture.runtime.eeScheduler().reset(fixture.ram.data(), main);
++            fixture.runtime.eeScheduler().run();
++
++            t.IsTrue(g_callback.parentResumed, "failed callback must return control to the parent");
++            t.Equals(g_callback.pollResult, kInvalidAddress, "invalid packet range must fail Poll honestly");
++            t.Equals(g_callback.events.size(), size_t{1}, "failed ExSend must not synthesize WRITE_DONE");
++            if (!g_callback.events.empty())
++            {
++                t.Equals(g_callback.events.front(), 3u, "only WRITE should reach the guest");
++            }
++            t.Equals(g_callback.firstSendResult, kInvalidAddress, "ExSend must reject a range crossing guest RAM");
++            t.Equals(g_callback.secondSendResult, kInvalidAddress,
++                     "a terminal ExSend error must reject a later valid packet without accepting it");
++            t.IsTrue(g_callback.busy && !g_callback.doneClearedBusy,
++                     "unsent packets must leave busy ownership with the guest");
++        });
++
++        tc.Run("DECI2 validates open, socket, route, lock, and argument failures", [](TestCase &t)
++        {
++            Fixture fixture;
++            fixture.runtime.registerFunction(kHandlerPc, deciCallback);
++
++            t.Equals(openTty(fixture, fixture.direct, 0x00118100u), kInvalidAddress,
++                     "open must reject a missing handler");
++            const int32_t opaqueOptSocket = openTty(fixture, fixture.direct, kHandlerPc, PS2_RAM_SIZE - 2u);
++            t.IsTrue(opaqueOptSocket > 0, "open must preserve an opaque opt value without dereferencing it");
++            t.Equals(deciCall(fixture, fixture.direct, 2, {static_cast<uint32_t>(opaqueOptSocket)}), 0,
++                     "opaque opt socket should still close normally");
++            t.Equals(openTty(fixture, fixture.direct, kHandlerPc, 0u, PS2_RAM_SIZE - 2u), kInvalidAddress,
++                     "open must reject a userArea range it promises to retain");
++            t.Equals(deciCall(fixture, fixture.direct, 1, {0x9999u, 0u, kHandlerPc, 0u}), kNoRoute,
++                     "non-TTY protocol must be rejected");
++
++            const int32_t socket = openTty(fixture, fixture.direct);
++            t.IsTrue(socket > 0, "supported local TTY open should allocate a socket");
++            t.Equals(openTty(fixture, fixture.direct), kAlreadyUsed,
++                     "one runtime may own only one local TTY protocol socket");
++            t.Equals(deciCall(fixture, fixture.direct, 3, {static_cast<uint32_t>(socket), static_cast<uint32_t>('X')}),
++                     kNoRoute, "unsupported DECI2 destination must fail");
++            t.Equals(deciCall(fixture, fixture.direct, -9, {static_cast<uint32_t>(socket)}), kNotLocked,
++                     "unlocking an unlocked socket must fail");
++            t.Equals(deciCall(fixture, fixture.direct, -8, {static_cast<uint32_t>(socket)}), 0,
++                     "locking an open socket should succeed once");
++            t.Equals(deciCall(fixture, fixture.direct, -8, {static_cast<uint32_t>(socket)}), kAlreadyLocked,
++                     "double locking must fail");
++            t.Equals(deciCall(fixture, fixture.direct, -9, {static_cast<uint32_t>(socket)}), 0,
++                     "unlocking a held socket should succeed");
++            t.Equals(deciCall(fixture, fixture.direct, 99, {static_cast<uint32_t>(socket)}), kInvalid,
++                     "unknown DECI2 operation must fail");
++            t.Equals(deciCall(fixture, fixture.direct, 2, {0x7fffffffu}), kInvalidSocket,
++                     "unknown socket must fail");
++
++            setRegU32(fixture.direct, 4, 1u);
++            setRegU32(fixture.direct, 5, PS2_RAM_SIZE - 4u);
++            ps2_syscalls::Deci2Call(fixture.ram.data(), &fixture.direct, &fixture.runtime);
++            t.Equals(result(fixture.direct), kInvalidAddress, "truncated SDK argument block must fail");
++        });
++
++        tc.Run("DECI2 close and owner reset retire stale pending callbacks only", [](TestCase &t)
++        {
++            Fixture first;
++            Fixture second;
++            first.runtime.registerFunction(kHandlerPc, deciCallback);
++            second.runtime.registerFunction(kHandlerPc, deciCallback);
++            const int32_t firstSocket = openTty(first, first.direct);
++            const int32_t secondSocket = openTty(second, second.direct);
++            t.IsTrue(firstSocket > 0 && secondSocket > 0, "separate runtimes should own independent local TTY sockets");
++
++            t.Equals(deciCall(first, first.direct, 3, {static_cast<uint32_t>(firstSocket), static_cast<uint32_t>('H')}), 0,
++                     "first runtime should queue a local TTY send");
++            t.Equals(deciCall(first, first.direct, 2, {static_cast<uint32_t>(firstSocket)}), 0,
++                     "close should retire the pending local TTY session");
++            t.Equals(deciCall(first, first.direct, 4, {static_cast<uint32_t>(firstSocket)}), kInvalidSocket,
++                     "closed socket must never schedule a stale handler");
++
++            const int32_t resetSocket = openTty(first, first.direct);
++            t.IsTrue(resetSocket > 0, "closed local TTY protocol may be reopened");
++            t.Equals(deciCall(first, first.direct, 3, {static_cast<uint32_t>(resetSocket), static_cast<uint32_t>('H')}), 0,
++                     "reopened socket should queue before reset");
++            ps2_syscalls::resetDeci2State(&first.runtime);
++            t.Equals(deciCall(first, first.direct, 4, {static_cast<uint32_t>(resetSocket)}), kInvalidSocket,
++                     "runtime reset must retire its own stale DECI2 callback sink");
++            t.Equals(deciCall(second, second.direct, -8, {static_cast<uint32_t>(secondSocket)}), 0,
++                     "owner-scoped reset must preserve another runtime's channel");
++        });
++
++        tc.Run("DECI2 close and reopen cancels an attached WRITE callback without disturbing its replacement", [](TestCase &t)
++        {
++            Fixture fixture;
++            resetCloseReplaceState();
++            registerCloseReplaceFixture(fixture);
++
++            R5900Context main{};
++            main.pc = kCloseMainPc;
++            fixture.runtime.eeScheduler().reset(fixture.ram.data(), main);
++            fixture.runtime.eeScheduler().run();
++
++            t.IsTrue(g_closeReplace.parentResumed, "parent must resume after the attached stale callback is cancelled");
++            t.Equals(g_closeReplace.oldWriteCount, 1u, "old WRITE handler must actually execute and suspend before close");
++            t.Equals(g_closeReplace.oldResumeCount, 0u, "closed WRITE handler must never resume after its semaphore wake");
++            t.Equals(g_closeReplace.oldDoneCount, 0u, "closed WRITE handler must never receive WRITE_DONE");
++            t.Equals(g_closeReplace.closeResult, 0, "close must retire the active callback session");
++            t.IsTrue(g_closeReplace.replacementOpenResult > 0,
++                     "reopen must allocate a current replacement channel after close");
++            t.IsTrue(g_closeReplace.replacementSocket != g_closeReplace.oldSocket,
++                     "replacement must not reuse the stale socket identity");
++            t.IsTrue(g_closeReplace.replacementPendingAtCancellation,
++                     "replacement must remain pending until old invocation cancellation completes");
++            t.Equals(g_closeReplace.replacementPollResult, 0,
++                     "replacement channel must complete independently of the cancelled callback");
++            t.Equals(g_closeReplace.replacementEvents.size(), size_t{2},
++                     "replacement channel should receive its own WRITE and WRITE_DONE callbacks");
++            if (g_closeReplace.replacementEvents.size() == 2u)
++            {
++                t.Equals(g_closeReplace.replacementEvents[0], 3u, "replacement first callback should be WRITE");
++                t.Equals(g_closeReplace.replacementEvents[1], 4u, "replacement second callback should be WRITE_DONE");
++            }
++        });
++
++        tc.Run("DECI2 EE callback survives a supported IOP reset", [](TestCase &t)
++        {
++            Fixture fixture;
++            resetCallbackState();
++            g_callback.resetIopWhileWriting = true;
++            registerSchedulerFixture(fixture);
++
++            R5900Context main{};
++            main.pc = kMainPc;
++            fixture.runtime.eeScheduler().reset(fixture.ram.data(), main);
++            fixture.runtime.eeScheduler().run();
++
++            t.Equals(g_callback.resetResult, 1, "IOP reset must not reject the independent DECI2 EE callback");
++            t.Equals(g_callback.pollResult, 0, "IOP reset must preserve the active EE-owned DECI2 channel");
++            t.Equals(g_callback.events.size(), size_t{2}, "preserved channel should still deliver WRITE_DONE");
++            t.IsTrue(g_callback.doneClearedBusy, "guest completion remains responsible for busy state after IOP reset");
++        });
++    });
++}

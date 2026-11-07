@@ -1,0 +1,324 @@
+From f736e9831bf97e0ce6dc68bada33917e0eeed603 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:41:37 -0500
+Subject: [PATCH] launcher support: UTF-8 command line on Windows, Windows
+ handoff without a second engine, digest-cache temp files
+
+- main.cpp: decode the wide command line to UTF-8 on Windows (the CRT argv
+  is ANSI and loses non-ASCII characters in user names / data folders);
+  warn about unknown options instead of ignoring them silently.
+- ps2_runtime.cpp loadExecPS2: handoff file is read through the wide
+  environment on Windows and written as UTF-8; without the launcher a
+  Windows handoff is refused with a message (the old _execv spawned a second
+  engine and returned into the first, leaving two engines on one memory
+  card). Linux exec path unchanged.
+- ps2_disc_mount.cpp: the digest cache is written through a per-process
+  temporary that is removed on failure (the launcher writes the same file),
+  LOCALAPPDATA is read as wide, the cache hit or miss is logged, and the
+  cache is documented as a convenience, not a security boundary.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp | 48 ++++++++++++++--
+ ps2xRuntime/src/lib/ps2_runtime.cpp    | 76 ++++++++++++--------------
+ ps2xRuntime/src/main.cpp               | 42 ++++++++++++++
+ 3 files changed, 119 insertions(+), 47 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 02f8c68..f8e0d88 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -8,11 +8,13 @@
+ #include "runtime/sha256.h"
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <iostream>
+ #include <limits>
+ #include <memory>
+ #include <mutex>
+@@ -23,6 +25,7 @@
+ #include <windows.h>
+ #else
+ #include <sys/stat.h>
++#include <unistd.h>
+ #endif
+ 
+ namespace ps2_disc
+@@ -145,11 +148,14 @@ namespace ps2_disc
+ 
+         // Hashing a 4 GB image costs seconds per launch. A disc whose file
+         // identity (device, inode, size, mtime, ctime) matches an earlier
+-        // successful verification is trusted without re-reading it.
++        // successful verification is trusted without re-reading it. This is a
++        // convenience for the player's own machine, not a security boundary:
++        // the file is user-writable and keyed by path and file identity, so a
++        // modified image with restored timestamps would be trusted.
+         std::filesystem::path digestCachePath()
+         {
+ #ifdef _WIN32
+-            const char *base = std::getenv("LOCALAPPDATA");
++            const wchar_t *base = _wgetenv(L"LOCALAPPDATA"); // wide: the narrow value loses non-ANSI characters
+             return base ? std::filesystem::path(base) / "ga2" / "disc-verify.json" : std::filesystem::path{};
+ #else
+             if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+@@ -179,6 +185,15 @@ namespace ps2_disc
+             catch (const std::exception &) { return false; }
+         }
+ 
++        unsigned long processId()
++        {
++#ifdef _WIN32
++            return GetCurrentProcessId();
++#else
++            return static_cast<unsigned long>(getpid());
++#endif
++        }
++
+         void rememberDigest(const std::filesystem::path &image, const Identity &id, std::string_view sha)
+         {
+             try
+@@ -191,9 +206,29 @@ namespace ps2_disc
+                 if (!cache.is_object()) cache = nlohmann::json::object();
+                 cache[image.string()] = {{"identity", identityJson(id)}, {"sha256", std::string(sha)}};
+                 std::filesystem::create_directories(path.parent_path());
+-                const auto temp = path.string() + ".tmp";
+-                std::ofstream(temp) << cache.dump(1) << '\n';
+-                std::filesystem::rename(temp, path);
++                // The launcher writes this file too: a temporary named per
++                // process and call (never shared), renamed over the cache. A
++                // concurrent writer can cost one entry (the next launch hashes
++                // once), not a torn file; a failed write leaves no temporary.
++                static std::atomic<unsigned> counter{0u};
++                auto temp = path;
++                temp += ".tmp" + std::to_string(processId()) + "." + std::to_string(counter++);
++                try
++                {
++                    {
++                        std::ofstream out(temp, std::ios::trunc);
++                        out << cache.dump(1) << '\n';
++                        out.flush();
++                        if (!out) throw std::runtime_error("cannot write the digest cache");
++                    }
++                    std::filesystem::rename(temp, path);
++                }
++                catch (...)
++                {
++                    std::error_code ignored;
++                    std::filesystem::remove(temp, ignored);
++                    throw;
++                }
+             }
+             catch (const std::exception &) {}
+         }
+@@ -347,6 +382,9 @@ namespace ps2_disc
+             if (!digestFile(manifest, hash, &snapshot) || hash != manifestSha256)
+                 throw std::runtime_error("disc metadata digest mismatch");
+             const bool cached = cachedDigestMatches(image, before, imageSha256);
++            std::cerr << "[disc mount] " << (cached ? "image digest taken from the verification cache"
++                                                    : "hashing the image (no matching verification cache entry)")
++                      << std::endl;
+             if (!cached && (!digestFile(image, hash) || hash != imageSha256))
+                 throw std::runtime_error("disc image digest mismatch");
+             const auto metadata = nlohmann::json::parse(snapshot);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5169c1a..a61e30e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1353,22 +1353,27 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+         std::cerr << "[exec] no registered disc holds " << guestPath << std::endl;
+         return false;
+     }
+-    std::vector<std::string> argv{target->binary.string(), target->bootElf.string()};
++    // Command-line text is UTF-8 on every platform (the launcher decodes it that way).
++    const auto utf8 = [](const std::filesystem::path &path) {
++        const auto text = path.u8string();
++        return std::string(text.begin(), text.end());
++    };
++    std::vector<std::string> argv{utf8(target->binary), utf8(target->bootElf)};
+     for (size_t i = 0u; i < discs.size(); ++i)
+     {
+         if (int(i) != boot) continue;
+-        argv.insert(argv.end(), {"--disc-image", discs[i].image.string(), "--disc-manifest", discs[i].manifest.string(),
++        argv.insert(argv.end(), {"--disc-image", utf8(discs[i].image), "--disc-manifest", utf8(discs[i].manifest),
+                                  "--disc-image-sha256", discs[i].imageSha256,
+                                  "--disc-manifest-sha256", discs[i].manifestSha256});
+     }
+     for (size_t i = 0u; i < discs.size(); ++i)
+         if (int(i) != boot)
+-            argv.insert(argv.end(), {"--extra-disc", discs[i].image.string(), discs[i].manifest.string(),
++            argv.insert(argv.end(), {"--extra-disc", utf8(discs[i].image), utf8(discs[i].manifest),
+                                      discs[i].imageSha256, discs[i].manifestSha256});
+     if (const auto &mc = getIoPaths().mcRoot; !mc.empty())
+-        argv.insert(argv.end(), {"--mc-root", mc.string()});
++        argv.insert(argv.end(), {"--mc-root", utf8(mc)});
+     for (const auto &t : targets)
+-        argv.insert(argv.end(), {"--exec-target", t.elfName, t.binary.string(), t.bootElf.string()});
++        argv.insert(argv.end(), {"--exec-target", t.elfName, utf8(t.binary), utf8(t.bootElf)});
+     for (const auto &arg : args)
+         argv.insert(argv.end(), {"--guest-arg", arg});
+     std::cerr << "[exec] handing over to " << target->binary.filename().string() << std::endl;
+@@ -1378,12 +1383,18 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+     // included) and keep the new program from inheriting our descriptors
+     // (disc images, card files, audio and GPU devices).
+     std::fflush(nullptr);
+-    // Started by the launcher: hand it the next command line (one argument
+-    // per line) and exit with kHandoffExitCode; the launcher runs it and keeps
+-    // waiting, which also works on Windows where exec spawns a new process.
+-    if (const char *handoff = std::getenv("GA2_HANDOFF_FILE"); handoff && *handoff)
++    // Started by the launcher: hand it the next command line (one UTF-8
++    // argument per line) and exit with kHandoffExitCode; the launcher runs it
++    // and keeps waiting (which also works on Windows, where there is no exec).
++    std::filesystem::path handoffPath;
++#ifdef _WIN32
++    if (const wchar_t *handoff = _wgetenv(L"GA2_HANDOFF_FILE"); handoff && *handoff) handoffPath = handoff;
++#else
++    if (const char *handoff = std::getenv("GA2_HANDOFF_FILE"); handoff && *handoff) handoffPath = handoff;
++#endif
++    if (!handoffPath.empty())
+     {
+-        std::ofstream out(std::filesystem::path(handoff), std::ios::trunc);
++        std::ofstream out(handoffPath, std::ios::trunc);
+         for (const auto &arg : argv)
+             out << arg << '\n';
+         out.close();
+@@ -1392,10 +1403,21 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+             std::fflush(nullptr);
+             std::_Exit(kHandoffExitCode);
+         }
+-        std::cerr << "[exec] cannot write the handoff file " << handoff << std::endl;
++        std::cerr << "[exec] cannot write the handoff file " << utf8(handoffPath) << std::endl;
+         return false;
+     }
+-#ifndef _WIN32
++#ifdef _WIN32
++    // Windows has no exec: _execv starts a second process and returns in this
++    // one, which would leave two engines on one memory card while the guest
++    // saw a failure. The launcher (ga2.exe) does the handoff; without it the
++    // guest gets the error and keeps running.
++    std::cerr << "[exec] a program handoff needs the launcher (GA2_HANDOFF_FILE is not set); "
++                 "start the game through ga2.exe"
++              << std::endl;
++    return false;
++#else
++    // Keep the new program from inheriting our descriptors (disc images, card
++    // files, audio and GPU devices).
+     if (DIR *fds = opendir("/proc/self/fd"))
+     {
+         const int self = dirfd(fds);
+@@ -1407,39 +1429,9 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+         }
+         closedir(fds);
+     }
+-#endif
+     std::vector<char *> raw;
+     for (auto &arg : argv) raw.push_back(arg.data());
+     raw.push_back(nullptr);
+-#ifdef _WIN32
+-    // The CRT joins argv with spaces unquoted; quote like CommandLineToArgvW.
+-    std::vector<std::string> quoted;
+-    for (const auto &arg : argv)
+-    {
+-        if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos)
+-        {
+-            quoted.push_back(arg);
+-            continue;
+-        }
+-        std::string q = "\"";
+-        size_t slashes = 0;
+-        for (char c : arg)
+-        {
+-            if (c == '\\') { ++slashes; continue; }
+-            if (c == '"') q.append(slashes * 2 + 1, '\\');
+-            else q.append(slashes, '\\');
+-            slashes = 0;
+-            q.push_back(c);
+-        }
+-        q.append(slashes * 2, '\\');
+-        q.push_back('"');
+-        quoted.push_back(q);
+-    }
+-    std::vector<const char *> rawQuoted;
+-    for (auto &arg : quoted) rawQuoted.push_back(arg.c_str());
+-    rawQuoted.push_back(nullptr);
+-    _execv(argv.front().c_str(), rawQuoted.data());
+-#else
+     execv(raw[0], raw.data());
+ #endif
+     std::cerr << "[exec] exec failed: " << std::strerror(errno) << std::endl;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 7f9eb23..1a1d2b5 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -25,6 +25,21 @@
+ #include <cstring>
+ #endif
+ 
++#ifdef _WIN32
++// The few Win32 calls the UTF-8 command line needs, declared here instead of
++// including <windows.h>: this file shares unity batches with generated code,
++// which must not see the Win32 macros (near, far, ...). The declarations match
++// the SDK's.
++extern "C"
++{
++    __declspec(dllimport) wchar_t *__stdcall GetCommandLineW(void);
++    __declspec(dllimport) wchar_t **__stdcall CommandLineToArgvW(const wchar_t *, int *);
++    __declspec(dllimport) void *__stdcall LocalFree(void *);
++    __declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned, unsigned long, const wchar_t *, int, char *, int,
++                                                           const char *, int *);
++}
++#endif
++
+ namespace
+ {
+ #if defined(__ANDROID__)
+@@ -172,6 +187,31 @@ int main(int argc, char *argv[])
+     redirectStdioToLogcat();
+ #endif
+     setupTerminateLogger();
++#ifdef _WIN32
++    // The CRT's argv is in the ANSI code page: a path with characters outside
++    // it (a user name, the launcher's data folder) would arrive as '?'. Decode
++    // the wide command line to UTF-8 instead (std::filesystem reads UTF-8).
++    std::vector<std::string> utf8Arguments;
++    std::vector<char *> utf8Argv;
++    {
++        int wideCount = 0;
++        if (wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &wideCount))
++        {
++            for (int i = 0; i < wideCount; ++i)
++            {
++                const int size = WideCharToMultiByte(65001u /* CP_UTF8 */, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
++                std::string text(size > 1 ? size_t(size - 1) : 0u, '\0');
++                if (size > 1) WideCharToMultiByte(65001u, 0, wide[i], -1, text.data(), size, nullptr, nullptr);
++                utf8Arguments.push_back(std::move(text));
++            }
++            LocalFree(wide);
++            for (auto &text : utf8Arguments) utf8Argv.push_back(text.data());
++            utf8Argv.push_back(nullptr);
++            argc = wideCount;
++            argv = utf8Argv.data();
++        }
++    }
++#endif
+ 
+     try
+     {
+@@ -280,7 +320,9 @@ int main(int argc, char *argv[])
+                 else if (option == "--disc-manifest") metadata = std::filesystem::absolute(argv[index]).lexically_normal();
+                 else if (option == "--disc-image-sha256") imageHash = argv[index];
+                 else metadataHash = argv[index];
++                continue;
+             }
++            std::cerr << "[main] ignoring unknown option " << option << std::endl;
+         }
+         PS2Runtime::setGuestArgs(guestArgs);
+         if (!image.empty() || !metadata.empty() || !imageHash.empty() || !metadataHash.empty())
+-- 
+2.55.0
+

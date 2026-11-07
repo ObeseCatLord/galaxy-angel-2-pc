@@ -1,0 +1,1213 @@
+From 4bb891f02d7564a55300e1b944ac748c8102b981 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:33:35 -0500
+Subject: [PATCH 28/31] ga2: private native31/37/45 runtime (SPU host PCM, IPU
+ input device)
+
+---
+ ps2xRuntime/include/ps2_runtime.h        |   1 +
+ ps2xRuntime/include/runtime/ps2_audio.h  |   5 +
+ ps2xRuntime/include/runtime/ps2_memory.h |  18 +
+ ps2xRuntime/src/lib/ps2_audio.cpp        | 138 ++++++
+ ps2xRuntime/src/lib/ps2_iop_host.cpp     |  10 +
+ ps2xRuntime/src/lib/ps2_iop_host.h       |   2 +
+ ps2xRuntime/src/lib/ps2_memory.cpp       | 592 +++++++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_pcm_queue.h      |  40 ++
+ ps2xRuntime/src/lib/ps2_runtime.cpp      |  81 +++-
+ 9 files changed, 847 insertions(+), 40 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ps2_pcm_queue.h
+
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 74d8c7e..fec0887 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -410,6 +410,7 @@ public:
+     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
++    void drainIpuDeviceInterrupts(uint8_t *rdram, uint32_t vaddr);
+ 
+     void requestStop();
+     bool isStopRequested() const;
+diff --git a/ps2xRuntime/include/runtime/ps2_audio.h b/ps2xRuntime/include/runtime/ps2_audio.h
+index a8c2a55..710f995 100644
+--- a/ps2xRuntime/include/runtime/ps2_audio.h
++++ b/ps2xRuntime/include/runtime/ps2_audio.h
+@@ -4,6 +4,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
++#include <span>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -23,6 +24,10 @@ public:
+               uint32_t voiceIndex = 0xFFFFFFFFu);
+     void stop(uint32_t voiceId);
+     void stopAll();
++    // Borrowed interleaved stereo48k PCM, synchronously copied on guest owner.
++    // False means unavailable, invalid format or capacity/ownership failure.
++    bool submitSpuPcm(std::span<const int16_t> samples, uint32_t sampleRate);
++    bool resetSpuPcm();
+     void setAudioReady(bool ready) { m_audioReady = ready; }
+ 
+ private:
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 76574c4..2b16665 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -9,7 +9,10 @@
+ #include <unordered_map>
+ #include <atomic>
+ #include <iostream>
++#include <memory>
+ #include <mutex>
++#include <stdexcept>
++#include <string>
+ 
+ #include "gs/ps2_gif_arbiter.h"
+ #if defined(_MSC_VER)
+@@ -23,6 +26,17 @@
+ 
+ class GS;
+ 
++class IpuUnsupportedOperation final : public std::runtime_error
++{
++public:
++    explicit IpuUnsupportedOperation(const std::string &message)
++        : std::runtime_error(message)
++    {
++    }
++};
++
++class IpuDevice;
++
+ constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
+ constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
+ constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+@@ -345,6 +359,8 @@ public:
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
++    // IPU command completion is an INTC source, distinct from DMAC channel 4.
++    bool consumeIpuInterrupt();
+ 
+     int pollDmaRegisters();
+ 
+@@ -452,6 +468,8 @@ public:
+     };
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
++    std::unique_ptr<IpuDevice> m_ipu;
++    void processIpuDma();
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 6bb6494..ec8ddb7 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_host_backend.h"
+ #include <cstring>
+ #include <vector>
++#include "ps2_pcm_queue.h"
+ 
+ namespace
+ {
+@@ -69,6 +70,62 @@ namespace ps2_vag
+                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
+ }
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <chrono>
++#include <string>
++
++// PRIVATE OBSERVER: bytes submitted by the existing single PCM producer.
++// Called with existing m_mutex held. No audio-thread I/O, clock adjustment,
++// playback replacement, or modification of the original queue return value.
++namespace {
++struct PrivatePcmObservation {
++    FILE* raw = nullptr;
++    FILE* rows = nullptr;
++    uint64_t frames = 0, calls = 0, failed = 0, next_row = 48000;
++    bool disabled = false;
++    std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
++    PrivatePcmObservation() {
++        const char* folder = std::getenv("GA2_PRIVATE_PCM_OBSERVATION");
++        if (!folder || !*folder) { disabled = true; return; }
++        std::string prefix(folder);
++        // Exclusive creation: never overwrite a previous/private user file.
++        raw = std::fopen((prefix + "/producer-pcm.s16le").c_str(), "wbx");
++        rows = std::fopen((prefix + "/producer-rows.csv").c_str(), "wx");
++        if (!raw || !rows) { disabled = true; std::fprintf(stderr,"[private PCM observer] exclusive open failed\n"); return; }
++        std::fprintf(rows,"host_seconds,submitted_frames,calls,failed_submission_calls,raw_bytes\n");
++        std::fflush(rows);
++    }
++    ~PrivatePcmObservation() { if (raw) std::fclose(raw); if (rows) std::fclose(rows); }
++    bool record(std::span<const int16_t> samples, bool result) noexcept {
++        if (disabled) return result;
++        if (samples.size()/2 > 32000000 - frames) {
++            disabled = true; std::fprintf(stderr,"[private PCM observer] 32M frame cap reached\n"); return result;
++        }
++        const size_t written = std::fwrite(samples.data(), sizeof(int16_t), samples.size(), raw);
++        if (written != samples.size()) {
++            disabled = true; std::fprintf(stderr,"[private PCM observer] raw write failed\n"); return result;
++        }
++        frames += samples.size()/2; ++calls; failed += !result;
++        // Retain a bounded prefix even if the owned game is terminated.
++        if (calls%1024 == 0 && std::fflush(raw)) {
++            disabled = true; std::fprintf(stderr,"[private PCM observer] raw flush failed\n"); return result;
++        }
++        if (frames >= next_row) {
++            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-origin).count();
++            if (std::fflush(raw) || std::fprintf(rows,"%.9f,%llu,%llu,%llu,%llu\n",elapsed,
++                (unsigned long long)frames,(unsigned long long)calls,
++                (unsigned long long)failed,(unsigned long long)(frames*4)) < 0 || std::fflush(rows)) {
++                disabled = true; std::fprintf(stderr,"[private PCM observer] row write failed\n"); return result;
++            }
++            next_row = frames + 48000;
++        }
++        return result;
++    }
++};
++PrivatePcmObservation& privatePcmObservation() { static PrivatePcmObservation observation; return observation; }
++}
++
+ struct PS2AudioBackend::Impl
+ {
+     struct TrackedSound
+@@ -77,8 +134,88 @@ struct PS2AudioBackend::Impl
+         uint32_t sampleKey;
+     };
+     std::vector<TrackedSound> activeSounds;
++    SpuPcmQueue pcm;
++    AudioStream pcmStream{};
++    bool pcmStarted = false;
++    static std::mutex callbackMutex;
++    static Impl *callbackOwner;
++    static void pcmCallback(void *buffer, unsigned int frames)
++    {
++        auto output = std::span<int16_t>(static_cast<int16_t *>(buffer), size_t(frames) * 2u);
++        std::lock_guard lock(callbackMutex);
++        if (callbackOwner) callbackOwner->pcm.consume(output);
++        else std::fill(output.begin(), output.end(), int16_t{});
++    }
++    void closePcm()
++    {
++#if !defined(PLATFORM_VITA)
++        // Raylib callback executes under its audio lock. Detachment waits for
++        // it before clearing ownership. Never hold callbackMutex in raylib.
++        if (pcmStarted) SetAudioStreamCallback(pcmStream, nullptr);
++        {
++            std::lock_guard lock(callbackMutex);
++            if (callbackOwner == this) callbackOwner = nullptr;
++            pcm.clear();
++        }
++        if (pcmStarted) { StopAudioStream(pcmStream); UnloadAudioStream(pcmStream); }
++        pcmStarted = false; pcmStream = {};
++#endif
++    }
+ };
+ 
++std::mutex PS2AudioBackend::Impl::callbackMutex;
++PS2AudioBackend::Impl *PS2AudioBackend::Impl::callbackOwner = nullptr;
++
++bool PS2AudioBackend::submitSpuPcm(std::span<const int16_t> samples, uint32_t sampleRate)
++{
++#if defined(PLATFORM_VITA)
++    (void)samples; (void)sampleRate;
++    return false;
++#else
++    std::lock_guard lock(m_mutex);
++    if (!m_audioReady || sampleRate != 48000 || samples.size() % 2u ||
++        samples.size() / 2u > SpuPcmQueue::CapacityFrames) return false;
++    if (samples.empty()) return true;
++    auto observe = [&](bool result) noexcept {
++        try { return privatePcmObservation().record(samples, result); }
++        catch (...) { std::fprintf(stderr,"[private PCM observer] initialization failed\n"); return result; }
++    };
++    if (!m_impl->pcmStarted)
++    {
++        bool initialPushSucceeded = true;
++        {
++            std::lock_guard callbackLock(Impl::callbackMutex);
++            if (Impl::callbackOwner && Impl::callbackOwner != m_impl.get()) initialPushSucceeded = false;
++            else {
++                Impl::callbackOwner = m_impl.get();
++                if (!m_impl->pcm.push(samples)) { Impl::callbackOwner = nullptr; initialPushSucceeded = false; }
++            }
++        }
++        if (!initialPushSucceeded) return observe(false);
++        m_impl->pcmStream = LoadAudioStream(48000, 16, 2);
++        if (!IsAudioStreamValid(m_impl->pcmStream)) { m_impl->closePcm(); return observe(false); }
++        m_impl->pcmStarted = true;
++        SetAudioStreamCallback(m_impl->pcmStream, Impl::pcmCallback);
++        PlayAudioStream(m_impl->pcmStream);
++        return observe(true);
++    }
++    bool result;
++    { std::lock_guard callbackLock(Impl::callbackMutex); result = m_impl->pcm.push(samples); }
++    return observe(result);
++#endif
++}
++
++bool PS2AudioBackend::resetSpuPcm()
++{
++#if defined(PLATFORM_VITA)
++    return false;
++#else
++    std::lock_guard lock(m_mutex);
++    m_impl->closePcm();
++    return true;
++#endif
++}
++
+ PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
+ {
+ }
+@@ -315,6 +452,7 @@ void PS2AudioBackend::stop(uint32_t voiceId)
+ void PS2AudioBackend::stopAll()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    m_impl->closePcm();
+ #if defined(PLATFORM_VITA)
+     return;
+ #else
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 5afe7fb..e74a22d 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -400,6 +400,16 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
+                                             receive.size);
+ }
+ 
++bool PS2IopHostAdapter::submitSpuPcm(std::span<const int16_t> samples, uint32_t sampleRate)
++{
++    return m_runtime.audioBackend().submitSpuPcm(samples, sampleRate);
++}
++
++bool PS2IopHostAdapter::resetSpuPcm()
++{
++    return m_runtime.audioBackend().resetSpuPcm();
++}
++
+ bool PS2IopHostAdapter::readSifRegister(ps2x::iop::SifRegister reg, uint32_t &value) const
+ {
+     return ps2_stubs::readIopSifRegister(static_cast<uint32_t>(reg), value);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 3b849ab..a488a5b 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -68,6 +68,8 @@ public:
+                       uint32_t function,
+                       ps2x::iop::GuestBuffer send,
+                       ps2x::iop::GuestBuffer receive) override;
++    bool submitSpuPcm(std::span<const int16_t> samples, uint32_t sampleRate) override;
++    bool resetSpuPcm() override;
+ 
+     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
+     std::string translateGuestPath(std::string_view path) const override;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 6f4879a..710d122 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -238,8 +238,341 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
+     return basePage * 2048 + y * strideBytes + x * 4;
+ }
+ 
++// This deliberately models only the input side that the reached movie parser
++// uses.  It follows PCSX2's IPU FIFO/BP transition rules without importing its
++// decoder or output/presentation ownership.
++class IpuDevice
++{
++public:
++    static constexpr uint32_t kCommand = 0x10002000u;
++    static constexpr uint32_t kControl = 0x10002010u;
++    static constexpr uint32_t kBitPointer = 0x10002020u;
++    static constexpr uint32_t kTop = 0x10002030u;
++    static constexpr uint32_t kInputFifo = 0x10007010u;
++    static constexpr uint32_t kOutputFifo = 0x10007000u;
++
++    IpuDevice() { reset(); }
++
++    void reset()
++    {
++        input_.fill({});
++        internal_.fill({});
++        quantIntra_.fill(0);
++        quantNonIntra_.fill(0);
++        vq_.fill(0);
++        thresholds_.fill(0);
++        inputRead_ = inputWrite_ = inputCount_ = 0u;
++        bp_ = fp_ = 0u;
++        control_ = data_ = top_ = 0u;
++        command_ = 0xffffffffu;
++        busy_ = dataBusy_ = topBusy_ = dataRequested_ = interrupt_ = false;
++        pending_ = Pending::None;
++        pendingBytes_ = pendingTarget_ = 0u;
++        fdecSkipApplied_ = false;
++    }
++
++    uint32_t readCommand()
++    {
++        // CMD reads outside FDEC/VDEC peek the bit window without advancing it.
++        if ((command_ >> 28u) != 4u)
++            (void)peek32(data_);
++        return data_;
++    }
++    uint32_t readCommandBusy() const { return dataBusy_ ? 0x80000000u : 0u; }
++    uint64_t readCommand64()
++    {
++        return static_cast<uint64_t>(readCommand()) |
++               (static_cast<uint64_t>(dataBusy_ ? 0x80000000u : 0u) << 32u);
++    }
++    uint32_t readControl() const
++    {
++        return (control_ & 0x47f30000u) |
++               (inputCount_ & 0xfu) |
++               (busy_ ? 0x80000000u : 0u);
++    }
++    uint32_t readBitPointer() const
++    {
++        return (bp_ & 0x7fu) | ((inputCount_ & 0xfu) << 8u) | ((fp_ & 0x3u) << 16u);
++    }
++    uint64_t readTop64() const
++    {
++        return static_cast<uint64_t>(top_) |
++               (static_cast<uint64_t>(topBusy_ ? 0x80000000u : 0u) << 32u);
++    }
++    uint32_t readTop() const { return top_; }
++    bool consumeInterrupt()
++    {
++        const bool wasPending = interrupt_;
++        interrupt_ = false;
++        return wasPending;
++    }
++    bool needsData() const { return dataRequested_; }
++    uint32_t inputCount() const { return inputCount_; }
++
++    void writeControl(uint32_t value)
++    {
++        control_ = (control_ & 0x8000ffffu) | (value & 0x47f30000u);
++        if ((value & (1u << 30u)) != 0u)
++            softReset();
++    }
++
++    void writeCommand(uint32_t value)
++    {
++        const uint32_t opcode = value >> 28u;
++        if (busy_ && opcode != 0u && opcode != 9u)
++            throw IpuUnsupportedOperation("IPU command while busy: 0x" + hex(value));
++
++        command_ = value;
++        fdecSkipApplied_ = false;
++        pendingBytes_ = pendingTarget_ = 0u;
++        switch (opcode)
++        {
++        case 0: // BCLR
++            clearInput(value & 0x7fu);
++            dataBusy_ = false;
++            completeCommand();
++            return;
++        case 4: // FDEC
++            pending_ = Pending::Fdec;
++            busy_ = true;
++            dataBusy_ = topBusy_ = true;
++            service();
++            return;
++        case 5: // SETIQ: 64-byte quantizer matrix
++            pending_ = Pending::SetIq;
++            pendingTarget_ = quantIntra_.size();
++            busy_ = true;
++            service();
++            return;
++        case 6: // SETVQ: 16 RGB16 entries
++            pending_ = Pending::SetVq;
++            pendingTarget_ = vq_.size();
++            busy_ = true;
++            service();
++            return;
++        case 9: // SETTH
++            thresholds_[0] = static_cast<uint16_t>(value & 0x1ffu);
++            thresholds_[1] = static_cast<uint16_t>((value >> 16u) & 0x1ffu);
++            completeCommand();
++            return;
++        default:
++            throw IpuUnsupportedOperation("unsupported IPU command 0x" + hex(value) +
++                                          " (opcode " + std::to_string(opcode) + ")");
++        }
++    }
++
++    bool writeInput(const uint8_t *qword, bool serviceNow = true)
++    {
++        if (inputCount_ == input_.size())
++            return false;
++        std::memcpy(input_[inputWrite_].data(), qword, input_[inputWrite_].size());
++        inputWrite_ = (inputWrite_ + 1u) & 7u;
++        ++inputCount_;
++        if (inputCount_ == input_.size())
++            dataRequested_ = false;
++        if (serviceNow)
++            service();
++        return true;
++    }
++
++    void service()
++    {
++        if (!busy_)
++            return;
++
++        switch (pending_)
++        {
++        case Pending::Fdec:
++            if (!fdecSkipApplied_)
++            {
++                if (!advance(command_ & 0x3fu))
++                    return;
++                fdecSkipApplied_ = true;
++            }
++            if (!peek32(data_))
++                return;
++            top_ = data_;
++            dataBusy_ = topBusy_ = false;
++            completeCommand();
++            return;
++        case Pending::SetIq:
++        case Pending::SetVq:
++            if (pending_ == Pending::SetIq && !fdecSkipApplied_)
++            {
++                if (!advance(command_ & 0x3fu))
++                    return;
++                fdecSkipApplied_ = true;
++            }
++            while (pendingBytes_ < pendingTarget_)
++            {
++                // SETIQ/SETVQ accept one 64-bit table word at a time. A partial
++                // word must not advance BP or become a completed table prefix.
++                if (!fill(64u))
++                    return;
++                for (uint32_t index = 0; index < 8u; ++index)
++                {
++                    uint8_t byte = 0u;
++                    for (uint32_t bit = 0u; bit < 8u; ++bit)
++                    {
++                        const uint32_t sourceBit = bp_ + index * 8u + bit;
++                        const uint8_t source = internal_[sourceBit / 128u][(sourceBit % 128u) / 8u];
++                        byte = static_cast<uint8_t>((byte << 1u) | ((source >> (7u - (sourceBit & 7u))) & 1u));
++                    }
++                    if (pending_ == Pending::SetIq)
++                    {
++                        auto &matrix = (command_ & (1u << 27u)) != 0u ? quantNonIntra_ : quantIntra_;
++                        matrix[pendingBytes_ + index] = byte;
++                    }
++                    else
++                        vq_[pendingBytes_ + index] = byte;
++                }
++                advance(64u);
++                pendingBytes_ += 8u;
++            }
++            completeCommand();
++            return;
++        case Pending::None:
++            return;
++        }
++    }
++
++private:
++    enum class Pending : uint8_t { None, Fdec, SetIq, SetVq };
++
++    static std::string hex(uint32_t value)
++    {
++        static constexpr char digits[] = "0123456789abcdef";
++        std::string result(8u, '0');
++        for (size_t index = 0; index < result.size(); ++index)
++            result[result.size() - 1u - index] = digits[(value >> (index * 4u)) & 0xfu];
++        return result;
++    }
++
++    void clearInput(uint32_t bitOffset)
++    {
++        input_.fill({});
++        internal_.fill({});
++        inputRead_ = inputWrite_ = inputCount_ = 0u;
++        bp_ = bitOffset;
++        fp_ = 0u;
++        dataRequested_ = true;
++    }
++
++    void softReset()
++    {
++        clearInput(0u);
++        thresholds_.fill(0u);
++        control_ &= 0x07f33f00u;
++        data_ = top_ = 0u;
++        command_ = 0xffffffffu;
++        busy_ = dataBusy_ = topBusy_ = false;
++        pending_ = Pending::None;
++        pendingBytes_ = pendingTarget_ = 0u;
++        fdecSkipApplied_ = false;
++        interrupt_ = true;
++    }
++
++    void completeCommand()
++    {
++        busy_ = false;
++        pending_ = Pending::None;
++        pendingBytes_ = pendingTarget_ = 0u;
++        interrupt_ = true;
++    }
++
++    bool popInput(std::array<uint8_t, 16> &out)
++    {
++        if (inputCount_ <= 1u)
++            dataRequested_ = true;
++        if (inputCount_ == 0u)
++            return false;
++        out = input_[inputRead_];
++        inputRead_ = (inputRead_ + 1u) & 7u;
++        --inputCount_;
++        return true;
++    }
++
++    bool fill(uint32_t bits)
++    {
++        while (fp_ * 128u < bp_ + bits)
++        {
++            if (fp_ == internal_.size() || !popInput(internal_[fp_]))
++                return false;
++            ++fp_;
++        }
++        return true;
++    }
++
++    bool advance(uint32_t bits)
++    {
++        // PCSX2's tIPU_BP::Advance intentionally applies the new BP even when
++        // FillBuffer starves.  The pending command then resumes at that BP.
++        (void)fill(bits);
++        bp_ += bits;
++        if (bp_ < 128u)
++            return true;
++
++        bp_ -= 128u;
++        if (fp_ == 2u)
++        {
++            internal_[0] = internal_[1];
++            fp_ = 1u;
++        }
++        else if (popInput(internal_[0]))
++        {
++            fp_ = 1u;
++        }
++        else
++        {
++            fp_ = 0u;
++        }
++        return true;
++    }
++
++    bool peek32(uint32_t &out)
++    {
++        if (!fill(32u))
++            return false;
++        uint32_t result = 0u;
++        for (uint32_t bit = 0u; bit < 32u; ++bit)
++        {
++            const uint32_t sourceBit = bp_ + bit;
++            const uint8_t byte = internal_[sourceBit / 128u][(sourceBit % 128u) / 8u];
++            result = (result << 1u) | ((byte >> (7u - (sourceBit & 7u))) & 1u);
++        }
++        out = result;
++        return true;
++    }
++
++    std::array<std::array<uint8_t, 16>, 8> input_{};
++    std::array<std::array<uint8_t, 16>, 2> internal_{};
++    std::array<uint8_t, 64> quantIntra_{};
++    std::array<uint8_t, 64> quantNonIntra_{};
++    std::array<uint8_t, 32> vq_{};
++    std::array<uint16_t, 2> thresholds_{};
++    uint32_t inputRead_ = 0u;
++    uint32_t inputWrite_ = 0u;
++    uint32_t inputCount_ = 0u;
++    uint32_t bp_ = 0u;
++    uint32_t fp_ = 0u;
++    uint32_t control_ = 0u;
++    uint32_t data_ = 0u;
++    uint32_t top_ = 0u;
++    uint32_t command_ = 0xffffffffu;
++    uint32_t pendingBytes_ = 0u;
++    uint32_t pendingTarget_ = 0u;
++    bool busy_ = false;
++    bool dataBusy_ = false;
++    bool topBusy_ = false;
++    bool dataRequested_ = false;
++    bool interrupt_ = false;
++    bool fdecSkipApplied_ = false;
++    Pending pending_ = Pending::None;
++};
++
+ PS2Memory::PS2Memory()
+-    : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
++    : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr),
++      m_ipu(std::make_unique<IpuDevice>())
+ {
+     ps2SetScratchpadHostPtr(nullptr);
+ }
+@@ -334,6 +667,7 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_vif1PendingDirectHl = false;
+     m_vif1DirectTailBytes = 0u;
+     resetEeTimers();
++    m_ipu->reset();
+ 
+     try
+     {
+@@ -821,6 +1155,17 @@ uint64_t PS2Memory::read64(uint32_t address)
+         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
+     }
+ 
++    if (physAddr == IpuDevice::kCommand)
++    {
++        const uint64_t result = m_ipu->readCommand64();
++        processIpuDma(); // Reading outside FDEC can assert input demand.
++        return result;
++    }
++    if (physAddr == IpuDevice::kTop)
++        return m_ipu->readTop64();
++    if (physAddr == IpuDevice::kControl || physAddr == IpuDevice::kBitPointer)
++        return readIORegister(physAddr);
++
+     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
+     // to avoid any side-effects from read32 handlers.
+     if (isIoRegister(address))
+@@ -842,6 +1187,9 @@ __m128i PS2Memory::read128(uint32_t address)
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
++    if (!scratch && physAddr == IpuDevice::kOutputFifo)
++        throw IpuUnsupportedOperation("IPU output FIFO read is not implemented");
++
+     if (scratch)
+     {
+         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "read128 scratchpad", address);
+@@ -1072,6 +1420,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
++    if (!scratch && physAddr == IpuDevice::kInputFifo)
++    {
++        alignas(16) std::array<uint8_t, 16> fifoData{};
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData.data()), value);
++        m_ipu->writeInput(fifoData.data());
++        processIpuDma();
++        return;
++    }
++
+     if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
+     {
+         alignas(16) uint8_t fifoData[16];
+@@ -1181,25 +1538,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
+-    if (address >= 0x10002000 && address <= 0x10002030)
++    if (address == IpuDevice::kCommand)
+     {
+-        if (address == 0x10002010)
+-        {
+-            m_ioRegisters[address] = value & ~(1u << 31);
+-            if (value & (1u << 30))
+-            {
+-                m_ioRegisters[0x10002000] = 0;
+-                m_ioRegisters[0x10002020] = 0;
+-                m_ioRegisters[0x10002030] = 0;
+-            }
+-        }
+-        else
+-        {
+-            m_ioRegisters[address] = value;
+-        }
++        m_ipu->writeCommand(value);
++        processIpuDma();
++        return true;
++    }
++
++    if (address == IpuDevice::kControl)
++    {
++        m_ipu->writeControl(value);
++        processIpuDma();
+         return true;
+     }
+ 
++    // Writes to the read-only halves/status registers do not replace device state.
++    if (address >= 0x10002000u && address < 0x10002040u)
++        return true;
++
+     if (address == 0x1000E010u)
+     {
+         const uint32_t current = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+@@ -1218,8 +1574,55 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
++    // The output device is outside this bounded input implementation. Never
++    // accept a DMA start that would appear to complete without producing data.
++    if (address == 0x1000B000u && (value & 0x100u) != 0u)
++        throw IpuUnsupportedOperation("IPU output DMA is not implemented");
++
++    if (address == 0x1000B400u)
++    {
++        uint32_t &chcr = m_ioRegisters[address];
++        if ((chcr & 0x100u) != 0u)
++        {
++            // An active CHCR accepts only STR cancellation; changing mode/tag
++            // requires a subsequent write after stopping (reference Dmac.cpp).
++            if ((value & 0x100u) == 0u)
++                chcr &= ~0x100u;
++            return true;
++        }
++        if ((value & 0x100u) != 0u)
++        {
++            if ((value & 0x40u) != 0u)
++                throw IpuUnsupportedOperation("IPU DMA tag-transfer-enable is unsupported");
++            const uint32_t mode = (value >> 2u) & 3u;
++            if (mode != 0u && mode != 1u)
++                throw IpuUnsupportedOperation("unsupported IPU DMA mode " + std::to_string(mode));
++            uint32_t &qwc = m_ioRegisters[address + 0x20u];
++            // A normal zero start underflows the 16-bit counter after its first
++            // qword. Preserve that transition without eager whole-block copying.
++            if (mode == 0u && qwc == 0u)
++                qwc = 0x10000u;
++            m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++        }
++        chcr = value;
++        processIpuDma();
++        return true;
++    }
++
+     m_ioRegisters[address] = value;
+ 
++    if (address == 0x1000F590u)
++    {
++        // ENABLEW controls the read-side suspension register. Resume only this
++        // newly implemented device; unrelated DMA ownership remains unchanged.
++        m_ioRegisters[0x1000F520u] = value;
++        processIpuDma();
++        return true;
++    }
++
++    if (address == 0x1000E000u && (value & 1u) != 0u)
++        processIpuDma();
++
+     if (address >= 0x10003C00u && address < 0x10003E00u)
+     {
+         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+@@ -1664,6 +2067,120 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+     queueCompletedDmacCause(cause);
+ }
+ 
++void PS2Memory::processIpuDma()
++{
++    static constexpr uint32_t kChannel = 0x1000B400u;
++    uint32_t chcr = m_ioRegisters[kChannel];
++    const auto dctrl = m_ioRegisters.find(0x1000E000u);
++    if (dctrl != m_ioRegisters.end() && (dctrl->second & 1u) == 0u)
++        return;
++    const auto enable = m_ioRegisters.find(0x1000F520u);
++    if (enable != m_ioRegisters.end() && (enable->second & 0x00ff0000u) != 0u)
++        return;
++    if ((chcr & 0x100u) == 0u || !m_ipu->needsData())
++        return;
++
++    const uint32_t mode = (chcr >> 2u) & 0x3u;
++    if (mode != 0u && mode != 1u)
++        throw IpuUnsupportedOperation("unsupported IPU DMA mode " + std::to_string(mode));
++
++    auto readQword = [this](uint32_t address, std::array<uint8_t, 16> &out)
++    {
++        if ((address & 0x80000000u) != 0u || isScratchpad(address))
++            throw IpuUnsupportedOperation("IPU DMA scratchpad source is unsupported");
++        const uint32_t physical = translateAddress(address);
++        if (physical >= PS2_RAM_SIZE || (address & 15u) != 0u)
++            throw IpuUnsupportedOperation("IPU DMA requires an aligned RDRAM source");
++        for (uint32_t offset = 0u; offset < out.size(); ++offset)
++            out[offset] = m_rdram[(physical + offset) & PS2_RAM_MASK];
++    };
++
++    auto finish = [this]()
++    {
++        completeDmacChannel(kChannel, 4u);
++    };
++
++    auto consumeBlock = [&]()
++    {
++        uint32_t &madr = m_ioRegisters[kChannel + 0x10u];
++        uint32_t &qwc = m_ioRegisters[kChannel + 0x20u];
++        while (qwc != 0u && m_ipu->needsData())
++        {
++            std::array<uint8_t, 16> qword{};
++            readQword(madr, qword);
++            if (!m_ipu->writeInput(qword.data(), false))
++                break;
++            madr = (madr + 16u) & 0x7ffffff0u;
++            --qwc;
++        }
++        m_ipu->service();
++    };
++
++    if (mode == 0u)
++    {
++        consumeBlock();
++        if (m_ioRegisters[kChannel + 0x20u] == 0u)
++            finish();
++        return;
++    }
++
++    // QWC and CHCR.TAG already describe retained chain progress. Derive
++    // termination from them at execution, including starts deferred by DMAE or
++    // suspension; separately cached flags become stale if QWC is reprogrammed.
++    auto finalTag = [&]()
++    {
++        const uint32_t tagId = (chcr >> 28u) & 7u;
++        return tagId == 0u || tagId == 7u ||
++               ((chcr & 0x80000000u) != 0u && (chcr & 0x80u) != 0u);
++    };
++    constexpr uint32_t kMaxZeroQwordTags = 4096u;
++    uint32_t zeroQwordTags = 0u;
++    while (m_ipu->needsData())
++    {
++        uint32_t &qwc = m_ioRegisters[kChannel + 0x20u];
++        if (qwc == 0u)
++        {
++            if (++zeroQwordTags > kMaxZeroQwordTags)
++                throw IpuUnsupportedOperation("IPU DMA REF/REFE chain exceeded zero-QW tag bound");
++            const uint32_t tadr = m_ioRegisters[kChannel + 0x30u];
++            std::array<uint8_t, 16> tagBytes{};
++            readQword(tadr, tagBytes);
++            uint64_t tag = 0u;
++            std::memcpy(&tag, tagBytes.data(), sizeof(tag));
++            const uint16_t tagQwc = static_cast<uint16_t>(tag & 0xffffu);
++            const uint8_t id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
++            if (id != 3u && id != 0u)
++                throw IpuUnsupportedOperation("unsupported IPU DMA tag id " + std::to_string(id));
++
++            qwc = tagQwc;
++            const uint32_t tagAddress = static_cast<uint32_t>(tag >> 32u);
++            if ((tagAddress & 0x80000000u) != 0u)
++                throw IpuUnsupportedOperation("IPU DMA scratchpad tag is unsupported");
++            m_ioRegisters[kChannel + 0x10u] = tagAddress & 0x7ffffff0u;
++            m_ioRegisters[kChannel + 0x30u] = tadr + 16u;
++            chcr = (chcr & 0x0000ffffu) |
++                   (static_cast<uint32_t>((tag >> 16u) & 0xffffu) << 16u);
++            m_ioRegisters[kChannel] = chcr;
++            if (qwc == 0u && finalTag())
++            {
++                finish();
++                return;
++            }
++            if (qwc == 0u)
++                continue;
++        }
++
++        consumeBlock();
++        if (m_ioRegisters[kChannel + 0x20u] != 0u)
++            return;
++        if (finalTag())
++        {
++            finish();
++            return;
++        }
++    }
++}
++
+ void PS2Memory::processPendingTransfers()
+ {
+     const bool hadGif = !m_pendingGifTransfers.empty();
+@@ -2282,6 +2799,11 @@ int PS2Memory::pollDmaRegisters()
+     return 0;
+ }
+ 
++bool PS2Memory::consumeIpuInterrupt()
++{
++    return m_ipu->consumeInterrupt();
++}
++
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
+     size_t timerIndex = 0u;
+@@ -2321,27 +2843,25 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return 0u;
+     }
+ 
+-    if (address >= 0x10002000 && address <= 0x10002030)
++    if (address == IpuDevice::kCommand)
+     {
+-        uint32_t val = 0;
+-        switch (address)
+-        {
+-        case 0x10002000:
+-            val = m_ioRegisters[address];
+-            break;
+-        case 0x10002010:
+-            val = m_ioRegisters[address] & ~(1u << 31);
+-            break;
+-        case 0x10002020:
+-        case 0x10002030:
+-            val = m_ioRegisters[address];
+-            break;
+-        default:
+-            val = 0;
+-            break;
+-        }
+-        return val;
++        const uint32_t result = m_ipu->readCommand();
++        processIpuDma(); // Preserve the sampled value; service the new demand.
++        return result;
+     }
++    if (address == IpuDevice::kControl)
++        return m_ipu->readControl();
++    if (address == IpuDevice::kBitPointer)
++        return m_ipu->readBitPointer();
++    if (address == IpuDevice::kTop)
++        return m_ipu->readTop();
++
++    if (address == IpuDevice::kCommand + 4u)
++        return m_ipu->readCommandBusy();
++    if (address == IpuDevice::kTop + 4u)
++        return static_cast<uint32_t>(m_ipu->readTop64() >> 32u);
++    if (address >= 0x10002000u && address < 0x10002040u)
++        return 0u;
+ 
+     if (address == 0x10003020u) // GIF_STAT
+     {
+@@ -2365,6 +2885,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         {
+             if ((address & 0xFF) == 0x00)
+             {
++                if (address == 0x1000B400u || address == 0x1000B000u)
++                    return m_ioRegisters[address];
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+                 return channelStatus;
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+new file mode 100644
+index 0000000..f3b8a80
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -0,0 +1,40 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++// Serialized by the backend callback-owner mutex. Samples always stay stereo.
++class SpuPcmQueue
++{
++public:
++    static constexpr size_t CapacityFrames = 96000;
++    bool push(std::span<const int16_t> samples)
++    {
++        if (samples.size() % 2u || samples.size() / 2u > CapacityFrames - m_count)
++            return false;
++        for (size_t i = 0; i < samples.size() / 2u; ++i)
++        {
++            const size_t p = ((m_head + m_count + i) % CapacityFrames) * 2u;
++            m_samples[p] = samples[2u*i]; m_samples[p+1u] = samples[2u*i+1u];
++        }
++        m_count += samples.size() / 2u;
++        return true;
++    }
++    void consume(std::span<int16_t> output)
++    {
++        std::fill(output.begin(), output.end(), int16_t{});
++        const size_t frames = std::min(output.size() / 2u, m_count);
++        for (size_t i = 0; i < frames; ++i)
++        {
++            const size_t p = ((m_head + i) % CapacityFrames) * 2u;
++            output[2u*i] = m_samples[p]; output[2u*i+1u] = m_samples[p+1u];
++        }
++        m_head = (m_head + frames) % CapacityFrames; m_count -= frames;
++    }
++    void clear() noexcept { m_head = m_count = 0; }
++private:
++    std::array<int16_t, CapacityFrames * 2u> m_samples{};
++    size_t m_head = 0, m_count = 0;
++};
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 133b865..b3f4d03 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -556,6 +556,7 @@ PS2Runtime::~PS2Runtime()
+ #else
+         if (IsAudioDeviceReady())
+         {
++            m_audioBackend.stopAll();
+             CloseAudioDevice();
+             m_audioBackend.setAudioReady(false);
+         }
+@@ -1634,6 +1635,21 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+     }
+ }
+ 
++// IPU completion is produced only by EE-owned MMIO/FIFO/DMA work. Queue handlers
++// through the existing scheduler, never invoke guest code inline from the device.
++void PS2Runtime::drainIpuDeviceInterrupts(uint8_t *rdram, uint32_t vaddr)
++{
++    const uint32_t phys = vaddr & 0x1FFFFFFFu;
++    if (!((phys >= 0x10002000u && phys < 0x10002100u) ||
++          (phys >= 0x10007000u && phys < 0x10007020u) ||
++          (phys >= 0x1000B400u && phys < 0x1000B500u) ||
++          (phys & ~3u) == 0x1000E000u || (phys & ~3u) == 0x1000F590u))
++        return;
++    drainCompletedDmacHandlers(rdram);
++    if (m_memory.consumeIpuInterrupt())
++        eeScheduler().dispatchIrq(false, 8u); // INTC_IPU, distinct from DMAC channel 4.
++}
++
+ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
+ {
+     raiseGuestException(ctx, EXCEPTION_TRAP);
+@@ -2155,7 +2171,13 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
+     try
+     {
+-        return m_memory.read8(vaddr);
++        const auto value = m_memory.read8(vaddr);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++        return value;
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2168,7 +2190,13 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
+     try
+     {
+-        return m_memory.read16(vaddr);
++        const auto value = m_memory.read16(vaddr);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++        return value;
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2181,7 +2209,13 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
+     try
+     {
+-        return m_memory.read32(vaddr);
++        const auto value = m_memory.read32(vaddr);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++        return value;
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2194,7 +2228,13 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
+     try
+     {
+-        return m_memory.read64(vaddr);
++        const auto value = m_memory.read64(vaddr);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++        return value;
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2207,7 +2247,13 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
+ {
+     try
+     {
+-        return m_memory.read128(vaddr);
++        const auto value = m_memory.read128(vaddr);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++        return value;
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2222,6 +2268,11 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
+     try
+     {
+         m_memory.write8(vaddr, value);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2235,6 +2286,11 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+     try
+     {
+         m_memory.write16(vaddr, value);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2248,8 +2304,13 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+     try
+     {
+         m_memory.write32(vaddr, value);
++        drainIpuDeviceInterrupts(rdram, vaddr);
+         drainCompletedDmacHandlers(rdram);
+     }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
++    }
+     catch (const std::exception &)
+     {
+         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+@@ -2262,6 +2323,11 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+     try
+     {
+         m_memory.write64(vaddr, value);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+@@ -2277,6 +2343,11 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
+     try
+     {
+         m_memory.write128(vaddr, value);
++        drainIpuDeviceInterrupts(rdram, vaddr);
++    }
++    catch (const IpuUnsupportedOperation &)
++    {
++        throw; // Missing device behavior is a host compatibility failure, not a guest address fault.
+     }
+     catch (const std::exception &)
+     {
+-- 
+2.55.0
+

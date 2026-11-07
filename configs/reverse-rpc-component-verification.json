@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "source_status": "astra-reviewed-private-finite-original-ee-sdk-composition",
+  "accepted_runtime_patch_prefix": 21,
+  "production_transport_integrated": false,
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "scope": "finite controlled schedule, synthetic MIPS module and selected synthetic EE service",
+    "disposition": "docs/reviews/reverse-rpc-exec-boundary.md"
+  },
+  "observed_route": [
+    "authored real MIPS Call16 import",
+    "existing SIF command carrier",
+    "original SetQueue/Register",
+    "original empty-queue A0-to-C0 ingress",
+    "original GetNext/RpcLoop/Exec",
+    "checked same-owner yielding synthetic service",
+    "actual distinct64-byte replies in IOP RAM",
+    "original epilogue",
+    "original MIPS continuation stores"
+  ],
+  "observed_counts": {
+    "calls": 2,
+    "reply_bytes_per_call": 64,
+    "continuations": 2,
+    "EE_service_thread": 2,
+    "EE_execution_lifetime": 2,
+    "intervening_resets": 0
+  },
+  "original_identity": {
+    "generated_source_files": 16,
+    "annotated_instruction_files": 13,
+    "matched_instruction_words": 365,
+    "existing_runtime_known_wrapper_files": 3
+  },
+  "guards_observed": [
+    "full SP/GP after original epilogue",
+    "low64 S0..S4 restoration",
+    "returned S0 upper64 survives",
+    "original registration/queue/stale tail",
+    "native SDK packet pool remains empty",
+    "existing SIF carrier free and reuse"
+  ],
+  "negative_controls": {
+    "same_binary": true,
+    "wrong_parent_restore_exit": 1,
+    "skipped_epilogue_exit": 1
+  },
+  "artifact_sha256": {
+    "fixture_cpp": "3a0e08bfa8dd1a96d7d919fce303b2ce493e4423e6da3544e91f37a7efc0d06a",
+    "fixture_irx": "e116fb6e4ab0f346e3051f25f23112ecb9e9f86983dccab7b6977e711ec585ad",
+    "binary": "d46cfa4683d9345faabe9cc94aa05e2f0eaada6940228b5b101e651e59cd7f25"
+  },
+  "limits": [
+    "BC nonempty branch not executed by this combined fixture",
+    "controlled explicit IOP advancement after epilogue",
+    "primary zero result words are weak; supplemental reviewed variants use nonzero sentinels",
+    "not original STREAM/EE3/IOP17",
+    "no cancellation/revocation/null/length/unmapped or IRQ/timer-handler matrix acceptance",
+    "no production packet convention or native audio/gameplay acceptance"
+  ],
+  "publication_variants": {
+    "retired-publication": {
+      "reviewed_model": "gpt-6-astra",
+      "reviewed_effort": "ultra",
+      "scope": "finite synthetic service and explicit private IOP schedule",
+      "build_exit": 0,
+      "run_exit": 0,
+      "binary_sha256": "bed97fdbfe104f1b00f41a476cfb6bd6fa0560e215fcdd0ad412e4f41ec96878",
+      "fixture_sha256": "446f6bf7b567dbe3a7ac3a5b24bcb39047ba53c35cd550d0851f08d8a77e50ff",
+      "negative_controls": {
+        "wrong-parent-restore": 1,
+        "skip-epilogue": 1
+      },
+      "detached_publications": 2,
+      "ordinary_owner_survives": true,
+      "nonzero_result_sentinels_become_zero": true,
+      "forced_original_cache_resumes": 0,
+      "asserted_vblank_events": 0
+    },
+    "retired-events": {
+      "reviewed_model": "gpt-6-astra",
+      "reviewed_effort": "ultra",
+      "scope": "finite synthetic service and explicit private IOP schedule",
+      "build_exit": 0,
+      "run_exit": 0,
+      "binary_sha256": "d1559c89c53f61bfb2df20336b76d78ba360b1760d7f40f1d50fa125dc927cd1",
+      "fixture_sha256": "371aec126514f6600e11da3b753943f488e469bbe37535a327f81754df19bc89",
+      "negative_controls": {
+        "wrong-parent-restore": 1,
+        "skip-epilogue": 1
+      },
+      "detached_publications": 2,
+      "ordinary_owner_survives": true,
+      "nonzero_result_sentinels_become_zero": true,
+      "forced_original_cache_resumes": 2,
+      "asserted_vblank_events": 2
+    }
+  },
+  "original_handler_runtime_owned22": {
+    "reviewed_model": "gpt-6-astra",
+    "reviewed_effort": "ultra",
+    "build_exit": 0,
+    "run_exit": 0,
+    "binary_sha256": "bf728c9bc52dec3dea18217f087fce7ae2ce9e9e2f2af902394b3bc40d703d9f",
+    "fixture_sha256": "147610ce18f7e98a9b2c0f38dbf85e7d2dfb1779ace9e2cb38189588a4d0c3f7",
+    "EE_handler": "0x20F410",
+    "opcodes": [
+      999,
+      0
+    ],
+    "actual_EE_reply": "0x7EDE80",
+    "reply_bytes_per_call": 64,
+    "calls": 2,
+    "MIPS_continuations": 2,
+    "EE_owner_thread": 2,
+    "EE_owner_lifetime": 2,
+    "EE_cycles": 3072,
+    "command_retirement_policy": "whole checked command Return joined with original Exec epilogue",
+    "original_generated_source_files": 19,
+    "matched_annotated_instruction_words": 522,
+    "negative_controls": {
+      "wrong-parent-restore": 0,
+      "skip-epilogue": 1
+    },
+    "wrong_parent_control_discriminating": false,
+    "reply_helper_resumes": 0,
+    "processed_VBlank_events": 2,
+    "production_transport_integrated": false,
+    "scope": "Authored MIPS caller; actual original EE999/null-op0 handler and dependencies, observed40-byte payloads; initiallyzero ready state",
+    "limits": [
+      "not actual STREAM17IRX caller or reply-dependent worker behavior",
+      "no full999 CPU/RAM parity",
+      "nonnull callback and ready paths unproved",
+      "native packet conventions, cancellation/provider/observer/range/timer/IRQ pending",
+      "no native PCM/voice/audio/gameplay acceptance",
+      "separate storage-handoff composition not inherited"
+    ]
+  },
+  "original_handler_storage_handoff23": {
+    "reviewed_model": "gpt-6-astra",
+    "reviewed_effort": "ultra",
+    "private_composition": true,
+    "source_patch_prefix": 22,
+    "build_exit": 0,
+    "run_exit": 0,
+    "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+    "fixture_sha256": "26ec6a259d5b600df4d4dc2572f76fbbc1e846347ca175071d51f8fc3703c66d",
+    "run_log_sha256": "08d446ab4a0516388d7a32ae0b03ee94a4aca82e8b7a96e9051334457f21490c",
+    "actual_addresses": {
+      "queue": "0x7EDDF0",
+      "server": "0x7EDE08",
+      "reply": "0x7EDE80",
+      "payload": "0x7EDEC0",
+      "handler": "0x20F410"
+    },
+    "baseline": {
+      "EE_cycles": 3000,
+      "Wake_handoffs": 2,
+      "publications_with_live_old_command": 2,
+      "checked_command_Returns": 2,
+      "handler_returns": 2,
+      "Exec_epilogues": 2,
+      "MIPS_continuations": 2,
+      "reply_bytes_per_call": 64,
+      "intervening_resets": 0,
+      "reply_helper_resumes": 0,
+      "processed_VBlank_events": 2
+    },
+    "controls": {
+      "wrong-parent-restore": {
+        "exit_code": 0,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "08d446ab4a0516388d7a32ae0b03ee94a4aca82e8b7a96e9051334457f21490c"
+      },
+      "skip-epilogue": {
+        "exit_code": 1,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "974607e682ae7337ec0bff95afeac7860d5b702ba0491ecb1e879ce974d36e52"
+      },
+      "cancel-old-command": {
+        "exit_code": 0,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "1effaf26cb83034a891d7fb32f5e7e9889ed5390e54bc467f594bbb077004b0e"
+      },
+      "advance-before-command-tail": {
+        "exit_code": 0,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "c24bbebb2a49c4bcc89c60275110f20b02f46dc91d6e17fc37918dcfbaff3aae"
+      },
+      "cancel-after-next-admission": {
+        "exit_code": 0,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "10d9167006c41bf04347adabcae2b2aa71a2352a83d9f3884bc9f0488b9c94fd"
+      },
+      "require-cancel-during-replacement": {
+        "exit_code": 1,
+        "binary_sha256": "756b58dd18e7702dd22702cfc57faf009042d4a67c735003a54a663e3a007e87",
+        "log_sha256": "d21dd78e468f7c11a3e4644a2cedc411a21f6ea836be95040642b893946f6ddb"
+      }
+    },
+    "accepted_stress_claim": "new active request admission while old command remains live, followed by eventual old cancellation",
+    "cancel_while_replacement_active_verified": false,
+    "combined_cancel_witness": {
+      "matched": 0,
+      "missed_full_predicate": 1
+    },
+    "wrong_parent_control_discriminating": false,
+    "upper_lane_claim": "original Exec entry upper preserved, not discrimination of handler-produced changes",
+    "native_transport_integrated": false,
+    "limits": [
+      "authored IOP caller and ordinary EE2/life2, not native STREAM17 worker",
+      "fixed game addresses, not arbitrary alias/range validation",
+      "no forced native scheduler/timing policy",
+      "strict active replacement cancellation diagnostic is missing coverage, not production defect",
+      "pre-publication cancellation/provider/observer/null/length/unmapped/timerIRQ/nonnull/ready gates open",
+      "no native audio/gameplay acceptance"
+    ]
+  }
+}

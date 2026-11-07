@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "source_commit": "e545065",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "production_change": false,
+  "status": "all four Japanese opening narration groups visually observed natively; full scene progression/audio/performance unverified",
+  "native_associated_captures": [
+    {
+      "capture": "captures/native-zettai/20261009-113719",
+      "record_sha256": "1ec5cdc84a035e6e49581611ae2363232826106c6d9e4ada09ee8acd0c3f5458",
+      "observer_sha256": "5cbf583bf0ccf26a1740ba1dc56d5e1d5ebc88b20338c32862d445e28720d38a",
+      "vsync_tick": 1534,
+      "visible_dimensions": [
+        640,
+        448
+      ],
+      "storage_bytes": 1310720,
+      "display_fbp": 0,
+      "display_psm": 2,
+      "context_frames": [
+        {
+          "fbp": 0,
+          "fbw": 10,
+          "psm": 2,
+          "fbmsk": 0
+        },
+        {
+          "fbp": 70,
+          "fbw": 10,
+          "psm": 0,
+          "fbmsk": 0
+        }
+      ],
+      "replay_byte_differences": 0,
+      "replay_record_sha256": "3a4cb6305accdbb7c66f8f8d604721cd2de3a956bc12a2286d5979b4ab910ea8",
+      "native_narration_visually_verified": false
+    },
+    {
+      "capture": "captures/native-zettai/20261009-114110",
+      "record_sha256": "729ad75c409e095ad6623cc8fe9b66d2c0213f8ebba29dc4b6e61f1a6c622b07",
+      "observer_sha256": "8149e889c37bd19eee151f6ddab36b3ad985b6a1e35e2abecab47bdc69dc54b7",
+      "vsync_tick": 1519,
+      "visible_dimensions": [
+        640,
+        448
+      ],
+      "storage_bytes": 1310720,
+      "display_fbp": 0,
+      "display_psm": 2,
+      "context_frames": [
+        {
+          "fbp": 0,
+          "fbw": 10,
+          "psm": 2,
+          "fbmsk": 0
+        },
+        {
+          "fbp": 70,
+          "fbw": 10,
+          "psm": 0,
+          "fbmsk": 0
+        }
+      ],
+      "replay_byte_differences": 0,
+      "replay_record_sha256": "3a4cb6305accdbb7c66f8f8d604721cd2de3a956bc12a2286d5979b4ab910ea8",
+      "native_narration_visually_verified": false
+    },
+    {
+      "capture": "captures/native-zettai/20261009-115236",
+      "record_sha256": "d4f23b9ed3b880c2556efa42a1cbcc85e88c9c2f8360d7dfd827aa1bcb42910d",
+      "observer_sha256": "ead10d313818ece68486f9e2dc0be19339fb7c70a73df7047e464029caec6678",
+      "list_helper_sha256": "a7eff702647e2020b0e71c6c5b49832be1817fc4bc39863c11f343403b3f30a0",
+      "vsync_tick": 1669,
+      "visible_dimensions": [
+        640,
+        448
+      ],
+      "storage_bytes": 1310720,
+      "display_fbp": 0,
+      "display_psm": 2,
+      "context_frames": [
+        {
+          "fbp": 0,
+          "fbw": 10,
+          "psm": 2,
+          "fbmsk": 0
+        },
+        {
+          "fbp": 70,
+          "fbw": 10,
+          "psm": 0,
+          "fbmsk": 0
+        }
+      ],
+      "replay_byte_differences": 0,
+      "native_narration_visually_verified": false,
+      "narration_scope": "Absent in earlier sample"
+    },
+    {
+      "capture": "captures/native-zettai/20261009-115647",
+      "record_sha256": "52c7c82c9039c749e68570fb8c251551223b74bb968c84a86247984eb161e9d1",
+      "observer_sha256": "ead10d313818ece68486f9e2dc0be19339fb7c70a73df7047e464029caec6678",
+      "list_helper_sha256": "a7eff702647e2020b0e71c6c5b49832be1817fc4bc39863c11f343403b3f30a0",
+      "vsync_tick": 2497,
+      "visible_dimensions": [
+        640,
+        448
+      ],
+      "storage_bytes": 1310720,
+      "display_fbp": 0,
+      "display_psm": 2,
+      "context_frames": [
+        {
+          "fbp": 0,
+          "fbw": 10,
+          "psm": 2,
+          "fbmsk": 0
+        },
+        {
+          "fbp": 70,
+          "fbw": 10,
+          "psm": 0,
+          "fbmsk": 0
+        }
+      ],
+      "replay_byte_differences": 0,
+      "native_narration_visually_verified": true,
+      "narration_scope": "All four opening groups"
+    }
+  ],
+  "sampled_original_state_parity": {
+    "reference_capture": "captures/reference-zettai/20261009-113914",
+    "reference_consistency": "sequential reads, not atomic or guest-time-aligned with native",
+    "native_capture": "captures/native-zettai/20261009-114110",
+    "opening_descriptor": "0x2d4880",
+    "list_helper_requested_words": 86,
+    "first_list_sampled_nodes": 2,
+    "first_list_termination": "sentinel",
+    "second_list_sampled_nodes": 8,
+    "second_list_termination": "eight-node bound",
+    "list_sample_dict_equal": true,
+    "full_list_or_font_state_parity": false
+  },
+  "reference_gs": {
+    "capture": "captures/reference-zettai/20261009-114350",
+    "private_artifacts": "research/reference-opening-state",
+    "pcsx2_version": "v2.8.2",
+    "gs_serialization_version": 9,
+    "vram_offset": 425,
+    "vram_bytes": 4194304,
+    "tail_bytes": 84,
+    "gs_bin_bytes": 4194813,
+    "context_fbp": 70,
+    "context_fbw": 10,
+    "context_psm": 0,
+    "decoded_fbp70_contains_narration": true,
+    "screenshot_dimensions": [
+      640,
+      480
+    ],
+    "decoded_view_dimensions": [
+      640,
+      448
+    ],
+    "pixel_exact_screenshot_parity": false,
+    "texture_cache_readback_on_close": false,
+    "general_vram_screenshot_coherence_verified": false
+  },
+  "replay_tool": {
+    "source_sha256": "8dbb5391e8e05556ded79fe8dfb6bcd8808cf1a6e7f9adccb093a1d6281c8134",
+    "binary_sha256": "a3bcdd5a42a8800ed5c40eae71c9b0b1ce51e09989bba01e01038f9c042e3529",
+    "runtime_archive_sha256": "27c6bfab95cd7a4a8bd42ff7230eb29a958f809dd9448f63d31f6e2878a27acd",
+    "scope": "Reproduction of captured CPU presentation, not original GS correctness"
+  },
+  "correctness_review": "Astra gpt-6-astra ultra independently signed off all four native narration groups, associated frame/hash/full-storage replay, bounded partial state parity, matching stock GS state/dump layout, limited stock-input presentation and daemon sample timer. No full scene/voice/performance acceptance.",
+  "limitations": [
+    "Snapshot/frame association does not align stock/native guest timing.",
+    "Sampled handles/nodes are not proven pixel-producing jobs; second list truncated.",
+    "Initial 113326 observer serialization failed and is excluded from associated evidence.",
+    "Candidate PSMCT32 FBP0 decoding is not actual display PSMCT16; presentation output is authoritative.",
+    "Earlier narration-absent samples were too early to establish a rendering defect. All four groups are now observed natively; full opening progression, voice, battle, saves, high-FPS and other-disc gameplay remain unverified."
+  ],
+  "later_native_live_evidence": {
+    "capture": "captures/native-zettai/20261009-115647",
+    "screenshot": "timing-live-120012.png",
+    "first_narration_line_visible": true,
+    "owner_cwd_verified": true,
+    "capture_terminal": true,
+    "scope": "First line in real application screenshot; all four groups in associated delayed native host frame. Not full scene progression, voice or performance proof.",
+    "all_four_narration_groups_in_delayed_host_frame": true
+  },
+  "stock_input_presentation": {
+    "capture": "captures/reference-zettai/20261009-115440",
+    "private_artifacts": "research/reference-opening-gsdump",
+    "compressed_dump_sha256": "22da74f4269aaef3261802d6b001e41fc9197dec2cc9350e73b44ccb6af30bd5",
+    "parser_sha256": "c4afe3312db5f1eb1a211c82173b496c7c2897004aa7c77812a918df0f8c97a3",
+    "packet_count": 2988,
+    "transfer_packet_count": 2980,
+    "transfer_bytes": 957040,
+    "seven_privileged_registers_equal_native_114110": true,
+    "stock_full_request_equal_native": false,
+    "vsync_tick_source": "synthetic field parity from CSR.FIELD, not stock tick",
+    "narration_visible_through_existing_native_presentation": true,
+    "stock_screenshot_pixel_parity": false,
+    "preceding_native_draw_stages_verified": false,
+    "correctness_review": "Astra Ultra verified source/layout/raw slices/packet EOF and glyph-preserving image; parser count/order rails then added and rerun"
+  },
+  "later_native_readiness_sample": {
+    "private_reference": "research/reference-opening-state/original-readiness-fields.json",
+    "native_captures": [
+      "captures/native-zettai/20261009-115236",
+      "captures/native-zettai/20261009-115647"
+    ],
+    "sampled_words": 8,
+    "sample_equal_reference": true,
+    "full_readiness_or_timing_proof": false
+  },
+  "capture_harness": {
+    "change": "debug sample timer daemonized to avoid delaying debugger shutdown after early stop",
+    "tooling_tests_passed": 27,
+    "early_gdb_quit_smoke_seconds": 0.077,
+    "native_runtime_rebuilt": false
+  },
+  "ordinary_followup": {
+    "capture": "captures/native-zettai/20261009-120900",
+    "status": "running; no behavior accepted yet",
+    "seconds_bound": 590,
+    "debugger": false,
+    "purpose": "scene progression beyond opening narration"
+  }
+}

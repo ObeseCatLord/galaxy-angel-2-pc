@@ -1,0 +1,497 @@
+From 84cdbd260213e2c4b556114e96d67ab375a63ba2 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:09:01 -0500
+Subject: [PATCH] ga2: code review 55 fixes, round 2
+
+- LoadExecPS2: a program on no registered disc returns an error to the
+  guest instead of exec'ing a command line the child rejects; before exec,
+  all stdio streams are flushed and every descriptor is marked CLOEXEC.
+- Disc changer runs in guest time (30 vsyncs) instead of wall-clock 500 ms,
+  and only inserts a disc when the game looks for that disc's program
+  (SLPM_xxx.xx), so unrelated misses never swap discs.
+- Memory-card entry times use the console clock (JST), like the CDVD RTC.
+- GS CSR: bits 0..4 write-one-to-clear, the rest read-only to the guest;
+  VSINT latches at vblank start.
+- Interrupt causes raised while masked stay pending and are delivered when
+  the cause is enabled (INTC_STAT/D_STAT behaviour).
+- paraLLEl-GS readback ring consumes finished frames oldest first, so the
+  newest finished frame is presented.
+- VU1 generator: D/T halt pairs count as MAC readers.
+
+Verified: 561/561 runtime tests, IOP suites, VU1 replay --reference 0
+mismatches, Zettai load+save, Mugen 2 Extra Route and Eigou 2 disc checks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h    |  4 ++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    | 12 +++++
+ .../src/lib/Kernel/Stubs/MemoryCard.cpp       | 11 ++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             | 11 ++--
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp        | 53 ++++++++++++++-----
+ ps2xRuntime/src/lib/ps2_disc_mount.h          |  8 +--
+ ps2xRuntime/src/lib/ps2_memory.cpp            | 51 ++++++------------
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 29 ++++++++++
+ ps2xTest/src/ga2_vu1_gen.cpp                  |  6 ++-
+ ps2xTest/src/ps2_gs_tests.cpp                 | 28 ++++++----
+ 10 files changed, 139 insertions(+), 74 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 7ca9cc7..daf1270 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -487,6 +487,10 @@ private:
+     int m_dmacTailOrder = 1000;
+     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
++    // Causes raised while masked stay pending (INTC_STAT/D_STAT) and are
++    // delivered when the cause is enabled again.
++    uint32_t m_pendingIntcMask = 0u;
++    uint32_t m_pendingDmacMask = 0u;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f192a30..c4586c2 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -122,6 +122,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_dmacTailOrder = 1000;
+     m_enabledIntcMask = 0xFFFFFFFFu;
+     m_enabledDmacMask = 0xFFFFFFFFu;
++    m_pendingIntcMask = 0u;
++    m_pendingDmacMask = 0u;
+     m_currentThreadId = 0;
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+@@ -1696,6 +1698,8 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+     if (cause < 32u)
+     {
+         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
++        uint32_t &pending = dmac ? m_pendingDmacMask : m_pendingIntcMask;
++        const bool wasEnabled = (mask & (1u << cause)) != 0u;
+         if (enabled)
+         {
+             mask |= 1u << cause;
+@@ -1704,6 +1708,11 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+         {
+             mask &= ~(1u << cause);
+         }
++        if (enabled && !wasEnabled && (pending & (1u << cause)) != 0u)
++        {
++            pending &= ~(1u << cause);
++            dispatchIrq(dmac, cause);
++        }
+     }
+     return KE_OK;
+ }
+@@ -1714,6 +1723,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+     if (cause < 32u && (mask & (1u << cause)) == 0u)
+     {
++        (dmac ? m_pendingDmacMask : m_pendingIntcMask) |= 1u << cause;
+         return;
+     }
+     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+@@ -2386,6 +2396,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+             }
+         }
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
++        // VSINT latches at every vblank start until the guest writes it back (W1C).
++        m_runtime.memory().gs().csr.fetch_or(0x8ull, std::memory_order_acq_rel);
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 80b6d5a..3b1ee44 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -252,12 +252,15 @@ namespace ps2_stubs
+             return resolved.lexically_normal();
+         }
+ 
+-        bool localtimeSafeMc(const std::time_t *value, std::tm *out)
++        // Card entries carry the console clock, which on a Japanese PS2 (and in
++        // the CDVD RTC this runtime reports) is JST: UTC+9, no DST.
++        bool consoleTimeMc(const std::time_t *value, std::tm *out)
+         {
++            const std::time_t jst = *value + 9 * 60 * 60;
+ #ifdef _WIN32
+-            return localtime_s(out, value) == 0;
++            return gmtime_s(out, &jst) == 0;
+ #else
+-            return localtime_r(value, out) != nullptr;
++            return gmtime_r(&jst, out) != nullptr;
+ #endif
+         }
+ 
+@@ -287,7 +290,7 @@ namespace ps2_stubs
+         void writeMcDateTime(SceMcStDateTime &out, std::time_t value)
+         {
+             std::tm tm{};
+-            if (!localtimeSafeMc(&value, &tm))
++            if (!consoleTimeMc(&value, &tm))
+             {
+                 std::memset(&out, 0, sizeof(out));
+                 return;
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 0f2c127..c66d91e 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -235,7 +235,9 @@ namespace
+     // Asynchronous readback ring: never wait for the GPU on the game thread.
+     void readbackLocked(State &s, const ScanoutResult &result)
+     {
+-        for (int k = 1; k <= 2; ++k)
++        // slotIndex is the oldest submission: consume finished slots oldest
++        // first so the newest finished frame is the one presented.
++        for (int k = 0; k < 3; ++k)
+         {
+             ReadbackSlot &old = s.slots[(s.slotIndex + k) % 3];
+             if (old.pending && old.fence && old.fence->wait_timeout(0))
+@@ -243,12 +245,7 @@ namespace
+         }
+         ReadbackSlot &slot = s.slots[s.slotIndex];
+         if (slot.pending)
+-        {
+-            if (slot.fence && slot.fence->wait_timeout(0))
+-                consumeSlotLocked(s, slot);
+-            else
+-                return; // GPU is behind; drop this frame's copy
+-        }
++            return; // GPU is behind; drop this frame's copy
+         const uint32_t w = result.image->get_width(), h = result.image->get_height();
+         if (!slot.buffer || slot.width != w || slot.height != h)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 3b83208..486e1ef 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -52,12 +52,19 @@ namespace ps2_disc
+             Identity identity;
+             std::unordered_map<std::string, File> files;
+             DiscInfo info;
++            std::string bootKey; // the disc's program, e.g. "SLPM_667.79"
+         };
+         std::vector<Disc> discs;
+         size_t currentDisc = 0u;
+-        std::chrono::steady_clock::time_point changerArmedAt{};
+-        uint32_t trayPolls = 0u;
+-        constexpr auto kChangerHold = std::chrono::milliseconds(500);
++        // The changer runs in guest time (vsyncs), so host stalls cannot
++        // disarm it in the middle of a disc check.
++        uint64_t (*guestClock)() = nullptr;
++        uint64_t changerArmedAt = 0u;
++        bool changerEverArmed = false;
++        uint64_t trayOpenedAt = 0u;
++        bool trayEverOpened = false;
++        constexpr uint64_t kChangerHoldVsyncs = 30u;
++        constexpr uint64_t kTrayCycleVsyncs = 30u;
+ 
+         bool identity(const std::filesystem::path &path, Identity &result)
+         {
+@@ -196,9 +203,14 @@ namespace ps2_disc
+             catch (const std::exception &) {}
+         }
+ 
++        uint64_t guestNow()
++        {
++            return guestClock ? guestClock() : 0u;
++        }
++
+         bool changerArmedLocked()
+         {
+-            return std::chrono::steady_clock::now() - changerArmedAt < kChangerHold;
++            return changerEverArmed && guestNow() - changerArmedAt <= kChangerHoldVsyncs;
+         }
+ 
+         uint64_t unsignedField(const nlohmann::json &item, const char *name)
+@@ -302,6 +314,8 @@ namespace ps2_disc
+             Disc disc;
+             disc.image = image;
+             disc.info = {image, manifest, std::string(imageSha256), std::string(manifestSha256)};
++            if (metadata.contains("boot") && metadata["boot"].contains("path"))
++                disc.bootKey = pathKey(metadata["boot"]["path"].get<std::string>());
+             for (const auto &entry : entries)
+             {
+                 const std::string key = pathKey(entry.at("path").get<std::string>());
+@@ -365,7 +379,7 @@ namespace ps2_disc
+             verifiedImage = configured; verifiedIdentity = disc.identity;
+             mode = Mode::Verified; files = std::move(disc.files);
+             discs.clear(); currentDisc = 0u;
+-            discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info});
++            discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info, disc.bootKey});
+             return true;
+         }
+         catch (const std::exception &failure)
+@@ -424,19 +438,33 @@ namespace ps2_disc
+         return -1;
+     }
+ 
++    void setGuestClock(uint64_t (*clock)())
++    {
++        std::lock_guard lock(mutex);
++        guestClock = clock;
++    }
++
+     void armChanger()
+     {
+         std::lock_guard lock(mutex);
+-        if (!changerArmedLocked()) trayPolls = 0u;
+-        changerArmedAt = std::chrono::steady_clock::now();
++        if (!changerArmedLocked()) trayEverOpened = false;
++        changerArmedAt = guestNow();
++        changerEverArmed = true;
+     }
+ 
+     bool trayOpenNow()
+     {
+         std::lock_guard lock(mutex);
+         // A disc-change scene resets its tray flags on entry, so keep cycling:
+-        // open for one status poll, then closed for 29.
+-        return changerArmedLocked() && trayPolls++ % 30u == 0u;
++        // the tray reads open for one status poll every kTrayCycleVsyncs.
++        if (!changerArmedLocked())
++            return false;
++        const uint64_t now = guestNow();
++        if (trayEverOpened && now - trayOpenedAt < kTrayCycleVsyncs)
++            return false;
++        trayEverOpened = true;
++        trayOpenedAt = now;
++        return true;
+     }
+ 
+     bool findFile(std::string_view guestPath, File &file, std::filesystem::path *image)
+@@ -452,11 +480,12 @@ namespace ps2_disc
+             return true;
+         }
+         if (discs.size() < 2u || !changerArmedLocked()) return false;
+-        // The game is asking for a disc it does not see: insert the registered
+-        // disc that has the file (boot disc first, then registration order).
++        // The game is checking for another disc: the disc checks look for the
++        // disc's own program (SLPM_xxx.xx), so only that inserts a disc; any
++        // other miss stays a miss.
+         for (size_t index = 0u; index < discs.size(); ++index)
+         {
+-            if (index == currentDisc) continue;
++            if (index == currentDisc || discs[index].bootKey != key) continue;
+             const auto entry = discs[index].files.find(key);
+             if (entry == discs[index].files.end()) continue;
+             file = entry->second;
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+index e1ecb5d..14d0b3b 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.h
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -43,11 +43,13 @@ namespace ps2_disc
+     [[nodiscard]] std::vector<DiscInfo> registeredDiscs();
+     // Index (into registeredDiscs) of the disc holding the file, or -1.
+     [[nodiscard]] int discHolding(std::string_view guestPath);
++    // Guest time source (vsync count) for the changer.
++    void setGuestClock(uint64_t (*clock)());
+     // Called every frame by a game's disc-change scene: arms the changer and
+-    // the virtual tray for ~0.5 s.
++    // the virtual tray for 30 guest vsyncs.
+     void armChanger();
+-    // Virtual tray for sceCdStatus: true on the polls where the tray should
+-    // read as open (one poll in 30 while the changer is armed).
++    // Virtual tray for sceCdStatus: true on the poll where the tray should read
++    // as open (at most once per 30 guest vsyncs while the changer is armed).
+     [[nodiscard]] bool trayOpenNow();
+     [[nodiscard]] std::string pathKey(std::string_view guestPath);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 749537d..0bc168e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -102,46 +102,26 @@ namespace
+ 
+     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+ 
+-    // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
+-    // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
+-    // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
+-    // so the whole read-modify-write is a single atomic step -- this register is
+-    // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
+-    // other threads, so a load-then-store here would race with them.
+-    inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
++    // Guest writes to GS CSR. Bits 0..4 (SIGNAL, FINISH, HSINT, VSINT, EDWINT)
++    // are write-one-to-clear; FLUSH (8) and RESET (9) are actions that never
++    // latch; NFIELD/FIELD/FIFO and REV/ID (12..63) are read-only. Writing 8
++    // therefore clears VSINT instead of setting it (the SDK's vsync wait).
++    // compare_exchange keeps the update atomic with the scheduler (FIELD,
++    // VSINT) and the GIF (SIGNAL/FINISH).
++    constexpr uint64_t kCsrWriteOneToClear = 0x1Full;
++
++    inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
+     {
+-        constexpr uint32_t kW1cMask = 0x3u;
+         uint64_t expected = csr.load();
+-        uint64_t desired;
+-        do
++        while (!csr.compare_exchange_weak(expected, expected & ~(value & kCsrWriteOneToClear)))
+         {
+-            if (off == 0u)
+-            {
+-                uint32_t oldLow = static_cast<uint32_t>(expected & 0xFFFFFFFFull);
+-                uint32_t mergedLow = (oldLow & kW1cMask) | (value & ~kW1cMask);
+-                desired = (expected & 0xFFFFFFFF00000000ull) | static_cast<uint64_t>(mergedLow);
+-                desired &= ~static_cast<uint64_t>(value & kW1cMask);
+-            }
+-            else
+-            {
+-                uint64_t mask = 0xFFFFFFFFull << (off * 8u);
+-                desired = (expected & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+-            }
+-        } while (!csr.compare_exchange_weak(expected, desired));
++        }
+     }
+ 
+-    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
+-    // write-one-to-clear against the current value).
+-    inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
++    inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
+     {
+-        constexpr uint64_t kW1cMask = 0x3ull;
+-        uint64_t expected = csr.load();
+-        uint64_t desired;
+-        do
+-        {
+-            desired = (expected & kW1cMask) | (value & ~kW1cMask);
+-            desired &= ~(value & kW1cMask);
+-        } while (!csr.compare_exchange_weak(expected, desired));
++        if (off == 0u)
++            writeCsrFull(csr, value); // the high dword is read-only
+     }
+ 
+     constexpr std::array<uint32_t, 4> kEeTimerBases = {
+@@ -992,8 +972,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+         {
+-            // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
+-            // Done as a single atomic RMW -- see writeCsrHalf's comment.
++            // CSR: write-one-to-clear status bits, read-only elsewhere (writeCsrFull).
+             writeCsrHalf(gs_regs.csr, off, value);
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 50f4797..d39c42e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,8 @@
+ #ifdef _WIN32
+ #include <process.h>
+ #else
++#include <dirent.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #endif
+ #include <fstream>
+@@ -829,6 +831,10 @@ bool PS2Runtime::syncCoreSubsystems()
+         m_gifArbiter.setTapFn([](GifPathId path, const uint8_t *data, uint32_t size)
+                               { ga2_pgs::gifTransfer(static_cast<uint32_t>(path), data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    // The disc changer counts guest vsyncs, not wall time.
++    static PS2Runtime *s_clockOwner = nullptr;
++    s_clockOwner = this;
++    ps2_disc::setGuestClock([]() -> uint64_t { return s_clockOwner->memory().gs().vsyncTick.load(std::memory_order_acquire); });
+     m_memory.setLocalToHostReader([this](uint8_t *dst, uint32_t bytes) { return m_gs.consumeLocalToHostBytes(dst, bytes); });
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+@@ -1249,6 +1255,12 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+     // The disc holding the program boots; the rest of the set comes along.
+     const auto discs = ps2_disc::registeredDiscs();
+     const int boot = ps2_disc::discHolding(guestPath);
++    if (boot < 0)
++    {
++        // The guest gets an error and keeps running (e.g. Mugen disc 1 not added).
++        std::cerr << "[exec] no registered disc holds " << guestPath << std::endl;
++        return false;
++    }
+     std::vector<std::string> argv{target->binary.string(), target->bootElf.string()};
+     for (size_t i = 0u; i < discs.size(); ++i)
+     {
+@@ -1270,6 +1282,23 @@ bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std
+     std::cerr << "[exec] handing over to " << target->binary.filename().string() << std::endl;
+     std::cout.flush();
+     std::cerr.flush();
++    // exec runs no destructors: flush every stdio stream (memory card files
++    // included) and keep the new program from inheriting our descriptors
++    // (disc images, card files, audio and GPU devices).
++    std::fflush(nullptr);
++#ifndef _WIN32
++    if (DIR *fds = opendir("/proc/self/fd"))
++    {
++        const int self = dirfd(fds);
++        while (const dirent *entry = readdir(fds))
++        {
++            const int fd = std::atoi(entry->d_name);
++            if (fd > 2 && fd != self)
++                fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
++        }
++        closedir(fds);
++    }
++#endif
+     std::vector<char *> raw;
+     for (auto &arg : argv) raw.push_back(arg.data());
+     raw.push_back(nullptr);
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index 6e71c5e..a95293a 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -66,9 +66,13 @@ namespace
+             const bool iBit = (upper >> 31) != 0u;
+             producer[i] = VU::upperProducesFmacFlags(upper);
+             const uint32_t op = lower >> 25;
++            // A D/T halt can end the run here (and a later MSCAL may read
++            // MAC first), so halt pairs count as readers too.
++            const bool halts = ((upper >> 27) & 3u) != 0u;
++            macReader[i] = halts;
+             if (!iBit)
+             {
+-                macReader[i] = op == 0x18u || op == 0x1Au || op == 0x1Bu;   // FMEQ, FMAND, FMOR
++                macReader[i] = halts || op == 0x18u || op == 0x1Au || op == 0x1Bu; // FMEQ, FMAND, FMOR
+                 statusReader[i] = op == 0x14u || op == 0x16u || op == 0x17u; // FSEQ, FSAND, FSOR
+                 statusRead = statusRead || statusReader[i];
+             }
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..7645c54 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -422,17 +422,23 @@ void register_ps2_gs_tests()
+             constexpr uint32_t kGsCsr = 0x12001000u;
+             constexpr uint32_t kGsImr = 0x12001010u;
+ 
+-            const uint64_t csrPattern = 0xA1B2C3D4E5F60718ull;
+-            mem.write64(kGsCsr, csrPattern);
+-            t.Equals(mem.read64(kGsCsr), csrPattern, "64-bit CSR read should match prior 64-bit write");
+-            t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrPattern & 0xFFFFFFFFull), "CSR low dword read should match");
+-            t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrPattern >> 32), "CSR high dword read should match");
+-
+-            mem.write32(kGsCsr, 0x11223344u);
+-            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411223344ull, "32-bit low write should preserve CSR high dword");
+-
+-            mem.write32(kGsCsr + 4u, 0x55667788u);
+-            t.Equals(mem.read64(kGsCsr), 0x5566778811223344ull, "32-bit high write should preserve CSR low dword");
++            // Hardware CSR: status bits 0..4 are write-one-to-clear, the rest
++            // (FIELD, FIFO, REV, ID) is read-only to the guest.
++            const uint64_t csrState = 0x551B00000000201Full; // ID/REV, FIELD, SIGNAL..EDWINT
++            mem.gs().csr.store(csrState);
++            t.Equals(mem.read64(kGsCsr), csrState, "64-bit CSR read should return the device state");
++            t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrState & 0xFFFFFFFFull), "CSR low dword read should match");
++            t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrState >> 32), "CSR high dword read should match");
++
++            mem.write32(kGsCsr, 0x3u);
++            t.Equals(mem.read64(kGsCsr), 0x551B00000000201Cull, "writing 1 clears SIGNAL/FINISH only");
++
++            mem.write32(kGsCsr + 4u, 0xFFFFFFFFu);
++            t.Equals(mem.read64(kGsCsr), 0x551B00000000201Cull, "the high dword (REV/ID) is read-only");
++
++            mem.write64(kGsCsr, 0xFFFF00000000F008ull);
++            t.Equals(mem.read64(kGsCsr), 0x551B000000002014ull,
++                     "64-bit write clears VSINT and ignores read-only bits");
+ 
+             const uint64_t imrPattern = 0x0123456789ABCDEFull;
+             mem.write64(kGsImr, imrPattern);
+-- 
+2.55.0
+

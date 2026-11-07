@@ -1,0 +1,179 @@
+From 44bc152854eb1e9e1c8b0eacb07a813e548b1b2a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:08:47 -0500
+Subject: [PATCH] ga2: scratchpad interleave/chain DMA failure handling
+
+- Interleave: TQWC 0 moves the transfer as one block and the SQWC skip
+  follows every block, the final partial one included (PCSX2).
+- Interleave and chain transfers this model cannot finish (address outside
+  RAM, CALL/RET tags, reserved mode 3) restore CHCR/MADR/QWC/SADR/TADR and
+  throw an explicit error instead of returning half-advanced with STR set
+  and no completion (review 55 G2).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_memory.cpp | 41 +++++++++++++++++--------
+ ps2xTest/src/ps2_memory_tests.cpp  | 48 ++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+), 12 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 0bc168e..96b754e 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1824,6 +1824,24 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+                      m_ioRegisters[channelBase + 0x30u], m_ioRegisters[0x1000E030u]);
+     }
+ 
++    // A transfer this model cannot finish restores the channel and fails
++    // loudly instead of leaving it half-advanced with STR set.
++    const uint32_t savedChcr = m_ioRegisters[channelBase];
++    const uint32_t savedMadr = madr, savedQwc = qwcReg, savedSadr = sadr;
++    const uint32_t savedTadr = m_ioRegisters[channelBase + 0x30u];
++    const auto fail = [&](const char *why) -> bool
++    {
++        m_ioRegisters[channelBase] = savedChcr;
++        madr = savedMadr;
++        qwcReg = savedQwc;
++        sadr = savedSadr;
++        m_ioRegisters[channelBase + 0x30u] = savedTadr;
++        char message[160];
++        std::snprintf(message, sizeof(message), "SPR %s DMA mode %u: %s (chcr=%08x madr=%08x tadr=%08x)",
++                      fromScratchpad ? "from" : "to", mode, why, chcr, savedMadr, savedTadr);
++        throw std::runtime_error(message);
++    };
++
+     auto copyQwords = [&](uint32_t mainAddress, uint32_t qwords) -> bool
+     {
+         for (uint32_t i = 0; i < qwords; ++i)
+@@ -1858,17 +1876,16 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+         const uint32_t sqwc = m_ioRegisters[0x1000E030u] & 0xFFu;
+         const uint32_t tqwc = (m_ioRegisters[0x1000E030u] >> 16u) & 0xFFu;
+         uint32_t remaining = qwcReg & 0xFFFFu;
+-        if (tqwc == 0u)
+-            return false;
+         while (remaining != 0u)
+         {
+-            const uint32_t run = std::min(tqwc, remaining);
++            // TQWC 0 moves the rest as one block; SQWC follows every block,
++            // the final partial one included (PCSX2 _SPR0interleave).
++            const uint32_t run = tqwc == 0u ? remaining : std::min(tqwc, remaining);
+             if (!copyQwords(madr, run))
+-                return false;
++                return fail("main-memory address outside RAM");
+             madr = (madr + run * 16u) & 0x7FFFFFF0u;
+             remaining -= run;
+-            if (run == tqwc)
+-                madr = (madr + sqwc * 16u) & 0x7FFFFFF0u;
++            madr = (madr + sqwc * 16u) & 0x7FFFFFF0u;
+         }
+         qwcReg = 0u;
+         completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+@@ -1883,7 +1900,7 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+             {
+                 const uint32_t qwc = qwcReg & 0xFFFFu;
+                 if (!copyQwords(madr, qwc))
+-                    return false;
++                    return fail("main-memory address outside RAM");
+                 madr = (madr + qwc * 16u) & 0x7FFFFFF0u;
+                 qwcReg = 0u;
+             }
+@@ -1904,10 +1921,10 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+                 }
+                 catch (const std::exception &)
+                 {
+-                    return false;
++                    return fail("tag address outside RAM");
+                 }
+                 if (tagOffset + 16u > PS2_RAM_SIZE)
+-                    return false;
++                    return fail("tag address outside RAM");
+                 std::memcpy(&tag, m_rdram + tagOffset, sizeof(tag));
+             }
+             const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+@@ -1932,13 +1949,13 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+                 case 2u: madr = tadr + 16u; m_ioRegisters[channelBase + 0x30u] = address; break; // NEXT
+                 case 3u: case 4u: madr = address; m_ioRegisters[channelBase + 0x30u] = tadr + 16u; break; // REF/REFS
+                 case 7u: madr = tadr + 16u; end = true; break; // END
+-                default: return false; // CALL/RET are not valid for scratchpad DMA
++                default: return fail("CALL/RET tags are not modelled");
+                 }
+             }
+             if (qwc != 0u)
+             {
+                 if (!copyQwords(madr, qwc))
+-                    return false;
++                    return fail("main-memory address outside RAM");
+                 madr = (madr + qwc * 16u) & 0x7FFFFFF0u;
+             }
+             if (end)
+@@ -1948,7 +1965,7 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+         completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+         return true;
+     }
+-    return false;
++    return fail("mode 3 is reserved");
+ }
+ 
+ void PS2Memory::completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause, uint64_t latencyCycles)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 094b20c..21e30a2 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2006,6 +2006,54 @@ void register_ps2_memory_tests()
+                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+         });
+ 
++        tc.Run("DMAC SPR_FROM interleave skips SQWC after every block and TQWC 0 is one block", [](TestCase &t)
++        {
++            for (const bool wholeBlock : {false, true})
++            {
++                PS2Memory mem;
++                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++                constexpr uint32_t kChannel = 0x1000D000u;
++                constexpr uint32_t kMadr = 0x00030000u;
++                for (uint32_t i = 0; i < 3u * 16u; ++i)
++                    mem.getScratchpad()[i] = static_cast<uint8_t>(0x40u + i);
++                // TQWC 2 / SQWC 1, or TQWC 0 (whole transfer as one block).
++                mem.writeIORegister(0x1000E030u, wholeBlock ? 1u : ((2u << 16u) | 1u));
++                mem.writeIORegister(kChannel + 0x10u, kMadr);
++                mem.writeIORegister(kChannel + 0x20u, 3u);
++                mem.writeIORegister(kChannel + 0x80u, 0u);
++                mem.writeIORegister(kChannel + 0x00u, 0x100u | (2u << 2u));
++                const uint8_t *ram = mem.getRDRAM();
++                const uint32_t thirdAt = wholeBlock ? kMadr + 32u : kMadr + 48u; // 2 qwords, skip 1, 1 qword
++                t.Equals(static_cast<uint32_t>(ram[kMadr]), 0x40u, "first block lands at MADR");
++                t.Equals(static_cast<uint32_t>(ram[kMadr + 16u]), 0x50u, "first block is contiguous");
++                t.Equals(static_cast<uint32_t>(ram[thirdAt]), 0x60u, "third qword lands after the skip");
++                const uint32_t expectedMadr = wholeBlock ? kMadr + 48u + 16u : kMadr + 48u + 32u;
++                t.Equals(mem.readIORegister(kChannel + 0x10u), expectedMadr, "SQWC follows the final partial block too");
++                t.IsTrue((mem.readIORegister(kChannel) & 0x100u) == 0u, "interleave completes the channel");
++            }
++        });
++
++        tc.Run("DMAC SPR_TO chain with a CALL tag restores the channel and fails loudly", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            constexpr uint32_t kChannel = 0x1000D400u;
++            constexpr uint32_t kTadr = 0x00031000u;
++            const uint64_t callTag = (5ull << 28u) | 1ull; // CALL, 1 qword
++            std::memcpy(mem.getRDRAM() + kTadr, &callTag, sizeof(callTag));
++            mem.writeIORegister(kChannel + 0x10u, 0x00032000u);
++            mem.writeIORegister(kChannel + 0x20u, 0u);
++            mem.writeIORegister(kChannel + 0x30u, kTadr);
++            mem.writeIORegister(kChannel + 0x80u, 0u);
++            bool threw = false;
++            try { mem.writeIORegister(kChannel + 0x00u, 0x100u | (1u << 2u)); }
++            catch (const std::runtime_error &) { threw = true; }
++            t.IsTrue(threw, "an unmodelled CALL tag must fail explicitly");
++            t.Equals(mem.readIORegister(kChannel + 0x30u), kTadr, "TADR must be restored");
++            t.Equals(mem.readIORegister(kChannel + 0x10u), 0x00032000u, "MADR must be restored");
++            t.IsTrue(mem.consumeCompletedDmacCauses().empty(), "a failed chain must not complete the channel");
++        });
++
+         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+-- 
+2.55.0
+

@@ -1,0 +1,598 @@
+From b061136cbefb61faf28ee992035aade789c5bc1f Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:27:15 -0500
+Subject: [PATCH] keyboard: Enter is Circle, Start moves to P, Ctrl skips
+ messages
+
+- ps2_pad_keys.h: the keyboard pad map as a header-only function (fake
+  keyboard in the tests). Enter, keypad Enter, C and Esc are Circle; Start is
+  P; Alt+Enter stays the fullscreen shortcut and presses nothing, also when
+  Alt is released first.
+- Ctrl (either side) held skips story messages: ga2_framepace skip state,
+  fed by the game side (native/compat/ga2_skip.cpp: the ADV scene's update,
+  the choice/menu builtin and the ship map's update) and by the pad: Circle
+  every other pad frame, only while a story script is on and nothing blocks
+  it. Any other button pressed while Ctrl is held disarms until Ctrl is
+  released; the system menu and the backlog on the picture (strict colour
+  signatures, ps2_mouse_menus) block it too. Scripted pad runs ignore Ctrl.
+- tests: pad_keymap_tests.cpp (the keyboard map with a fake keyboard, Alt+Enter, Ctrl).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_framepace.h |  21 +++
+ ps2xRuntime/src/lib/ga2_framepace.cpp       |  42 ++++++
+ ps2xRuntime/src/lib/ps2_mouse_menus.cpp     |  50 +++++++
+ ps2xRuntime/src/lib/ps2_mouse_menus.h       |   5 +
+ ps2xRuntime/src/lib/ps2_pad.cpp             |  68 +++++----
+ ps2xRuntime/src/lib/ps2_pad_keys.h          |  88 ++++++++++++
+ ps2xTest/CMakeLists.txt                     |   1 +
+ ps2xTest/src/main.cpp                       |   2 +
+ ps2xTest/src/pad_keymap_tests.cpp           | 151 ++++++++++++++++++++
+ 9 files changed, 392 insertions(+), 36 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ps2_pad_keys.h
+ create mode 100644 ps2xTest/src/pad_keymap_tests.cpp
+
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index 982351f..b489c71 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -89,6 +89,27 @@ namespace ga2_framepace
+     };
+     void setScriptedPad(uint16_t held);
+     uint16_t scriptedPad();
++
++    // Message skipping: holding Ctrl presses Circle (the confirm button that advances a message) every other pad frame,
++    // 30 a second at the native rate (the games take presses as edges), but only while that is the right thing: a
++    // story script is on (the ADV scene updates in the adventure scene) and nothing that must not be confirmed is up
++    // (a choice or menu, the ship map). The pad side holds the button; the game side says what is up.
++    //   setSkipHeld     main thread (ps2_pad.cpp): Ctrl is down; never in scripted pad runs or with the cheat menu open.
++    //   setSkipScreenBlocked / skipDisarm  main thread: a menu is on the picture / the player pressed another button
++    //                   (the system menu, the backlog, Auto, Cross, Start ...): skipping stops until Ctrl is released.
++    //   skipSeenMessage game thread (native/compat/ga2_skip.cpp), at each update of the story scene.
++    //   skipSeenBlock   game thread, at each call of the choice / menu builtin and each update of the ship map.
++    //   skipAdvance     game thread, once per pad frame (port 0 read): decides from the calls since the last frame;
++    //                   a state seen within the last three pad frames counts as current.
++    //   skipNow         the decision of the current frame: PSPadBackend::readState presses Circle.
++    void setSkipHeld(bool held);
++    bool skipHeld();
++    void setSkipScreenBlocked(bool blocked);
++    void skipDisarm();
++    void skipSeenMessage();
++    void skipSeenBlock();
++    void skipAdvance();
++    bool skipNow();
+ }
+ 
+ // The oracle: one line per game loop iteration plus events, stamped with the
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index 30ad141..7aa3d37 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -183,8 +183,50 @@ namespace ga2_framepace
+     namespace
+     {
+         std::atomic<uint16_t> g_scriptedPad{0};
++        std::atomic<bool> g_skipHeld{false};
+     }
+     void setScriptedPad(uint16_t held) { g_scriptedPad.store(held, std::memory_order_relaxed); }
++    namespace
++    {
++        std::atomic<bool> g_skipDisarmed{false}, g_skipScreenBlocked{false};
++    }
++    void setSkipHeld(bool held)
++    {
++        g_skipHeld.store(held, std::memory_order_relaxed);
++        if (!held)
++            g_skipDisarmed.store(false, std::memory_order_relaxed); // Ctrl released: armed again at the next press
++    }
++    void setSkipScreenBlocked(bool blocked) { g_skipScreenBlocked.store(blocked, std::memory_order_relaxed); }
++    void skipDisarm() { g_skipDisarmed.store(true, std::memory_order_relaxed); }
++    bool skipHeld() { return g_skipHeld.load(std::memory_order_relaxed); }
++
++    namespace
++    {
++        // Pad frames (port 0 reads) and the frame each state was last seen at.
++        std::atomic<uint64_t> g_skipFrame{1000};
++        std::atomic<uint64_t> g_skipMessageAt{0}, g_skipBlockAt{0};
++        std::atomic<bool> g_skipNow{false};
++        constexpr uint64_t kSkipFresh = 3;
++    }
++    void skipSeenMessage() { g_skipMessageAt.store(g_skipFrame.load(std::memory_order_relaxed), std::memory_order_relaxed); }
++    void skipSeenBlock() { g_skipBlockAt.store(g_skipFrame.load(std::memory_order_relaxed), std::memory_order_relaxed); }
++    void skipAdvance()
++    {
++        const uint64_t frame = g_skipFrame.fetch_add(1, std::memory_order_relaxed) + 1;
++        const bool message = frame - g_skipMessageAt.load(std::memory_order_relaxed) <= kSkipFresh;
++        const bool block = frame - g_skipBlockAt.load(std::memory_order_relaxed) <= kSkipFresh;
++        const bool ready = skipHeld() && message && !block && !g_skipDisarmed.load(std::memory_order_relaxed) &&
++                           !g_skipScreenBlocked.load(std::memory_order_relaxed);
++        // Circle every other pad frame: a press, a release (the games take presses as edges: 30 a second at the native rate).
++        const bool now = ready && (frame & 1u) == 0;
++        static const bool trace = std::getenv("GA2_SKIP_TRACE") != nullptr;
++        if (trace && now != g_skipNow.load(std::memory_order_relaxed))
++            std::fprintf(stderr, "[skip] %lld ms pad frame %llu: Circle %s (ctrl %d, message %d, blocked %d)\n",
++                         (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() % 1000000), (unsigned long long)frame,
++                         now ? "pressed" : "released", skipHeld() ? 1 : 0, message ? 1 : 0, block ? 1 : 0);
++        g_skipNow.store(now, std::memory_order_relaxed);
++    }
++    bool skipNow() { return g_skipNow.load(std::memory_order_relaxed); }
+     uint16_t scriptedPad() { return g_scriptedPad.load(std::memory_order_relaxed); }
+ 
+     namespace
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+index 2e0ec1c..bed3545 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.cpp
+@@ -421,4 +421,54 @@ namespace ps2_mouse_menus
+     }
+ 
+     bool ownsClick() { return g_owns; }
++
++    bool storyOverlayUp()
++    {
++        if (!g_ram)
++            return false;
++        // System menu: one red row (the cursor) and three blue ones, at the same rows the pointer menus use.
++        {
++            const VisualMenu &menu = visualMenus().front();
++            int red = 0, blue = 0;
++            for (const Item &it : menu.items)
++            {
++                const int y = static_cast<int>((it.y0 + it.y1) * 0.5f);
++                int r = 0, g = 0, b = 0, n = 0;
++                for (int x = static_cast<int>(it.x0) + 15; x < static_cast<int>(it.x1) - 8; x += 6, ++n)
++                {
++                    uint8_t rgb[3];
++                    if (!ps2_mouse::pixel(x, y, rgb))
++                        return false;
++                    r += rgb[0];
++                    g += rgb[1];
++                    b += rgb[2];
++                }
++                if (n == 0)
++                    return false;
++                r /= n;
++                g /= n;
++                b /= n;
++                if (r > b + 30 && r > g + 25 && g < 110 && b < 120)
++                    ++red;
++                else if (b > r + 30)
++                    ++blue;
++            }
++            if (red == 1 && blue == static_cast<int>(menu.items.size()) - 1)
++                return true;
++        }
++        // Backlog: a black caption corner and a dark green scroll track down the right side.
++        {
++            uint8_t rgb[3];
++            if (ps2_mouse::pixel(40, 27, rgb) && rgb[0] < 16 && rgb[1] < 16 && rgb[2] < 16)
++            {
++                int track = 0;
++                for (int y : {120, 300, 380})
++                    if (ps2_mouse::pixel(548, y, rgb) && rgb[0] < 24 && rgb[1] >= 50 && rgb[1] <= 90 && rgb[2] >= 36 && rgb[2] <= 70)
++                        ++track;
++                if (track >= 2)
++                    return true;
++            }
++        }
++        return false;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_mouse_menus.h b/ps2xRuntime/src/lib/ps2_mouse_menus.h
+index 8c9efd5..365d654 100644
+--- a/ps2xRuntime/src/lib/ps2_mouse_menus.h
++++ b/ps2xRuntime/src/lib/ps2_mouse_menus.h
+@@ -16,4 +16,9 @@ namespace ps2_mouse_menus
+     // The pointer is on an item of a menu on screen; the left button belongs
+     // to the menu (it is not also Circle).
+     bool ownsClick();
++    // The story scene's system menu (ロード / セーブ / オプション / ゲームをやめる) or the backlog is on the picture:
++    // independent of the pointer, for the Ctrl message skip (it must never confirm either). Strict signatures (the
++    // menu's red and blue rows, the backlog's black caption and dark green scroll track), because a false alarm only
++    // costs the skip. Main thread, after the frame was presented; the picture lags the game by a frame or two.
++    bool storyOverlayUp();
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 0aae9ad..5ccb302 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,9 +1,11 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_pad_input.h"
++#include "ps2_pad_keys.h"
+ #include "ga2_vr.h"
+ #include "ga2_cheat_menu.h"
+ #include "ps2_mouse.h"
++#include "ps2_mouse_menus.h"
+ #include "runtime/gs/gs_pgs.h"
+ #include "runtime/ga2_framepace.h"
+ #include <cctype>
+@@ -142,39 +144,11 @@ namespace
+         }
+         else
+         {
+-            if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-                clearBit(PAD_UP);
+-            if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-                clearBit(PAD_DOWN);
+-            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-                clearBit(PAD_LEFT);
+-            if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-                clearBit(PAD_RIGHT);
+-            if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-                clearBit(PAD_CROSS);
+-            if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-                clearBit(PAD_CIRCLE);
+-            if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-                clearBit(PAD_SQUARE);
+-            if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-                clearBit(PAD_TRIANGLE);
+-            if (IsKeyDown(KEY_Q))
+-                clearBit(PAD_L1);
+-            if (IsKeyDown(KEY_E))
+-                clearBit(PAD_R1);
+-            if (IsKeyDown(KEY_LEFT_SHIFT))
+-                clearBit(PAD_L2);
+-            if (IsKeyDown(KEY_RIGHT_SHIFT))
+-                clearBit(PAD_R2);
+-            if (IsKeyDown(KEY_ENTER) && !IsKeyDown(KEY_LEFT_ALT) && !IsKeyDown(KEY_RIGHT_ALT)) // Alt+Enter: fullscreen
+-                clearBit(PAD_START);
+-            if (IsKeyDown(KEY_TAB))
+-                clearBit(PAD_SELECT);
+-            // Stick clicks (battles: pilot view / map with L3, unit camera with R3).
+-            if (IsKeyDown(KEY_R))
+-                clearBit(PAD_L3);
+-            if (IsKeyDown(KEY_F))
+-                clearBit(PAD_R3);
++            // The keyboard map is ps2_pad_keys.h (the prompt icons and docs/PLAYING.md show it).
++            static ps2_pad_keys::State keys;
++            const uint16_t held = ps2_pad_keys::held(
++                keys, [](int key) { return IsKeyDown(key); }, [](int key) { return IsKeyPressed(key); });
++            btns &= static_cast<uint16_t>(~held);
+         }
+ 
+         // Mouse (ps2_mouse): clicks, wheel, known menus and the on-screen pad.
+@@ -234,8 +208,8 @@ namespace
+         else
+         {
+             for (int key : {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_W, KEY_A, KEY_S, KEY_D, KEY_X, KEY_C, KEY_Z, KEY_V,
+-                            KEY_Q, KEY_E, KEY_R, KEY_F, KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_ESCAPE, KEY_LEFT_SHIFT,
+-                            KEY_RIGHT_SHIFT})
++                            KEY_Q, KEY_E, KEY_R, KEY_F, KEY_SPACE, KEY_ENTER, KEY_KP_ENTER, KEY_P, KEY_TAB, KEY_ESCAPE,
++                            KEY_LEFT_SHIFT, KEY_RIGHT_SHIFT})
+                 if (IsKeyPressed(key))
+                     style = "keyboard";
+             if (IsGamepadAvailable(0))
+@@ -269,6 +243,21 @@ void ps2PadSampleHostInput()
+     detectInputStyle();
+     std::array<uint8_t, 32> pad{};
+     sampleHostPad(pad.data());
++    // Ctrl held skips messages (the game side decides what that may press: native/compat/ga2_skip.cpp). The keyboard
++    // reads whether or not a gamepad is plugged in; scripted pad runs see only the script.
++    static const bool scriptOnly = std::getenv("GA2_PAD_SCRIPT") != nullptr;
++    const bool skip = !scriptOnly && !ga2_cheat_menu::open() && ps2_pad_keys::skipHeld([](int key) { return IsKeyDown(key); });
++    ga2_framepace::setSkipHeld(skip);
++    if (skip)
++    {
++        // Any button but Circle and the D-pad (the system menu on Select, the backlog on Square, Auto, Cross, Start,
++        // from the keyboard, the mouse or the on-screen pad alike) stops the skipping until Ctrl is released; the system
++        // menu or the backlog already on the picture blocks it too (it must never confirm either).
++        const uint16_t pressed = static_cast<uint16_t>(~(pad[2] | (pad[3] << 8)));
++        if (pressed & ~(PAD_CIRCLE | PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT))
++            ga2_framepace::skipDisarm();
++        ga2_framepace::setSkipScreenBlocked(ps2_mouse_menus::storyOverlayUp());
++    }
+     // The cheat menu takes the input while it is open: the game sees an idle pad.
+     if (ga2_cheat_menu::open())
+     {
+@@ -289,7 +278,7 @@ bool ps2PadHostShoulderPressure(uint8_t out[4])
+     return g_hostShoulderShared != std::array<uint8_t, 4>{};
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+         return false;
+@@ -301,6 +290,13 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         std::memcpy(data, g_hostPad.data(), 32);
+     else
+         neutralPad(data); // no window has presented yet
++    // Ctrl skips messages by pressing Circle every other frame (ga2_framepace.h).
++    if (port == 0 && slot == 0)
++    {
++        ga2_framepace::skipAdvance();
++        if (ga2_framepace::skipNow())
++            data[3] = static_cast<uint8_t>(data[3] & ~(PAD_CIRCLE >> 8));
++    }
+     // Scripted buttons (the timing oracle): held on top of the real pad.
+     if (const uint16_t held = ga2_framepace::scriptedPad())
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_pad_keys.h b/ps2xRuntime/src/lib/ps2_pad_keys.h
+new file mode 100644
+index 0000000..1d6a256
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_pad_keys.h
+@@ -0,0 +1,88 @@
++#pragma once
++
++// The keyboard's pad map (docs/PLAYING.md, native/buttons/keyboard/*.png: the
++// prompt icons show these keys). Header only so the tests can drive it with a
++// fake keyboard.
++//
++//   D-pad      arrows, WASD (the left stick follows, see ps2_pad.cpp)
++//   Circle     Enter, keypad Enter, C, Esc     (Alt+Enter is fullscreen, not Circle)
++//   Cross      X, Space
++//   Square     Z, keypad 0
++//   Triangle   V, keypad 1
++//   L1 / R1    Q / E
++//   L2 / R2    Left Shift / Right Shift
++//   Start      P
++//   Select     Tab
++//   L3 / R3    R / F
++//   Ctrl (held) skips messages: skipHeld() below, used by ps2_pad.cpp
++#include <cstdint>
++#include <initializer_list>
++
++#include "ps2_host_backend.h"
++
++namespace ps2_pad_keys
++{
++    // The PS2 pad's bit values (a pressed button is a 0 bit in the pad data).
++    enum Bit : uint16_t
++    {
++        Select = 0x0001u, L3 = 0x0002u, R3 = 0x0004u, Start = 0x0008u,
++        Up = 0x0010u, Right = 0x0020u, Down = 0x0040u, Left = 0x0080u,
++        L2 = 0x0100u, R2 = 0x0200u, L1 = 0x0400u, R1 = 0x0800u,
++        Triangle = 0x1000u, Circle = 0x2000u, Cross = 0x4000u, Square = 0x8000u,
++    };
++
++    // Memory between samples: an Enter that went down with Alt held is the
++    // fullscreen shortcut for as long as it stays down, even if Alt is released
++    // first (it must not turn into Circle half way through the keystroke).
++    struct State
++    {
++        bool enterIsShortcut = false;
++    };
++
++    // The buttons the keyboard holds now (active-high). `down(key)` is "the key
++    // is held", `pressed(key)` "went down this frame" (raylib's IsKeyDown /
++    // IsKeyPressed).
++    template <class DownFn, class PressedFn>
++    uint16_t held(State &state, DownFn &&down, PressedFn &&pressed)
++    {
++        uint16_t out = 0;
++        auto any = [&](std::initializer_list<int> keys) {
++            for (int key : keys)
++                if (down(key))
++                    return true;
++            return false;
++        };
++        const bool alt = down(KEY_LEFT_ALT) || down(KEY_RIGHT_ALT);
++        if (!down(KEY_ENTER))
++            state.enterIsShortcut = false;
++        else if (alt && pressed(KEY_ENTER))
++            state.enterIsShortcut = true;
++
++        if (any({KEY_UP, KEY_W})) out |= Up;
++        if (any({KEY_DOWN, KEY_S})) out |= Down;
++        if (any({KEY_LEFT, KEY_A})) out |= Left;
++        if (any({KEY_RIGHT, KEY_D})) out |= Right;
++        if (any({KEY_X, KEY_SPACE})) out |= Cross;
++        if (any({KEY_C, KEY_ESCAPE, KEY_KP_ENTER}) || (down(KEY_ENTER) && !alt && !state.enterIsShortcut))
++            out |= Circle;
++        if (any({KEY_Z, KEY_KP_0})) out |= Square;
++        if (any({KEY_V, KEY_KP_1})) out |= Triangle;
++        if (down(KEY_Q)) out |= L1;
++        if (down(KEY_E)) out |= R1;
++        if (down(KEY_LEFT_SHIFT)) out |= L2;
++        if (down(KEY_RIGHT_SHIFT)) out |= R2;
++        if (down(KEY_P)) out |= Start;
++        if (down(KEY_TAB)) out |= Select;
++        // Stick clicks (battles: pilot view / map with L3, unit camera with R3).
++        if (down(KEY_R)) out |= L3;
++        if (down(KEY_F)) out |= R3;
++        return out;
++    }
++
++    // Ctrl (either side) held: skip messages.
++    template <class DownFn>
++    bool skipHeld(DownFn &&down)
++    {
++        return down(KEY_LEFT_CONTROL) || down(KEY_RIGHT_CONTROL);
++    }
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 22bacf6..95a6a3d 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -28,6 +28,7 @@ add_library(ps2_test_lib STATIC
+     src/r5900_decoder_tests.cpp
+     src/elf_analyzer_tests.cpp
+     src/pad_input_tests.cpp
++    src/pad_keymap_tests.cpp
+     src/ga2_vr_input_tests.cpp
+     src/ga2_settings_tests.cpp
+     src/ga2_text_icons_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 191d369..a59ec48 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -6,6 +6,7 @@ void register_code_generator_tests();
+ void register_r5900_decoder_tests();
+ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
++void register_pad_keymap_tests();
+ void register_ga2_vr_input_tests();
+ void register_ga2_settings_tests();
+ void register_ga2_text_icons_tests();
+@@ -44,6 +45,7 @@ int main()
+     register_r5900_decoder_tests();
+     register_elf_analyzer_tests();
+     register_pad_input_tests();
++    register_pad_keymap_tests();
+     register_ga2_vr_input_tests();
+     register_ga2_settings_tests();
+     register_ga2_text_icons_tests();
+diff --git a/ps2xTest/src/pad_keymap_tests.cpp b/ps2xTest/src/pad_keymap_tests.cpp
+new file mode 100644
+index 0000000..97fc0ad
+--- /dev/null
++++ b/ps2xTest/src/pad_keymap_tests.cpp
+@@ -0,0 +1,151 @@
++#include "MiniTest.h"
++
++#include "ps2_pad_keys.h"
++#include "runtime/ga2_framepace.h"
++
++#include <set>
++
++namespace
++{
++    using ps2_pad_keys::held;
++
++    // A fake keyboard: the keys held now, and the ones that went down this frame.
++    struct Keyboard
++    {
++        std::set<int> down, pressed;
++        ps2_pad_keys::State state;
++        uint16_t read() { return held(state, [&](int k) { return down.count(k) != 0; }, [&](int k) { return pressed.count(k) != 0; }); }
++        uint16_t only(std::initializer_list<int> keys)
++        {
++            down.clear();
++            pressed.clear();
++            state = {};
++            down.insert(keys);
++            pressed.insert(keys);
++            return read();
++        }
++    };
++}
++
++void register_pad_keymap_tests()
++{
++    MiniTest::Case("PadKeymap", [](TestCase &tc) {
++        tc.Run("Enter, keypad Enter, C and Esc are Circle (the confirm button)", [](TestCase &t) {
++            Keyboard kb;
++            for (int key : {KEY_ENTER, KEY_KP_ENTER, KEY_C, KEY_ESCAPE})
++                t.Equals(unsigned(kb.only({key})), unsigned(ps2_pad_keys::Circle), "key is exactly Circle");
++        });
++
++        tc.Run("Start is P and no longer Enter", [](TestCase &t) {
++            Keyboard kb;
++            t.Equals(unsigned(kb.only({KEY_P})), unsigned(ps2_pad_keys::Start), "P is Start");
++            t.IsTrue((kb.only({KEY_ENTER}) & ps2_pad_keys::Start) == 0, "Enter is not Start");
++        });
++
++        tc.Run("Alt+Enter (fullscreen) is not Circle, in either order", [](TestCase &t) {
++            Keyboard kb;
++            t.Equals(unsigned(kb.only({KEY_LEFT_ALT, KEY_ENTER})), 0u, "Alt then Enter: nothing");
++            t.Equals(unsigned(kb.only({KEY_RIGHT_ALT, KEY_ENTER})), 0u, "right Alt too");
++            // Alt is released first while Enter is still down: still the shortcut, not Circle.
++            kb.only({KEY_LEFT_ALT, KEY_ENTER});
++            kb.down.erase(KEY_LEFT_ALT);
++            kb.pressed.clear();
++            t.Equals(unsigned(kb.read()), 0u, "Alt released, Enter still down: nothing");
++            // Released and pressed again: Circle.
++            kb.down.erase(KEY_ENTER);
++            kb.read();
++            kb.down.insert(KEY_ENTER);
++            kb.pressed.insert(KEY_ENTER);
++            t.Equals(unsigned(kb.read()), unsigned(ps2_pad_keys::Circle), "a fresh Enter is Circle again");
++        });
++
++        tc.Run("the other keys keep their buttons", [](TestCase &t) {
++            using namespace ps2_pad_keys;
++            Keyboard kb;
++            const std::pair<int, uint16_t> expected[] = {
++                {KEY_UP, Up}, {KEY_W, Up}, {KEY_DOWN, Down}, {KEY_S, Down}, {KEY_LEFT, Left}, {KEY_A, Left},
++                {KEY_RIGHT, Right}, {KEY_D, Right}, {KEY_X, Cross}, {KEY_SPACE, Cross}, {KEY_Z, Square},
++                {KEY_KP_0, Square}, {KEY_V, Triangle}, {KEY_KP_1, Triangle}, {KEY_Q, L1}, {KEY_E, R1},
++                {KEY_LEFT_SHIFT, L2}, {KEY_RIGHT_SHIFT, R2}, {KEY_TAB, Select}, {KEY_R, L3}, {KEY_F, R3}};
++            for (const auto &e : expected)
++                t.Equals(unsigned(kb.only({e.first})), unsigned(e.second), "key maps to its button");
++        });
++
++        tc.Run("every key maps to one button and every button has a key", [](TestCase &t) {
++            Keyboard kb;
++            uint16_t all = 0;
++            for (int key = 0; key < 400; ++key)
++            {
++                const uint16_t b = kb.only({key});
++                t.IsTrue((b & (b - 1u)) == 0, "no key presses two buttons");
++                all |= b;
++            }
++            t.Equals(unsigned(all), 0xFFFFu, "all 16 buttons are reachable");
++        });
++
++        tc.Run("Ctrl skips and presses no button", [](TestCase &t) {
++            Keyboard kb;
++            t.Equals(unsigned(kb.only({KEY_LEFT_CONTROL})), 0u, "left Ctrl is no pad button");
++            t.Equals(unsigned(kb.only({KEY_RIGHT_CONTROL})), 0u, "right Ctrl is no pad button");
++            auto down = [&](int k) { return kb.down.count(k) != 0; };
++            kb.only({KEY_LEFT_CONTROL});
++            t.IsTrue(ps2_pad_keys::skipHeld(down), "left Ctrl skips");
++            kb.only({KEY_RIGHT_CONTROL});
++            t.IsTrue(ps2_pad_keys::skipHeld(down), "right Ctrl skips");
++            kb.only({KEY_ENTER});
++            t.IsTrue(!ps2_pad_keys::skipHeld(down), "Enter does not skip");
++        });
++    
++        tc.Run("Ctrl skip: Circle every other pad frame, only while a story script is on and nothing blocks it", [](TestCase &t) {
++            using namespace ga2_framepace;
++            auto frames = [](int n, bool message, bool block) {
++                int presses = 0;
++                for (int i = 0; i < n; ++i)
++                {
++                    if (message)
++                        skipSeenMessage();
++                    if (block)
++                        skipSeenBlock();
++                    skipAdvance();
++                    presses += skipNow() ? 1 : 0;
++                }
++                return presses;
++            };
++            setSkipScreenBlocked(false);
++            setSkipHeld(false);
++            frames(10, true, false);
++            t.Equals(frames(10, true, false), 0, "Ctrl up: nothing pressed");
++            setSkipHeld(true);
++            t.Equals(frames(10, true, false), 5, "Ctrl down in a story: every other frame");
++            // consecutive presses are separated by a release
++            bool previous = false;
++            bool alternates = true;
++            for (int i = 0; i < 12; ++i)
++            {
++                skipSeenMessage();
++                skipAdvance();
++                alternates = alternates && !(previous && skipNow());
++                previous = skipNow();
++            }
++            t.IsTrue(alternates, "never two presses in a row");
++            frames(6, false, false);
++            t.Equals(frames(10, false, false), 0, "no story script: nothing pressed");
++            frames(1, true, false);
++            t.Equals(frames(10, true, true), 0, "a choice or the ship map is up: nothing pressed");
++            frames(6, false, false);
++            t.Equals(frames(10, true, false), 5, "the block ended: pressing again");
++            setSkipScreenBlocked(true);
++            t.Equals(frames(10, true, false), 0, "the system menu or backlog is on the picture: nothing pressed");
++            setSkipScreenBlocked(false);
++            t.Equals(frames(10, true, false), 5, "and again");
++            skipDisarm();
++            t.Equals(frames(10, true, false), 0, "another button was pressed: stopped while Ctrl stays down");
++            setSkipHeld(false);
++            setSkipHeld(true);
++            t.Equals(frames(10, true, false), 5, "Ctrl released and pressed again: armed");
++            setSkipHeld(false);
++            frames(4, true, false);
++            t.Equals(frames(10, true, false), 0, "released: stops");
++        });
++    });
++}
+-- 
+2.56.0
+

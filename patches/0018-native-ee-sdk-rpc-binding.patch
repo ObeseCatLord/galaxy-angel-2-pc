@@ -1,0 +1,616 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index e82d557..d545640 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -11,6 +11,14 @@
+ 
+ namespace ps2x::iop
+ {
++    struct GuestRpcBinding
++    {
++        // Zero is a completed lookup (serverAddress may be zero). Negative
++        // means unsupported/invalid; the IOP caller must preserve its client.
++        int32_t result = -48;
++        uint32_t serverAddress = 0;
++        uint32_t bufferAddress = 0;
++    };
+     enum class HostPathKind : uint32_t
+     {
+         ElfDirectory = 0,
+@@ -156,5 +164,6 @@ namespace ps2x::iop
+         // IOP view: MSFLAG clears bits, SMFLAG sets bits, SUBADDR assigns.
+         virtual bool writeSifRegister(SifRegister, uint32_t) { return false; }
+         virtual void resetIopSifRegisters() {}
++        virtual GuestRpcBinding lookupGuestRpcBinding(uint32_t) { return {}; }
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index fe2984d..cb2dacc 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -177,10 +177,35 @@ namespace ps2x::iop::detail
+         case 10:
+         case 11:
+         case 14: // InitRpc
+-        case 15:
+-        case 16:
+             setV0(0);
+             return true;
++        case 15: // Bind an IOP client to an actual EE SDK server.
++        {
++            const uint32_t client = cpu.gpr[4];
++            if (client == 0u || (client & 3u) != 0u || !m_memory.ownsRamRange(client, 40u))
++            { setV0(uint32_t(-2)); return true; }
++            if (cpu.gpr[6] != 0u) // Only completed synchronous lookup is supported.
++            { setV0(uint32_t(-48)); return true; }
++            const GuestRpcBinding binding = m_host.lookupGuestRpcBinding(cpu.gpr[5]);
++            if (binding.result != 0)
++            { setV0(binding.result < 0 ? uint32_t(binding.result) : uint32_t(-5)); return true; }
++            std::array<uint32_t, 10> words{};
++            if (!m_memory.readRam(client, words.data(), sizeof(words)))
++            { setV0(uint32_t(-2)); return true; }
++            words[0] = 0u; // completed packet; no synthetic packet allocation
++            words[2] = 0xFFFFFFFFu; // no live semaphore allocation
++            words[4] = 0u; // command
++            words[5] = binding.bufferAddress;
++            words[9] = binding.serverAddress;
++            // rpc_id/mode/cbuf/end_function/end_param retain their prior values.
++            if (!m_memory.writeRam(client, words.data(), sizeof(words)))
++            { setV0(uint32_t(-2)); return true; }
++            setV0(0u);
++            return true;
++        }
++        case 16: // Reverse execution/completion is not implemented by binding.
++            setV0(uint32_t(-48));
++            return true;
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..5348d37 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -300,6 +300,8 @@ public:
+     bool writeIopMemory(uint32_t address, const void *source, size_t size);
+     bool zeroIopMemory(uint32_t address, size_t size);
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
++    // Exact-executable SDK metadata supplied by a verified game override.
++    void configureNativeEeRpcQueueRoot(uint32_t address);
+ 
+     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
+     void setDebugUiCallbacks(DebugUiCallback initCallback,
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index c861e51..7d50e01 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -14,6 +14,7 @@
+ #include <iostream>
+ #include <limits>
+ #include <utility>
++#include <unordered_set>
+ 
+ #if !defined(_WIN32)
+ #include <sys/types.h>
+@@ -101,6 +102,83 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
+     return CallScope(*this, context, rdram);
+ }
+ 
++PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCycleCall(uint8_t *rdram)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    // A nested pump retains its current invocation token, context and backing.
++    // Only an unscoped ordinary worker advance needs a new serialized scope.
++    if (m_activeToken != 0u) return {};
++    return enterCall(nullptr, rdram);
++}
++
++namespace
++{
++    bool nativeRpcRamRange(uint32_t address, size_t size)
++    {
++        // Main RAM and its existing direct/uncached/kseg aliases only. The
++        // general pointer helper mirrors other addresses; SDK metadata must
++        // not turn a malformed pointer into a different valid list node.
++        const bool alias = address < 0x20000000u ||
++                           (address >= 0x20000000u && address < 0x40000000u) ||
++                           (address >= 0x80000000u && address < 0xC0000000u);
++        const uint32_t physical = address & 0x1FFFFFFFu;
++        return alias && (address & 3u) == 0u && physical < PS2_RAM_SIZE &&
++               size <= PS2_RAM_SIZE - physical;
++    }
++}
++
++void PS2IopHostAdapter::configureNativeEeRpcQueueRoot(uint32_t address)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    if (m_activeToken != 0u)
++        throw std::logic_error("native EE RPC metadata must be configured outside IOP execution");
++    if (!nativeRpcRamRange(address, 4u))
++        throw std::invalid_argument("native EE RPC queue-root address is outside aligned EE RAM");
++    m_nativeEeRpcQueueRoot = address;
++}
++
++ps2x::iop::GuestRpcBinding PS2IopHostAdapter::lookupGuestRpcBinding(uint32_t sid)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    if (!m_nativeEeRpcQueueRoot || !m_activeToken)
++        return {}; // no configured SDK authority / no serialized guest call
++    const auto read = [&](uint32_t address, void *out, size_t size, uint8_t *&physical)
++    {
++        if (!address || !nativeRpcRamRange(address, size) || !guestRange(address, size, physical)) return false;
++        std::memcpy(out, physical, size);
++        return true;
++    };
++    uint32_t queueAddress = 0;
++    uint8_t *physical = nullptr;
++    if (!read(m_nativeEeRpcQueueRoot, &queueAddress, 4u, physical)) return {-2, 0u, 0u};
++    // Original SDK membership is authoritative. No native/HLE merge, cached
++    // queue head, registry publication, or fallback on incomplete traversal.
++    std::unordered_set<const uint8_t *> queues, servers;
++    uint32_t remaining = 512u; // one budget shared by both lists
++    while (queueAddress)
++    {
++        std::array<uint32_t, 6> queue{};
++        if (remaining == 0u) return {-5, 0u, 0u};
++        --remaining;
++        if (!read(queueAddress, queue.data(), sizeof(queue), physical)) return {-2, 0u, 0u};
++        if (!queues.insert(physical).second) return {-5, 0u, 0u};
++        uint32_t serverAddress = queue[2];
++        while (serverAddress)
++        {
++            std::array<uint32_t, 17> server{};
++            if (remaining == 0u) return {-5, 0u, 0u};
++            --remaining;
++            if (!read(serverAddress, server.data(), sizeof(server), physical)) return {-2, 0u, 0u};
++            if (!servers.insert(physical).second) return {-5, 0u, 0u};
++            if (server[0] == sid)
++                return {0, serverAddress, server[2]};
++            serverAddress = server[14]; // original SDK link at +0x38
++        }
++        queueAddress = queue[5]; // original SDK next at +0x14
++    }
++    return {0, 0u, 0u}; // fully searched, absent provider
++}
++
+ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
+ {
+     begin = nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 1bb9c6d..cfdc8e6 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -46,6 +46,8 @@ public:
+     [[nodiscard]] CallScope enterCall(R5900Context *context,
+                                       uint8_t *rdram = nullptr);
+ 
++    [[nodiscard]] CallScope enterCycleCall(uint8_t *rdram);
++
+     ps2x::iop::RebootTransferTracker rebootTransfers;
+ 
+     bool readGuest(uint32_t address, void *destination, size_t size) const override;
+@@ -95,6 +97,8 @@ public:
+     bool readSifRegister(ps2x::iop::SifRegister reg, uint32_t &value) const override;
+     bool writeSifRegister(ps2x::iop::SifRegister reg, uint32_t value) override;
+     void resetIopSifRegisters() override;
++    ps2x::iop::GuestRpcBinding lookupGuestRpcBinding(uint32_t sid) override;
++    void configureNativeEeRpcQueueRoot(uint32_t address);
+ 
+ private:
+     friend class CallScope;
+@@ -103,6 +107,7 @@ private:
+ 
+     PS2Runtime &m_runtime;
+     std::recursive_mutex m_callMutex;
++    uint32_t m_nativeEeRpcQueueRoot = 0;
+     R5900Context *m_activeContext = nullptr;
+     uint8_t *m_activeRdram = nullptr;
+     uint64_t m_activeToken = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index ca6cde3..b8c7b04 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -576,6 +576,11 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
+     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
+ }
+ 
++void PS2Runtime::configureNativeEeRpcQueueRoot(uint32_t address)
++{
++    m_iopHost->configureNativeEeRpcQueueRoot(address);
++}
++
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+ {
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+@@ -672,6 +677,9 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    uint8_t *rdram = m_eeScheduler->rdram();
++    if (!rdram) rdram = m_boundRdram ? m_boundRdram : m_memory.getRDRAM();
++    auto scope = m_iopHost->enterCycleCall(rdram);
+     m_iopSubsystem->runEeCycles(eeCycles);
+ }
+ 
+@@ -1073,6 +1081,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         std::cerr << "[ps2xIOP] failed to compute ELF CRC32 for '" << elfPath << "'" << std::endl;
+     }
+     ps2x::iop::GameIdentity identity;
++    // A different ELF must not inherit an earlier executable's SDK root.
++    configureNativeEeRpcQueueRoot(0u);
+     identity.elfName = module.name;
+     identity.entryPoint = m_cpuContext.pc;
+     identity.crc32 = elfCrc32;
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index c2fc5ed..d01a1bf 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
++#include <fstream>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -240,6 +241,152 @@ namespace
+         return value;
+     }
+ 
++    constexpr uint32_t kNativeRoot = 0x00041000u;
++    constexpr uint32_t kNativeQueue = 0x00042000u;
++    constexpr uint32_t kNativeServer = 0x00043000u;
++    constexpr uint32_t kNativeBuffer = 0x00044000u;
++    constexpr uint32_t kNativeSid = 0x12344321u;
++    constexpr std::array<uint32_t, 12> kNativeClientSeed = {
++        0xCAFE0000u, 0xCAFE0001u, 0xCAFE0002u, 0xCAFE0003u,
++        0xCAFE0004u, 0xCAFE0005u, 0xCAFE0006u, 0xCAFE0007u,
++        0xCAFE0008u, 0xCAFE0009u, 0xCAFE000Au, 0xCAFE000Bu};
++
++    void nativeQueue(TestEnv &env, uint32_t queue = kNativeQueue,
++                     uint32_t server = kNativeServer, uint32_t next = 0u)
++    {
++        // SDK registration fields; active==0 is still a registered provider.
++        writeGuestStruct(env.rpcRam, queue, SifRpcDataQueue{3, 0, server, 0u, 0u, next});
++    }
++
++    void nativeServer(TestEnv &env, uint32_t server = kNativeServer,
++                      uint32_t buffer = kNativeBuffer, uint32_t sid = kNativeSid,
++                      uint32_t next = 0u)
++    {
++        SifRpcServerData descriptor{};
++        descriptor.sid = static_cast<int32_t>(sid);
++        descriptor.func = kNativeBuffer + 0x100u;
++        descriptor.buf = buffer;
++        descriptor.link = next;
++        descriptor.base = kNativeQueue;
++        writeGuestStruct(env.rpcRam, server, descriptor);
++    }
++
++    void nativeAuthority(TestEnv &env)
++    {
++        nativeQueue(env);
++        nativeServer(env);
++        writeGuestU32(env.rpcRam, kNativeRoot, kNativeQueue);
++        env.runtime.configureNativeEeRpcQueueRoot(kNativeRoot);
++    }
++
++    struct NativeBindObservation
++    {
++        int32_t result;
++        std::array<uint32_t, 12> client;
++        bool destinationPreserved = false;
++    };
++
++    NativeBindObservation nativeBind(TestEnv &env, uint32_t client = 0x00010200u,
++                                     uint32_t mode = 0u, uint32_t sid = kNativeSid,
++                                     uint16_t ordinal = 15u)
++    {
++        // Real MIPS IRX import -> real runtime host adapter, no mock registry.
++        // Reset also proves that IOP reboot does not erase EE SDK authority.
++        iop_test::require(PS2IopTransport::reset(&env.runtime), "native fixture reset must succeed");
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040000u | (client >> 16u), 0x34840000u | (client & 0xFFFFu),
++            0x3C050000u | (sid >> 16u), 0x34A50000u | (sid & 0xFFFFu),
++            0x3C060000u | (mode >> 16u), 0x34C60000u | (mode & 0xFFFFu),
++            0x0C00401Du, 0u, // jal 0x10074: sifcmd import
++            0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++        });
++        image.words(0x60u, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,
++                           0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++        image.words(0x1FCu, {kNativeClientSeed[0], kNativeClientSeed[1], kNativeClientSeed[2],
++            kNativeClientSeed[3], kNativeClientSeed[4], kNativeClientSeed[5], kNativeClientSeed[6],
++            kNativeClientSeed[7], kNativeClientSeed[8], kNativeClientSeed[9], kNativeClientSeed[10],
++            kNativeClientSeed[11]});
++        const uint32_t destinationStart = client == 0u ? 0u : ((client & 0x1FFFFFFFu) & ~3u) - 4u;
++        std::array<uint8_t, 64> expectedDestination{};
++        // Reset leaves unowned RAM zero. Do not seed it via writeIopMemory:
++        // that API marks bytes owned and would invalidate a truncated-client test.
++        if (destinationStart >= 0x10400u && destinationStart < 0x10500u)
++            std::fill(image.bytes.begin() + 0x100u + destinationStart - 0x10000u,
++                      image.bytes.end(), uint8_t{0xA5u});
++        // Only the owned image overlap is seeded; adjacent RAM remains unowned.
++        for (size_t i = 0; i < expectedDestination.size(); ++i)
++        {
++            const uint32_t address = destinationStart + static_cast<uint32_t>(i);
++            if (address >= 0x10000u && address < 0x10500u)
++                expectedDestination[i] = image.bytes[0x100u + address - 0x10000u];
++        }
++        std::memcpy(env.rpcRam + 0x48000u, image.bytes.data(), image.bytes.size());
++        const auto loaded = env.runtime.loadIopModuleBuffer(0x48000u);
++        iop_test::require(loaded.moduleId > 0, "native bind fixture must load");
++        NativeBindObservation observed{loaded.startResult, {}};
++        iop_test::require(env.runtime.readIopMemory(0x101FCu, observed.client.data(), sizeof(observed.client)),
++                          "native bind client readback must succeed");
++        std::array<uint8_t, 64> actualDestination{};
++        iop_test::require(env.runtime.readIopMemory(destinationStart, actualDestination.data(), actualDestination.size()),
++                          "actual client neighborhood readback must succeed");
++        observed.destinationPreserved = actualDestination == expectedDestination;
++        return observed;
++    }
++
++    void loadNativeBindingWorker(TestEnv &env)
++    {
++        iop_test::require(PS2IopTransport::reset(&env.runtime), "worker fixture reset must succeed");
++        iop_test::Irx image;
++        image.words(0u, {0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040001u, 0x34840280u, 0x0C004029u, 0u, // CreateThread 0x100a4
++            0x00402021u, 0x00002821u, 0x0C00402Bu, 0u, // StartThread 0x100ac
++            0x8FBF001Cu, 0u, 0x00001021u, 0x27BD0020u, 0x03E00008u, 0u});
++        image.words(0x60u, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,
++                           0x03E00008u, 0x2400000Fu, 0u, 0u});
++        image.words(0x90u, {0x41E00000u, 0u, 0x0101u, 0x61626874u, 0x00006573u,
++                           0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        std::memcpy(image.bytes.data() + 0x100u + 0x1FCu, kNativeClientSeed.data(), sizeof(kNativeClientSeed));
++        image.words(0x280u, {0u, 0u, 0x10300u, 0x400u, 30u});
++        image.words(0x300u, {
++            0x3C100001u, 0x36100400u, // s0 request/count/status
++            0x8E080000u, 0x8E090004u, 0u,
++            0x1109FFFAu, 0u, // unchanged ->0x10300
++            0xAE080004u,
++            0x3C040001u, 0x34840200u,
++            0x3C050000u | (kNativeSid >> 16u), 0x34A50000u | (kNativeSid & 0xFFFFu),
++            0x00003021u, 0x0C00401Du, 0u,
++            0xAE020008u, 0x080040C0u, 0u});
++        std::memcpy(env.runtime.memory().getRDRAM() + 0x48000u, image.bytes.data(), image.bytes.size());
++        const auto result = env.runtime.loadIopModuleBuffer(0x48000u);
++        iop_test::require(result.moduleId > 0 && result.startResult == 0, "binding worker startup returns before binding");
++    }
++
++    NativeBindObservation runNativeBindingWorker(TestEnv &env, uint32_t request)
++    {
++        iop_test::require(env.runtime.writeIopMemory(0x10400u, &request, sizeof(request)), "worker request written");
++        env.runtime.eeScheduler().accountCycles(40000u);
++        uint32_t count = 0u;
++        NativeBindObservation observed{};
++        iop_test::require(env.runtime.readIopMemory(0x10404u, &count, sizeof(count)) && count == request,
++                          "worker must actually execute outside module startup");
++        iop_test::require(env.runtime.readIopMemory(0x10408u, &observed.result, sizeof(observed.result)), "worker status readback");
++        iop_test::require(env.runtime.readIopMemory(0x101FCu, observed.client.data(), sizeof(observed.client)), "worker client readback");
++        return observed;
++    }
++
++    std::array<uint32_t, 12> completedNativeClient(uint32_t server, uint32_t buffer)
++    {
++        auto expected = kNativeClientSeed;
++        expected[1] = 0u; // packet
++        expected[3] = 0xFFFFFFFFu; // no live semaphore
++        expected[5] = 0u; // command
++        expected[6] = buffer;
++        expected[10] = server;
++        return expected;
++    }
++
+     constexpr uint32_t kRpcCallEntry = 0x00370000u;
+     constexpr uint32_t kRpcCallResume = 0x00370010u;
+     constexpr uint32_t kEeRpcFunction = 0x00370020u;
+@@ -311,6 +458,208 @@ void register_ps2_sif_rpc_tests()
+ {
+     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
+     {
++        tc.Run("native IOP bind follows original inactive EE queue and preserves client guards", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            const auto queueBefore = readGuestStruct<SifRpcDataQueue>(env.rpcRam, kNativeQueue);
++            const auto serverBefore = readGuestStruct<SifRpcServerData>(env.rpcRam, kNativeServer);
++            const auto observed = nativeBind(env);
++            t.Equals(observed.result, 0, "registered provider binds through actual IRX import");
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer, kNativeBuffer),
++                     "only packet/semaphore/command/buffer/server change; neighboring bytes remain");
++            t.IsTrue(std::memcmp(&queueBefore, env.rpcRam + kNativeQueue, sizeof(queueBefore)) == 0,
++                     "lookup preserves original queue bytes");
++            t.IsTrue(std::memcmp(&serverBefore, env.rpcRam + kNativeServer, sizeof(serverBefore)) == 0,
++                     "lookup preserves original server descriptor");
++        });
++
++        tc.Run("native IOP bind uses SDK order and live removal instead of HLE fallback", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            registerRpc(env, 0x45000u, kNativeSid, 0x45100u); // deliberately conflicting HLE provider
++            nativeServer(env, kNativeServer + 0x100u, kNativeBuffer + 0x100u);
++            nativeServer(env, kNativeServer, kNativeBuffer, kNativeSid, kNativeServer + 0x100u);
++            t.IsTrue(nativeBind(env).client == completedNativeClient(kNativeServer, kNativeBuffer),
++                     "first original server wins over later duplicate and HLE provider");
++            writeGuestU32(env.rpcRam, kNativeQueue + 8u, kNativeServer + 0x100u);
++            t.IsTrue(nativeBind(env).client == completedNativeClient(kNativeServer + 0x100u, kNativeBuffer + 0x100u),
++                     "server unlink is immediately visible without notification");
++            writeGuestU32(env.rpcRam, kNativeRoot, 0u); // SDK queue removal leaves descriptor/list bytes intact
++            auto observed = nativeBind(env);
++            t.Equals(observed.result, 0, "readable empty original root is completed NotFound");
++            t.IsTrue(observed.client == completedNativeClient(0u, 0u), "removed queue cannot resurrect via HLE or stale bytes");
++            writeGuestU32(env.rpcRam, kNativeRoot, kNativeQueue);
++            t.IsTrue(nativeBind(env).client == completedNativeClient(kNativeServer + 0x100u, kNativeBuffer + 0x100u),
++                     "re-registration is read afresh after IOP reset");
++            observed = nativeBind(env, 0x10200u, 0u, kNativeSid + 1u);
++            t.Equals(observed.result, 0, "fully searched absent SID completes");
++            t.IsTrue(observed.client == completedNativeClient(0u, 0u), "absent SID clears remote binding only");
++        });
++
++        tc.Run("native IOP bind rejects unsupported and invalid client paths without writes", [](TestCase &t)
++        {
++            TestEnv env(true);
++            auto observed = nativeBind(env);
++            t.Equals(observed.result, -48, "unconfigured SDK domain is unsupported");
++            t.IsTrue(observed.client == kNativeClientSeed, "unsupported domain preserves every client byte");
++            nativeAuthority(env);
++            for (const auto [client, mode, ordinal, error] :
++                 {std::array<uint32_t, 4>{0x10200u, 1u, 15u, uint32_t(-48)},
++                  std::array<uint32_t, 4>{0u, 0u, 15u, uint32_t(-2)},
++                  std::array<uint32_t, 4>{0x10201u, 0u, 15u, uint32_t(-2)},
++                  std::array<uint32_t, 4>{0x104F0u, 0u, 15u, uint32_t(-2)},
++                  std::array<uint32_t, 4>{0x10200u, 0u, 16u, uint32_t(-48)}})
++            {
++                observed = nativeBind(env, client, mode, kNativeSid, static_cast<uint16_t>(ordinal));
++                t.Equals(observed.result, static_cast<int32_t>(error), "unsupported/invalid operation fails explicitly");
++                t.IsTrue(observed.client == kNativeClientSeed, "failure preserves unrelated fixture client");
++                t.IsTrue(observed.destinationPreserved, "failure preserves bytes surrounding actual rejected destination");
++            }
++        });
++
++        tc.Run("native IOP bind preserves original pointer aliases and detects physical cycles", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            env.runtime.configureNativeEeRpcQueueRoot(kNativeRoot | 0x80000000u);
++            writeGuestU32(env.rpcRam, kNativeRoot, kNativeQueue | 0xA0000000u);
++            writeGuestU32(env.rpcRam, kNativeQueue + 8u, kNativeServer | 0x80000000u);
++            auto observed = nativeBind(env, 0x80010200u);
++            t.Equals(observed.result, 0, "cached/uncached EE and owned IOP aliases bind");
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer | 0x80000000u, kNativeBuffer),
++                     "binding retains actual guest server address");
++            writeGuestU32(env.rpcRam, kNativeServer + 0x38u, kNativeServer | 0xA0000000u);
++            observed = nativeBind(env, 0x10200u, 0u, kNativeSid + 1u);
++            t.Equals(observed.result, -5, "server cycle through different alias is incomplete traversal");
++            t.IsTrue(observed.client == kNativeClientSeed, "cycle is failure, not NotFound");
++            writeGuestU32(env.rpcRam, kNativeQueue + 8u, 0u);
++            writeGuestU32(env.rpcRam, kNativeQueue + 0x14u, kNativeQueue | 0x80000000u);
++            observed = nativeBind(env);
++            t.Equals(observed.result, -5, "queue alias cycle fails");
++            t.IsTrue(observed.client == kNativeClientSeed, "queue cycle preserves client");
++        });
++
++        tc.Run("native IOP bind checks complete EE ranges before publishing", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            for (uint32_t queue : {kNativeQueue + 1u, PS2_RAM_SIZE - 4u, 0x02000000u, 0x40000000u, 0x70000000u, 0xC0000000u})
++            {
++                writeGuestU32(env.rpcRam, kNativeRoot, queue);
++                const auto observed = nativeBind(env);
++                t.Equals(observed.result, -2, "unaligned/truncated/unmapped queue fails");
++                t.IsTrue(observed.client == kNativeClientSeed, "invalid queue preserves client");
++            }
++            writeGuestU32(env.rpcRam, kNativeRoot, kNativeQueue);
++            for (uint32_t server : {kNativeServer + 1u, PS2_RAM_SIZE - 4u, 0x02000000u, 0x40000000u, 0x70000000u, 0xC0000000u})
++            {
++                writeGuestU32(env.rpcRam, kNativeQueue + 8u, server);
++                const auto observed = nativeBind(env);
++                t.Equals(observed.result, -2, "unaligned/truncated/unmapped descriptor fails");
++                t.IsTrue(observed.client == kNativeClientSeed, "invalid descriptor preserves client");
++            }
++        });
++
++        tc.Run("native IOP bind shares one traversal budget across queues and servers", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            // 256 queues +256 servers exactly consume512nodes.
++            for (uint32_t i = 0u; i < 256u; ++i)
++            {
++                const uint32_t queue = 0x50000u + i * 0x20u;
++                const uint32_t server = 0x60000u + i * 0x50u;
++                nativeQueue(env, queue, server, i == 255u ? 0u : queue + 0x20u);
++                nativeServer(env, server, kNativeBuffer + i * 4u, i == 255u ? kNativeSid : kNativeSid + 1u);
++            }
++            writeGuestU32(env.rpcRam, kNativeRoot, 0x50000u);
++            auto observed = nativeBind(env);
++            t.Equals(observed.result, 0, "matching512thnode must bind");
++            t.IsTrue(observed.client == completedNativeClient(0x60000u + 255u * 0x50u, kNativeBuffer + 255u * 4u),
++                     "budget edge preserves actual provider");
++            observed = nativeBind(env, 0x10200u, 0u, kNativeSid + 2u);
++            t.Equals(observed.result, 0, "complete512node search can be absent");
++            t.IsTrue(observed.client == completedNativeClient(0u, 0u), "complete absence publishes no provider");
++            writeGuestU32(env.rpcRam, 0x50000u + 255u * 0x20u + 0x14u, 0x70000u);
++            nativeQueue(env, 0x70000u, kNativeServer);
++            observed = nativeBind(env, 0x10200u, 0u, kNativeSid + 2u);
++            t.Equals(observed.result, -5, "513th aggregate node fails even though each list is below512");
++            t.IsTrue(observed.client == kNativeClientSeed, "cap exhaustion preserves client");
++        });
++
++        tc.Run("native IOP worker rebinds live SDK providers without reset and uses active EE backing", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            loadNativeBindingWorker(env);
++            auto observed = runNativeBindingWorker(env, 1u);
++            t.Equals(observed.result, 0, "ordinary cycle advancement scopes actual worker bind");
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer, kNativeBuffer), "worker binds original provider");
++            nativeServer(env, kNativeServer + 0x100u, kNativeBuffer + 0x100u);
++            writeGuestU32(env.rpcRam, kNativeQueue + 8u, kNativeServer + 0x100u);
++            observed = runNativeBindingWorker(env, 2u);
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer + 0x100u, kNativeBuffer + 0x100u),
++                     "server unlink/re-register visible within same IOP lifetime");
++            writeGuestU32(env.rpcRam, kNativeRoot, 0u);
++            observed = runNativeBindingWorker(env, 3u);
++            t.Equals(observed.result, 0, "removed queue completes NotFound");
++            t.IsTrue(observed.client == completedNativeClient(0u, 0u), "queue unlink leaves stale descriptor unusable without reset");
++            writeGuestU32(env.rpcRam, kNativeRoot, kNativeQueue);
++            observed = runNativeBindingWorker(env, 4u);
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer + 0x100u, kNativeBuffer + 0x100u),
++                     "restored root visible without reset");
++            // A scheduler may use externally supplied EE backing. Keep a
++            // conflicting provider in runtime RAM to detect wrong selection.
++            env.rpcRam = env.rdram.data();
++            nativeAuthority(env);
++            nativeServer(env, kNativeServer, kNativeBuffer + 0x200u);
++            env.runtime.eeScheduler().reset(env.rpcRam, env.ctx);
++            observed = runNativeBindingWorker(env, 5u);
++            t.IsTrue(observed.client == completedNativeClient(kNativeServer, kNativeBuffer + 0x200u),
++                     "cycle scope reads scheduler EE backing rather than unrelated runtime RAM");
++        });
++
++        tc.Run("native EE RPC root configuration validates and preserves the current authority", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            for (uint32_t address : {kNativeRoot + 1u, PS2_RAM_SIZE, 0x40000000u, 0x70000000u, 0xC0000000u})
++            {
++                bool rejected = false;
++                try { env.runtime.configureNativeEeRpcQueueRoot(address); }
++                catch (const std::invalid_argument &) { rejected = true; }
++                t.IsTrue(rejected, "invalid root address must be rejected");
++                t.IsTrue(nativeBind(env).client == completedNativeClient(kNativeServer, kNativeBuffer),
++                         "failed configuration leaves previous authority intact");
++            }
++            writeGuestU32(env.rpcRam, PS2_RAM_SIZE - 4u, kNativeQueue);
++            env.runtime.configureNativeEeRpcQueueRoot(PS2_RAM_SIZE - 4u);
++            t.IsTrue(nativeBind(env).client == completedNativeClient(kNativeServer, kNativeBuffer),
++                     "last full aligned root cell remains valid");
++            env.runtime.configureNativeEeRpcQueueRoot(0u);
++            const auto observed = nativeBind(env);
++            t.Equals(observed.result, -48, "explicitly disabled authority is unsupported");
++            t.IsTrue(observed.client == kNativeClientSeed, "disabled authority preserves client");
++        });
++
++        tc.Run("native EE RPC authority is cleared on successful executable replacement", [](TestCase &t)
++        {
++            TestEnv env(true);
++            nativeAuthority(env);
++            t.Equals(nativeBind(env).result, 0, "authority starts configured");
++            ScopedTempDir temp("native_rpc_root_reload");
++            const auto path = temp.path / "synthetic.elf";
++            iop_test::Irx elf(0x100000u);
++            { std::ofstream out(path, std::ios::binary);
++              out.write(reinterpret_cast<const char *>(elf.bytes.data()), elf.bytes.size()); }
++            t.IsTrue(env.runtime.loadELF(path.string()), "synthetic replacement ELF loads");
++            const auto observed = nativeBind(env);
++            t.Equals(observed.result, -48, "new ELF cannot inherit earlier SDK root even with intact old RAM");
++            t.IsTrue(observed.client == kNativeClientSeed, "unconfigured replacement preserves client");
++        });
++
+         tc.Run("failed native RPC preserves reply and suppresses completion", [](TestCase &t)
+         {
+             TestEnv env(true);

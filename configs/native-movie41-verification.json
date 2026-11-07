@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-10",
+  "reviewer": "gpt-6-astra",
+  "effort": "ultra",
+  "effective_verified": true,
+  "accepted": "bounded exercised IPU command-mirror defect on original parser path",
+  "samples": 4,
+  "post_load_values": [
+    "0x40000000",
+    "0x40000008",
+    "0x40000008"
+  ],
+  "owner": [
+    1,
+    1,
+    0
+  ],
+  "decoder_object": "0x1b5de40",
+  "context_payloads_independently_compared": 62,
+  "object_hashes_independently_checked": 4,
+  "binary_dependencies_and_process_absence": "main verified; not independently rechecked by Astra",
+  "excluded": [
+    "infinite hang",
+    "exclusive movie-black cause",
+    "full SDK return semantics",
+    "input-byte identity",
+    "DMA consumption",
+    "hardware busy timing",
+    "movie recovery",
+    "speech",
+    "normal timing"
+  ],
+  "next_step": "Matched-reference byte-identified input/results/bit consumption, then original refill/output/SDK ownership and minimal adapter design review",
+  "goal_status": "active",
+  "binary_sha256": "1872e7159eae9d91a3610b1282bb4eec0441b80c1603bc71462a7cd006381938",
+  "shared_source_prefix": 24,
+  "native_candidate": "private native38 unchanged",
+  "target_run": "run2",
+  "bound_seconds": 886.5868607179727,
+  "audiovisual_recording": false,
+  "gameplay_accepted": false
+}

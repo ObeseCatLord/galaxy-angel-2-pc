@@ -1,0 +1,144 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..dc6a8c0 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -39,6 +39,9 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdStreamTimeout = 5000u;
+         constexpr uint32_t kCdvdSyncTimeout = 15000u;
+         constexpr uint32_t kCdvdmanVersion = 0x0226u;
++        // CDVDMAN's transfer workspace exposed by sceGetFsvRbuf (ordinal 47).
++        // ps2sdk/iop/cdvd/cdvdman/src/cdvdman.c uses a 42128-byte buffer.
++        constexpr uint32_t kFsvReadBufferSize = 42128u;
+ 
+         uint32_t alignSectors(uint64_t bytes)
+         {
+@@ -183,11 +186,17 @@ namespace ps2x::iop::detail
+         ~Impl()
+         {
+             closeFiles();
++            if (fsvReadBuffer != 0u)
++                (void)memory.freeAllocation(fsvReadBuffer);
+         }
+ 
+         void reset()
+         {
+             closeFiles();
++            // Release before the enclosing emulator resets its memory allocator.
++            if (fsvReadBuffer != 0u)
++                (void)memory.freeAllocation(fsvReadBuffer);
++            fsvReadBuffer = 0u;
+             callback = {};
+             initialized = false;
+             mediaMode = 0u;
+@@ -292,6 +301,16 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+ 
++            case 47: // sceGetFsvRbuf
++                if (fsvReadBuffer == 0u)
++                {
++                    fsvReadBuffer = memory.allocate(kFsvReadBufferSize, 16u);
++                    if (fsvReadBuffer != 0u)
++                        (void)memory.zeroRam(fsvReadBuffer, kFsvReadBufferSize);
++                }
++                cpu.gpr[2] = fsvReadBuffer;
++                return true;
++
+             case 50: // sceCdSC
+             {
+                 const int32_t code = static_cast<int32_t>(a0);
+@@ -720,6 +739,7 @@ namespace ps2x::iop::detail
+         uint32_t lastReadTimeout = 0u;
+         int interruptEventFlagId = 0;
+         uint64_t imageHandle = 0u;
++        uint32_t fsvReadBuffer = 0u;
+         bool virtualIsoBuilt = false;
+         bool virtualIsoValid = false;
+         uint32_t volumeSectors = 0u;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..af25d88 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -115,12 +115,14 @@ namespace ps2x::iop::detail
+ 
+         void reset()
+         {
++            // CDVD owns a dynamically allocated transfer workspace. Retire it
++            // while allocation ownership still refers to the previous epoch.
++            cdvd.reset();
+             memory.reset();
+             kernel.reset();
+             modules.clear();
+             imports.reset();
+             rpc.reset();
+-            cdvd.reset();
+             intrman.reset();
+             timrman.reset();
+             ioman.reset();
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..93e320a 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -274,6 +274,53 @@ namespace
+         return passed;
+     }
+ 
++    bool testCdvdReadBufferOwnership()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        kernel.reset();
++        IopCdvd cdvd(host, memory, kernel);
++        IopCpuState cpu{};
++        constexpr uint32_t bufferBytes = 42128u;
++        if (!expect(cdvd.dispatchImport(47u, cpu), "sceGetFsvRbuf was not handled"))
++            return false;
++        const uint32_t buffer = cpu.gpr[2];
++        if (!expect(buffer != 0u && memory.ownsRamRange(buffer, bufferBytes),
++                    "sceGetFsvRbuf did not allocate an owned IOP transfer buffer"))
++            return false;
++        memory.write32(buffer, 0x12345678u);
++        memory.write32(buffer + bufferBytes - 4u, 0xABCDEF01u);
++        const uint32_t other = memory.allocate(128u, 16u);
++        if (!expect(other != 0u && other >= buffer + bufferBytes, "buffer overlaps another allocation") ||
++            !expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] == buffer,
++                    "sceGetFsvRbuf changed its pointer within a boot") ||
++            !expect(memory.read32(buffer) == 0x12345678u &&
++                        memory.read32(buffer + bufferBytes - 4u) == 0xABCDEF01u,
++                    "repeated lookup cleared live transfer data"))
++            return false;
++        memory.write32(other, 0x76543210u);
++        cdvd.reset();
++        if (!expect(!memory.ownsRamRange(buffer, bufferBytes), "CDVD reset retained buffer ownership") ||
++            !expect(memory.ownsRamRange(other, 128u) && memory.read32(other) == 0x76543210u,
++                    "CDVD reset released unrelated IOP memory"))
++            return false;
++        memory.reset();
++        kernel.reset();
++        if (!expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] != 0u,
++                    "buffer did not allocate after full reboot") ||
++            !expect(memory.read32(cpu.gpr[2]) == 0u &&
++                        memory.read32(cpu.gpr[2] + bufferBytes - 4u) == 0u,
++                    "reboot exposed stale transfer bytes"))
++            return false;
++        cdvd.reset();
++        memory.reset();
++        const uint32_t exhausted = memory.allocate(IopMemory::HeapLimit - IopMemory::HeapBase, 16u);
++        return expect(exhausted != 0u, "could not exhaust the IOP allocator") &&
++               expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] == 0u,
++                      "allocation failure produced a fake transfer-buffer pointer");
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopTimrman timrman;
+@@ -331,7 +378,7 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testTimrmanPeriodicCallback())
++        !testCdvdReadBufferOwnership() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;

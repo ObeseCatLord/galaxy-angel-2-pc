@@ -1,0 +1,44 @@
+From ee19f39525e26eec6b38d14eb52b3dc720c8caf9 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:01:20 -0500
+Subject: [PATCH] TextureDescriptor.rendered_source: base page last written by
+ rendering
+
+The host's texture replacement hook skips render targets (post-process
+inputs, frame copies): they are not art and change every frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 1 +
+ gs/gs_renderer.hpp  | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 93e6d2c..021a809 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1592,6 +1592,7 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 	desc.tex1.desc.K = 0;
+ 
+ 	update_texture_page_rects();
++	desc.rendered_source = tracker.texture_may_super_sample(state_tracker.tex.page_rects[0]) ? 1u : 0u;   // [texreplace]
+ 
+ 	// Be quite conservative when we decide to attempt super sampled textures.
+ 	// This is mostly only useful in:
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index efb7bee..e425146 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -104,6 +104,9 @@ struct TextureDescriptor
+ 
+ 	// This information is purely implied from the desc, so don't compare or hash it.
+ 	TexRect rect;
++	// [texreplace] the base page was last written by rendering, not by a host upload: a render target
++	// (post-process input, frame copy), not art. Not part of the key; the host's replacement hook skips these.
++	uint32_t rendered_source = 0;
+ 
+ 	inline bool operator==(const TextureDescriptor &other) const
+ 	{
+-- 
+2.55.0
+

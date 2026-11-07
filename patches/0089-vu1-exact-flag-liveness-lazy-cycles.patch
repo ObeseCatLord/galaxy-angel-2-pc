@@ -1,0 +1,2606 @@
+From c0827a4b065240d44bba63582dbc3bc4c0df0644 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 07:33:56 -0500
+Subject: [PATCH] vu1: exact flag liveness, lazy block cycles, vector flag
+ results, leaner dispatch
+
+Callgrind (generated path, ga2_vu1_check --repeat 1; eigou-2 narration / zettai
+map): 592.5M -> 330.0M Ir (-44.3%) and 543.6M -> 300.2M (-44.8%), from 71.6 to
+39.9 host instructions per VU cycle on narration. --reference: 0 mismatches on
+narration, map, battle and tutorial; ps2x_tests 579/579. Steps, in order
+(narration / map Ir after the step):
+
+- MAC liveness (ga2_vu1_plan.h): a producer is dead when a later producer is
+  already four pairs old at every reader (before: the latest one had to be),
+  so 80 of 234 flag-producing pairs in the big program drop to 24; a D/T halt
+  ends the run only if the unit has the bit enabled (it counts like an E bit
+  and the producer at/after a halt stays live), and the control flow is
+  analysed with a pair entered as a delay slot apart from one entered by a
+  jump (a slot that is also a jump target followed the wrong successors).
+  504.6M / 462.6M.
+- Blocks: the cycle counter is only written by pairs that look at it or at
+  what the FDIV/EFU pipelines commit (pairNeedsCycle, a whitelist of ops that
+  do not), plus the pipeline commits due by then, and by finishBlock; no
+  per-cycle advance or commit poll. Direct jumps between blocks (static branch
+  targets; tail calls between chunks, musttail on clang), no code-size check
+  after a block, VF/ACC ready cycles that are complete when the block ends are
+  not stored. (A non-inlined pairNeedsCycle cost +40% until forced inline.)
+  435.2M / 399.4M.
+- CLIP liveness (kFlagClip): a CLIP superseded by a later clip write four
+  pairs old at every clip reader only shifts the clip history. 425.3M / 390.6M.
+- FMAC flag results: MAC bits for the flagged pairs are computed four lanes at
+  once (ADD/SUB/MUL, accumulating forms, OPMSUB/OPMULA) instead of per lane
+  with branches and long double fallbacks; the flag entry is queued inline.
+  391.6M / 359.6M.
+- Normal-range fast paths: results whose exponent is in [1, 253] (single
+  rounding) or [61, 253] with an unsaturated product (accumulating forms)
+  need no clamping and have only a sign flag; proved in the code comments.
+  369.2M / 339.6M.
+- Block guards on VF/VI/ACC registers at offset >= 3 hold by construction
+  (writes complete four cycles after issue) and are not emitted; no
+  m_state.cycles store per block. 346.7M / 319.4M.
+- Chunks of 128 pairs (was 48) and no stack protector in them: fewer
+  hand-overs. Costs ~60% more compile time for the programs. 329.2M / 299.4M.
+- Generated programs start or resume at any pair that expects what is pending
+  (kFacts per pair; registerJitEntry gets the table) instead of interpreting
+  until nothing is pending: a chunk boundary between a branch and its delay
+  slot no longer costs a generic step (880 Ir each, 3% of narration at 48-pair
+  chunks). 330.0M / 300.2M at 128-pair chunks.
+
+Fix found by the fuzzer, present before: the compiler merged "restore the
+lanes a pair does not write" into vector arithmetic (a multiply by 1.0), which
+quieted signaling-NaN bit patterns that VU registers also hold as integers
+(ITOF with a partial dest). Lane copies now move bits (ga2_vu1::copyLane).
+
+Tools: ga2_vu1_fuzz (ps2xTest) emits random programs and compares the
+interpreter with generated programs, or with an interpreter that only computes
+some flag results (--flags), over random states with resumes, GIF packets and
+every float class; GA2_VU1GEN_HITDUMP gives per-pair execution counts.
+ga2_vu1_plan.h holds the generator's analyses (flag liveness, entry facts,
+blocks) so the fuzzer runs the same code.
+
+Verification: ga2_vu1_check --reference x3 on the four captures: 0 mismatches;
+ps2x_tests 579/579; the interpreter's digests (state, VU memory, GIF, cycles)
+are identical to b86ec90 on 1.9M random runs, and its replay of the recorded
+digests of the real captures gives the same results as b86ec90; generated
+programs vs the interpreter on 540 random images (3.7M random-state runs) and
+on 70 more with 16-pair chunks (0.65M): 0 mismatches; candidates that only
+compute some flag results (--flags 1..6) vs the full interpreter: 0
+mismatches (mutated fast paths are caught within seconds). Not checked in the
+game itself.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h        |  63 +-
+ ps2xRuntime/include/runtime/ps2_vu1_exec.inl | 341 ++++++++-
+ ps2xRuntime/include/runtime/ps2_vu1_step.inl | 104 ++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      |  25 +-
+ ps2xTest/CMakeLists.txt                      |   3 +
+ ps2xTest/src/ga2_vu1_fuzz.cpp                | 733 +++++++++++++++++++
+ ps2xTest/src/ga2_vu1_gen.cpp                 | 477 +++++-------
+ ps2xTest/src/ga2_vu1_plan.h                  | 317 ++++++++
+ 8 files changed, 1687 insertions(+), 376 deletions(-)
+ create mode 100644 ps2xTest/src/ga2_vu1_fuzz.cpp
+ create mode 100644 ps2xTest/src/ga2_vu1_plan.h
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 25a1569..dd8316d 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -137,11 +137,12 @@ public:
+         bool tBit = false;
+         uint8_t upperVfShadowReg = 0;
+         uint8_t suppressedLowerVf = 0;
+-        // Observable FMAC flag results (kFlagMac | kFlagStatus); generated
+-        // programs clear what no instruction can read.
+-        uint8_t flagMode = 3;
++        // Observable flag results (kFlagMac | kFlagStatus for FMAC results,
++        // kFlagClip for CLIP); generated programs clear what no instruction
++        // can read.
++        uint8_t flagMode = 7;
+     };
+-    static constexpr uint8_t kFlagMac = 1u, kFlagStatus = 2u, kFlagAll = 3u;
++    static constexpr uint8_t kFlagMac = 1u, kFlagStatus = 2u, kFlagClip = 4u, kFlagAll = 7u;
+ 
+     enum class StepResult : uint8_t
+     {
+@@ -167,10 +168,11 @@ public:
+     // Programs for single entry points (used when no program matches the
+     // whole image), keyed by the entry pair and the code reachable from it
+     // (ps2_vu1_reach.h). chunks[pair] runs a chunk of the program from that
+-    // pair (as a generated run() loop would); statusElided: valid only in
+-    // images without status flag readers.
+-    static void registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, bool elidesFlags,
+-                                 bool statusElided);
++    // pair (as a generated run() loop would) when pendingMatches(facts[pair])
++    // (EntryFacts bits below); statusElided: valid only in images without
++    // status flag readers.
++    static void registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, const uint8_t *facts,
++                                 bool elidesFlags, bool statusElided);
+     bool lastRunEnded() const { return m_lastRunEnded; }
+     static DecodedInstructionPair decodeForCodegen(const uint8_t *vuCode, uint32_t pc);
+     // Codegen: whether this upper instruction queues MAC/status flag results.
+@@ -192,6 +194,15 @@ public:
+     // stepLoopHead right after a pair: its pipelines are already committed.
+     inline bool stepLoopHeadAfterPair(const StepArgs &args);
+     bool resumesInDelaySlot() const { return m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot; }
++    // What a generated pair is compiled to find pending when it starts (PairEntry
++    // as bits): a run may start or resume at it when it expects what is pending.
++    static constexpr uint8_t kEntryMayBranch = 1u, kEntryMayEnd = 2u, kEntryMayHalt = 4u;
++    bool pendingMatches(uint8_t entryFacts) const
++    {
++        return (!m_state.branchPending || (entryFacts & kEntryMayBranch) != 0u) &&
++               (!m_state.ebit || (entryFacts & kEntryMayEnd) != 0u) &&
++               (!m_state.haltAfterDelaySlot || (entryFacts & kEntryMayHalt) != 0u);
++    }
+     StepResult stepGeneric(const StepArgs &args);
+ 
+     // ---- Statically scheduled blocks (ga2_vu1_gen)
+@@ -259,13 +270,22 @@ public:
+     // written by finishBlock. The branch-read backup of the previous VI
+     // write (readBranchVi) is only kept when the next pair reads it: the
+     // block's last pair and the pair before a final branch.
+-    inline StepResult stepPairScheduled(const DecodedInstructionPair &decoded, uint32_t stallCycles, bool keepBranchBackup,
++    inline StepResult stepPairScheduled(const DecodedInstructionPair &decoded, uint64_t issueCycle, bool keepBranchBackup,
+                                         const StepArgs &args);
++    // Whether a pair looks at the cycle counter or at what the FDIV/EFU
++    // pipelines commit (flag results, CLIP, flag readers, Q/P readers and
++    // writers). Inside a block only these pairs get the cycle counter (and
++    // the pipelines' commits due by then); the others do not touch either.
++    static constexpr bool pairNeedsCycle(const DecodedInstructionPair &decoded);
+     // After the block: its writes' ready cycles, as the pairs would have left
+     // them, and the state's PC (endPc, or the branch target when the block
+-    // ends in a taken branch and its delay slot) and cycle counter.
++    // ends in a taken branch and its delay slot) and cycle counter (the entry
++    // cycle plus the block's length in cycles).
+     inline void finishBlock(uint64_t entryCycle, const BlockFinal *finals, uint32_t finalCount, uint32_t regWriteReady,
+-                            uint32_t endPc, bool endsInBranch);
++                            uint32_t cycles, uint32_t endPc, bool endsInBranch);
++    // stepLoopHeadAfterPair after a block, for programs whose code image has
++    // as many bytes as the PC can address (every PC a block leaves at is in it).
++    bool stepLoopHeadAfterBlock(const StepArgs &args) const { return m_cycle < args.budgetEnd && !m_stopRequested; }
+ 
+     // GA2_VU1_BLOCKSTATS=1 (ga2_vu1_check): how often blocks run and why not.
+     struct BlockStats
+@@ -347,11 +367,10 @@ private:
+     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{}; // ring
+     uint32_t m_flagHead = 0;
+     uint32_t m_flagCount = 0;
+-    FlagPipelineEntry *allocFlagEntry()
++    bool makeRoomForFlagEntry();
++    __attribute__((always_inline)) FlagPipelineEntry *allocFlagEntry()
+     {
+-        if (m_flagCount == kMaxFlagEntries)
+-            syncFlags();
+-        if (m_flagCount == kMaxFlagEntries)
++        if (__builtin_expect(m_flagCount == kMaxFlagEntries, 0) && !makeRoomForFlagEntry())
+             return nullptr;
+         FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount++) & (kMaxFlagEntries - 1u)];
+         entry = {};
+@@ -421,6 +440,7 @@ private:
+     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
+     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
+     DecodedInstructionPair m_uncachedDecoded{};
++    uint8_t m_decodeFlagMode = kFlagAll;
+     JitProgram m_jitProgram = nullptr;
+     uint64_t *m_pcHits = nullptr;
+     const PS2Memory *m_jitMemory = nullptr;
+@@ -440,6 +460,10 @@ private:
+ public:
+     // Reference runs (ga2_vu1_replay --reference) use the interpreter only.
+     void setGeneratedProgramsEnabled(bool enabled) { m_jitEnabled = enabled; m_jitMemory = nullptr; }
++    // Test hook (ga2_vu1_fuzz): the flag results the interpreter computes
++    // (DecodedInstructionPair::flagMode), to run the flag-eliding paths of
++    // generated programs without a generated program. Set before code is loaded.
++    void setDecodeFlagMode(uint8_t mode) { m_decodeFlagMode = mode; m_decodedCodeCacheValid = false; }
+ 
+ private:
+     const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+@@ -451,6 +475,10 @@ private:
+     void applyDest(float *dst, const float *result, uint8_t dest);
+     void applyDestAcc(const float *result, uint8_t dest);
+     void produceFmacFlags(float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
++    // Normalizes an FMAC result and computes its MAC bits, four lanes at once,
++    // for the common cases; false (result unchanged) when the scalar path must decide.
++    bool fmacMacVector(float *result, uint8_t dest, uint32_t upper, uint32_t &mac);
++    void queueMac(uint32_t mac);
+     void applyFmacDest(float *dst, float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
+     void applyFmacDestAcc(float *result, uint8_t dest, uint32_t upper, uint8_t flagMode);
+     static bool isFmacProductSum(uint32_t upper);
+@@ -463,7 +491,9 @@ private:
+     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky,
+                          bool writesStatus = true, bool writesMac = true);
+     void queueFsset(uint16_t immediate);
+-    void queueClip(uint32_t clip);
++    // observable: whether any later instruction can read this CLIP result (it
++    // still shifts into the clip history that later results carry).
++    void queueClip(uint32_t clip, bool observable);
+     void queueFcset(uint32_t clip);
+     void queueQ(float value, uint32_t latency, uint32_t statusDi);
+     void queueP(float value, uint32_t latency);
+@@ -479,7 +509,6 @@ private:
+             commitReadyPipelinesSlow();
+     }
+     inline void advanceOneCycle();
+-    inline void advanceBlockCycle();
+     bool blockMayRunCounted(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue, uint32_t pairCount,
+                             const StepArgs &args) const;
+     void advanceTo(uint64_t targetCycle);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+index c8963cd..8848a00 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_exec.inl
+@@ -17,6 +17,17 @@
+ 
+ namespace ga2_vu1
+ {
++    // Copies one lane as bits. VU registers also hold integers, whose patterns
++    // include signaling NaNs; compilers merge neighbouring float lane copies
++    // into vector arithmetic (a multiply by 1.0 for the lane that is only
++    // copied), which would quiet them.
++    __attribute__((always_inline)) inline void copyLane(float *dst, const float *src)
++    {
++        uint32_t bits;
++        __builtin_memcpy(&bits, src, sizeof(bits));
++        __builtin_memcpy(dst, &bits, sizeof(bits));
++    }
++
+     // VU operand rule for four lanes at once (VU1Interpreter::normalizeOperand):
+     // denormals read as signed zero, Inf/NaN as signed max. Branchless.
+     __attribute__((always_inline)) inline void normalizeOperands4(const float *in, float *out)
+@@ -46,6 +57,87 @@ namespace ga2_vu1
+         }
+ #endif
+     }
++
++#if defined(__SSE2__)
++    // Four 32-bit lanes from the high dwords of two double pairs (sign and
++    // all-ones compare masks live there).
++    __attribute__((always_inline)) inline __m128i packHigh(__m128d lo, __m128d hi)
++    {
++        return _mm_castps_si128(_mm_shuffle_ps(_mm_castpd_ps(lo), _mm_castpd_ps(hi), _MM_SHUFFLE(3, 1, 3, 1)));
++    }
++
++    // The component-order bit mask (x in bit 0) of the all-ones lanes of m, and the
++    // same in the order of the MAC/dest bits (x in bit 3).
++    __attribute__((always_inline)) inline int componentBits(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)); }
++    __attribute__((always_inline)) inline int laneBits(__m128i m)
++    {
++        return _mm_movemask_ps(_mm_castsi128_ps(_mm_shuffle_epi32(m, _MM_SHUFFLE(0, 1, 2, 3))));
++    }
++    __attribute__((always_inline)) inline int componentDestBits(uint8_t dest)
++    {
++        return ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
++    }
++
++    // Whether every lane of dest in an FMAC result has a biased exponent in
++    // [lo, hi]. A single-rounding result (sum, difference, product) in
++    // [1, 253] is a normal number whose exact value is one too, and needs no
++    // clamping and has only a sign flag. A product-sum result is computed in
++    // float with two roundings, which agrees when in [61, 253] and the
++    // product itself did not saturate (see productSumUnsaturated).
++    __attribute__((always_inline)) inline bool lanesInRange(const float *result, uint8_t dest, int lo, int hi)
++    {
++        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
++        const __m128i e = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
++        const __m128i ok = _mm_and_si128(_mm_cmpgt_epi32(e, _mm_set1_epi32(lo - 1)), _mm_cmpgt_epi32(_mm_set1_epi32(hi + 1), e));
++        return (~componentBits(ok) & componentDestBits(dest)) == 0;
++    }
++
++    // Whether no lane of dest in the product vs * b of a product-sum has a magnitude
++    // of 2^127 or more (judged from the operands' exponents; the float multiply
++    // saturates at FLT_MAX, which hides an overflow that the exact sum shows).
++    __attribute__((always_inline)) inline bool productSumUnsaturated(const float *vs, const float *b, uint8_t dest)
++    {
++        const __m128i evs = _mm_and_si128(_mm_srli_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(vs)), 23), _mm_set1_epi32(0xFF));
++        const __m128i eb = _mm_and_si128(_mm_srli_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(b)), 23), _mm_set1_epi32(0xFF));
++        const __m128i ok = _mm_cmpgt_epi32(_mm_set1_epi32(380), _mm_add_epi32(evs, eb));
++        return (~componentBits(ok) & componentDestBits(dest)) == 0;
++    }
++
++    struct ExactClasses
++    {
++        __m128i zero, over, under, sign; // all-ones lanes, component order
++    };
++
++    // Classifies four exact (double) FMAC results as normalizeFmacExactResult
++    // does, and fixes the float results of the lanes in dest accordingly
++    // (zero and underflow -> signed zero, overflow -> signed FLT_MAX). Returns
++    // false, changing nothing, when a lane in dest is exactly FLT_MAX: the
++    // double may hide an overflow there and the caller decides precisely.
++    __attribute__((always_inline)) inline bool classifyExact(__m128d exactLo, __m128d exactHi, uint8_t dest, float *result,
++                                                             ExactClasses &c)
++    {
++        const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
++        const __m128d maxD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
++        const __m128d minD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
++        const __m128d absLo = _mm_and_pd(exactLo, absMask), absHi = _mm_and_pd(exactHi, absMask);
++        const int destLanes = componentDestBits(dest);
++        const __m128i atMax = packHigh(_mm_cmpeq_pd(absLo, maxD), _mm_cmpeq_pd(absHi, maxD));
++        if ((componentBits(atMax) & destLanes) != 0)
++            return false;
++        c.zero = packHigh(_mm_cmpeq_pd(exactLo, _mm_setzero_pd()), _mm_cmpeq_pd(exactHi, _mm_setzero_pd()));
++        c.over = packHigh(_mm_cmpgt_pd(absLo, maxD), _mm_cmpgt_pd(absHi, maxD));
++        c.under = _mm_andnot_si128(c.zero, packHigh(_mm_cmplt_pd(absLo, minD), _mm_cmplt_pd(absHi, minD)));
++        c.sign = _mm_and_si128(packHigh(exactLo, exactHi), _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        const __m128i toZero = _mm_or_si128(c.zero, c.under);
++        const __m128i fixed = _mm_or_si128(_mm_and_si128(toZero, c.sign),
++                                           _mm_and_si128(c.over, _mm_or_si128(c.sign, _mm_set1_epi32(0x7F7FFFFF))));
++        const __m128i laneSelect = _mm_set_epi32(dest & 1 ? -1 : 0, dest & 2 ? -1 : 0, dest & 4 ? -1 : 0, dest & 8 ? -1 : 0);
++        const __m128i change = _mm_and_si128(_mm_or_si128(toZero, c.over), laneSelect);
++        const __m128i r = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(result), _mm_or_si128(_mm_andnot_si128(change, r), _mm_and_si128(change, fixed)));
++        return true;
++    }
++#endif
+ }
+ using ga2_vu1::laneForComponent;
+ __attribute__((always_inline)) inline float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+@@ -122,13 +214,13 @@ __attribute__((always_inline)) inline void VU1Interpreter::queueStore(uint32_t a
+ __attribute__((always_inline)) inline void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+ {
+     if (dest & 0x8u)
+-        dst[0] = result[0];
++        ga2_vu1::copyLane(dst, result);
+     if (dest & 0x4u)
+-        dst[1] = result[1];
++        ga2_vu1::copyLane(dst + 1, result + 1);
+     if (dest & 0x2u)
+-        dst[2] = result[2];
++        ga2_vu1::copyLane(dst + 2, result + 2);
+     if (dest & 0x1u)
+-        dst[3] = result[3];
++        ga2_vu1::copyLane(dst + 3, result + 3);
+ }
+ 
+ __attribute__((always_inline)) inline void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+@@ -180,6 +272,14 @@ namespace ga2_vu1
+         default: return {};
+         }
+     }
++
++    // The multiplier B of a uniform product-sum acc +/- vs * B as stored (not normalized).
++    __attribute__((always_inline)) inline void rawMultiplier(const ProductSumShape &shape, const float *vt, float q, float i, float *b)
++    {
++        for (int c = 0; c < 4; ++c)
++            b[c] = shape.source == 3u ? vt[c] : shape.source == 0u ? vt[shape.bc] : shape.source == 1u ? q : i;
++    }
++
+ }
+ 
+ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest, uint32_t upper,
+@@ -188,6 +288,16 @@ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(f
+     const bool productSum = isFmacProductSum(upper);
+ #if defined(__SSE2__)
+     const ga2_vu1::ProductSumShape shape = ga2_vu1::productSumShape(upper);
++    if (productSum && shape.uniform && !flagsNeeded && ga2_vu1::lanesInRange(result, dest, 61, 253))
++    {
++        float b[4];
++        ga2_vu1::rawMultiplier(shape, m_state.vf[FT(upper)], m_state.q, m_state.i, b);
++        if (ga2_vu1::productSumUnsaturated(m_state.vf[FS(upper)], b, dest))
++        {
++            laneFlags[0] = laneFlags[1] = laneFlags[2] = laneFlags[3] = 0u;
++            return;
++        }
++    }
+     if (productSum && shape.uniform)
+     {
+         // The exact (double) result of all four lanes at once; the per-lane
+@@ -208,35 +318,15 @@ __attribute__((always_inline)) inline void VU1Interpreter::normalizeFmacResult(f
+         const __m128d exactLo = shape.subtract ? _mm_sub_pd(accLo, productLo) : _mm_add_pd(accLo, productLo);
+         const __m128d exactHi = shape.subtract ? _mm_sub_pd(accHi, productHi) : _mm_add_pd(accHi, productHi);
+ 
+-        // Classify all lanes (normalizeFmacExactResult, vectorized). The high
+-        // dword of each double carries its sign and all-ones compare masks.
+-        const auto pack = [](__m128d lo, __m128d hi) {
+-            return _mm_castps_si128(_mm_shuffle_ps(_mm_castpd_ps(lo), _mm_castpd_ps(hi), _MM_SHUFFLE(3, 1, 3, 1)));
+-        };
+-        const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+-        const __m128d maxD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
+-        const __m128d minD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
+-        const __m128d absLo = _mm_and_pd(exactLo, absMask), absHi = _mm_and_pd(exactHi, absMask);
+-        const int destLanes = ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8);
+-        const __m128i atMax = pack(_mm_cmpeq_pd(absLo, maxD), _mm_cmpeq_pd(absHi, maxD));
+-        if ((_mm_movemask_ps(_mm_castsi128_ps(atMax)) & destLanes) == 0)
++        // Classify all lanes (normalizeFmacExactResult, vectorized).
++        ga2_vu1::ExactClasses classes;
++        if (ga2_vu1::classifyExact(exactLo, exactHi, dest, result, classes))
+         {
+-            const __m128i zero = pack(_mm_cmpeq_pd(exactLo, _mm_setzero_pd()), _mm_cmpeq_pd(exactHi, _mm_setzero_pd()));
+-            const __m128i over = pack(_mm_cmpgt_pd(absLo, maxD), _mm_cmpgt_pd(absHi, maxD));
+-            const __m128i under = _mm_andnot_si128(zero, pack(_mm_cmplt_pd(absLo, minD), _mm_cmplt_pd(absHi, minD)));
+-            const __m128i sign = _mm_and_si128(pack(exactLo, exactHi), _mm_set1_epi32(static_cast<int>(0x80000000u)));
+-            const __m128i toZero = _mm_or_si128(zero, under);
+-            const __m128i fixed = _mm_or_si128(_mm_and_si128(toZero, sign),
+-                                               _mm_and_si128(over, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+-            const __m128i laneSelect = _mm_set_epi32(dest & 1 ? -1 : 0, dest & 2 ? -1 : 0, dest & 4 ? -1 : 0, dest & 8 ? -1 : 0);
+-            const __m128i change = _mm_and_si128(_mm_or_si128(toZero, over), laneSelect);
+-            const __m128i r = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+-            _mm_storeu_si128(reinterpret_cast<__m128i *>(result),
+-                             _mm_or_si128(_mm_andnot_si128(change, r), _mm_and_si128(change, fixed)));
+             if (flagsNeeded)
+             {
+-                const int z = _mm_movemask_ps(_mm_castsi128_ps(zero)), o = _mm_movemask_ps(_mm_castsi128_ps(over));
+-                const int u = _mm_movemask_ps(_mm_castsi128_ps(under)), n = _mm_movemask_ps(_mm_castsi128_ps(sign));
++                const int destLanes = ga2_vu1::componentDestBits(dest);
++                const int z = ga2_vu1::componentBits(classes.zero), o = ga2_vu1::componentBits(classes.over);
++                const int u = ga2_vu1::componentBits(classes.under), n = ga2_vu1::componentBits(classes.sign);
+                 for (uint32_t component = 0; component < 4u; ++component)
+                 {
+                     const int bit = 1 << component;
+@@ -640,19 +730,200 @@ __attribute__((always_inline)) inline void VU1Interpreter::updateFmacFlags(const
+     entry->writesStatus = writesStatus;
+ }
+ 
++__attribute__((always_inline)) inline void VU1Interpreter::queueMac(uint32_t mac)
++{
++    FlagPipelineEntry *entry = allocFlagEntry();
++    if (!entry)
++    {
++        reportReservedInstruction(true, 0xFFFFFFFFu);
++        return;
++    }
++    entry->valid = true;
++    entry->issueCycle = m_cycle;
++    entry->readyCycle = m_cycle + kFmacLatency;
++    entry->mac = mac;
++    entry->writesMac = true;
++    entry->writesStatus = false;
++}
++
++#if defined(__SSE2__)
++namespace ga2_vu1
++{
++    // Multiplications (MUL.., MULA.., OPMULA) and their operands' shape, for telling
++    // an exact zero product from an underflow.
++    struct MulShape
++    {
++        bool mul = false;
++        uint8_t source = 0; // 0 vt[bc], 1 Q, 2 I, 3 vt[c], 4 OPMULA
++        uint8_t bc = 0;
++    };
++
++    __attribute__((always_inline)) inline MulShape mulShape(uint32_t upper)
++    {
++        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++        const uint8_t code = op < 0x3Cu ? op : static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++        if (code >= 0x18u && code <= 0x1Bu)
++            return {true, 0u, static_cast<uint8_t>(code & 3u)};
++        if (code == 0x1Cu)
++            return {true, 1u, 0u};
++        if (code == 0x1Eu)
++            return {true, 2u, 0u};
++        if (code == 0x2Au)
++            return {true, 3u, 0u};
++        if (op >= 0x3Cu && code == 0x2Eu)
++            return {true, 4u, 0u};
++        return {};
++    }
++}
++#endif
++
++__attribute__((always_inline)) inline bool VU1Interpreter::fmacMacVector(float *result, uint8_t dest, uint32_t upper, uint32_t &mac)
++{
++#if defined(__SSE2__)
++    const bool productSum = isFmacProductSum(upper);
++    const ga2_vu1::ProductSumShape shape = ga2_vu1::productSumShape(upper);
++    const int destLanes = ga2_vu1::componentDestBits(dest);
++    bool normalResults = false;
++    if (!productSum)
++        normalResults = ga2_vu1::lanesInRange(result, dest, 1, 253);
++    else if (shape.uniform && ga2_vu1::lanesInRange(result, dest, 61, 253))
++    {
++        float b[4];
++        ga2_vu1::rawMultiplier(shape, m_state.vf[FT(upper)], m_state.q, m_state.i, b);
++        normalResults = ga2_vu1::productSumUnsaturated(m_state.vf[FS(upper)], b, dest);
++    }
++    if (normalResults)
++    {
++        // Normal results: only the sign flag, and the values stand.
++        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
++        mac = static_cast<uint32_t>(ga2_vu1::laneBits(_mm_cmpgt_epi32(_mm_setzero_si128(), bits)) & dest) << 4;
++        return true;
++    }
++    __m128i zero, sign, under, over; // lanes of the flags, component order
++    if (productSum)
++    {
++        // acc +/- vs * B (or OPMSUB's cross products) in double, which is
++        // exact; the classification is that of normalizeFmacResult.
++        alignas(16) float vs[4], vt[4], acc[4], b[4];
++        ga2_vu1::normalizeOperands4(m_state.vf[FS(upper)], vs);
++        ga2_vu1::normalizeOperands4(m_state.vf[FT(upper)], vt);
++        ga2_vu1::normalizeOperands4(m_state.acc, acc);
++        bool subtract = true;
++        if (shape.uniform)
++        {
++            subtract = shape.subtract;
++            const float scalar = shape.source == 0u ? vt[shape.bc]
++                                 : shape.source == 1u ? normalizeOperand(m_state.q)
++                                                      : normalizeOperand(m_state.i);
++            for (int c = 0; c < 4; ++c)
++                b[c] = shape.source == 3u ? vt[c] : scalar;
++        }
++        else
++        {
++            // OPMSUB: acc[c] - vs[left] * vt[right], and 0 in w.
++            alignas(16) float l[4] = {vs[1], vs[2], vs[0], 0.0f};
++            alignas(16) float r[4] = {vt[2], vt[0], vt[1], 0.0f};
++            acc[3] = 0.0f;
++            std::memcpy(vs, l, sizeof(vs));
++            std::memcpy(b, r, sizeof(b));
++        }
++        const __m128 vs4 = _mm_load_ps(vs), b4 = _mm_load_ps(b), acc4 = _mm_load_ps(acc);
++        const __m128d productLo = _mm_mul_pd(_mm_cvtps_pd(vs4), _mm_cvtps_pd(b4));
++        const __m128d productHi = _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(vs4, vs4)), _mm_cvtps_pd(_mm_movehl_ps(b4, b4)));
++        const __m128d accLo = _mm_cvtps_pd(acc4), accHi = _mm_cvtps_pd(_mm_movehl_ps(acc4, acc4));
++        const __m128d exactLo = subtract ? _mm_sub_pd(accLo, productLo) : _mm_add_pd(accLo, productLo);
++        const __m128d exactHi = subtract ? _mm_sub_pd(accHi, productHi) : _mm_add_pd(accHi, productHi);
++        ga2_vu1::ExactClasses classes;
++        if (!ga2_vu1::classifyExact(exactLo, exactHi, dest, result, classes))
++            return false;
++        zero = _mm_or_si128(classes.zero, classes.under); // an underflow sets Z too
++        sign = classes.sign;
++        under = classes.under;
++        over = classes.over;
++    }
++    else
++    {
++        // One rounding toward zero from normalized operands: the float result
++        // classifies like the exact one, except that a zero hides exact zero
++        // vs underflow (known from the operands of a product; a sum is zero
++        // only when exactly zero) and FLT_MAX hides overflow (left to the
++        // scalar path).
++        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
++        const __m128i mag = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
++        const __m128i isZero = _mm_cmpeq_epi32(mag, _mm_setzero_si128());
++        const __m128i isMax = _mm_cmpeq_epi32(mag, _mm_set1_epi32(0x7F7FFFFF));
++        if ((ga2_vu1::componentBits(isMax) & destLanes) != 0)
++            return false;
++        const __m128i denormal = _mm_andnot_si128(isZero, _mm_cmpgt_epi32(_mm_set1_epi32(0x00800000), mag));
++        over = _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x7F7FFFFF));
++        sign = _mm_cmpgt_epi32(_mm_setzero_si128(), bits);
++        under = denormal;
++        zero = _mm_or_si128(isZero, denormal);
++        const ga2_vu1::MulShape mul = ga2_vu1::mulShape(upper);
++        if (mul.mul && (ga2_vu1::componentBits(isZero) & destLanes) != 0)
++        {
++            // A zero product underflowed unless an operand was zero.
++            __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FS(upper)]));
++            const float *vt = m_state.vf[FT(upper)];
++            __m128i bv;
++            switch (mul.source)
++            {
++            case 0: bv = _mm_castps_si128(_mm_set1_ps(vt[mul.bc])); break;
++            case 1: bv = _mm_castps_si128(_mm_set1_ps(m_state.q)); break;
++            case 2: bv = _mm_castps_si128(_mm_set1_ps(m_state.i)); break;
++            case 3: bv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(vt)); break;
++            default:
++                // OPMULA: vs[1..2,0] * vt[2,0,1]; w is exactly 0.
++                a = _mm_shuffle_epi32(a, _MM_SHUFFLE(3, 0, 2, 1));
++                bv = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(vt)), _MM_SHUFFLE(3, 1, 0, 2));
++                a = _mm_and_si128(a, _mm_set_epi32(0, -1, -1, -1));
++                break;
++            }
++            const __m128i expMask = _mm_set1_epi32(0x7F800000);
++            __m128i zeroOperand = _mm_or_si128(_mm_cmpeq_epi32(_mm_and_si128(a, expMask), _mm_setzero_si128()),
++                                               _mm_cmpeq_epi32(_mm_and_si128(bv, expMask), _mm_setzero_si128()));
++            if (mul.source == 4u)
++                zeroOperand = _mm_or_si128(zeroOperand, _mm_set_epi32(-1, 0, 0, 0));
++            under = _mm_or_si128(under, _mm_andnot_si128(zeroOperand, isZero));
++        }
++        // Values: denormal -> signed zero, Inf/NaN -> signed FLT_MAX.
++        ga2_vu1::normalizeOperands4(result, result);
++    }
++    const uint32_t z = static_cast<uint32_t>(ga2_vu1::laneBits(zero)), n = static_cast<uint32_t>(ga2_vu1::laneBits(sign));
++    const uint32_t u = static_cast<uint32_t>(ga2_vu1::laneBits(under)), o = static_cast<uint32_t>(ga2_vu1::laneBits(over));
++    const uint32_t d = dest;
++    mac = (z & d) | ((n & d) << 4) | ((u & d) << 8) | ((o & d) << 12);
++    return true;
++#else
++    (void)result; (void)dest; (void)upper; (void)mac;
++    return false;
++#endif
++}
++
+ // flagMode (kFlagMac | kFlagStatus) says which flag results a later
+ // instruction can observe; the generator clears bits it proves dead. Result
+ // values are computed identically either way.
+ __attribute__((always_inline)) inline void VU1Interpreter::produceFmacFlags(float *result, uint8_t dest, uint32_t upper,
+                                                                           uint8_t flagMode)
+ {
++    const uint8_t fmacMode = flagMode & (kFlagMac | kFlagStatus);
++    if (fmacMode == kFlagMac)
++    {
++        uint32_t mac = 0u;
++        if (fmacMacVector(result, dest, upper, mac))
++        {
++            if (dest != 0u)
++                queueMac(mac);
++            return;
++        }
++    }
+     uint8_t laneFlags[4]{};
+-    normalizeFmacResult(result, dest, upper, laneFlags, flagMode != 0u);
+-    if (flagMode == kFlagAll)
++    normalizeFmacResult(result, dest, upper, laneFlags, fmacMode != 0u);
++    if (fmacMode == (kFlagMac | kFlagStatus))
+         updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest));
+-    else if (flagMode == kFlagMac)
++    else if (fmacMode == kFlagMac)
+         updateFmacFlags(laneFlags, dest, 0u, false);
+-    else if (flagMode == kFlagStatus)
++    else if (fmacMode == kFlagStatus)
+         updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(upper, dest), true, false);
+ }
+ 
+@@ -1076,7 +1347,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::execUpper(uint32_t in
+                 flags |= 0x10u;
+             if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
+                 flags |= 0x20u;
+-            queueClip(flags);
++            queueClip(flags, (flagMode & kFlagClip) != 0u);
+             return;
+         }
+         case 0x20: // ADDAq
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_step.inl b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+index 9a3f6bd..e741afc 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_step.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+@@ -19,14 +19,6 @@ __attribute__((always_inline)) inline void VU1Interpreter::advanceOneCycle()
+         progressXgkick();
+ }
+ 
+-// advanceOneCycle inside a block: m_state.cycles is written by finishBlock and
+-// PATH1 is idle.
+-__attribute__((always_inline)) inline void VU1Interpreter::advanceBlockCycle()
+-{
+-    ++m_cycle;
+-    commitReadyPipelines();
+-}
+-
+ __attribute__((always_inline)) inline uint64_t VU1Interpreter::usageReadyCycle(const InstructionUsage &usage, uint64_t ready) const
+ {
+     // Written without loops over pointers so that constant usages fold.
+@@ -244,7 +236,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         float *reg = m_state.vf[upperWrite.reg];
+         for (uint32_t component = 0; component < 4u; ++component)
+             if ((upperWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                reg[component] = oldUpperVf[component];
++                ga2_vu1::copyLane(reg + component, oldUpperVf + component);
+         const uint32_t latency =
+             decoded.upperUsage.vfLatency != 0u
+                 ? decoded.upperUsage.vfLatency
+@@ -258,7 +250,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         float *reg = m_state.vf[lowerWrite.reg];
+         for (uint32_t component = 0; component < 4u; ++component)
+             if ((lowerWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                reg[component] = oldLowerVf[component];
++                ga2_vu1::copyLane(reg + component, oldLowerVf + component);
+         const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
+                                      ? decoded.lowerUsage.vfLatency
+                                      : decoded.lowerUsage.latency;
+@@ -272,7 +264,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         // flags still use the normal four-cycle FMAC timeline.
+         for (uint32_t component = 0; component < 4u; ++component)
+             if ((decoded.upperUsage.accWrite & ga2_vu1::laneForComponent(component)) == 0u)
+-                m_state.acc[component] = oldAcc[component];
++                ga2_vu1::copyLane(m_state.acc + component, oldAcc + component);
+         m_regWriteReady = std::max<uint64_t>(m_regWriteReady, m_cycle + kAccForwardLatency);
+     }
+     if (writtenVi != 0u)
+@@ -396,16 +388,84 @@ __attribute__((always_inline)) inline bool VU1Interpreter::blockMayRun(const Blo
+     return ok;
+ }
+ 
++__attribute__((always_inline)) constexpr bool VU1Interpreter::pairNeedsCycle(const DecodedInstructionPair &d)
++{
++    // Whitelists of what never reaches the cycle counter or the pipelines;
++    // everything else counts.
++    const uint32_t upper = d.upper;
++    const uint32_t op = upper & 0x3Fu;
++    bool needs = true;
++    if (op < 0x3Cu)
++    {
++        if ((op >= 0x10u && op <= 0x17u) || op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu)
++            needs = false; // MAX/MINI: no flags
++        else if (op == 0x1Cu || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u)
++            needs = true;  // reads Q
++        else
++            needs = (d.flagMode & (kFlagMac | kFlagStatus)) != 0u;
++    }
++    else
++    {
++        const uint32_t special = (upper & 3u) | ((upper >> 4) & 0x7Cu);
++        if ((special >= 0x10u && special <= 0x17u) || special == 0x1Du || special == 0x2Fu || special == 0x30u)
++            needs = false; // ITOF/FTOI/ABS/NOP
++        else if (special == 0x1Fu)
++            needs = (d.flagMode & kFlagClip) != 0u; // CLIP (an unobservable one only shifts the clip history)
++        else if (special == 0x1Cu || special == 0x20u || special == 0x21u || special == 0x24u || special == 0x25u)
++            needs = true;  // reads Q
++        else
++            needs = (d.flagMode & (kFlagMac | kFlagStatus)) != 0u;
++    }
++    if (needs)
++        return true;
++    if (d.iBit)
++        return false;
++    const uint32_t lower = d.lower;
++    if (lower == 0u || lower == 0x8000033Cu)
++        return false;
++    switch (lower >> 25)
++    {
++    case 0x00: case 0x01: case 0x04: case 0x05: case 0x08: case 0x09:
++    case 0x20: case 0x21: case 0x24: case 0x25: case 0x28: case 0x29: case 0x2C: case 0x2D: case 0x2E: case 0x2F:
++        return false;
++    case 0x40:
++    {
++        const uint32_t funct = lower & 0x3Fu;
++        if (funct >= 0x30u && funct <= 0x35u)
++            return false; // IADD ... IOR
++        if (funct < 0x3Cu)
++            return true;
++        const uint32_t special = (lower & 3u) | ((lower >> 4) & 0x7Cu);
++        switch (special)
++        {
++        case 0x30: case 0x31: case 0x34: case 0x35: case 0x36: case 0x37: case 0x3C: case 0x3D: case 0x3E: case 0x3F:
++        case 0x40: case 0x41: case 0x42: case 0x43: case 0x68: case 0x69:
++            return false; // MOVE, MR32, LQI.., MTIR, MFIR, ILWR, ISWR, R register, XTOP, XITOP
++        default:
++            return true;
++        }
++    }
++    default:
++        return true;
++    }
++}
++
+ // stepPairAfter for a pair inside a block that may run on its schedule:
+ // nothing can be pending from a branch, E bit or halt, the stall is known,
+-// and the ready cycles are written once by finishBlock.
++// and the ready cycles are written once by finishBlock. The cycle counter
++// holds the block's entry cycle; pairs that look at it (pairNeedsCycle) get
++// their issue cycle, with the pipeline commits due by then, which is all a
++// per-cycle advance would have made visible to them.
+ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPairScheduled(const DecodedInstructionPair &decoded,
+-                                                                                                uint32_t stallCycles,
++                                                                                                uint64_t issueCycle,
+                                                                                                 bool keepBranchBackup,
+                                                                                                 const StepArgs &a)
+ {
+-    for (uint32_t cycle = 0; cycle < stallCycles; ++cycle)
+-        advanceBlockCycle();
++    if (pairNeedsCycle(decoded))
++    {
++        m_cycle = issueCycle;
++        commitReadyPipelines();
++    }
+ 
+     uint8_t writtenVi = 0u;
+     int32_t oldVi = 0;
+@@ -451,7 +511,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+             float *reg = m_state.vf[upperWrite.reg];
+             for (uint32_t component = 0; component < 4u; ++component)
+                 if ((upperWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                    reg[component] = oldUpperVf[component];
++                    ga2_vu1::copyLane(reg + component, oldUpperVf + component);
+         }
+         else
+             std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+@@ -460,7 +520,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+             float *reg = m_state.vf[lowerWrite.reg];
+             for (uint32_t component = 0; component < 4u; ++component)
+                 if ((lowerWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
+-                    reg[component] = oldLowerVf[component];
++                    ga2_vu1::copyLane(reg + component, oldLowerVf + component);
+         }
+         else if (hasDistinctLowerWrite)
+             std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+@@ -468,7 +528,7 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         {
+             for (uint32_t component = 0; component < 4u; ++component)
+                 if ((decoded.upperUsage.accWrite & ga2_vu1::laneForComponent(component)) == 0u)
+-                    m_state.acc[component] = oldAcc[component];
++                    ga2_vu1::copyLane(m_state.acc + component, oldAcc + component);
+         }
+     }
+     else
+@@ -503,14 +563,14 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+         m_state.vi[0] = 0;
+     }
+ 
+-    advanceBlockCycle();
+     return StepResult::Continue;
+ }
+ 
+ __attribute__((always_inline)) inline void VU1Interpreter::finishBlock(uint64_t entryCycle, const BlockFinal *finals,
+                                                                         uint32_t finalCount, uint32_t regWriteReady,
+-                                                                        uint32_t endPc, bool endsInBranch)
++                                                                        uint32_t cycles, uint32_t endPc, bool endsInBranch)
+ {
++    m_cycle = entryCycle + cycles;
+     if (endsInBranch && m_state.branchPending)
+     {
+         // The branch pair counted its delay down and its slot took the jump.
+@@ -520,7 +580,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::finishBlock(uint64_t
+     }
+     else
+         m_state.pc = endPc;
+-    m_state.cycles = m_cycle;
++    // (m_state.cycles is written when the run ends.)
+ #pragma clang loop unroll(full)
+     for (uint32_t k = 0; k < finalCount; ++k)
+     {
+@@ -541,4 +601,6 @@ __attribute__((always_inline)) inline void VU1Interpreter::finishBlock(uint64_t
+     }
+     if (regWriteReady != 0u)
+         m_regWriteReady = std::max(m_regWriteReady, entryCycle + regWriteReady);
++    // What the pipelines committed during the block is only visible from here.
++    commitReadyPipelines();
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index babe710..25c67dd 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -123,9 +123,11 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+     entry->writesSticky = true;
+ }
+ 
+-void VU1Interpreter::queueClip(uint32_t clip)
++void VU1Interpreter::queueClip(uint32_t clip, bool observable)
+ {
+     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
++    if (!observable)
++        return;
+     FlagPipelineEntry *entry = allocFlagEntry();
+     if (!entry)
+     {
+@@ -189,6 +191,12 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+     reportReservedInstruction(false, 0xFFFFFFF9u);
+ }
+ 
++bool VU1Interpreter::makeRoomForFlagEntry()
++{
++    syncFlags();
++    return m_flagCount != kMaxFlagEntries;
++}
++
+ void VU1Interpreter::syncFlagsSlow()
+ {
+     // Flag entries all have the FMAC latency and commit exactly at their ready
+@@ -845,6 +853,7 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+     decoded.mBit = (decoded.upper & 0x20000000u) != 0u;
+     decoded.dBit = (decoded.upper & 0x10000000u) != 0u;
+     decoded.tBit = (decoded.upper & 0x08000000u) != 0u;
++    decoded.flagMode = m_decodeFlagMode;
+     decoded.upperUsage = decodeUpperUsage(decoded.upper);
+     if (!decoded.iBit)
+         decoded.lowerUsage = decodeLowerUsage(decoded.lower);
+@@ -1074,6 +1083,7 @@ namespace
+     struct RegisteredEntry
+     {
+         const VU1Interpreter::JitProgram *chunks = nullptr;
++        const uint8_t *facts = nullptr;
+         uint32_t entryPair = 0;
+         bool elidesFlags = false;
+         bool statusElided = false;
+@@ -1128,6 +1138,7 @@ namespace
+ struct VU1Interpreter::JitEntryTable
+ {
+     std::vector<JitProgram> chunks;
++    std::vector<uint8_t> facts; // per pair with a chunk: what it expects pending (kEntryMay*)
+     std::vector<uint8_t> tried;
+     bool readsStatus = false;
+     bool elidesFlags = false;
+@@ -1143,10 +1154,10 @@ void VU1Interpreter::registerJitProgram(uint64_t codeHash, JitProgram program, b
+     jitRegistry()[codeHash] = {program, elidesFlags};
+ }
+ 
+-void VU1Interpreter::registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, bool elidesFlags,
+-                                      bool statusElided)
++void VU1Interpreter::registerJitEntry(uint32_t entryPair, uint64_t reachKey, const JitProgram *chunks, const uint8_t *facts,
++                                      bool elidesFlags, bool statusElided)
+ {
+-    jitEntryRegistry()[reachKey] = {chunks, entryPair, elidesFlags, statusElided};
++    jitEntryRegistry()[reachKey] = {chunks, facts, entryPair, elidesFlags, statusElided};
+ }
+ 
+ // Runs a microprogram from the merged entry-program table: chunks where a
+@@ -1172,7 +1183,10 @@ VU1Interpreter::StepResult VU1Interpreter::runJitEntries(VU1Interpreter &vu, con
+         // entered with nothing pending, so programs can share a table.
+         for (uint32_t p : reached.pairs)
+             if (!table.chunks[p])
++            {
+                 table.chunks[p] = r->second.chunks[p];
++                table.facts[p] = r->second.facts[p];
++            }
+         table.elidesFlags = table.elidesFlags || r->second.elidesFlags;
+     };
+ 
+@@ -1184,7 +1198,7 @@ VU1Interpreter::StepResult VU1Interpreter::runJitEntries(VU1Interpreter &vu, con
+         JitProgram chunk = nullptr;
+         // After an interpreted pair something may be pending that a chunk's
+         // entry facts rule out: interpret until it settles.
+-        if ((pc & 7u) == 0u && (pc >> 3) < pairs && !vu.resumesInDelaySlot())
++        if ((pc & 7u) == 0u && (pc >> 3) < pairs && vu.pendingMatches(table.facts[pc >> 3]))
+         {
+             const uint32_t index = pc >> 3;
+             chunk = table.chunks[index];
+@@ -1484,6 +1498,7 @@ VU1Interpreter::JitProgram VU1Interpreter::lookupJitProgram(const uint8_t *vuCod
+         {
+             table = std::make_unique<JitEntryTable>();
+             table->chunks.assign(codeSize / 8u, nullptr);
++            table->facts.assign(codeSize / 8u, 0u);
+             table->tried.assign(codeSize / 8u, 0u);
+             table->readsStatus = ps2_vu1_reach::readsStatus(vuCode, codeSize / 8u);
+         }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 9e9d326..8969fc6 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -131,6 +131,9 @@ add_executable(ga2_vu1_replay src/ga2_vu1_replay.cpp)
+ target_link_libraries(ga2_vu1_replay PRIVATE ps2_runtime)
+ add_executable(ga2_vu1_gen src/ga2_vu1_gen.cpp)
+ target_link_libraries(ga2_vu1_gen PRIVATE ps2_runtime)
++# Random-program differential fuzzer (interpreter vs generated programs); see src/ga2_vu1_fuzz.cpp.
++add_executable(ga2_vu1_fuzz src/ga2_vu1_fuzz.cpp)
++target_link_libraries(ga2_vu1_fuzz PRIVATE ps2_runtime)
+ 
+ if(PS2X_RUNTIME_SHARED)
+     target_link_options(ps2x_tests PRIVATE "LINKER:--export-dynamic-symbol=g_ps2RecompiledFunctionTable*")
+diff --git a/ps2xTest/src/ga2_vu1_fuzz.cpp b/ps2xTest/src/ga2_vu1_fuzz.cpp
+new file mode 100644
+index 0000000..9012f63
+--- /dev/null
++++ b/ps2xTest/src/ga2_vu1_fuzz.cpp
+@@ -0,0 +1,733 @@
++// Differential fuzzer for the VU1 interpreter and the generated VU1 programs.
++//
++//   ga2_vu1_fuzz emit <dir> <images> <seed> [maxPairs [--flagheavy]]
++//       Writes random 16 KB code images (<hash>.bin) and the entry pairs to
++//       run them from (<hash>.entries) into <dir>.
++//   ga2_vu1_fuzz run <dir> <statesPerImage> [seed] [--lines] [--flags <mode>]
++//       Runs every image of <dir> from random machine states (registers,
++//       flags, data memory with GIF packets) and compares the runtime, with
++//       the generated programs linked into this binary, against its
++//       interpreter: state, VU memory, GIF packets, cycles. The status flag is
++//       only compared in images that read it, and MAC and CLIP results only
++//       when a run ended (the same promise as ga2_vu1_check --reference). A run
++//       with a small cycle budget is sometimes resumed. FUZZ_MAXREPORT=<n>
++//       lists n mismatches (default 20); FUZZ_TRACE=<image>:<state> lists the
++//       pairs the interpreter ran for one state.
++//       --lines prints one digest line per run of the interpreter (the oracle),
++//       to compare two builds of the interpreter: diff the outputs.
++//       --flags <mode> runs the candidate as an interpreter computing only
++//       that set of flag results (1 MAC, 2 status, 4 CLIP), which exercises
++//       the paths generated programs use when flags are dead.
++//   ga2_vu1_fuzz list <image.bin>
++//       The pairs of an image with the generator's flag modes.
++//
++// Testing generated programs: emit images, run ga2_vu1_gen <outdir> <dir>/*.bin
++// (the .entries files make them entry programs), compile the output and link
++// it with this file's object (ga2_vu1_programs in the native build does that
++// for the game's programs), then run. GA2_VU1GEN_CHUNKPAIRS=10 while
++// generating splits the small programs into several chunk functions, which
++// tests the hand-over between chunks.
++//
++// The programs are random but valid (no reserved instructions), with branches
++// that stay inside the program, E bits and D/T halts, XGKICK packets, flag
++// readers and writers, FDIV/EFU operations and operands from every float
++// class (zero, denormal, Inf/NaN, FLT_MAX, FLT_MIN neighbourhoods).
++#include "ga2_vu1_capture.h"
++#include "ga2_vu1_plan.h"
++#include "runtime/ps2_vu1_reach.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <filesystem>
++#include <string>
++
++namespace
++{
++    using VU = VU1Interpreter;
++
++    struct Rng
++    {
++        uint64_t s;
++        explicit Rng(uint64_t seed)
++        {
++            // splitmix64 to spread nearby seeds
++            uint64_t z = seed + 0x9E3779B97F4A7C15ull;
++            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++            s = (z ^ (z >> 31)) | 1ull;
++        }
++        uint64_t next()
++        {
++            s ^= s << 13;
++            s ^= s >> 7;
++            s ^= s << 17;
++            return s;
++        }
++        uint32_t u32() { return static_cast<uint32_t>(next() >> 24); }
++        uint32_t below(uint32_t n) { return n ? u32() % n : 0u; }
++        bool chance(uint32_t percent) { return below(100) < percent; }
++        template <typename T, size_t N>
++        T pick(const T (&a)[N]) { return a[below(static_cast<uint32_t>(N))]; }
++    };
++
++    uint32_t randFloatBits(Rng &r)
++    {
++        const uint32_t sign = r.chance(50) ? 0x80000000u : 0u;
++        const uint32_t mant = r.u32() & 0x7FFFFFu;
++        switch (r.below(24))
++        {
++        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
++            return sign | ((100u + r.below(55u)) << 23) | mant; // moderate magnitudes
++        case 11: return sign;                                              // zero
++        case 12: return sign | (r.chance(50) ? (mant & 0xFFu) : mant);   // denormal (or zero)
++        case 13: return sign | 0x7F800000u | (r.chance(50) ? 0u : mant);   // Inf/NaN
++        case 14: return sign | 0x7F7FFFFFu - r.below(4);                  // FLT_MAX
++        case 15: return sign | 0x00800000u + r.below(4);                  // FLT_MIN
++        case 16: { static const float v[] = {1.0f, 2.0f, 0.5f, 3.0f, 4.0f, 16.0f, 255.0f, 4096.0f, 0.25f};
++                   float f = v[r.below(9)]; uint32_t b; std::memcpy(&b, &f, 4); return sign | (b & 0x7FFFFFFFu); }
++        case 17: return r.u32();                                           // any bits
++        case 18: return sign | ((1u + r.below(254u)) << 23) | mant;        // any normal exponent
++        case 19: return sign | ((253u + r.below(2u)) << 23) | mant;        // overflow neighbourhood
++        case 20: return sign | ((1u + r.below(3u)) << 23) | mant;          // underflow neighbourhood
++        case 21: return sign | ((126u + r.below(3u)) << 23) | mant;
++        default: return sign | ((110u + r.below(36u)) << 23) | mant;
++        }
++    }
++
++    uint32_t randIntReg(Rng &r, uint32_t pairs)
++    {
++        switch (r.below(8))
++        {
++        case 0: return r.u32() & 0xFFFFu;
++        case 1: return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(r.u32())));
++        case 2: return r.below(4u);
++        default: return r.below(pairs + 4u);
++        }
++    }
++
++    // ---- Programs
++
++    struct Prog
++    {
++        std::vector<uint8_t> code;
++        std::vector<uint32_t> entries;
++        uint32_t pairs = 0;
++    };
++
++    uint32_t vfReg(Rng &r)
++    {
++        if (r.chance(75))
++            return r.below(8u);
++        return r.below(32u);
++    }
++    uint32_t viReg(Rng &r) { return r.chance(80) ? r.below(8u) : r.below(16u); }
++    uint32_t destMask(Rng &r)
++    {
++        if (r.chance(4)) return 0u;
++        if (r.chance(35)) return 0xFu;
++        return r.below(16u);
++    }
++    uint32_t imm11(int32_t v) { return static_cast<uint32_t>(v) & 0x7FFu; }
++
++    // flagHeavy: mostly FMAC arithmetic and MAC/clip readers, in short programs (flag-result checks).
++    uint32_t upperWord(Rng &r, bool flagHeavy)
++    {
++        const uint32_t dest = destMask(r), ft = vfReg(r), fs = vfReg(r), fd = vfReg(r);
++        const uint32_t common = (dest << 21) | (ft << 16) | (fs << 11);
++        const uint32_t kind = flagHeavy ? r.below(100) * 85 / 100 : r.below(100);
++        if (kind < 38)
++        {
++            static const uint32_t ops[] = {
++                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
++                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
++                0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
++                // arithmetic is the interesting part
++                0x00, 0x03, 0x07, 0x0B, 0x0F, 0x18, 0x1A, 0x1C, 0x21, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E};
++            return common | (fd << 6) | r.pick(ops);
++        }
++        if (kind < 78)
++        {
++            static const uint32_t specials[] = {
++                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
++                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
++                0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x2E,
++                0x1F, 0x1F, 0x1F, 0x08, 0x0B, 0x29, 0x2A, 0x14, 0x10, 0x1D};
++            const uint32_t sp = r.pick(specials);
++            return common | ((sp >> 2) << 6) | 0x3Cu | (sp & 3u);
++        }
++        return 0x000002FFu; // NOP
++    }
++
++    uint32_t specialLower(uint32_t dest, uint32_t ft, uint32_t fs, uint32_t sp)
++    {
++        return (0x40u << 25) | (dest << 21) | (ft << 16) | (fs << 11) | ((sp >> 2) << 6) | 0x3Cu | (sp & 3u);
++    }
++
++    bool isBranchLower(uint32_t lower)
++    {
++        const uint32_t op = lower >> 25;
++        return op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || (op >= 0x28u && op <= 0x2Fu && op != 0x2Au && op != 0x2Bu);
++    }
++
++    uint32_t lowerWord(Rng &r, uint32_t pairs, uint32_t index, bool branchOk, bool flagHeavy)
++    {
++        const uint32_t dest = destMask(r), ft = vfReg(r), fs = vfReg(r);
++        const uint32_t it = viReg(r), is = viReg(r), id = viReg(r);
++        const uint32_t mem = r.below(64u);
++        const int32_t memImm = static_cast<int32_t>(r.below(8u)) - 3;
++        uint32_t kind = r.below(100);
++        if (flagHeavy && kind >= 30 && kind < 62)
++            kind = 50 + r.below(12u); // flag readers
++        else if (flagHeavy && kind >= 62)
++            kind = r.below(30u);
++        if (kind < 16) // NOP
++            return r.chance(70) ? 0x8000033Cu : 0u;
++        if (kind < 30)
++        {
++            switch (r.below(8))
++            {
++            case 0: return (0x00u << 25) | (dest << 21) | (ft << 16) | (is << 11) | imm11(static_cast<int32_t>(mem) % 32 - 4); // LQ
++            case 1: return (0x01u << 25) | (dest << 21) | (it << 16) | (fs << 11) | imm11(static_cast<int32_t>(mem) % 32 - 4); // SQ
++            case 2: return (0x04u << 25) | (dest << 21) | (it << 16) | (is << 11) | imm11(memImm);                    // ILW
++            case 3: return (0x05u << 25) | (dest << 21) | (it << 16) | (is << 11) | imm11(memImm);                    // ISW
++            case 4: return specialLower(dest, ft, is, 0x34); // LQI
++            case 5: return specialLower(dest, it, fs, 0x35); // SQI
++            case 6: return specialLower(dest, ft, is, 0x36); // LQD
++            default: return specialLower(dest, it, fs, 0x37); // SQD
++            }
++        }
++        if (kind < 48) // integer
++        {
++            switch (r.below(9))
++            {
++            case 0: return (0x08u << 25) | ((r.below(16u)) << 21) | (it << 16) | (is << 11) | (r.u32() & 0x7FFu); // IADDIU
++            case 1: return (0x09u << 25) | ((r.below(16u)) << 21) | (it << 16) | (is << 11) | (r.u32() & 0x7FFu); // ISUBIU
++            case 2: return (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | 0x30u; // IADD
++            case 3: return (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | 0x31u; // ISUB
++            case 4: return (0x40u << 25) | (it << 16) | (is << 11) | ((r.u32() & 0x1Fu) << 6) | 0x32u; // IADDI
++            case 5: return (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | 0x34u; // IAND
++            case 6: return (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | 0x35u; // IOR
++            case 7: return specialLower(r.below(16u), it, fs, 0x3C); // MTIR
++            default: return specialLower(dest, ft, is, 0x3D); // MFIR
++            }
++        }
++        if (kind < 62) // flag access
++        {
++            switch (r.below(12))
++            {
++            case 0: return (0x10u << 25) | (r.u32() & 0xFFFFFFu);                  // FCEQ
++            case 1: return (0x11u << 25) | (r.u32() & 0xFFFFFFu);                  // FCSET
++            case 2: return (0x12u << 25) | (r.u32() & 0xFFFFFFu);                  // FCAND
++            case 3: return (0x13u << 25) | (r.u32() & 0xFFFFFFu);                  // FCOR
++            case 4: return (0x14u << 25) | ((r.below(2u)) << 21) | (it << 16) | (r.u32() & 0x7FFu);  // FSEQ
++            case 5: return (0x15u << 25) | ((r.below(2u)) << 21) | (r.u32() & 0x7FFu);               // FSSET
++            case 6: return (0x16u << 25) | ((r.below(2u)) << 21) | (it << 16) | (r.u32() & 0x7FFu);  // FSAND
++            case 7: return (0x17u << 25) | ((r.below(2u)) << 21) | (it << 16) | (r.u32() & 0x7FFu);  // FSOR
++            case 8: return (0x18u << 25) | (it << 16) | (is << 11);                // FMEQ
++            case 9: return (0x1Au << 25) | (it << 16) | (is << 11);                // FMAND
++            case 10: return (0x1Bu << 25) | (it << 16) | (is << 11);               // FMOR
++            default: return (0x1Cu << 25) | (it << 16);                            // FCGET
++            }
++        }
++        if (kind < 74) // vector moves, R/P
++        {
++            switch (r.below(10))
++            {
++            case 0: case 1: return specialLower(dest, ft, fs, 0x30);  // MOVE
++            case 2: return specialLower(dest, ft, fs, 0x31);          // MR32
++            case 3: return specialLower(dest, ft, fs, 0x40);          // RNEXT
++            case 4: return specialLower(dest, ft, fs, 0x41);          // RGET
++            case 5: return specialLower(dest, ft, fs, 0x42) | (r.below(4u) << 21); // RINIT
++            case 6: return specialLower(dest, ft, fs, 0x43) | (r.below(4u) << 21); // RXOR
++            case 7: return specialLower(dest, ft, fs, 0x64);          // MFP
++            case 8: return specialLower(dest, it, fs, 0x68 + r.below(2u)); // XTOP/XITOP
++            default: return specialLower(dest, it, is, 0x3E + r.below(2u)); // ILWR/ISWR
++            }
++        }
++        if (kind < 84) // FDIV / EFU
++        {
++            const uint32_t fsf = r.below(4u) << 21, ftf = r.below(4u) << 23;
++            static const uint32_t efu[] = {0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7C, 0x7D, 0x7B};
++            switch (r.below(8))
++            {
++            case 0: return specialLower(0, ft, fs, 0x38) | fsf | ftf;
++            case 1: return specialLower(0, ft, fs, 0x39) | ftf;
++            case 2: return specialLower(0, ft, fs, 0x3A) | fsf | ftf;
++            case 3: return specialLower(0, ft, fs, 0x3B); // WAITQ
++            default: return specialLower(0, ft, fs, r.pick(efu)) | fsf;
++            }
++        }
++        if (kind < 87) // XGKICK
++            return specialLower(0, 0, 0, 0x6C) | (is << 11);
++        if (!branchOk)
++            return r.chance(50) ? 0x8000033Cu : (0x40u << 25) | (it << 16) | (is << 11) | (id << 6) | 0x30u;
++        const int32_t target = static_cast<int32_t>(r.below(pairs - 2u)); // never past the E bit
++        const uint32_t imm = imm11(target - static_cast<int32_t>(index) - 1);
++        switch (r.below(10))
++        {
++        case 0: return (0x20u << 25) | imm;                                  // B
++        case 1: return (0x21u << 25) | (it << 16) | imm;                     // BAL
++        case 2: return (0x24u << 25) | (is << 11);                           // JR
++        case 3: return (0x25u << 25) | (it << 16) | (is << 11);              // JALR
++        case 4: return (0x28u << 25) | (it << 16) | (is << 11) | imm;        // IBEQ
++        case 5: return (0x29u << 25) | (it << 16) | (is << 11) | imm;        // IBNE
++        case 6: return (0x2Cu << 25) | (is << 11) | imm;                     // IBLTZ
++        case 7: return (0x2Du << 25) | (is << 11) | imm;                     // IBGTZ
++        case 8: return (0x2Eu << 25) | (is << 11) | imm;                     // IBLEZ
++        default: return (0x2Fu << 25) | (is << 11) | imm;                    // IBGEZ
++        }
++    }
++
++    Prog makeProgram(Rng &r, uint32_t maxPairs, bool flagHeavy)
++    {
++        Prog p;
++        p.code.assign(0x4000u, 0u);
++        p.pairs = 12u + r.below(maxPairs > 12u ? maxPairs - 11u : 1u);
++        bool prevBranch = false, prevEnd = false;
++        const bool withEnd = true; // a program that falls off its end would run through all of code memory
++        for (uint32_t i = 0; i < p.pairs; ++i)
++        {
++            uint32_t upper = 0, lower = 0;
++            for (int attempt = 0; attempt < 32; ++attempt)
++            {
++                upper = upperWord(r, flagHeavy);
++                const bool iBit = r.chance(5);
++                if (iBit)
++                    upper |= 0x80000000u;
++                const bool last = i + 1u == p.pairs;
++                const bool endPair = withEnd && i + 2u == p.pairs;
++                lower = iBit ? randFloatBits(r) : lowerWord(r, p.pairs, i, !prevBranch && !prevEnd && !last && !endPair && i + 4u < p.pairs, flagHeavy);
++                if (!iBit && prevEnd && isBranchLower(lower))
++                    continue;
++                if (endPair)
++                    upper |= 0x40000000u; // E bit; the next pair is its delay slot
++                else if (r.chance(1))
++                    upper |= r.chance(50) ? 0x10000000u : 0x08000000u; // D / T
++                else if (r.chance(1) && !prevBranch && i + 3u < p.pairs && !isBranchLower(lower))
++                    upper |= 0x40000000u; // an early E bit
++                if (r.chance(3))
++                    upper |= 0x20000000u; // M
++                const VU::DecodedInstructionPair d = VU::decodeForCodegen(std::vector<uint8_t>{
++                    static_cast<uint8_t>(lower), static_cast<uint8_t>(lower >> 8), static_cast<uint8_t>(lower >> 16), static_cast<uint8_t>(lower >> 24),
++                    static_cast<uint8_t>(upper), static_cast<uint8_t>(upper >> 8), static_cast<uint8_t>(upper >> 16), static_cast<uint8_t>(upper >> 24)}.data(), 0u);
++                if (d.upperUsage.reserved || d.lowerUsage.reserved)
++                    continue;
++                break;
++            }
++            const bool branch = (upper >> 31) == 0u && isBranchLower(lower);
++            std::memcpy(p.code.data() + i * 8u, &lower, 4);
++            std::memcpy(p.code.data() + i * 8u + 4u, &upper, 4);
++            prevEnd = ((upper >> 30) & 1u) != 0u;
++            prevBranch = branch;
++        }
++        p.entries.push_back(0u);
++        if (r.chance(35))
++            p.entries.push_back(r.below(p.pairs));
++        return p;
++    }
++
++    // ---- Machine state
++
++    VU1State randomState(Rng &r, uint32_t pairs)
++    {
++        VU1State s{};
++        for (auto &reg : s.vf)
++            for (float &lane : reg)
++            {
++                const uint32_t b = randFloatBits(r);
++                std::memcpy(&lane, &b, 4);
++            }
++        s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
++        s.vf[0][3] = 1.0f;
++        for (int k = 1; k < 16; ++k)
++            s.vi[k] = static_cast<int32_t>(randIntReg(r, pairs));
++        s.vi[0] = 0;
++        for (float &lane : s.acc)
++        {
++            const uint32_t b = randFloatBits(r);
++            std::memcpy(&lane, &b, 4);
++        }
++        auto fl = [&r](float &f) { const uint32_t b = randFloatBits(r); std::memcpy(&f, &b, 4); };
++        fl(s.q);
++        fl(s.p);
++        fl(s.i);
++        s.r = 0x3F800000u | (r.u32() & 0x7FFFFFu);
++        s.mac = r.u32() & 0xFFFFu;
++        s.clip = r.u32() & 0xFFFFFFu;
++        s.status = r.u32() & 0xFFFu;
++        s.top = r.u32() & 0x3FFu;
++        s.itop = r.u32() & 0x3FFu;
++        s.dBitEnabled = r.chance(10);
++        s.tBitEnabled = r.chance(10);
++        return s;
++    }
++
++    void randomData(Rng &r, std::vector<uint8_t> &data)
++    {
++        data.resize(0x4000u);
++        for (size_t q = 0; q < data.size() / 16u; ++q)
++        {
++            uint32_t w[4];
++            if (r.chance(14))
++            {
++                // A GIF tag: small NLOOP, usually EOP, PACKED/REGLIST/IMAGE.
++                const uint64_t nloop = r.below(4u), eop = r.chance(80) ? 1u : 0u, nreg = r.below(16u), flg = r.below(3u);
++                const uint64_t lo = nloop | (eop << 15) | (flg << 58) | (nreg << 60);
++                w[0] = static_cast<uint32_t>(lo);
++                w[1] = static_cast<uint32_t>(lo >> 32);
++                w[2] = r.u32();
++                w[3] = r.u32();
++            }
++            else
++                for (uint32_t &x : w)
++                    x = randFloatBits(r);
++            std::memcpy(data.data() + q * 16u, w, 16);
++        }
++    }
++
++    // ---- Running
++
++    class Machine
++    {
++    public:
++        explicit Machine(bool generated)
++        {
++            memory = std::make_unique<PS2Memory>();
++            memory->initialize();
++            gs = std::make_unique<GS>();
++            vu = std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1);
++            vu->setGifSink(&ga2_vu1cap::GifHash::sink, &gif);
++            vu->setGeneratedProgramsEnabled(generated);
++        }
++        void load(const std::vector<uint8_t> &code)
++        {
++            for (uint32_t off = 0; off < code.size(); off += 4u)
++            {
++                uint32_t word;
++                std::memcpy(&word, code.data() + off, 4);
++                memory->write32(0x11008000u + off, word);
++            }
++        }
++        void start(const VU1State &state, const std::vector<uint8_t> &data, uint64_t cycle)
++        {
++            std::memcpy(memory->getVU1Data(), data.data(), data.size());
++            gif = ga2_vu1cap::GifHash{};
++            vu->restoreForReplay(state, cycle);
++        }
++        void execute(uint32_t pc, uint32_t top, uint32_t itop, uint32_t maxCycles)
++        {
++            vu->execute(memory->getVU1Code(), 0x4000u, memory->getVU1Data(), 0x4000u, *gs, memory.get(), pc, top, itop, maxCycles);
++        }
++        void resume(uint32_t top, uint32_t itop, uint32_t maxCycles)
++        {
++            vu->resume(memory->getVU1Code(), 0x4000u, memory->getVU1Data(), 0x4000u, *gs, memory.get(), top, itop, maxCycles);
++        }
++        std::unique_ptr<PS2Memory> memory;
++        std::unique_ptr<GS> gs;
++        std::unique_ptr<VU1Interpreter> vu;
++        ga2_vu1cap::GifHash gif;
++    };
++
++    struct Digest
++    {
++        uint64_t state, data, gif, gifBytes, cycle;
++        bool ended;
++    };
++
++    Digest digest(Machine &m, bool maskStatus, bool maskMac, bool maskClip = false)
++    {
++        VU1State s = m.vu->state();
++        if (maskStatus)
++            s.status = 0u;
++        if (maskMac)
++            s.mac = 0u;
++        if (maskClip)
++            s.clip = 0u;
++        return {VU1Interpreter::digestState(s), VU1Interpreter::digestBytes(m.memory->getVU1Data(), 0x4000u), m.gif.digest,
++                m.gif.bytes, m.vu->cycle(), m.vu->lastRunEnded()};
++    }
++
++    // Names of the state fields that differ (for mismatch reports).
++    std::string stateDiff(const VU1State &a, const VU1State &b)
++    {
++        std::string out;
++        char buf[256];
++        for (int r = 0; r < 32; ++r)
++            if (std::memcmp(a.vf[r], b.vf[r], 16) != 0)
++            {
++                uint32_t x[4], y[4];
++                std::memcpy(x, a.vf[r], 16);
++                std::memcpy(y, b.vf[r], 16);
++                std::snprintf(buf, sizeof(buf), " vf%d(%08x.%08x.%08x.%08x/%08x.%08x.%08x.%08x)", r, x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]);
++                out += buf;
++            }
++        for (int r = 0; r < 16; ++r)
++            if (a.vi[r] != b.vi[r])
++            {
++                std::snprintf(buf, sizeof(buf), " vi%d(%d/%d)", r, a.vi[r], b.vi[r]);
++                out += buf;
++            }
++        if (std::memcmp(a.acc, b.acc, 16) != 0) out += " acc";
++        if (std::memcmp(&a.q, &b.q, 4) != 0) out += " q";
++        if (std::memcmp(&a.p, &b.p, 4) != 0) out += " p";
++        if (std::memcmp(&a.i, &b.i, 4) != 0) out += " i";
++        if (a.r != b.r) out += " r";
++        if (a.pc != b.pc) out += " pc";
++        if (a.mac != b.mac) { std::snprintf(buf, sizeof(buf), " mac(%x/%x)", a.mac, b.mac); out += buf; }
++        if (a.clip != b.clip) { std::snprintf(buf, sizeof(buf), " clip(%x/%x)", a.clip, b.clip); out += buf; }
++        if (a.status != b.status) { std::snprintf(buf, sizeof(buf), " status(%x/%x)", a.status, b.status); out += buf; }
++        if (a.ebit != b.ebit || a.haltAfterDelaySlot != b.haltAfterDelaySlot || a.branchPending != b.branchPending ||
++            a.branchTarget != b.branchTarget || a.branchDelay != b.branchDelay || a.stoppedByD != b.stoppedByD ||
++            a.stoppedByT != b.stoppedByT)
++            out += " control";
++        return out;
++    }
++
++    // ignoreCycles: a run waits for its last flag result to commit before it ends,
++    // so without FMAC flag results at all, or without CLIP results (--flags 4, 1),
++    // it can end earlier.
++    bool same(const Digest &a, const Digest &b, bool ignoreCycles = false)
++    {
++        return a.state == b.state && a.data == b.data && a.gif == b.gif && a.gifBytes == b.gifBytes &&
++               (ignoreCycles || a.cycle == b.cycle) && a.ended == b.ended;
++    }
++
++    std::vector<uint8_t> readFile(const std::filesystem::path &p)
++    {
++        std::ifstream in(p, std::ios::binary);
++        return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    }
++
++    // list <image.bin>: the pairs with the generator's flag modes.
++    int list(int argc, char **argv)
++    {
++        if (argc < 3)
++            return 2;
++        const std::vector<uint8_t> code = readFile(argv[2]);
++        const std::vector<uint8_t> modes = ga2_vu1plan::flagModes(code);
++        const ga2_vu1plan::EntryFacts facts = ga2_vu1plan::entryFacts(code);
++        const std::vector<bool> targets = ga2_vu1plan::branchTargets(code);
++        uint32_t last = 0;
++        for (uint32_t i = 0; i < code.size() / 8u; ++i)
++            if (ps2_vu1_reach::word(code.data(), i, 0) || ps2_vu1_reach::word(code.data(), i, 1))
++                last = i;
++        for (uint32_t i = 0; i <= last; ++i)
++        {
++            const uint32_t lo = ps2_vu1_reach::word(code.data(), i, 0), up = ps2_vu1_reach::word(code.data(), i, 1);
++            std::printf("%4u %08x %08x mode %u%s%s%s%s\n", i, lo, up, modes[i], VU::upperProducesFmacFlags(up) ? " P" : "",
++                        targets[i] ? " T" : "", facts.mayBranch[i] ? " mb" : "", (up >> 30) & 1u ? " E" : "");
++        }
++        return 0;
++    }
++
++    int emit(int argc, char **argv)
++    {
++        if (argc < 5)
++            return 2;
++        const std::filesystem::path dir = argv[2];
++        const uint32_t images = static_cast<uint32_t>(std::atoi(argv[3]));
++        const uint64_t seed = std::strtoull(argv[4], nullptr, 0);
++        const uint32_t maxPairs = argc > 5 ? static_cast<uint32_t>(std::atoi(argv[5])) : 48u;
++        const bool flagHeavy = argc > 6 && !std::strcmp(argv[6], "--flagheavy");
++        std::filesystem::create_directories(dir);
++        for (uint32_t k = 0; k < images; ++k)
++        {
++            Rng r(seed * 1000003ull + k);
++            const Prog p = makeProgram(r, maxPairs, flagHeavy);
++            const uint64_t hash = VU1Interpreter::digestBytes(p.code.data(), p.code.size());
++            char name[64];
++            std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
++            std::ofstream(dir / (std::string(name) + ".bin"), std::ios::binary)
++                .write(reinterpret_cast<const char *>(p.code.data()), static_cast<std::streamsize>(p.code.size()));
++            std::ofstream entries(dir / (std::string(name) + ".entries"));
++            for (uint32_t e : p.entries)
++                entries << e << "\n";
++        }
++        std::printf("wrote %u images to %s\n", images, dir.c_str());
++        return 0;
++    }
++
++    int run(int argc, char **argv)
++    {
++        if (argc < 4)
++            return 2;
++        const std::filesystem::path dir = argv[2];
++        const uint32_t states = static_cast<uint32_t>(std::atoi(argv[3]));
++        uint64_t seed = 1;
++        bool lines = false;
++        int flagMode = -1;
++        for (int i = 4; i < argc; ++i)
++        {
++            if (!std::strcmp(argv[i], "--lines"))
++                lines = true;
++            else if (!std::strcmp(argv[i], "--flags") && i + 1 < argc)
++                flagMode = std::atoi(argv[++i]);
++            else
++                seed = std::strtoull(argv[i], nullptr, 0);
++        }
++        std::vector<std::filesystem::path> images;
++        for (const auto &e : std::filesystem::directory_iterator(dir))
++            if (e.path().extension() == ".bin")
++                images.push_back(e.path());
++        std::sort(images.begin(), images.end());
++
++        const char *statsEnv = std::getenv("GA2_VU1_BLOCKSTATS");
++        const bool blockStats = statsEnv && *statsEnv && *statsEnv != '0';
++        VU1Interpreter::s_blockStatsOn = blockStats;
++        std::string traceImage;
++        uint32_t traceState = ~0u;
++        if (const char *t = std::getenv("FUZZ_TRACE"))
++        {
++            const std::string spec = t;
++            const size_t colon = spec.find(':');
++            if (colon != std::string::npos)
++            {
++                traceImage = spec.substr(0, colon);
++                traceState = static_cast<uint32_t>(std::atoi(spec.c_str() + colon + 1));
++            }
++        }
++        const uint64_t maxReport = std::getenv("FUZZ_MAXREPORT") ? std::strtoull(std::getenv("FUZZ_MAXREPORT"), nullptr, 0) : 20u;
++        Machine ref(false), cand(flagMode < 0);
++        if (flagMode >= 0)
++            cand.vu->setDecodeFlagMode(static_cast<uint8_t>(flagMode));
++        uint64_t runs = 0, mismatches = 0, endedRuns = 0, resumed = 0;
++        for (const auto &path : images)
++        {
++            const std::vector<uint8_t> code = readFile(path);
++            if (code.size() != 0x4000u)
++                continue;
++            std::vector<uint32_t> entries;
++            {
++                std::ifstream in(std::filesystem::path(path).replace_extension(".entries"));
++                for (uint32_t e = 0; in >> e;)
++                    entries.push_back(e);
++            }
++            if (entries.empty())
++                entries.push_back(0u);
++            // --flags <mode>: the candidate is the interpreter computing only that mode's flag results
++            // (kFlagMac=1, kFlagStatus=2, kFlagClip=4); what it skips is not compared.
++            const bool readsStatus = flagMode < 0 ? ps2_vu1_reach::readsStatus(code.data(), static_cast<uint32_t>(code.size() / 8u))
++                                                  : (flagMode & 2) != 0;
++            if (flagMode >= 0)
++            {
++                // A reader of a result the candidate does not compute needs it.
++                bool skip = false;
++                for (uint32_t i = 0; i < 2048u && !skip; ++i)
++                {
++                    if ((ps2_vu1_reach::word(code.data(), i, 1) >> 31) != 0u)
++                        continue;
++                    const uint32_t op = ps2_vu1_reach::word(code.data(), i, 0) >> 25;
++                    skip = ((flagMode & 2) == 0 && (op == 0x14u || op == 0x16u || op == 0x17u)) ||
++                           ((flagMode & 1) == 0 && (op == 0x18u || op == 0x1Au || op == 0x1Bu)) ||
++                           ((flagMode & 4) == 0 && (op == 0x10u || op == 0x12u || op == 0x13u || op == 0x1Cu));
++                }
++                if (skip)
++                    continue;
++            }
++            const uint64_t hash = VU1Interpreter::digestBytes(code.data(), code.size());
++            uint32_t pairs = 1u;
++            for (uint32_t i = 0; i < 2048u; ++i)
++                if (ps2_vu1_reach::word(code.data(), i, 0) || ps2_vu1_reach::word(code.data(), i, 1))
++                    pairs = i + 1u;
++            ref.load(code);
++            cand.load(code);
++            Rng r(seed ^ (hash * 0x9E3779B97F4A7C15ull));
++            for (uint32_t k = 0; k < states; ++k)
++            {
++                const VU1State state = randomState(r, pairs);
++                std::vector<uint8_t> data;
++                randomData(r, data);
++                const uint32_t entry = entries[r.below(static_cast<uint32_t>(entries.size()))];
++                const uint32_t top = r.u32() & 0x3FFu, itop = r.u32() & 0x3FFu;
++                const uint64_t cycle = r.below(64u);
++                uint32_t budget = r.chance(20) ? 8u + r.below(60u) : 200u + r.below(1200u);
++                ref.start(state, data, cycle);
++                cand.start(state, data, cycle);
++                // FUZZ_TRACE=<image stem>:<state index>: the pairs the interpreter ran.
++                std::vector<uint64_t> hitCounts(2048, 0u);
++                const bool trace = traceImage == path.stem().string() && traceState == k;
++                if (trace)
++                    ref.vu->setPcHitCounter(hitCounts.data());
++                ref.execute(entry * 8u, top, itop, budget);
++                if (trace)
++                {
++                    std::printf("trace %s state %u entry %u budget %u cycle0 %llu: mac %x -> %x, pairs run:", traceImage.c_str(), k, entry, budget,
++                                static_cast<unsigned long long>(cycle), state.mac, ref.vu->state().mac);
++                    for (uint32_t i = 0; i < 2048u; ++i)
++                        if (hitCounts[i])
++                            std::printf(" %u%s", i, hitCounts[i] > 1 ? ("x" + std::to_string(hitCounts[i])).c_str() : "");
++                    std::printf("\n");
++                }
++                cand.execute(entry * 8u, top, itop, budget);
++                for (uint32_t step = 0;; ++step)
++                {
++                    const bool ended = ref.vu->lastRunEnded();
++                    const bool noMac = flagMode >= 0 && (flagMode & 1) == 0, noClip = flagMode >= 0 && (flagMode & 4) == 0;
++                    const Digest a = digest(ref, !readsStatus, false), b = digest(cand, !readsStatus, noMac, noClip);
++                    const bool relax = flagMode >= 0 && ((flagMode & 3) == 0 || (flagMode & 4) == 0);
++                    // A run cut off by its budget has not drained the pipelines: MAC and CLIP results
++                    // the flag analysis proved unobservable (given the program runs on) may be missing.
++                    const bool ok = ended ? same(digest(ref, !readsStatus, noMac, noClip), b, relax)
++                                          : same(digest(ref, !readsStatus, true, true), digest(cand, !readsStatus, true, true), relax);
++                    ++runs;
++                    endedRuns += ended;
++                    if (lines)
++                        std::printf("%s %u.%u state=%016llx data=%016llx gif=%016llx/%llu cycle=%llu ended=%d\n",
++                                    path.stem().c_str(), k, step, static_cast<unsigned long long>(a.state),
++                                    static_cast<unsigned long long>(a.data), static_cast<unsigned long long>(a.gif),
++                                    static_cast<unsigned long long>(a.gifBytes), static_cast<unsigned long long>(a.cycle), ended);
++                    if (!ok)
++                    {
++                        ++mismatches;
++                        if (mismatches <= maxReport)
++                            std::printf("MISMATCH %s state %u step %u entry %u: state %s%s data %s gif %s cycles %llu vs %llu (ended %d vs %d)\n",
++                                        path.stem().c_str(), k, step, entry, a.state == b.state ? "ok" : "DIFF",
++                                        a.state == b.state ? "" : stateDiff(ref.vu->state(), cand.vu->state()).c_str(),
++                                        a.data == b.data ? "ok" : "DIFF", a.gif == b.gif && a.gifBytes == b.gifBytes ? "ok" : "DIFF",
++                                        static_cast<unsigned long long>(a.cycle), static_cast<unsigned long long>(b.cycle), ended, b.ended);
++                        break;
++                    }
++                    if (ended || step >= 3u || !r.chance(60))
++                        break;
++                    ++resumed;
++                    budget = 8u + r.below(300u);
++                    if (trace)
++                        std::fill(hitCounts.begin(), hitCounts.end(), 0u);
++                    ref.resume(top, itop, budget);
++                    cand.resume(top, itop, budget);
++                    if (trace)
++                    {
++                        std::printf("trace resume %u budget %u pairs run:", step + 1u, budget);
++                        for (uint32_t i = 0; i < 2048u; ++i)
++                            if (hitCounts[i])
++                                std::printf(" %u%s", i, hitCounts[i] > 1 ? ("x" + std::to_string(hitCounts[i])).c_str() : "");
++                        std::printf("\n");
++                    }
++                }
++            }
++        }
++        std::fprintf(stderr, "%zu images, %llu checks (%llu ended, %llu resumes): %llu mismatches\n", images.size(),
++                     static_cast<unsigned long long>(runs), static_cast<unsigned long long>(endedRuns),
++                     static_cast<unsigned long long>(resumed), static_cast<unsigned long long>(mismatches));
++        if (blockStats)
++        {
++            const VU1Interpreter::BlockStats &st = VU1Interpreter::blockStats();
++            std::fprintf(stderr, "blocks: %llu entries, %llu ran, %llu pairs ran in blocks, %llu cycles in blocks\n",
++                         static_cast<unsigned long long>(st.entries), static_cast<unsigned long long>(st.ran),
++                         static_cast<unsigned long long>(st.pairsRan), static_cast<unsigned long long>(st.cyclesRan));
++        }
++        return mismatches ? 1 : 0;
++    }
++}
++
++int main(int argc, char **argv)
++{
++    if (argc >= 2 && !std::strcmp(argv[1], "emit"))
++        return emit(argc, argv);
++    if (argc >= 2 && !std::strcmp(argv[1], "run"))
++        return run(argc, argv);
++    if (argc >= 2 && !std::strcmp(argv[1], "list"))
++        return list(argc, argv);
++    std::fprintf(stderr, "usage: %s emit <dir> <images> <seed> [maxPairs [--flagheavy]] | run <dir> <statesPerImage> [seed] [--lines]\n", argv[0]);
++    return 2;
++}
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index 88120eb..2f565d2 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -12,6 +12,7 @@
+ // those pairs (runtime/ps2_vu1_reach.h). Anything else falls back to the
+ // interpreter's step.
+ #include "ga2_vu1_capture.h"
++#include "ga2_vu1_plan.h"
+ #include "runtime/ps2_vu1_reach.h"
+ 
+ #include <algorithm>
+@@ -26,7 +27,14 @@
+ namespace
+ {
+     using VU = VU1Interpreter;
+-    constexpr uint32_t kChunkPairs = 48;
++    using namespace ga2_vu1plan;
++    // Pairs per chunk function (GA2_VU1GEN_CHUNKPAIRS overrides). Control that
++    // leaves a chunk costs a call, so bigger chunks run faster; compile time
++    // grows faster than linearly with their size.
++    const uint32_t kChunkPairs = [] {
++        const char *v = std::getenv("GA2_VU1GEN_CHUNKPAIRS");
++        return v && *v ? static_cast<uint32_t>(std::max(8, std::atoi(v))) : 128u;
++    }();
+ 
+     std::string usage(const VU::InstructionUsage &u)
+     {
+@@ -44,202 +52,6 @@ namespace
+         return buf;
+     }
+ 
+-    // Which FMAC flag results can any instruction observe? (Whole-program.)
+-    //
+-    // Status: only FSAND/FSEQ/FSOR read it, so it is dead everywhere unless the
+-    // image contains one. MAC: FMAND/FMEQ/FMOR read the MAC of the latest FMAC
+-    // result whose 4-cycle latency has elapsed. A result p is dead when, on
+-    // every path, a later flag-producing instruction q sits at least 4 pairs
+-    // (so at least 4 cycles) before the reader; at a program end only the
+-    // last result survives; indirect jumps lead anywhere, so they count as
+-    // readers. Values are unaffected: only flag bookkeeping is skipped.
+-    // inSet (entry programs): only these pairs are known; leaving them counts
+-    // as reaching any reader.
+-    std::vector<uint8_t> flagModes(const std::vector<uint8_t> &code, const std::vector<uint8_t> *inSet = nullptr)
+-    {
+-        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
+-        auto word = [&](uint32_t index, uint32_t half) {
+-            uint32_t w = 0;
+-            std::memcpy(&w, code.data() + index * 8u + half * 4u, 4);
+-            return w;
+-        };
+-        constexpr int kEnd = -1, kAnywhere = -2;
+-        std::vector<bool> macReader(pairs), statusReader(pairs), producer(pairs);
+-        std::vector<std::vector<int>> succ(pairs);
+-        bool statusRead = false;
+-        for (uint32_t i = 0; i < pairs; ++i)
+-        {
+-            const uint32_t lower = word(i, 0), upper = word(i, 1);
+-            const bool iBit = (upper >> 31) != 0u;
+-            producer[i] = VU::upperProducesFmacFlags(upper);
+-            const uint32_t op = lower >> 25;
+-            // A D/T halt can end the run here (and a later MSCAL may read
+-            // MAC first), so halt pairs count as readers too.
+-            const bool halts = ((upper >> 27) & 3u) != 0u;
+-            macReader[i] = halts;
+-            if (!iBit)
+-            {
+-                macReader[i] = halts || op == 0x18u || op == 0x1Au || op == 0x1Bu; // FMEQ, FMAND, FMOR
+-                statusReader[i] = op == 0x14u || op == 0x16u || op == 0x17u; // FSEQ, FSAND, FSOR
+-                statusRead = statusRead || statusReader[i];
+-            }
+-            succ[i].push_back(static_cast<int>((i + 1u) % pairs));
+-        }
+-        // Branch, jump and end effects apply after the delay slot (pair i + 1).
+-        for (uint32_t i = 0; i < pairs; ++i)
+-        {
+-            const uint32_t lower = word(i, 0), upper = word(i, 1);
+-            const uint32_t slot = (i + 1u) % pairs;
+-            if ((upper >> 30) & 1u) // E bit: the delay slot ends the program
+-            {
+-                succ[slot] = {kEnd};
+-                continue;
+-            }
+-            if ((upper >> 31) != 0u)
+-                continue;
+-            const uint32_t op = lower >> 25;
+-            const bool direct = op == 0x20u || op == 0x21u || (op >= 0x28u && op <= 0x2Fu && op != 0x2Au && op != 0x2Bu);
+-            const bool indirect = op == 0x24u || op == 0x25u;
+-            if (indirect)
+-                succ[slot] = {kAnywhere};
+-            else if (direct)
+-            {
+-                int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
+-                if (imm & 0x400) imm -= 0x800;
+-                const int target = static_cast<int>((static_cast<int64_t>(i) + 1 + imm + pairs) % pairs);
+-                const bool conditional = op >= 0x28u;
+-                succ[slot] = {target};
+-                if (conditional)
+-                    succ[slot].push_back(static_cast<int>((i + 2u) % pairs));
+-            }
+-        }
+-        if (inSet)
+-            for (uint32_t i = 0; i < pairs; ++i)
+-                for (int &n : succ[i])
+-                    if (n >= 0 && !(*inSet)[static_cast<uint32_t>(n)])
+-                        n = kAnywhere;
+-        // GA2_VU1GEN_ALLFLAGS=1: keep every flag result (a strict oracle build
+-        // for digest-mode replay).
+-        if (const char *all = std::getenv("GA2_VU1GEN_ALLFLAGS"); all && *all == '1')
+-            return std::vector<uint8_t>(pairs, VU::kFlagAll);
+-        std::vector<uint8_t> modes(pairs, statusRead ? VU::kFlagStatus : 0u);
+-        for (uint32_t p = 0; p < pairs; ++p)
+-        {
+-            if (!producer[p])
+-                continue;
+-            // State: pairs since the latest later producer (-1: none yet).
+-            std::vector<uint8_t> seen(pairs * 6u, 0);
+-            std::vector<std::pair<int, int>> stack;
+-            for (int n : succ[p])
+-                stack.emplace_back(n, -1);
+-            bool live = false;
+-            while (!stack.empty() && !live)
+-            {
+-                auto [node, since] = stack.back();
+-                stack.pop_back();
+-                if (since >= 4)
+-                    continue;                       // superseded for every later reader
+-                if (node == kEnd)
+-                {
+-                    live = since < 0;               // the end keeps the last result
+-                    continue;
+-                }
+-                if (node == kAnywhere || macReader[static_cast<uint32_t>(node)])
+-                {
+-                    live = true;
+-                    continue;
+-                }
+-                const uint32_t n = static_cast<uint32_t>(node);
+-                if (seen[n * 6u + static_cast<uint32_t>(since + 1)]++)
+-                    continue;
+-                const int next = producer[n] ? 1 : (since < 0 ? -1 : since + 1);
+-                for (int s : succ[n])
+-                    stack.emplace_back(s, next);
+-            }
+-            if (live)
+-                modes[p] |= VU::kFlagMac;
+-        }
+-        return modes;
+-    }
+-
+-    // What can be pending when a pair starts (see VU1Interpreter::PairEntry).
+-    // A pending branch is consumed by the branch's image successor (its delay
+-    // slot). The E bit and halt bits act after the pair that follows them, so
+-    // with a branch before them they take effect at the branch's destination:
+-    // its target, its fall-through, or (for JR/JALR) anywhere.
+-    struct EntryFacts
+-    {
+-        std::vector<bool> mayBranch, mayEnd, mayHalt;
+-    };
+-
+-    EntryFacts entryFacts(const std::vector<uint8_t> &code)
+-    {
+-        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
+-        auto word = [&](uint32_t index, uint32_t half) {
+-            uint32_t w = 0;
+-            std::memcpy(&w, code.data() + (index % pairs) * 8u + half * 4u, 4);
+-            return w;
+-        };
+-        auto isBranch = [&](uint32_t index) {
+-            const uint32_t lower = word(index, 0), upper = word(index, 1), op = lower >> 25;
+-            return (upper >> 31) == 0u &&
+-                   (op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || (op >= 0x28u && op <= 0x2Fu));
+-        };
+-        EntryFacts f{std::vector<bool>(pairs), std::vector<bool>(pairs), std::vector<bool>(pairs)};
+-        for (uint32_t i = 0; i < pairs; ++i)
+-        {
+-            const uint32_t prev = (i + pairs - 1u) % pairs;
+-            f.mayBranch[i] = isBranch(prev);
+-            f.mayEnd[i] = ((word(prev, 1) >> 30) & 1u) != 0u;
+-            f.mayHalt[i] = ((word(prev, 1) >> 27) & 3u) != 0u; // D (bit 28), T (bit 27)
+-        }
+-        for (uint32_t b = 0; b < pairs; ++b)
+-        {
+-            if (!isBranch(b))
+-                continue;
+-            const uint32_t slotUpper = word(b + 1u, 1);
+-            const bool end = ((slotUpper >> 30) & 1u) != 0u, halt = ((slotUpper >> 27) & 3u) != 0u;
+-            if (!end && !halt)
+-                continue;
+-            const uint32_t op = word(b, 0) >> 25;
+-            std::vector<uint32_t> targets;
+-            if (op == 0x24u || op == 0x25u)
+-                for (uint32_t t = 0; t < pairs; ++t)
+-                    targets.push_back(t);
+-            else
+-            {
+-                int32_t imm = static_cast<int32_t>(word(b, 0) & 0x7FFu);
+-                if (imm & 0x400) imm -= 0x800;
+-                targets.push_back(static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs));
+-                targets.push_back((b + 2u) % pairs);
+-            }
+-            for (uint32_t t : targets)
+-            {
+-                f.mayEnd[t] = f.mayEnd[t] || end;
+-                f.mayHalt[t] = f.mayHalt[t] || halt;
+-            }
+-        }
+-        return f;
+-    }
+-
+-    // Pairs that direct branches jump to. Control enters a block there, so a
+-    // block starts at each of them rather than running across one.
+-    std::vector<bool> branchTargets(const std::vector<uint8_t> &code)
+-    {
+-        const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
+-        std::vector<bool> target(pairs, false);
+-        for (uint32_t b = 0; b < pairs; ++b)
+-        {
+-            const uint32_t lower = ps2_vu1_reach::word(code.data(), b, 0), upper = ps2_vu1_reach::word(code.data(), b, 1);
+-            if ((upper >> 31) != 0u || !ps2_vu1_reach::isDirectBranch(lower >> 25))
+-                continue;
+-            int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
+-            if (imm & 0x400) imm -= 0x800;
+-            target[static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs)] = true;
+-        }
+-        return target;
+-    }
+-
+     std::string pair(const VU::DecodedInstructionPair &p, uint8_t flagMode)
+     {
+         char head[96];
+@@ -264,6 +76,57 @@ namespace
+         return "Vf";
+     }
+ 
++    // The ready cycles a block leaves behind that can still matter when it
++    // ends. A VF or ACC write that is complete by then needs no entry: every
++    // such write has the same latency, so the register's earlier ready cycle
++    // is older still, and both are past at the next block's entry. (VI
++    // writes differ in latency and keep theirs.)
++    std::vector<VU::BlockFinal> keptFinals(const VU::BlockSchedule &sc)
++    {
++        const uint32_t cycles = sc.issue[sc.count - 1u] + 1u;
++        std::vector<VU::BlockFinal> kept;
++        for (uint32_t f = 0; f < sc.finalCount; ++f)
++            if (sc.finals[f].kind == VU::BlockFinalKind::Vi || sc.finals[f].offset > cycles)
++                kept.push_back(sc.finals[f]);
++        return kept;
++    }
++
++    // The guards a block needs. Every VF, VI and ACC write completes at most
++    // four cycles after it issues, and everything that issued before the block
++    // did so before its entry cycle, so such a register is ready by the entry
++    // cycle + 3: a guard at offset 3 or later holds whatever happened before.
++    // (Q, P and the flag pipelines are different: their latencies are longer.)
++    std::vector<VU::BlockGuard> keptGuards(const VU::BlockSchedule &sc, bool shortLatencies)
++    {
++        std::vector<VU::BlockGuard> kept;
++        for (uint32_t g = 0; g < sc.guardCount; ++g)
++        {
++            const VU::BlockGuard &guard = sc.guards[g];
++            const bool registerGuard = guard.kind == VU::BlockGuardKind::Vf || guard.kind == VU::BlockGuardKind::Vi ||
++                                       guard.kind == VU::BlockGuardKind::Acc;
++            if (registerGuard && shortLatencies && guard.offset >= 3u)
++                continue;
++            kept.push_back(guard);
++        }
++        return kept;
++    }
++
++    // Whether every VF/VI/ACC write of these pairs has a latency of at most four cycles.
++    bool registerLatenciesShort(const std::vector<VU::DecodedInstructionPair> &decoded)
++    {
++        for (const VU::DecodedInstructionPair &d : decoded)
++            for (const VU::InstructionUsage *u : {&d.upperUsage, &d.lowerUsage})
++            {
++                if (u->vfWrite.reg != 0u && std::max<uint32_t>(u->vfLatency, u->latency) > 4u)
++                    return false;
++                if (u->viWrite != 0u && std::max<uint32_t>(u->viLatency, u->latency) > 4u)
++                    return false;
++                if (u->accWrite != 0u && std::max<uint32_t>(u->viLatency, u->latency) > 4u)
++                    return false;
++            }
++        return true;
++    }
++
+     const char *finalKind(VU::BlockFinalKind k)
+     {
+         switch (k)
+@@ -275,19 +138,14 @@ namespace
+         return "Vf";
+     }
+ 
+-    // A statically scheduled block starting at a chunk pair (see ps2_vu1.h).
+-    struct Block
+-    {
+-        uint32_t first = 0;
+-        std::vector<uint32_t> pairs;
+-        bool endsInBranch = false; // the last two pairs are a branch and its delay slot
+-        VU::BlockSchedule schedule;
+-    };
+-
+     std::string header()
+     {
+         return "// Generated by ga2_vu1_gen from a VU1 code image. Do not edit.\n"
+                "#include \"runtime/ps2_vu1_step.inl\"\n\nusing VU = VU1Interpreter;\n"
++               "// Chunks hand over to each other with tail calls; without guaranteed tail calls (not clang) they\n"
++               "// return to the run loop instead, which dispatches on the pc.\n"
++               "#if defined(__clang__)\n#define GA2_CHUNK_JUMP(f) [[clang::musttail]] return f(vu, a)\n#define GA2_CHUNK __attribute__((no_stack_protector))\n"
++               "#else\n#define GA2_CHUNK_JUMP(f) return VU::StepResult::Continue\n#define GA2_CHUNK\n#endif\n"
+                "static_assert(sizeof(VU::DecodedInstructionPair) == " +
+                std::to_string(sizeof(VU::DecodedInstructionPair)) + ", \"regenerate: DecodedInstructionPair layout changed\");\n";
+     }
+@@ -370,6 +228,13 @@ namespace
+         for (uint32_t i = 0; i < pairs; ++i)
+             dispatch += chunkOf[i] < 0 ? "    nullptr,\n" : "    " + std::string(base) + "_chunk" + std::to_string(chunkOf[i]) + ",\n";
+         dispatch += "};\n\n";
++        // What each pair expects pending when it starts (PairEntry as bits).
++        dispatch += "// What each pair expects pending (VU::kEntryMayBranch | kEntryMayEnd | kEntryMayHalt).\nconstexpr uint8_t kFacts[" +
++                    std::to_string(pairs) + "] = {";
++        for (uint32_t i = 0; i < pairs; ++i)
++            dispatch += std::string(i % 32u == 0u ? "\n    " : "") +
++                        std::to_string((facts.mayBranch[i] ? 1 : 0) | (facts.mayEnd[i] ? 2 : 0) | (facts.mayHalt[i] ? 4 : 0)) + ",";
++        dispatch += "\n};\n\n";
+         // An entry program registers its chunks; the runtime merges them
+         // with other programs found in the same image and runs the loop.
+         if (!target.entryProgram)
+@@ -377,17 +242,13 @@ namespace
+                     "// returns Continue with the loop head done for a pc outside itself.\n"
+                     "VU::StepResult run(VU &vu, const VU::StepArgs &a)\n{\n"
+                     "    if (!vu.stepLoopHead(a))\n        return VU::StepResult::Stop;\n"
+-                    "    // Pairs assume nothing is pending from a pair that did not just run;\n"
+-                    "    // a run that starts or resumes inside a delay slot steps it generically.\n"
+-                    "    while (vu.resumesInDelaySlot())\n    {\n"
+-                    "        const VU::StepResult r = vu.stepGeneric(a);\n"
+-                    "        if (r != VU::StepResult::Continue)\n            return r;\n"
+-                    "        if (!vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n    }\n"
+                     "    for (;;)\n    {\n"
+                     "        const uint32_t pc = vu.state().pc;\n"
+-                    "        // After an interpreted pair something may be pending that a\n"
+-                    "        // chunk's entry facts rule out: interpret until it settles.\n"
+-                    "        const Chunk chunk = (pc & 7u) == 0u && !vu.resumesInDelaySlot() ? kChunks[(pc >> 3) & " + std::to_string(pairs - 1) + "u] : nullptr;\n"
++                    "        // Pairs expect only what the pair before them in the image can leave\n"
++                    "        // pending; a run that starts or resumes elsewhere, or an interpreted\n"
++                    "        // pair that leaves something else pending, is stepped generically.\n"
++                    "        const uint32_t index = (pc >> 3) & " + std::to_string(pairs - 1) + "u;\n"
++                    "        const Chunk chunk = (pc & 7u) == 0u && vu.pendingMatches(kFacts[index]) ? kChunks[index] : nullptr;\n"
+                     "        const VU::StepResult r = chunk ? chunk(vu, a) : vu.stepGeneric(a);\n"
+                     "        if (r != VU::StepResult::Continue)\n            return r;\n"
+                     "        if (!chunk && !vu.stepLoopHead(a))\n            return VU::StepResult::Stop;\n"
+@@ -396,7 +257,7 @@ namespace
+         const bool elides = std::any_of(modes.begin(), modes.end(), [](uint8_t m) { return m != VU::kFlagAll; });
+         if (target.entryProgram)
+             std::snprintf(reg, sizeof(reg),
+-                          "struct Register\n{\n    Register() { VU::registerJitEntry(%u, 0x%016llxull, kChunks, %s, %s); }\n} registerProgram;\n}\n",
++                          "struct Register\n{\n    Register() { VU::registerJitEntry(%u, 0x%016llxull, kChunks, kFacts, %s, %s); }\n} registerProgram;\n}\n",
+                           target.entry, static_cast<unsigned long long>(target.key), elides ? "true" : "false",
+                           !modes.empty() && (modes[0] & VU::kFlagStatus) ? "false" : "true");
+         else
+@@ -412,9 +273,17 @@ namespace
+             return !(v && *v == '0');
+         }();
+         size_t blockCount = 0, blockPairs = 0;
++        std::vector<VU::DecodedInstructionPair> allDecoded;
++        for (uint32_t i = 0; i < pairs; ++i)
++            allDecoded.push_back(VU::decodeForCodegen(code.data(), i * 8u));
++        const bool shortLatencies = registerLatenciesShort(allDecoded);
+         for (size_t c = 0; c < chunks.size(); ++c)
+         {
+-            std::string out = header() + "\nnamespace\n{\n";
++            std::string out = header();
++            for (size_t k = 0; k < chunks.size(); ++k)
++                if (k != c)
++                    out += "VU::StepResult " + std::string(base) + "_chunk" + std::to_string(k) + "(VU &vu, const VU::StepArgs &a);\n";
++            out += "\nnamespace\n{\n";
+             std::vector<VU::DecodedInstructionPair> decoded;
+             for (uint32_t index : chunks[c])
+             {
+@@ -424,83 +293,43 @@ namespace
+                 out += "constexpr VU::DecodedInstructionPair kP" + std::to_string(index) + " = " +
+                        pair(VU::decodeForCodegen(code.data(), index * 8u), modes[index]) + ";\n";
+             }
+-            // Blocks: runs of consecutive pairs that fall through to each
+-            // other, with nothing pending from a branch, E bit or halt, and
+-            // entered only at their first pair (so split at branch targets).
++            // Statically scheduled blocks (ga2_vu1_plan.h).
+             std::unordered_map<uint32_t, Block> blockAt;
+             if (blocksEnabled)
++                blockAt = planBlocks(chunks[c], decoded, facts, isTarget, pairs);
++            for (const uint32_t index : chunks[c])
+             {
+-                const std::vector<uint32_t> &ch = chunks[c];
+-                // A pair may be entered with nothing pending from the pair before it.
+-                auto clean = [&](size_t k) {
+-                    const uint32_t index = ch[k];
+-                    return index + 1u < pairs && !facts.mayEnd[index] && !facts.mayHalt[index];
+-                };
+-                auto inBlock = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockablePair(decoded[k]); };
+-                // A block may end with a branch and its delay slot.
+-                auto branchPair = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockableBranchPair(decoded[k]); };
+-                auto slotPair = [&](size_t k) { return clean(k) && VU::blockablePair(decoded[k]); };
+-                auto follows = [&](size_t e) { return e < ch.size() && ch[e] == ch[e - 1] + 1u && !isTarget[ch[e]]; };
+-                for (size_t k = 0; k < ch.size();)
++                const auto bit = blockAt.find(index);
++                if (bit == blockAt.end())
++                    continue;
++                const Block &b = bit->second;
++                const VU::BlockSchedule &sc = b.schedule;
++                const std::string n = std::to_string(b.first);
++                const std::vector<VU::BlockGuard> guards = keptGuards(sc, shortLatencies);
++                if (!guards.empty())
+                 {
+-                    size_t e = k;
+-                    if (inBlock(k))
+-                    {
+-                        ++e;
+-                        while (e - k < VU::kMaxBlockPairs - 2u && follows(e) && inBlock(e))
+-                            ++e;
+-                    }
+-                    bool branchEnd = false;
+-                    if (e < ch.size() && (e == k || follows(e)) && branchPair(e) && follows(e + 1u) && slotPair(e + 1u))
+-                    {
+-                        e += 2u;
+-                        branchEnd = true;
+-                    }
+-                    if (e == k)
+-                    {
+-                        ++k;
+-                        continue;
+-                    }
+-                    if (e - k >= 2u)
+-                    {
+-                        Block b;
+-                        b.first = ch[k];
+-                        b.endsInBranch = branchEnd;
+-                        b.pairs.assign(ch.begin() + static_cast<long>(k), ch.begin() + static_cast<long>(e));
+-                        if (VU::scheduleBlockForCodegen(decoded.data() + k, static_cast<uint32_t>(e - k), b.schedule))
+-                        {
+-                            const VU::BlockSchedule &sc = b.schedule;
+-                            std::string n = std::to_string(b.first);
+-                            if (sc.guardCount)
+-                            {
+-                                out += "constexpr VU::BlockGuard kG" + n + "[] = {";
+-                                for (uint32_t g = 0; g < sc.guardCount; ++g)
+-                                    out += "{VU::BlockGuardKind::" + std::string(guardKind(sc.guards[g].kind)) + "," +
+-                                           std::to_string(sc.guards[g].reg) + "," + std::to_string(sc.guards[g].lane) + "," +
+-                                           std::to_string(sc.guards[g].offset) + "},";
+-                                out += "};\n";
+-                            }
+-                            if (sc.finalCount)
+-                            {
+-                                out += "constexpr VU::BlockFinal kF" + n + "[] = {";
+-                                for (uint32_t f = 0; f < sc.finalCount; ++f)
+-                                    out += "{VU::BlockFinalKind::" + std::string(finalKind(sc.finals[f].kind)) + "," +
+-                                           std::to_string(sc.finals[f].reg) + "," + std::to_string(sc.finals[f].lane) + "," +
+-                                           std::to_string(sc.finals[f].offset) + "},";
+-                                out += "};\n";
+-                            }
+-                            ++blockCount;
+-                            blockPairs += b.pairs.size();
+-                            blockAt.emplace(b.first, std::move(b));
+-                        }
+-                    }
+-                    k = e;
++                    out += "constexpr VU::BlockGuard kG" + n + "[] = {";
++                    for (const VU::BlockGuard &g : guards)
++                        out += "{VU::BlockGuardKind::" + std::string(guardKind(g.kind)) + "," + std::to_string(g.reg) + "," +
++                               std::to_string(g.lane) + "," + std::to_string(g.offset) + "},";
++                    out += "};\n";
++                }
++                const std::vector<VU::BlockFinal> finals = keptFinals(sc);
++                if (!finals.empty())
++                {
++                    out += "constexpr VU::BlockFinal kF" + n + "[] = {";
++                    for (const VU::BlockFinal &f : finals)
++                        out += "{VU::BlockFinalKind::" + std::string(finalKind(f.kind)) + "," + std::to_string(f.reg) + "," +
++                               std::to_string(f.lane) + "," + std::to_string(f.offset) + "},";
++                    out += "};\n";
+                 }
++                ++blockCount;
++                blockPairs += b.pairs.size();
+             }
+             // Threaded: the switch is only taken on entry and after a jump; a
+             // pair whose successor is the next pair of this chunk falls
+             // through behind one well-predicted compare.
+-            out += "}\n\nVU::StepResult " + std::string(base) + "_chunk" + std::to_string(c) +
++            out += "}\n\nGA2_CHUNK VU::StepResult " + std::string(base) + "_chunk" + std::to_string(c) +
+                    "(VU &vu, const VU::StepArgs &a)\n{\n    for (;;)\n    {\n"
+                    "        const uint32_t pc = vu.state().pc;\n"
+                    "        if ((pc & 7u) != 0u)\n            return VU::StepResult::Continue;\n"
+@@ -522,29 +351,57 @@ namespace
+                     const VU::BlockSchedule &sc = b.schedule;
+                     const uint32_t last = b.pairs.back();
+                     const std::string endPc = std::to_string((last + 1u) * 8u) + "u";
+-                    out += "    if (vu.blockMayRun(" + (sc.guardCount ? "kG" + n : std::string("nullptr")) + ", " +
+-                           std::to_string(sc.guardCount) + "u, " + std::to_string(sc.issue[sc.count - 1u]) + "u, " +
++                    const uint32_t cycles = sc.issue[sc.count - 1u] + 1u;
++                    const std::vector<VU::BlockFinal> finals = keptFinals(sc);
++                    const std::vector<VU::BlockGuard> guards = keptGuards(sc, shortLatencies);
++                    out += "    if (vu.blockMayRun(" + (guards.empty() ? std::string("nullptr") : "kG" + n) + ", " +
++                           std::to_string(guards.size()) + "u, " + std::to_string(sc.issue[sc.count - 1u]) + "u, " +
+                            std::to_string(sc.count) + "u, a))\n    {\n"
+                            "        const uint64_t e = vu.currentCycle();\n";
+                     for (uint32_t k = 0; k < sc.count; ++k)
+                     {
+-                        const uint32_t stall = k == 0 ? sc.issue[0] : sc.issue[k] - sc.issue[k - 1] - 1u;
+                         // A branch reads and links from its own pc.
+                         if (b.endsInBranch && k + 2u == sc.count)
+                             out += "        vu.state().pc = " + std::to_string(b.pairs[k] * 8u) + "u;\n";
+                         const bool keep = k + 1u == sc.count || (b.endsInBranch && k + 3u == sc.count);
+-                        out += "        vu.stepPairScheduled(kP" + std::to_string(b.pairs[k]) + ", " + std::to_string(stall) + "u, " +
++                        out += "        vu.stepPairScheduled(kP" + std::to_string(b.pairs[k]) + ", e" +
++                               (sc.issue[k] ? " + " + std::to_string(sc.issue[k]) + "u" : std::string()) + ", " +
+                                (keep ? "true" : "false") + ", a);\n";
+                     }
+-                    out += "        vu.finishBlock(e, " + (sc.finalCount ? "kF" + n : std::string("nullptr")) + ", " +
+-                           std::to_string(sc.finalCount) + "u, " + std::to_string(sc.regWriteReady) + "u, " + endPc + ", " +
+-                           (b.endsInBranch ? "true" : "false") + ");\n"
+-                           "        if (!vu.stepLoopHeadAfterPair(a))\n            return VU::StepResult::Stop;\n";
+-                    const bool nextHere = std::binary_search(chunks[c].begin(), chunks[c].end(), last + 1u);
+-                    if (nextHere)
+-                        out += "        if (vu.state().pc == " + endPc + ")\n            goto L" +
+-                               std::to_string(last + 1u) + ";\n";
+-                    out += "        continue;\n    }\n";
++                    out += "        vu.finishBlock(e, " + (finals.empty() ? std::string("nullptr") : "kF" + n) + ", " +
++                           std::to_string(finals.size()) + "u, " + std::to_string(sc.regWriteReady > cycles ? sc.regWriteReady : 0u) + "u, " +
++                           std::to_string(cycles) + "u, " + endPc + ", " + (b.endsInBranch ? "true" : "false") + ");\n"
++                           "        if (!vu.stepLoopHeadAfter" + (pairs == 2048u ? "Block" : "Pair") + "(a))\n            return VU::StepResult::Stop;\n";
++                    // Where the block goes next: statically known unless it ends in JR/JALR.
++                    // (Direct branch targets are masked to the 16 KB of code memory.)
++                    auto jumpTo = [&](uint32_t target) {
++                        if (std::binary_search(chunks[c].begin(), chunks[c].end(), target))
++                            return "goto L" + std::to_string(target) + ";\n";
++                        if (chunkOf[target] >= 0)
++                            return "GA2_CHUNK_JUMP(" + std::string(base) + "_chunk" + std::to_string(chunkOf[target]) + ");\n";
++                        return std::string("return VU::StepResult::Continue;\n");
++                    };
++                    if (!b.endsInBranch)
++                        out += "        " + jumpTo(last + 1u);
++                    else if (pairs != 2048u)
++                        out += "        continue;\n";
++                    else
++                    {
++                        const uint32_t branch = b.pairs[b.pairs.size() - 2u];
++                        const uint32_t lower = ps2_vu1_reach::word(code.data(), branch, 0);
++                        const uint32_t op = lower >> 25;
++                        int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
++                        if (imm & 0x400) imm -= 0x800;
++                        const uint32_t target = static_cast<uint32_t>(static_cast<int32_t>(branch) + 1 + imm + 2048) % 2048u;
++                        if (ps2_vu1_reach::isIndirectJump(op))
++                            out += "        continue;\n";
++                        else if (op == 0x20u || op == 0x21u)
++                            out += "        " + jumpTo(target);
++                        else
++                            out += "        if (vu.state().pc == " + std::to_string(target * 8u) + "u)\n            " + jumpTo(target) +
++                                   "        " + jumpTo(last + 1u);
++                    }
++                    out += "    }\n";
+                 }
+                 out += "    {\n        const VU::StepResult r = vu.stepPairAfter(kP" + n + ", VU::PairEntry{" +
+                        (prevBranch ? "true" : "false") + ", " + (prevEnd ? "true" : "false") + ", " +
+@@ -597,6 +454,30 @@ int main(int argc, char **argv)
+                 h[i] += counts[i];
+         }
+     }
++    // GA2_VU1GEN_HITDUMP=<file>: per-pair execution counts of the captured runs
++    // (hash, pair, hits, lower, upper, flag mode) for profiling the generated code.
++    if (const char *dump = std::getenv("GA2_VU1GEN_HITDUMP"); dump && *dump)
++    {
++        std::ofstream out(dump);
++        for (const auto &[hash, code] : cap.codes)
++        {
++            const auto it = hits.find(hash);
++            if (it == hits.end())
++                continue;
++            const std::vector<uint8_t> modes = flagModes(code);
++            for (uint32_t i = 0; i < code.size() / 8u && i < it->second.size(); ++i)
++                if (it->second[i] != 0u)
++                {
++                    uint32_t lower = 0, upper = 0;
++                    std::memcpy(&lower, code.data() + i * 8u, 4);
++                    std::memcpy(&upper, code.data() + i * 8u + 4u, 4);
++                    char line[128];
++                    std::snprintf(line, sizeof(line), "%016llx %u %llu %08x %08x %u\n", static_cast<unsigned long long>(hash), i,
++                                  static_cast<unsigned long long>(it->second[i]), lower, upper, modes[i]);
++                    out << line;
++                }
++        }
++    }
+     // Entry points recorded by the runtime next to a dumped image
+     // (<hash>.entries: one pair index per line).
+     std::unordered_map<uint64_t, std::vector<uint32_t>> recordedEntries;
+diff --git a/ps2xTest/src/ga2_vu1_plan.h b/ps2xTest/src/ga2_vu1_plan.h
+new file mode 100644
+index 0000000..eb1720f
+--- /dev/null
++++ b/ps2xTest/src/ga2_vu1_plan.h
+@@ -0,0 +1,317 @@
++// What ga2_vu1_gen decides about a code image, shared with the differential
++// fuzzer (ga2_vu1_fuzz) so both run the same analysis: flag liveness, what can
++// be pending when a pair starts, branch targets and the statically scheduled
++// blocks of a chunk.
++#pragma once
++#include "runtime/ps2_vu1.h"
++#include "runtime/ps2_vu1_reach.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace ga2_vu1plan
++{
++using VU = VU1Interpreter;
++
++// Which FMAC flag results can any instruction observe? (Whole-program.)
++//
++// Status: only FSAND/FSEQ/FSOR read it, so it is dead everywhere unless the
++// image contains one. MAC: FMAND/FMEQ/FMOR read the MAC of the latest FMAC
++// result whose 4-cycle latency has elapsed. A result p is dead when, on
++// every path, a later flag-producing instruction q is at least 4 pairs (so at
++// least 4 cycles) old at the reader: q's result is then visible and replaces
++// p's, whatever follows q. At a program end (E bit, or a D/T halt, which
++// may also not halt) the pipelines drain and only the last result survives. Indirect jumps lead
++// anywhere, so they count as readers. Values are unaffected: only flag
++// bookkeeping is skipped.
++// inSet (entry programs): only these pairs are known; leaving them counts
++// as reaching any reader.
++inline std::vector<uint8_t> flagModes(const std::vector<uint8_t> &code, const std::vector<uint8_t> *inSet = nullptr)
++{
++    const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++    auto word = [&](uint32_t index, uint32_t half) {
++        uint32_t w = 0;
++        std::memcpy(&w, code.data() + index * 8u + half * 4u, 4);
++        return w;
++    };
++    constexpr int kEnd = -1, kAnywhere = -2;
++    std::vector<bool> macReader(pairs), statusReader(pairs), producer(pairs), haltPair(pairs);
++    std::vector<bool> clipReader(pairs), clipProducer(pairs), clipElidable(pairs);
++    bool statusRead = false;
++    // Control flow over pairs, in two flavours: a pair entered as the delay
++    // slot of the branch (or E bit) before it (1), and a pair entered any other
++    // way (0, by a jump to it). Their successors differ: a delay slot goes where
++    // the branch goes (or ends the program), any other pair to the next one.
++    // Node = 2 * pair + flavour.
++    enum BranchKind : uint8_t { kNoBranch, kDirect, kConditional, kIndirect };
++    std::vector<uint8_t> branchKind(pairs, kNoBranch);
++    std::vector<bool> eBit(pairs);
++    for (uint32_t i = 0; i < pairs; ++i)
++    {
++        const uint32_t lower = word(i, 0), upper = word(i, 1);
++        const bool iBit = (upper >> 31) != 0u;
++        producer[i] = VU::upperProducesFmacFlags(upper);
++        const uint32_t op = lower >> 25;
++        eBit[i] = ((upper >> 30) & 1u) != 0u;
++        // A D/T halt can end the run here: the pipelines drain, so what
++        // survives is the last result, as at an E bit (a later run or MSCAL
++        // may read MAC first).
++        haltPair[i] = ((upper >> 27) & 3u) != 0u;
++        // CLIP (upper); FCSET (lower) also writes the clip register.
++        clipElidable[i] = (upper & 0x3Cu) == 0x3Cu && ((upper & 3u) | ((upper >> 4) & 0x7Cu)) == 0x1Fu;
++        clipProducer[i] = clipElidable[i] || (!iBit && op == 0x11u);
++        if (!iBit)
++        {
++            clipReader[i] = op == 0x10u || op == 0x12u || op == 0x13u || op == 0x1Cu; // FCEQ, FCAND, FCOR, FCGET
++            macReader[i] = op == 0x18u || op == 0x1Au || op == 0x1Bu; // FMEQ, FMAND, FMOR
++            statusReader[i] = op == 0x14u || op == 0x16u || op == 0x17u; // FSEQ, FSAND, FSOR
++            statusRead = statusRead || statusReader[i];
++            if (op == 0x24u || op == 0x25u)
++                branchKind[i] = kIndirect;
++            else if (op == 0x20u || op == 0x21u)
++                branchKind[i] = kDirect;
++            else if (op >= 0x28u && op <= 0x2Fu && op != 0x2Au && op != 0x2Bu)
++                branchKind[i] = kConditional;
++        }
++    }
++    std::vector<std::vector<int>> succ(2u * pairs);
++    // The pair after i, as entered from it.
++    auto nextAfter = [&](uint32_t i) {
++        return static_cast<int>(2u * ((i + 1u) % pairs) + ((branchKind[i] != kNoBranch || eBit[i]) ? 1u : 0u));
++    };
++    for (uint32_t i = 0; i < pairs; ++i)
++    {
++        succ[2u * i] = {nextAfter(i)};
++        const uint32_t before = (i + pairs - 1u) % pairs;
++        if (eBit[before]) // E bit: its delay slot ends the program
++            succ[2u * i + 1u] = {kEnd};
++        else if (branchKind[before] == kIndirect)
++            succ[2u * i + 1u] = {kAnywhere};
++        else if (branchKind[before] != kNoBranch)
++        {
++            const uint32_t lower = word(before, 0);
++            int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
++            if (imm & 0x400) imm -= 0x800;
++            const uint32_t target = static_cast<uint32_t>((static_cast<int64_t>(before) + 1 + imm + pairs) % pairs);
++            succ[2u * i + 1u] = {static_cast<int>(2u * target)};
++            if (branchKind[before] == kConditional)
++                succ[2u * i + 1u].push_back(nextAfter(i));
++        }
++        else
++            succ[2u * i + 1u] = succ[2u * i]; // not entered this way
++    }
++    if (inSet)
++        for (auto &list : succ)
++            for (int &n : list)
++                if (n >= 0 && !(*inSet)[static_cast<uint32_t>(n) / 2u])
++                    n = kAnywhere;
++    // GA2_VU1GEN_ALLFLAGS=1: keep every flag result (a strict oracle build
++    // for digest-mode replay).
++    if (const char *all = std::getenv("GA2_VU1GEN_ALLFLAGS"); all && *all == '1')
++        return std::vector<uint8_t>(pairs, VU::kFlagAll);
++    std::vector<uint8_t> modes(pairs, statusRead ? VU::kFlagStatus : 0u);
++    // Whether the result of pair p (a producer) can be read by anything:
++    // `reader` pairs read the register, `producer` pairs overwrite it.
++    auto observable = [&](uint32_t p, const std::vector<bool> &producerOf, const std::vector<bool> &reader) {
++        // A halt can end the run right after the pair, or after the delay slot that follows a
++        // halting branch: the last result survives.
++        if (haltPair[p] || haltPair[(p + pairs - 1u) % pairs])
++            return true;
++        // State: pairs since the first later producer (-1: none yet).
++        std::vector<uint8_t> seen(2u * pairs * 6u, 0);
++        std::vector<std::pair<int, int>> stack;
++        for (int n : succ[2u * p])
++            stack.emplace_back(n, -1);
++        const uint32_t before = (p + pairs - 1u) % pairs;
++        if (eBit[before] || branchKind[before] != kNoBranch) // p may be a delay slot
++            for (int n : succ[2u * p + 1u])
++                stack.emplace_back(n, -1);
++        while (!stack.empty())
++        {
++            auto [node, since] = stack.back();
++            stack.pop_back();
++            if (since >= 4)
++                continue;                       // superseded for every later reader
++            if (node == kAnywhere)
++                return true;
++            if (node == kEnd)
++            {
++                if (since < 0)
++                    return true;                // the end keeps the last result
++                continue;
++            }
++            const uint32_t n = static_cast<uint32_t>(node) / 2u;
++            if (reader[n])
++                return true;
++            // A D/T halt ends the run only when the unit has the bit enabled: the
++            // pipelines drain and the last result survives (if the halt pair's own
++            // result is not the last one). Otherwise the run goes on.
++            if (haltPair[n] && since < 0 && !producerOf[n])
++                return true;
++            if (seen[static_cast<uint32_t>(node) * 6u + static_cast<uint32_t>(since + 1)]++)
++                continue;
++            // Age of the first later producer: once it is four pairs old
++            // its result is visible to every reader and hides p's.
++            const int next = since >= 0 ? since + 1 : (producerOf[n] ? 1 : -1);
++            for (int s : succ[static_cast<uint32_t>(node)])
++                stack.emplace_back(s, next);
++        }
++        return false;
++    };
++    for (uint32_t p = 0; p < pairs; ++p)
++    {
++        if (producer[p] && observable(p, producer, macReader))
++            modes[p] |= VU::kFlagMac;
++        if (clipElidable[p] && observable(p, clipProducer, clipReader))
++            modes[p] |= VU::kFlagClip;
++    }
++    return modes;
++}
++
++// What can be pending when a pair starts (see VU1Interpreter::PairEntry).
++// A pending branch is consumed by the branch's image successor (its delay
++// slot). The E bit and halt bits act after the pair that follows them, so
++// with a branch before them they take effect at the branch's destination:
++// its target, its fall-through, or (for JR/JALR) anywhere.
++struct EntryFacts
++{
++    std::vector<bool> mayBranch, mayEnd, mayHalt;
++};
++
++inline EntryFacts entryFacts(const std::vector<uint8_t> &code)
++{
++    const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++    auto word = [&](uint32_t index, uint32_t half) {
++        uint32_t w = 0;
++        std::memcpy(&w, code.data() + (index % pairs) * 8u + half * 4u, 4);
++        return w;
++    };
++    auto isBranch = [&](uint32_t index) {
++        const uint32_t lower = word(index, 0), upper = word(index, 1), op = lower >> 25;
++        return (upper >> 31) == 0u &&
++               (op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u || (op >= 0x28u && op <= 0x2Fu));
++    };
++    EntryFacts f{std::vector<bool>(pairs), std::vector<bool>(pairs), std::vector<bool>(pairs)};
++    for (uint32_t i = 0; i < pairs; ++i)
++    {
++        const uint32_t prev = (i + pairs - 1u) % pairs;
++        f.mayBranch[i] = isBranch(prev);
++        f.mayEnd[i] = ((word(prev, 1) >> 30) & 1u) != 0u;
++        f.mayHalt[i] = ((word(prev, 1) >> 27) & 3u) != 0u; // D (bit 28), T (bit 27)
++    }
++    for (uint32_t b = 0; b < pairs; ++b)
++    {
++        if (!isBranch(b))
++            continue;
++        const uint32_t slotUpper = word(b + 1u, 1);
++        const bool end = ((slotUpper >> 30) & 1u) != 0u, halt = ((slotUpper >> 27) & 3u) != 0u;
++        if (!end && !halt)
++            continue;
++        const uint32_t op = word(b, 0) >> 25;
++        std::vector<uint32_t> targets;
++        if (op == 0x24u || op == 0x25u)
++            for (uint32_t t = 0; t < pairs; ++t)
++                targets.push_back(t);
++        else
++        {
++            int32_t imm = static_cast<int32_t>(word(b, 0) & 0x7FFu);
++            if (imm & 0x400) imm -= 0x800;
++            targets.push_back(static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs));
++            targets.push_back((b + 2u) % pairs);
++        }
++        for (uint32_t t : targets)
++        {
++            f.mayEnd[t] = f.mayEnd[t] || end;
++            f.mayHalt[t] = f.mayHalt[t] || halt;
++        }
++    }
++    return f;
++}
++
++// Pairs that direct branches jump to. Control enters a block there, so a
++// block starts at each of them rather than running across one.
++inline std::vector<bool> branchTargets(const std::vector<uint8_t> &code)
++{
++    const uint32_t pairs = static_cast<uint32_t>(code.size() / 8u);
++    std::vector<bool> target(pairs, false);
++    for (uint32_t b = 0; b < pairs; ++b)
++    {
++        const uint32_t lower = ps2_vu1_reach::word(code.data(), b, 0), upper = ps2_vu1_reach::word(code.data(), b, 1);
++        if ((upper >> 31) != 0u || !ps2_vu1_reach::isDirectBranch(lower >> 25))
++            continue;
++        int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
++        if (imm & 0x400) imm -= 0x800;
++        target[static_cast<uint32_t>((static_cast<int64_t>(b) + 1 + imm + pairs) % pairs)] = true;
++    }
++    return target;
++}
++
++
++// A statically scheduled block starting at a chunk pair (see ps2_vu1.h).
++struct Block
++{
++    uint32_t first = 0;
++    std::vector<uint32_t> pairs;
++    bool endsInBranch = false; // the last two pairs are a branch and its delay slot
++    VU::BlockSchedule schedule;
++};
++
++
++// Blocks of one chunk (ascending pair indices ch, their decoded pairs):
++// runs of consecutive pairs that fall through to each other, with nothing
++// pending from a branch, E bit or halt, entered only at their first pair (so
++// split at branch targets). A block may end with a branch and its delay slot.
++inline std::unordered_map<uint32_t, Block> planBlocks(const std::vector<uint32_t> &ch,
++                                                      const std::vector<VU::DecodedInstructionPair> &decoded,
++                                                      const EntryFacts &facts, const std::vector<bool> &isTarget,
++                                                      uint32_t pairs)
++{
++    std::unordered_map<uint32_t, Block> blockAt;
++    // A pair may be entered with nothing pending from the pair before it.
++    auto clean = [&](size_t k) {
++        const uint32_t index = ch[k];
++        return index + 1u < pairs && !facts.mayEnd[index] && !facts.mayHalt[index];
++    };
++    auto inBlock = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockablePair(decoded[k]); };
++    // A block may end with a branch and its delay slot.
++    auto branchPair = [&](size_t k) { return clean(k) && !facts.mayBranch[ch[k]] && VU::blockableBranchPair(decoded[k]); };
++    auto slotPair = [&](size_t k) { return clean(k) && VU::blockablePair(decoded[k]); };
++    auto follows = [&](size_t e) { return e < ch.size() && ch[e] == ch[e - 1] + 1u && !isTarget[ch[e]]; };
++    for (size_t k = 0; k < ch.size();)
++    {
++        size_t e = k;
++        if (inBlock(k))
++        {
++            ++e;
++            while (e - k < VU::kMaxBlockPairs - 2u && follows(e) && inBlock(e))
++                ++e;
++        }
++        bool branchEnd = false;
++        if (e < ch.size() && (e == k || follows(e)) && branchPair(e) && follows(e + 1u) && slotPair(e + 1u))
++        {
++            e += 2u;
++            branchEnd = true;
++        }
++        if (e == k)
++        {
++            ++k;
++            continue;
++        }
++        if (e - k >= 2u)
++        {
++            Block b;
++            b.first = ch[k];
++            b.endsInBranch = branchEnd;
++            b.pairs.assign(ch.begin() + static_cast<long>(k), ch.begin() + static_cast<long>(e));
++            if (VU::scheduleBlockForCodegen(decoded.data() + k, static_cast<uint32_t>(e - k), b.schedule))
++                blockAt.emplace(b.first, std::move(b));
++        }
++        k = e;
++    }
++    return blockAt;
++}
++}
+-- 
+2.55.0
+

@@ -1,0 +1,456 @@
+From c47abcf0454624138652e49f0061aaa1b8ea1185 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 12:18:04 -0500
+Subject: [PATCH] ga2: IOP clock follows the EE clock; click-free SPU output
+ queue
+
+The IOP ran ~0.9% ahead of EE time / 8 (0.7% from cycles run outside
+runEeCycles, e.g. synchronous RPC waits, 0.2% from slice overshoot), so the
+SPU produced ~48420 samples per real second and the output queue cut the
+excess every few seconds: audible pops in voices. runEeCycles now repays
+the IOP's lead (capped at kMaxIopLeadCycles) instead of adding to it.
+
+SpuPcmQueue: proportional + integral rate control, crossfaded skip past a
+500 ms backlog instead of hard drops, fade-out/refill/fade-in on underrun.
+GA2_PERF [audio] line reports producer/consumer rates, drift and skips.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/CMakeLists.txt                    |   1 +
+ ps2xIOP/src/emulator/iop_emulator.cpp     |  16 ++-
+ ps2xIOP/src/emulator/iop_emulator_const.h |   2 +
+ ps2xIOP/tests/iop_emulator_tests.cpp      |  21 +++
+ ps2xRuntime/src/lib/ps2_audio.cpp         |  19 ++-
+ ps2xRuntime/src/lib/ps2_pcm_queue.h       | 161 ++++++++++++++++------
+ ps2xTest/src/ps2_runtime_io_tests.cpp     |  57 ++++++++
+ 7 files changed, 230 insertions(+), 47 deletions(-)
+
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index adcf148..76c3c47 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -55,6 +55,7 @@ if(PS2X_IOP_BUILD_TESTS)
+     add_test(NAME ps2_iop_reboot_image_tests COMMAND ps2_iop_reboot_image_tests)
+     add_executable(ps2_iop_emulator_tests tests/iop_emulator_tests.cpp)
+     target_link_libraries(ps2_iop_emulator_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_emulator_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+     add_test(NAME ps2_iop_emulator_tests COMMAND ps2_iop_emulator_tests)
+ 
+     add_executable(ps2_iop_import_tests tests/iop_import_tests.cpp)
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index a5de97e..e0b3678 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -181,6 +181,7 @@ namespace ps2x::iop::detail
+             totalCycles = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
++            eeIopClock = 0;
+             activeCpu = nullptr;
+             rpcWaitCpu = nullptr;
+             rpcInstructionDeadline = rpcCycleDeadline = 0u;
+@@ -1348,6 +1349,7 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        uint64_t eeIopClock = 0; // IOP cycles the EE clock has granted
+         CpuState *activeCpu = nullptr;
+         CpuState *rpcWaitCpu = nullptr;
+         uint64_t rpcInstructionDeadline = 0;
+@@ -1428,8 +1430,18 @@ namespace ps2x::iop::detail
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+-        if (iopCycles)
+-            m_impl->runCycles(iopCycles);
++        // IOP time is EE time / 8. Synchronous RPC waits and slice overshoot
++        // run the IOP past that (measured ~0.9% in GA2, which made the SPU
++        // produce ~48420 samples per real second); the EE clock repays that
++        // lead instead of stacking new budget on top of it. A lead beyond
++        // kMaxIopLeadCycles (e.g. a long module start) is forgiven so the IOP
++        // never stalls for long.
++        Impl &impl = *m_impl;
++        impl.eeIopClock += iopCycles;
++        if (impl.totalCycles > impl.eeIopClock + kMaxIopLeadCycles)
++            impl.eeIopClock = impl.totalCycles - kMaxIopLeadCycles;
++        if (impl.eeIopClock > impl.totalCycles)
++            impl.runCycles(impl.eeIopClock - impl.totalCycles);
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+diff --git a/ps2xIOP/src/emulator/iop_emulator_const.h b/ps2xIOP/src/emulator/iop_emulator_const.h
+index 7004597..d317e0d 100644
+--- a/ps2xIOP/src/emulator/iop_emulator_const.h
++++ b/ps2xIOP/src/emulator/iop_emulator_const.h
+@@ -10,6 +10,8 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
+ constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
+ constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
+ constexpr uint32_t kDefaultSlice = 256u;
++// Largest IOP lead over the EE clock that later EE time repays (~1.8 ms).
++constexpr uint64_t kMaxIopLeadCycles = 65536u;
+ constexpr uint32_t kMaxCallInstructions = 2'000'000u;
+ constexpr uint32_t kModuleLoadBase = 0x00010000u;
+ constexpr uint32_t kStackGuardBytes = 64u;
+\ No newline at end of file
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index fd237d5..c21af9d 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2x/iop/iop_subsystem.h"
++#include "emulator/iop_emulator.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -1141,6 +1142,26 @@ int main()
+     if (!expect(!emittedUnhandledSeek,
+                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+ 
++    // IOP time follows the EE clock: time the IOP runs on its own (module
++    // start, RPC waits, slice overshoot) is repaid by later EE time rather
++    // than added to it, so the SPU's 48 kHz matches real time.
++    host.logs.clear();
++    ps2x::iop::detail::IopEmulator emulator(host);
++    writeCdvdSeekIrx(host, 0x100u);
++    (void)emulator.loadModuleBuffer(0x100u, nullptr, 0u);
++    const uint64_t lead = emulator.cycles();
++    if (!expect(lead > 0u && lead < 65536u, "module start did not run the IOP ahead of the EE clock")) return 1;
++    emulator.runEeCycles(8u * (lead / 2u));
++    if (!expect(emulator.cycles() == lead, "EE time did not repay the IOP lead")) return 1;
++    uint64_t eeClock = lead / 2u;
++    for (int n = 0; n < 4096; ++n)
++    {
++        emulator.runEeCycles(8u * 7u);
++        eeClock += 7u;
++    }
++    if (!expect(emulator.cycles() >= eeClock && emulator.cycles() < eeClock + 256u,
++                "IOP time drifted from the EE clock")) return 1;
++
+     std::cout << "ps2xIOP emulator smoke tests passed\n";
+     return 0;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 22ddfc2..52e1145 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -206,13 +206,22 @@ bool PS2AudioBackend::submitSpuPcm(std::span<const int16_t> samples, uint32_t sa
+     // as clicks).
+     static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
+     static auto lastReport = std::chrono::steady_clock::now();
+-    if (perf && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(5))
++    static uint64_t lastPushed = 0, lastPlayed = 0;
++    const auto now = std::chrono::steady_clock::now();
++    if (perf && now - lastReport > std::chrono::seconds(5))
+     {
+-        lastReport = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - lastReport).count();
++        lastReport = now;
+         std::lock_guard callbackLock(Impl::callbackMutex);
+-        std::fprintf(stderr, "[audio] queued %zu frames, underruns %llu (%llu frames), dropped %llu frames\n",
+-                     m_impl->pcm.queuedFrames(), (unsigned long long)m_impl->pcm.underruns(),
+-                     (unsigned long long)m_impl->pcm.underrunFrames(), (unsigned long long)m_impl->pcm.droppedFrames());
++        SpuPcmQueue &q = m_impl->pcm;
++        std::fprintf(stderr, "[audio] queued %zu (peak %zu) frames, in %.0f/s out %.0f/s, drift %+.3f%%, "
++                             "underruns %llu (%llu frames), skipped %llu, dropped %llu frames\n",
++                     q.queuedFrames(), q.takePeak(), double(q.pushedFrames() - lastPushed) / seconds,
++                     double(q.playedFrames() - lastPlayed) / seconds, 100.0 * q.driftCorrection(),
++                     (unsigned long long)q.underruns(), (unsigned long long)q.underrunFrames(),
++                     (unsigned long long)q.skippedFrames(), (unsigned long long)q.droppedFrames());
++        lastPushed = q.pushedFrames();
++        lastPlayed = q.playedFrames();
+     }
+     return observe(result);
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+index 5867d5f..daa5110 100644
+--- a/ps2xRuntime/src/lib/ps2_pcm_queue.h
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -6,15 +6,22 @@
+ #include <cstdint>
+ #include <span>
+ 
+-// Serialized by the backend callback-owner mutex. Samples always stay stereo.
++// SPU output (producer: IOP time) to the audio device (consumer: device
++// clock). Rate control keeps the backlog near SteadyLevelFrames; nothing is
++// ever cut mid-waveform, since every cut is an audible click:
++// - an underrun fades out over FadeFrames, then waits until the backlog is
++//   back at the steady level and fades in again;
++// - a backlog past TargetLatencyFrames (a long burst) skips the excess with
++//   a FadeFrames crossfade.
+ class SpuPcmQueue
+ {
+ public:
+     static constexpr size_t CapacityFrames = 96000;
+-    // Host output latency is bounded: when the producer runs ahead of the
+-    // audio device, the oldest queued frames are dropped instead of rejecting
+-    // the new ones (a rejection used to fault the whole IOP).
+-    static constexpr size_t TargetLatencyFrames = 7200; // 150 ms at 48 kHz
++    static constexpr size_t TargetLatencyFrames = 24000; // 500 ms at 48 kHz: skip beyond this
++    static constexpr size_t SteadyLevelFrames = 3600;    // 75 ms
++    static constexpr size_t FadeFrames = 96;             // 2 ms
++    static constexpr double MaxRateDeviation = 0.005;    // proportional part
++    static constexpr double MaxDriftCorrection = 0.005;  // integral part
+     bool push(std::span<const int16_t> samples)
+     {
+         if (samples.size() % 2u)
+@@ -22,53 +29,66 @@ public:
+         if (samples.size() / 2u > CapacityFrames)
+             samples = samples.last(CapacityFrames * 2u);
+         const size_t incoming = samples.size() / 2u;
+-        if (m_count + incoming > TargetLatencyFrames)
++        if (m_count + incoming > CapacityFrames)
+         {
+-            const size_t drop = std::min(m_count, m_count + incoming - TargetLatencyFrames);
++            const size_t drop = m_count + incoming - CapacityFrames;
+             m_head = (m_head + drop) % CapacityFrames;
+             m_count -= drop;
+             m_dropped += drop;
+         }
+-        for (size_t i = 0; i < samples.size() / 2u; ++i)
++        for (size_t i = 0; i < incoming; ++i)
+         {
+             const size_t p = ((m_head + m_count + i) % CapacityFrames) * 2u;
+             m_samples[p] = samples[2u*i]; m_samples[p+1u] = samples[2u*i+1u];
+         }
+-        m_count += samples.size() / 2u;
++        m_count += incoming;
++        m_pushed += incoming;
++        if (m_count > TargetLatencyFrames)
++            skipWithCrossfade(m_count - SteadyLevelFrames);
++        m_peak = std::max(m_peak, m_count);
+         return true;
+     }
+-    // The producer is paced by guest vblanks and the device by its own
+-    // crystal; a steady difference would turn into periodic drops at the
+-    // latency bound or zero-filled gaps. Consumption runs up to 0.5% faster
+-    // or slower to hold the queue near half the bound, interpolating between
+-    // frames (exact at the nominal rate). Underruns still zero-fill.
+-    static constexpr size_t SteadyLevelFrames = TargetLatencyFrames / 2u;
+-    static constexpr double MaxRateDeviation = 0.005;
+     void consume(std::span<int16_t> output)
+     {
+         std::fill(output.begin(), output.end(), int16_t{});
+-        const double error = (static_cast<double>(m_count) - SteadyLevelFrames) / SteadyLevelFrames;
+-        const double step = 1.0 + std::clamp(error * MaxRateDeviation, -MaxRateDeviation, MaxRateDeviation);
+         const size_t frames = output.size() / 2u;
++        m_played += frames;
+         size_t written = 0;
++        if (!m_playing)
++        {
++            written = fadeOut(output, 0);
++            if (m_count < SteadyLevelFrames)
++            {
++                if (m_started)
++                    m_underrunFrames += frames - written;
++                return;
++            }
++            // Fade in after an underrun; the very first start is exact.
++            m_gain = m_started ? 0.0 : 1.0;
++            m_playing = m_started = true;
++            m_phase = 0.0;
++        }
++        // Rate control on a smoothed level (pushes arrive in bursts): a
++        // proportional term plus a slow integral that learns the clock drift.
++        const double alpha = std::min(1.0, double(frames) / 4800.0);
++        m_level += (double(m_count) - m_level) * alpha;
++        const double error = std::clamp((m_level - double(SteadyLevelFrames)) / double(SteadyLevelFrames), -1.0, 1.0);
++        m_drift = std::clamp(m_drift + error * DriftGain * double(frames), -MaxDriftCorrection, MaxDriftCorrection);
++        const double step = 1.0 + error * MaxRateDeviation + m_drift;
+         for (; written < frames; ++written)
+         {
+             const size_t index = static_cast<size_t>(m_phase);
+             const double fraction = m_phase - static_cast<double>(index);
+-            if (index + (fraction != 0.0 ? 1u : 0u) >= m_count)
++            if (index + 1u >= m_count)
+                 break; // underrun
++            m_gain = std::min(1.0, m_gain + 1.0 / FadeFrames);
+             const size_t a = ((m_head + index) % CapacityFrames) * 2u;
+-            if (fraction == 0.0)
+-            {
+-                output[2u*written] = m_samples[a];
+-                output[2u*written+1u] = m_samples[a+1u];
+-            }
+-            else
++            const size_t b = ((m_head + index + 1u) % CapacityFrames) * 2u;
++            for (size_t c = 0; c < 2u; ++c)
+             {
+-                const size_t b = ((m_head + index + 1u) % CapacityFrames) * 2u;
+-                for (size_t c = 0; c < 2u; ++c)
+-                    output[2u*written+c] = static_cast<int16_t>(std::lround(
+-                        m_samples[a+c] + (m_samples[b+c] - m_samples[a+c]) * fraction));
++                const double v = m_samples[a+c] + (m_samples[b+c] - m_samples[a+c]) * fraction;
++                m_last[c] = v * m_gain;
++                output[2u*written+c] = static_cast<int16_t>(std::lround(m_last[c]));
+             }
+             m_phase += step;
+         }
+@@ -78,26 +98,87 @@ public:
+         m_phase -= static_cast<double>(consumed);
+         if (written < frames)
+         {
+-            m_phase = 0.0; // restart cleanly after an underrun
+-            if (m_started)
+-            {
+-                ++m_underruns;
+-                m_underrunFrames += frames - written;
+-            }
++            // Ran dry: fade the last sample out instead of cutting to zero,
++            // then refill before playing again.
++            m_playing = false;
++            m_fade = FadeFrames;
++            ++m_underruns;
++            m_underrunFrames += frames - written;
++            fadeOut(output, written);
+         }
+-        m_started = m_started || written > 0;
+     }
+-    void clear() noexcept { m_head = m_count = 0; m_phase = 0.0; }
++    void clear() noexcept
++    {
++        m_head = m_count = 0;
++        m_phase = 0.0;
++        m_playing = false;
++        m_started = false;
++        m_fade = 0;
++        m_level = double(SteadyLevelFrames);
++    }
+     size_t queuedFrames() const noexcept { return m_count; }
+     uint64_t droppedFrames() const noexcept { return m_dropped; }
+-    // Device callbacks that ran out of queued audio (after the first sound)
+-    // and the frames they zero-filled.
++    uint64_t skippedFrames() const noexcept { return m_skipped; }
+     uint64_t underruns() const noexcept { return m_underruns; }
+     uint64_t underrunFrames() const noexcept { return m_underrunFrames; }
++    uint64_t pushedFrames() const noexcept { return m_pushed; }
++    uint64_t playedFrames() const noexcept { return m_played; }
++    double driftCorrection() const noexcept { return m_drift; }
++    size_t takePeak() noexcept { const size_t p = m_peak; m_peak = m_count; return p; }
+ private:
++    // The integral reaches 0.5% after ~10 s at full error.
++    static constexpr double DriftGain = MaxDriftCorrection / (48000.0 * 10.0);
++
++    // Continue a fade-out of the last played sample; returns the frames written.
++    size_t fadeOut(std::span<int16_t> output, size_t at)
++    {
++        for (; m_fade > 0 && at < output.size() / 2u; ++at)
++        {
++            --m_fade;
++            const double g = double(m_fade) / double(FadeFrames);
++            for (size_t c = 0; c < 2u; ++c)
++                output[2u*at+c] = static_cast<int16_t>(std::lround(m_last[c] * g));
++        }
++        return at;
++    }
++
++    // Drop `skip` frames just past the read position, blending the frames
++    // before the cut into the frames after it so the waveform stays whole.
++    void skipWithCrossfade(size_t skip)
++    {
++        const size_t keep = static_cast<size_t>(m_phase) + 2u; // being interpolated
++        if (m_count < keep + skip + FadeFrames)
++            return;
++        for (size_t f = 0; f < FadeFrames; ++f)
++        {
++            const double w = (double(f) + 0.5) / double(FadeFrames);
++            const size_t from = ((m_head + keep + f) % CapacityFrames) * 2u;
++            const size_t to = ((m_head + keep + skip + f) % CapacityFrames) * 2u;
++            for (size_t c = 0; c < 2u; ++c)
++                m_samples[to+c] = static_cast<int16_t>(std::lround(m_samples[from+c] * (1.0 - w) + m_samples[to+c] * w));
++        }
++        // Move the kept frames up to the cut so the order stays intact.
++        for (size_t i = keep; i-- > 0;)
++        {
++            const size_t from = ((m_head + i) % CapacityFrames) * 2u;
++            const size_t to = ((m_head + i + skip) % CapacityFrames) * 2u;
++            m_samples[to] = m_samples[from];
++            m_samples[to+1u] = m_samples[from+1u];
++        }
++        m_head = (m_head + skip) % CapacityFrames;
++        m_count -= skip;
++        m_skipped += skip;
++        m_level = double(m_count);
++    }
++
+     std::array<int16_t, CapacityFrames * 2u> m_samples{};
+     size_t m_head = 0, m_count = 0;
+     double m_phase = 0.0; // fractional read position past m_head
+-    uint64_t m_dropped = 0, m_underruns = 0, m_underrunFrames = 0;
++    double m_level = double(SteadyLevelFrames), m_drift = 0.0, m_gain = 0.0;
++    double m_last[2]{};
++    size_t m_fade = 0; // fade-out frames left after an underrun
++    bool m_playing = false;
+     bool m_started = false;
++    uint64_t m_dropped = 0, m_skipped = 0, m_underruns = 0, m_underrunFrames = 0, m_pushed = 0, m_played = 0;
++    size_t m_peak = 0;
+ };
+diff --git a/ps2xTest/src/ps2_runtime_io_tests.cpp b/ps2xTest/src/ps2_runtime_io_tests.cpp
+index 08e4556..bedcae3 100644
+--- a/ps2xTest/src/ps2_runtime_io_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_io_tests.cpp
+@@ -778,6 +778,63 @@ void register_ps2_runtime_io_tests()
+                 t.Equals(silentFrames, size_t{0}, "drift must not underrun once settled");
+                 t.IsTrue(queue->queuedFrames() < SpuPcmQueue::TargetLatencyFrames, "level stays below the bound");
+             }
++            {
++                // GA2's IOP once ran 0.9% fast; the integral term absorbs drift
++                // beyond the proportional range without skipping.
++                auto queue = std::make_unique<SpuPcmQueue>();
++                std::vector<int16_t> chunk(484u * 2u, int16_t{1000});
++                std::vector<int16_t> out(480u * 2u);
++                for (int i = 0; i < 8; ++i)
++                    queue->push(chunk);
++                for (int i = 0; i < 20000; ++i)
++                {
++                    queue->push(chunk);
++                    queue->consume(out);
++                }
++                t.Equals(queue->skippedFrames() + queue->droppedFrames(), uint64_t{0}, "0.8% drift is absorbed");
++                t.IsTrue(queue->queuedFrames() < 2u * SpuPcmQueue::SteadyLevelFrames, "level returns near steady");
++            }
++        });
++
++        tc.Run("PCM queue never cuts the waveform on stalls and bursts", [](TestCase &t)
++        {
++            // A 440 Hz sine; the producer stalls (underrun) and catches up in
++            // bursts (including one past the latency bound). The output may
++            // fade but must never jump: a jump is an audible click.
++            auto queue = std::make_unique<SpuPcmQueue>();
++            constexpr double kAmp = 12000.0, kStep = 2.0 * 3.14159265358979 * 440.0 / 48000.0;
++            uint64_t produced = 0;
++            auto produce = [&](size_t frames) {
++                std::vector<int16_t> chunk(frames * 2u);
++                for (size_t f = 0; f < frames; ++f, ++produced)
++                    chunk[2u*f] = chunk[2u*f+1u] = static_cast<int16_t>(std::lround(kAmp * std::sin(kStep * double(produced))));
++                queue->push(chunk);
++            };
++            const double maxDelta = kAmp * kStep * 1.05 + 2.0; // steepest slope of the sine
++            std::vector<int16_t> out(480u * 2u);
++            int16_t previous = 0;
++            double worst = 0.0;
++            auto play = [&] {
++                queue->consume(out);
++                for (size_t f = 0; f < 480u; ++f)
++                {
++                    worst = std::max(worst, std::abs(double(out[2u*f]) - double(previous)));
++                    previous = out[2u*f];
++                }
++            };
++            for (int i = 0; i < 3000; ++i)
++            {
++                if (i == 500)
++                    for (int s = 0; s < 20; ++s) play(); // stall: runs dry
++                if (i == 1000) produce(9600);  // catch-up burst
++                if (i == 2000) produce(30000); // past the latency bound: crossfaded skip
++                produce(480);
++                play();
++            }
++            t.IsTrue(queue->underruns() >= 1u, "the stall underran");
++            t.IsTrue(queue->skippedFrames() > 0u, "the large burst was skipped");
++            t.Equals(queue->droppedFrames(), uint64_t{0}, "nothing was hard-dropped");
++            t.IsTrue(worst <= maxDelta, "no sample-to-sample jump beyond the sine's own slope");
+         });
+     });
+ }
+-- 
+2.55.0
+

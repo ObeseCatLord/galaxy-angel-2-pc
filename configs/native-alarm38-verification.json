@@ -1,0 +1,23 @@
+{
+  "narrow_not_found_cancel_adapter_accepted": true,
+  "authored_mips_candidate_passed": true,
+  "unchanged_source_control_failed_as_expected": true,
+  "fresh_iop_spu_suites_passed": 12,
+  "sdk_context_fidelity_accepted": false,
+  "original_sony_oracle_accepted": false,
+  "native_movie_recovery_accepted": false,
+  "voiced_dialogue_accepted": false,
+  "shipping_change_applied": false,
+  "full_goal_complete": false,
+  "reviewer": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "ultra",
+    "effective_verified": true
+  },
+  "review_sha256": "ee641e2b44b9c07b66012b346fde7b3160b3e61dd4bb8306d21fb75c4e19b26c",
+  "disposition_sha256": "af26c000ac171da81bb30a47b2da5f10cdbe597c2ea659db983e529bf1749d3a",
+  "candidate_binary_sha256": "1872e7159eae9d91a3610b1282bb4eec0441b80c1603bc71462a7cd006381938",
+  "private_artifacts": "research/native-alarm38",
+  "public_source_baseline": 23,
+  "allfive_public_native_baseline": 22
+}

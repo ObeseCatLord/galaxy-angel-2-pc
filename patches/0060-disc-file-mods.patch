@@ -1,0 +1,227 @@
+From b044c29759b1c70113f6e412d5aaae3c7746a53a Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:01:37 -0500
+Subject: [PATCH] ga2: disc file mods
+
+Files under $GA2_MODS/<disc program, e.g. SLPM_662.43>/ replace (or add)
+disc files with the same path. Each gets a sector range past the image
+end: sceCdSearchFile/open hand out that range and the host serves those
+sectors from the mod file, for both cdrom file reads and raw CDVD sector
+reads. Verified: byte-identical copies of ADV.DAT/IDX.DAT play normally;
+a zeroed IDX.DAT is what the game then reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp | 70 +++++++++++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_disc_mount.h   |  6 +++
+ ps2xRuntime/src/lib/ps2_iop_host.cpp   | 37 +++++++++++++-
+ ps2xRuntime/src/lib/ps2_iop_host.h     |  2 +
+ 4 files changed, 113 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 486e1ef..bc46c92 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -44,6 +44,12 @@ namespace ps2_disc
+         };
+         Identity verifiedIdentity;
+         std::unordered_map<std::string, File> files;
++        struct Overlay
++        {
++            uint64_t begin = 0u, end = 0u; // byte range in the image's sector space
++            std::filesystem::path host;
++            uint64_t size = 0u;
++        };
+         // Other registered discs; `files`/`verifiedImage` always describe the
+         // current one, and the primary is kept here too once a second disc exists.
+         struct Disc
+@@ -53,6 +59,7 @@ namespace ps2_disc
+             std::unordered_map<std::string, File> files;
+             DiscInfo info;
+             std::string bootKey; // the disc's program, e.g. "SLPM_667.79"
++            std::vector<Overlay> overlays;
+         };
+         std::vector<Disc> discs;
+         size_t currentDisc = 0u;
+@@ -280,6 +287,37 @@ namespace ps2_disc
+ 
+     namespace
+     {
++        void applyMods(Disc &disc, uint64_t imageSize)
++        {
++            const char *root = std::getenv("GA2_MODS");
++            if (!root || !*root || disc.bootKey.empty()) return;
++            const std::filesystem::path dir = std::filesystem::path(root) / disc.bootKey;
++            std::error_code error;
++            if (!std::filesystem::is_directory(dir, error)) return;
++            uint64_t next = (imageSize + 2047u) / 2048u * 2048u;
++            size_t count = 0u;
++            for (const auto &entry : std::filesystem::recursive_directory_iterator(dir, error))
++            {
++                if (!entry.is_regular_file(error)) continue;
++                const std::string key = pathKey(std::filesystem::relative(entry.path(), dir, error).generic_string());
++                const uint64_t size = entry.file_size(error);
++                if (key.empty() || error || size > UINT32_MAX)
++                {
++                    std::fprintf(stderr, "[mods] skipped %s\n", entry.path().string().c_str());
++                    continue;
++                }
++                const uint64_t lba = next / 2048u;
++                if (lba > UINT32_MAX) break;
++                disc.files[key] = File{static_cast<uint32_t>(size), {{static_cast<uint32_t>(lba), static_cast<uint32_t>(size)}}};
++                const uint64_t span = std::max<uint64_t>(2048u, (size + 2047u) / 2048u * 2048u);
++                disc.overlays.push_back(Overlay{next, next + span, entry.path(), size});
++                next += span;
++                ++count;
++            }
++            if (count)
++                std::fprintf(stderr, "[mods] %zu file(s) from %s\n", count, dir.string().c_str());
++        }
++
+         // Validates an image against its manifest (digests, geometry, file
+         // table); throws on any mismatch.
+         Disc loadDisc(const std::filesystem::path &image, const std::filesystem::path &manifest,
+@@ -339,6 +377,7 @@ namespace ps2_disc
+                     !disc.files.emplace(key, std::move(file)).second)
+                     throw std::runtime_error("duplicate/inconsistent disc file record");
+             }
++            applyMods(disc, imageSize);
+             if (!identity(image, disc.identity) || before != disc.identity)
+                 throw std::runtime_error("disc image changed during validation");
+             if (!cached)
+@@ -379,7 +418,7 @@ namespace ps2_disc
+             verifiedImage = configured; verifiedIdentity = disc.identity;
+             mode = Mode::Verified; files = std::move(disc.files);
+             discs.clear(); currentDisc = 0u;
+-            discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info, disc.bootKey});
++            discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info, disc.bootKey, std::move(disc.overlays)});
+             return true;
+         }
+         catch (const std::exception &failure)
+@@ -497,4 +536,33 @@ namespace ps2_disc
+         }
+         return false;
+     }
++
++    bool readOverlay(const std::filesystem::path &image, uint64_t position, uint8_t *destination, size_t size)
++    {
++        std::lock_guard lock(mutex);
++        const Disc *disc = nullptr;
++        for (const auto &candidate : discs)
++            if (candidate.image == image) disc = &candidate;
++        if (!disc) return false;
++        while (size != 0u)
++        {
++            const Overlay *overlay = nullptr;
++            for (const auto &candidate : disc->overlays)
++                if (position >= candidate.begin && position < candidate.end) overlay = &candidate;
++            if (!overlay) return false;
++            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(size, overlay->end - position));
++            std::memset(destination, 0, chunk);
++            const uint64_t within = position - overlay->begin;
++            if (within < overlay->size)
++            {
++                std::ifstream in(overlay->host, std::ios::binary);
++                in.seekg(static_cast<std::streamoff>(within));
++                const size_t wanted = static_cast<size_t>(std::min<uint64_t>(chunk, overlay->size - within));
++                if (!in.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(wanted)))
++                    return false;
++            }
++            destination += chunk; position += chunk; size -= chunk;
++        }
++        return true;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+index 14d0b3b..901f6ae 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.h
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -52,4 +52,10 @@ namespace ps2_disc
+     // as open (at most once per 30 guest vsyncs while the changer is armed).
+     [[nodiscard]] bool trayOpenNow();
+     [[nodiscard]] std::string pathKey(std::string_view guestPath);
++    // Mods: files under $GA2_MODS/<disc program, e.g. SLPM_662.43>/ replace
++    // (or add) disc files with the same path. findFile hands out sectors past
++    // the image end for them; readOverlay serves those sectors. Returns false
++    // when no mod file covers the position.
++    [[nodiscard]] bool readOverlay(const std::filesystem::path &image, uint64_t position,
++                                   uint8_t *destination, size_t size);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index b09a99a..f8dcff9 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -601,7 +601,7 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+     }
+     if (mountedImage && (generation != ps2_disc::generation() || !ps2_disc::imageReadable()))
+     { std::fclose(stream); return 0u; }
+-    m_hostFiles.emplace(handle, HostFile{stream, size, generation, {}});
++    m_hostFiles.emplace(handle, HostFile{stream, size, generation, {}, hostPath, size});
+     return handle;
+ }
+ 
+@@ -698,6 +698,14 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
+                 const uint64_t within = offset > logical ? offset - logical : 0u;
+                 const size_t chunk = static_cast<size_t>(std::min<uint64_t>(count - copied, part.size - within));
+                 const uint64_t position = uint64_t(part.lba) * 2048u + within;
++                if (position >= file.imageSize)
++                {
++                    // A mod file: sectors past the image end.
++                    if (!ps2_disc::readOverlay(file.path, position, staged.data() + copied, chunk))
++                        return false;
++                    copied += chunk; offset += chunk; logical = end;
++                    continue;
++                }
+ #if defined(_WIN32)
+                 const bool seek = position <= uint64_t(INT64_MAX) && _fseeki64(file.stream, int64_t(position), SEEK_SET) == 0;
+ #else
+@@ -715,6 +723,33 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
+         return true;
+     }
+ 
++    // Whole-image reads (CDVD sectors) past the image end are mod files when
++    // a registered disc has them there; otherwise this is an ordinary read.
++    if (size != 0u && offset + size > it->second.imageSize)
++    {
++        const HostFile &file = it->second;
++        std::vector<uint8_t> staged(size);
++        const size_t inImage = offset < file.imageSize ? static_cast<size_t>(file.imageSize - offset) : 0u;
++        if (ps2_disc::readOverlay(file.path, offset + inImage, staged.data() + inImage, size - inImage))
++        {
++            if (inImage != 0u)
++            {
++#if defined(_WIN32)
++                const bool seek = _fseeki64(file.stream, int64_t(offset), SEEK_SET) == 0;
++#else
++                const bool seek = fseeko(file.stream, off_t(offset), SEEK_SET) == 0;
++#endif
++                if (!seek || std::fread(staged.data(), 1u, inImage, file.stream) != inImage)
++                { std::clearerr(file.stream); return false; }
++            }
++            if (file.generation != 0u && (file.generation != ps2_disc::generation() || !ps2_disc::imageReadable()))
++                return false;
++            std::memcpy(destination, staged.data(), size);
++            bytesRead = size;
++            return true;
++        }
++    }
++
+ #if defined(_WIN32)
+     if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+         _fseeki64(it->second.stream, static_cast<int64_t>(offset), SEEK_SET) != 0)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 4539c80..3831be4 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -123,6 +123,8 @@ private:
+         uint64_t size = 0u;
+         uint64_t generation = 0u;
+         std::vector<ps2_disc::Extent> extents;
++        std::filesystem::path path;  // for mod overlays past the image end
++        uint64_t imageSize = 0u;     // bytes actually in the file
+     };
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+-- 
+2.55.0
+

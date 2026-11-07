@@ -1,0 +1,43 @@
+From 5235c7bec1309950cbe9151010410ad10dd6b011 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:22:08 -0500
+Subject: [PATCH] Hacks: disable_dither ignores DTHE (no ordered dither
+ pattern)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gs/gs_interface.cpp | 2 +-
+ gs/gs_interface.hpp | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 10120fb..e691a32 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1073,7 +1073,7 @@ uint32_t GSInterface::drawing_kick_update_state_vector()
+ 	StateVector state = {};
+ 
+ 	// Dither enable
+-	if (registers.dthe.desc.DTHE)
++	if (registers.dthe.desc.DTHE && !hacks.disable_dither)
+ 	{
+ 		state.blend_mode |= BLEND_MODE_DTHE_BIT;
+ 		state.dimx.x = registers.dimx.words[0];
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index e92d4b6..ba94e98 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -216,6 +216,10 @@ struct Hacks
+ 	// Can be useful when up-scaling to retain more texture detail.
+ 	bool disable_mipmaps = false;
+ 
++	// Ignores DTHE: no ordered dither pattern (games that dither into 16-bit
++	// buffers then show their colour steps instead of the checkerboard).
++	bool disable_dither = false;
++
+ 	// [texreplace] BT3-Recomp: sample every texture bilinearly regardless of TEX1 MMAG/MMIN (smooths 1x art at high
+ 	// scanout resolutions, the same knob as the host GL renderer's force_bilinear).
+ 	bool force_bilinear = false;
+-- 
+2.55.0
+

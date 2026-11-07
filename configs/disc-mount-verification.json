@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "scope": "native original-file and sector parity; image bootstrap and native game scenes unverified",
+  "image_and_manifest_sha256_verified": true,
+  "metadata_snapshot_bound_to_digest": true,
+  "ee_iop_original_file_search_agree": true,
+  "whole_original_ioprp_file_matches_import": true,
+  "iop_original_sector_matches_iso": true,
+  "sparse_over_2gib_collision_verified": true,
+  "a_b_a_generation_verified": true,
+  "same_path_replacement_verified": true,
+  "stale_native_file_handle_rejection_verified": true,
+  "malformed_metadata_rejected": true,
+  "configured_image_no_loose_fallback_verified": true,
+  "logical_multi_extent_ranges_verified": true,
+  "physical_sector_concatenation": false,
+  "single_lba_multi_extent_search": "rejected",
+  "quiescent_iop_reset_rejection_verified": true,
+  "native_ee_rpc_epoch_retirement_verified": false,
+  "native_bootstrap_verified": false,
+  "general_ee_vfs_iso_integration_verified": false,
+  "runtime_tests": {
+    "passed": 445,
+    "failed": 0
+  },
+  "iop_test_executables_passed": 8,
+  "tooling_tests_passed": 12,
+  "last_capture": "captures/disc-mount/20261009-033441-primary-verified/summary.json",
+  "verified_for_discs": [
+    "zettai",
+    "mugen-1",
+    "mugen-2",
+    "eigou-1",
+    "eigou-2"
+  ],
+  "validation_source": "completed primary patch0008 build, probes and tests",
+  "review": "mounted-disc-adapter.md",
+  "unannounced_same_size_replacement_verified": true,
+  "restored_mtime_inplace_edit_rejected": true,
+  "same_path_reapplication_cannot_bypass_verification": true,
+  "file_identity_os_validation": {
+    "linux": "verified",
+    "windows": "source-only-unverified"
+  },
+  "review_disposition": "mounted-disc-disposition.md",
+  "source_files_exactly_reproduced": 45,
+  "patch0008_sha256": "154eb9c4dfd92935534ae4a3293399f05fe9a3558f558b9df54f652cc7b048d7"
+}

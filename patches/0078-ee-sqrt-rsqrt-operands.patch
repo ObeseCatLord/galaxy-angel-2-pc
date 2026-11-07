@@ -1,0 +1,152 @@
+From aa35fe611f70543cc3b22aa55731b66cb80d77de Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 00:05:05 -0500
+Subject: [PATCH 78/78] recomp: EE SQRT.S/RSQRT.S and VU0 VSQRT/VRSQRT/VDIV
+ operand semantics
+
+SQRT.S takes its operand from the ft field (fs is 0 in real code), so
+'sqrt.s $f1, $f1' became f1 = sqrt(f0); RSQRT.S is fs / sqrt(ft), not
+1 / sqrt(fs). Both use the magnitude of a negative operand; RSQRT.S by
+zero gives the largest float. VU0 macro VRSQRT ignored fs, VSQRT clamped
+negatives to 0 and VDIV by zero returned 0.
+
+19-20 SQRT.S and all 4 RSQRT.S per Galaxy Angel II executable computed
+the wrong value; one of them broke the battle post-effect, whose
+additive white pass then covered the whole screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRecomp/src/lib/fpu_translator.cpp         |  8 ++--
+ ps2xRecomp/src/lib/vu_translation_helpers.cpp | 10 +++--
+ ps2xRuntime/include/ps2_runtime_macros.h      |  5 ++-
+ ps2xTest/src/code_generator_tests.cpp         | 39 +++++++++++++++++++
+ 4 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 944cee7..358fb49 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -57,8 +57,8 @@ namespace ps2recomp
+                                    "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+                                    "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+                                    ft, fd, fs, fd, fs, ft);
+-            case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++            case COP1_S_SQRT: // EE: SQRT.S fd, ft (the operand is in the ft field)
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -75,8 +75,8 @@ namespace ps2recomp
+                 return fmt::format("{{ int32_t tmp = FPU_FLOOR_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_CVT_W:
+                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+-            case COP1_S_RSQRT:
+-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
++            case COP1_S_RSQRT: // EE: RSQRT.S fd, fs, ft = fs / sqrt(ft)
++                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..08ccb98 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,21 +75,25 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : copysignf(3.402823466e+38f, (std::signbit(fs) != std::signbit(ft)) ? -1.0f : 1.0f); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(fabsf(ft)); }}", ft_reg, ft_reg, ftf);
+     }
+ 
++    // VU: VSQRT Q = sqrt(|ft.ftf|); VRSQRT Q = fs.fsf / sqrt(|ft.ftf|); division
++    // by zero gives the largest float with the quotient's sign.
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / sqrtf(fabsf(ft))) : copysignf(3.402823466e+38f, fs); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0f19c9f..f4e7a2a 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -609,7 +609,10 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
+ #define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
+ #define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+-#define FPU_SQRT_S(a) sqrtf((float)(a))
++// EE SQRT.S/RSQRT.S use the magnitude of a negative operand (and flag it);
++// RSQRT.S by zero gives the largest float with the dividend's sign.
++#define FPU_SQRT_S(a) sqrtf(fabsf((float)(a)))
++#define FPU_RSQRT_S(a, b) ((float)(b) == 0.0f ? copysignf(3.402823466e+38f, (float)(a)) : (float)(a) / sqrtf(fabsf((float)(b))))
+ #define FPU_ABS_S(a) fabsf((float)(a))
+ #define FPU_MOV_S(a) ((float)(a))
+ #define FPU_NEG_S(a) (-(float)(a))
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 00bb9fb..d3513ce 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1020,6 +1020,45 @@ void register_code_generator_tests()
+             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
+         });
+ 
++        tc.Run("EE SQRT.S reads ft and RSQRT.S divides fs by sqrt(ft)", [](TestCase &t) {
++            CodeGenerator gen({}, {});
++
++            // sqrt.s $f1, $f1 as Galaxy Angel II encodes it: 0x46010044 (fs field 0).
++            Instruction sqrt{};
++            sqrt.opcode = OPCODE_COP1;
++            sqrt.rs = COP1_S;
++            sqrt.function = COP1_S_SQRT;
++            sqrt.rt = 1;
++            sqrt.rd = 0;
++            sqrt.sa = 1;
++            const std::string sqrtCode = gen.translateInstruction(sqrt);
++            printGeneratedCode("EE SQRT.S", sqrtCode);
++            t.IsTrue(sqrtCode.find("ctx->f[1] = FPU_SQRT_S(ctx->f[1])") != std::string::npos,
++                     "SQRT.S takes its operand from ft");
++
++            Instruction rsqrt{};
++            rsqrt.opcode = OPCODE_COP1;
++            rsqrt.rs = COP1_S;
++            rsqrt.function = COP1_S_RSQRT;
++            rsqrt.rt = 2;
++            rsqrt.rd = 3;
++            rsqrt.sa = 4;
++            const std::string rsqrtCode = gen.translateInstruction(rsqrt);
++            printGeneratedCode("EE RSQRT.S", rsqrtCode);
++            t.IsTrue(rsqrtCode.find("ctx->f[4] = FPU_RSQRT_S(ctx->f[3], ctx->f[2])") != std::string::npos,
++                     "RSQRT.S computes fs / sqrt(ft)");
++
++            Instruction vrsqrt{};
++            vrsqrt.rd = 5;
++            vrsqrt.rt = 6;
++            vrsqrt.vectorInfo.fsf = 1;
++            vrsqrt.vectorInfo.ftf = 2;
++            const std::string vrsqrtCode = gen.translateVU_VRSQRT(vrsqrt);
++            t.IsTrue(vrsqrtCode.find("ctx->vu0_vf[5]") != std::string::npos &&
++                         vrsqrtCode.find("fs / sqrtf(fabsf(ft))") != std::string::npos,
++                     "VU0 VRSQRT computes fs.fsf / sqrt(|ft.ftf|)");
++        });
++
+         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
+             {
+                 CodeGenerator gen({}, {});
+-- 
+2.55.0
+

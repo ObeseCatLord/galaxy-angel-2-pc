@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "builds": [
+    {
+      "disc_id": "zettai",
+      "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+      "entry_points": [
+        "0x001034e0",
+        "0x001037b8",
+        "0x001037f8",
+        "0x00103870",
+        "0x00113c50",
+        "0x00113c78",
+        "0x00113ca8",
+        "0x00113cd8",
+        "0x00113d00",
+        "0x00113d28",
+        "0x00113d50",
+        "0x00113d78",
+        "0x00113d98",
+        "0x00113dc0",
+        "0x00113de8",
+        "0x00118d90",
+        "0x0013a290",
+        "0x0013a4b8",
+        "0x0013a4c0",
+        "0x0013a4c8",
+        "0x0013a4d0",
+        "0x001ddce0",
+        "0x00222608",
+        "0x00222640",
+        "0x002226b8",
+        "0x002226c0",
+        "0x00222f98",
+        "0x00222fd0",
+        "0x00223048",
+        "0x00223050",
+        "0x0023ed20",
+        "0x0023f0f8",
+        "0x0023fd00",
+        "0x00240328",
+        "0x00240698",
+        "0x00241bd0",
+        "0x00241cb0",
+        "0x00241df8",
+        "0x00256418",
+        "0x00256490",
+        "0x00256528",
+        "0x002565E0",
+        "0x002566B0",
+        "0x00256760",
+        "0x00256818",
+        "0x00256910",
+        "0x00256A10",
+        "0x00256AB0",
+        "0x00256B60",
+        "0x00256C40",
+        "0x00256D28",
+        "0x00256E00",
+        "0x00256ED0",
+        "0x00256FF0",
+        "0x0027db70",
+        "0x0027db88",
+        "0x0027dba0",
+        "0x0027e4a0"
+      ],
+      "evidence": "Native original registrations at0022f8e8 from00112d8c/00112d98 use descriptors002cede0/002cee60. Verified original callback slots14/18/20/24 and standalone routine boundaries; native JALR0022f944 executed00222608 then reached missing00222f98. See docs/reviews/graphics-descriptor-entries.md. Native capture20261009-011250 reaches descriptor002cf840 slot14 target0023fd00 through0022f944. Original00139e54/00139e60 register002cf840/002cf8c0; slots14/20/34 are verified standalone entries. Existing case bodies for both slot20 switch callbacks remain registered. See docs/reviews/later-descriptor-entries.md. Native capture20261009-035542 reaches JALR0027db58 target0027db70. Original constructor0027da98 installs descriptor002d3bf0 at object+34; caller0027db38 reads signed this-adjustment/target pair at+18/+1c. Three omitted standalone setters at descriptor slots18/20/28 have original executable boundaries and JR delay stores. See docs/reviews/object-operation-entries.md. Native041005/041203 nextreachedmissing JALR00103410->0013a290. Original object descriptor002d4338 slot08 pair has adjustment0/target0013a290; original eleven-case table002dd270 and callback boundary verified. Four omitted JR/zero-delay callbacks at descriptor20/28/30/38 retain original residual registers. See docs/reviews/object-factory-entries.md. Native044424 originalgetter0022f8d8 returnsactive002cf7c0 to0023104c; slot20 is0023f0f8. Only omittedswitchheader; original35wordtable002ec9c0 routessevenalreadyregisteredreturncases, selector19->0023f148 returns4 andheaderwrites6db0 toA1. See docs/reviews/descriptor-query-entry.md. Native045919/045920 original dispatch00237ae8 loads active descriptor002cf7c0 slot74 target0023ed20. Original standalone prologue/epilogue and35wordtable002ec930 verified; adding only this entry covers its omitted local case branches and uses existing shared continuation0023ed9c and guest epilogue0023ef2c. See docs/reviews/resource-initializer-entry.md. Native052130/052131 JALR001148b4->00113c78 reads descriptor002d3db0 pair10/14 (adjustment0). Original00113c30 installs descriptoratobject0 andinitializes indexat4. Eleven omitted standalone methods in pairs08..58 have independentJR/delay boundaries; no changed original mask/byte/store behavior. See docs/reviews/object-mask-entries.md. Native072824 originalJALR0015335C->001037B8 selects known002D3BF0 pair38/3C, adjustedA0object8F9A50,index1. All28live descriptorwords matchoriginal. Four omitted independent methods atpairs30/38/40/58 have original boundaries/JRdelay behavior; useexisting exactentry hints without rewriting collection logic. See docs/reviews/object-collection-entries.md. Native101924 JALR1054B4 reaches omitted original1DDCE0 via descriptor002D5F98 pair10/14, signed adjustment0,return1054BC. Original1DDCE0 andsame-descriptor pair18/1C target27E4A0 are independentJRRA/NOP methods; preserve residual state. Secondtarget isstaticcompleteness,liveexecutionunobserved. See docs/reviews/return-only-descriptor-entries.md. Native104111 nextJALR1193F0 reaches originalJRRA/NOP entry118D90,return1193F8. Originalroutine118D58 installsdescriptor2D3F98 atobject+C8; callerusespair10/14 adjustment0. Isolatedgenerationaddsoneheadwithoutchanging116419existingowners; full41candidatebatch withheldfor13unrelatedowner retargets. See docs/reviews/return-only-next-entry.md.",
+      "descriptor_callbacks": [
+        {
+          "descriptor": "0x002cede0",
+          "registration_call": "0x00112d8c",
+          "missing_entries": {
+            "0x14": "0x00222608",
+            "0x18": "0x00222640",
+            "0x20": "0x002226c0",
+            "0x24": "0x002226b8"
+          }
+        },
+        {
+          "descriptor": "0x002cee60",
+          "registration_call": "0x00112d98",
+          "missing_entries": {
+            "0x14": "0x00222f98",
+            "0x18": "0x00222fd0",
+            "0x20": "0x00223050",
+            "0x24": "0x00223048"
+          }
+        },
+        {
+          "descriptor": "0x002cf840",
+          "registration_call": "0x00139e54",
+          "missing_entries": {
+            "0x14": "0x0023fd00",
+            "0x20": "0x00240328",
+            "0x34": "0x00240698"
+          }
+        },
+        {
+          "descriptor": "0x002cf8c0",
+          "registration_call": "0x00139e60",
+          "missing_entries": {
+            "0x14": "0x00241bd0",
+            "0x20": "0x00241cb0",
+            "0x34": "0x00241df8"
+          }
+        }
+      ],
+      "object_operations": {
+        "descriptor": "0x002d3bf0",
+        "installer": "0x0027da98",
+        "dispatch": "0x0027db38",
+        "observed_call": "0x0027db58",
+        "pair_format": "signed16 this adjustment at slot; u32 function at slot+4; each pair8bytes",
+        "missing_entries": {
+          "0x18": "0x0027db70",
+          "0x20": "0x0027db88",
+          "0x28": "0x0027dba0"
+        }
+      },
+      "object_factory": {
+        "descriptor": "0x002d4338",
+        "observed_call": "0x00103410",
+        "caller": "0x001033c8",
+        "object_descriptor_offset": "0",
+        "pair_format": "signed16 this adjustment; function at pair+4",
+        "missing_entries": {
+          "0x08": "0x0013a290",
+          "0x20": "0x0013a4b8",
+          "0x28": "0x0013a4c0",
+          "0x30": "0x0013a4c8",
+          "0x38": "0x0013a4d0"
+        },
+        "switch_table": "0x002dd270",
+        "switch_cases": 11,
+        "switch_selector": "unsigned (A1-1) <11; invalid returns0 through original epilogue"
+      },
+      "descriptor_query": {
+        "descriptor": "0x002cf7c0",
+        "native_getter": "0x0022f8d8",
+        "getter_return": "0x0023104c",
+        "missing_entry": "0x0023f0f8",
+        "callback_slot": "0x20",
+        "observed_jalr": "0x00231054",
+        "switch_table": "0x002ec9c0",
+        "selector_count": 35,
+        "existing_case_targets": [
+          "0x0023f128",
+          "0x0023f130",
+          "0x0023f138",
+          "0x0023f140",
+          "0x0023f148",
+          "0x0023f150",
+          "0x0023f158"
+        ],
+        "output_word": "0x00006db0",
+        "registration_native": "unobserved; active pointer/slot verified through original getter"
+      },
+      "resource_initializer": {
+        "descriptor": "0x002cf7c0",
+        "callback_slot": "0x74",
+        "observed_jalr": "0x00237ae8",
+        "guest_return": "0x00237af0",
+        "missing_entry": "0x0023ed20",
+        "switch_table": "0x002ec930",
+        "selector_count": 35,
+        "shared_continuation": "0x0023ed9c",
+        "guest_epilogue": "0x0023ef2c",
+        "native_mode": 0
+      },
+      "object_masks": {
+        "descriptor": "0x002d3db0",
+        "installer": "0x00113c30",
+        "observed_call": "0x001148b4",
+        "guest_return": "0x001148bc",
+        "pair_format": "signed16 adjustment at slot; function at slot+4;8byte pairs",
+        "missing_entries": {
+          "0x08": "0x00113c50",
+          "0x10": "0x00113c78",
+          "0x18": "0x00113ca8",
+          "0x20": "0x00113cd8",
+          "0x28": "0x00113d00",
+          "0x30": "0x00113d28",
+          "0x38": "0x00113d50",
+          "0x40": "0x00113d78",
+          "0x48": "0x00113d98",
+          "0x50": "0x00113dc0",
+          "0x58": "0x00113de8"
+        },
+        "native_method": "0x00113c78",
+        "native_formula": "sext32(A) & ~sext32(B) & A1_low64; A=word32(002b6848+offset), B=word32(002b6850+offset), offset=(index<<2) mod2^32, address sums mod2^32"
+      },
+      "object_collection": {
+        "descriptor": "0x002d3bf0",
+        "installer": "0x0027da98",
+        "descriptor_offset": "0x34",
+        "observed_call": "0x0015335c",
+        "guest_return": "0x00153364",
+        "pair_format": "signed16 this adjustment at pair; function at pair+4;8byte pairs",
+        "missing_entries": {
+          "0x30": "0x001034e0",
+          "0x38": "0x001037b8",
+          "0x40": "0x001037f8",
+          "0x58": "0x00103870"
+        },
+        "native_baseline": "one original post-delay dispatch; live28descriptorwords matchELF,index1/twoentries; no callee in baseline",
+        "adjacent_descriptor": "0x002d3c68 excluded",
+        "native_verification": "one genuine1037B8valid-indexreturn withfull64residual/raw128allGPR/stack/object/list parity; othermethods/invalidbranch unobserved",
+        "verification": "object-collection-verification.json",
+        "runtime_resume_preservation": {
+          "source": "native/compat/zettai_sif.cpp",
+          "ranges": [
+            {
+              "first": "0x00145b9c",
+              "end_exclusive": "0x00145bf8",
+              "owner_entry": "0x00145b98",
+              "count": 23
+            },
+            {
+              "first": "0x0017e3b4",
+              "end_exclusive": "0x0017e400",
+              "owner_entry": "0x0017e3b0",
+              "count": 19
+            }
+          ],
+          "reason": "preserve previous exact-build continuation owners after observed raw generator overlap-order drift"
+        }
+      }
+    }
+  ]
+}

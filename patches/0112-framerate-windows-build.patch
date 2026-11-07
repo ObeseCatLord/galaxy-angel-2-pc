@@ -1,0 +1,50 @@
+From 53ed7d35f687264692a093276404b416e698f053 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:56:05 -0500
+Subject: [PATCH] framerate: Windows build (shot directory parse, per-thread
+ CPU report Linux-only)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_framepace.cpp | 4 +++-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp     | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index c252a4a..ea31dd7 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -67,6 +67,7 @@ namespace ga2_framepace
+         std::map<std::string, double> threadCpu()
+         {
+             std::map<std::string, double> out;
++#ifdef __linux__
+             if (DIR *dir = opendir("/proc/self/task"))
+             {
+                 const double hz = double(sysconf(_SC_CLK_TCK));
+@@ -90,7 +91,8 @@ namespace ga2_framepace
+                 }
+                 closedir(dir);
+             }
+-            return out;
++#endif
++            return out; // the per-thread report is Linux-only
+         }
+         std::map<std::string, double> g_lastCpu;
+     }
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index bc1d0ba..8e09d0d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -540,7 +540,7 @@ namespace
+                 shotInit = true;
+                 if (const char *spec = std::getenv("GA2_FRAMETRACE_SHOTS"); spec && std::strchr(spec, '@'))
+                 {
+-                    shotDir.assign(spec, std::strchr(spec, '@'));
++                    shotDir.assign(spec, size_t(std::strchr(spec, '@') - spec));
+                     for (const char *v = std::strchr(spec, '@') + 1; v && *v;)
+                     {
+                         char *end = nullptr;
+-- 
+2.55.0
+

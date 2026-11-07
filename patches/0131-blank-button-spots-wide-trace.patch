@@ -1,0 +1,63 @@
+From 87b5399deaae9b2f2bf51c5c23d625b71784bbbf Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 09:19:30 -0500
+Subject: [PATCH] button prompts: "blank" spots; GA2_WIDE_TRACE
+
+A button-map spot named "blank" is left empty in every style but
+PlayStation: the dialogue box's continue marker pulses a glow copy of the
+puck (if_tbox_005_b/006_b) over the puck, and an icon on that layer pulsed
+over the puck's icon at another size (the marker flickered).
+GA2_WIDE_TRACE=1 logs the presentation's switches between the wide and the
+4:3 shape (diagnostic for the hor+ scene detection).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_present.cpp    | 11 ++++++++++-
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp |  9 +++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index c347fe6..8245cec 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -557,7 +557,16 @@ namespace ga2_present
+         // scenes always fill the play area with plain bilinear. Hor+ 3D
+         // frames are anamorphic and fill the whole area.
+         const bool scene3d = ga2_activity::scene3d();
+-        g_wide = ga2_activity::wideFrame();
++        {
++            const bool wide = ga2_activity::wideFrame();
++            // GA2_WIDE_TRACE=1: when the picture switches between the wide and the 4:3 shape (diagnostic).
++            static const bool trace = std::getenv("GA2_WIDE_TRACE") != nullptr;
++            if (trace && wide != g_wide)
++                std::fprintf(stderr, "[wide] %s at vsync %llu (last VU1 vsync %lld, VU1 runs %llu)\n", wide ? "on" : "off",
++                             (unsigned long long)ga2_activity::vsyncs.load(), (long long)ga2_activity::last3dVsync.load(),
++                             (unsigned long long)ga2_activity::vu1Runs.load());
++            g_wide = wide;
++        }
+ 
+         const Rect window{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
+         const Rect area = fitAspect(window, s.aspect);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index d9a55a7..50eba33 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -152,6 +152,15 @@ namespace ga2_texpacks
+             bool drew = false;
+             for (const IconSpot &spot : spots)
+             {
++                // "blank": the spot is left empty in every style but PlayStation. For layers drawn over an icon
++                // (the dialogue box's continue marker pulses a glow copy of the puck on top of it): with an icon
++                // there too, a second icon of another size pulsed over the first and the marker flickered.
++                if (spot.button == "blank")
++                {
++                    ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, Color{0, 0, 0, 0});
++                    drew = true;
++                    continue;
++                }
+                 const ::Image *art = icon(spot.button, ga2_buttonmatch::wideSpot(spot.w, spot.h));
+                 if (!art)
+                     continue;
+-- 
+2.56.0
+

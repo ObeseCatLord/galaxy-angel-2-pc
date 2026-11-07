@@ -1,0 +1,308 @@
+From 2b4765446ad91f03c3c8e8833868fba899cfbde3 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:56:06 -0500
+Subject: [PATCH] ga2: texture palettes, icon fitting, stacked mods, audio
+ queue counters
+
+- gs_texpacks: palettes come from the CPU GS backend's CLUT buffer
+  (gs_clut_snapshot.h) unless TEX0 reloads them (then from CBP), so 4-bit
+  textures using CSA slices of a loaded 256-colour CLUT decode correctly;
+  button icons are fitted by their visible bounds.
+- Disc mods: GA2_MODS takes several roots (";", highest priority first).
+- Audio: the PCM queue counts underruns; GA2_PERF prints queue level,
+  underruns and drops every 5 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../include/runtime/gs/gs_clut_snapshot.h     | 13 +++++
+ .../include/runtime/gs/gs_cpu_backend.h       |  2 +
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp     | 19 +++++++
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp        | 32 +++++++++--
+ ps2xRuntime/src/lib/ps2_audio.cpp             | 12 ++++
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp        | 57 ++++++++++++-------
+ ps2xRuntime/src/lib/ps2_disc_mount.h          |  3 +-
+ ps2xRuntime/src/lib/ps2_pcm_queue.h           | 15 ++++-
+ 8 files changed, 124 insertions(+), 29 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/gs/gs_clut_snapshot.h
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_clut_snapshot.h b/ps2xRuntime/include/runtime/gs/gs_clut_snapshot.h
+new file mode 100644
+index 0000000..4d826b6
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_clut_snapshot.h
+@@ -0,0 +1,13 @@
++// The CPU GS backend's CLUT buffer (as loaded by TEX0.CLD), for code that
++// decodes paletted textures outside the CPU rasterizer (gs_texpacks).
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace ga2_gs
++{
++    // 512 16-bit halves: CT32 entry i = lo[i] | hi[i + 256] << 16, CT16 entry
++    // i = lo[i] (as GSCpuBackend stores them). False without a CPU backend.
++    bool clutSnapshot(std::array<uint16_t, 512> &out);
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index cbd4c7a..775f40c 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -17,6 +17,8 @@ public:
+ 
+     void Submit(const GSPrimitiveBatch &batch) override;
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    // A copy of the CLUT buffer (see runtime/gs/gs_clut_snapshot.h).
++    bool copyClut(std::array<uint16_t, 512> &out);
+     void BeginTransfer(const GSTransferCommand &command) override;
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index e6f0290..9f5f1e3 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_pgs.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_clut_snapshot.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+@@ -443,8 +444,26 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    GSCpuBackend *g_clutOwner = nullptr; // the backend whose CLUT buffer clutSnapshot reads
++}
++
++bool ga2_gs::clutSnapshot(std::array<uint16_t, 512> &out)
++{
++    return g_clutOwner && g_clutOwner->copyClut(out);
++}
++
++bool GSCpuBackend::copyClut(std::array<uint16_t, 512> &out)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    out = m_clut;
++    return true;
++}
++
+ GSCpuBackend::GSCpuBackend()
+ {
++    g_clutOwner = this;
+     using namespace GSMem;
+     static std::once_flag lookupTablesOnce;
+     std::call_once(lookupTablesOnce, []()
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 6a60d70..11c3f07 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -10,12 +10,14 @@
+ #if defined(PS2X_HAVE_PGS)
+ 
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/gs/gs_clut_snapshot.h"
+ #include <nlohmann/json.hpp>
+ #include "raylib.h"
+ 
+ #include "device.hpp"
+ #include "gs_interface.hpp"
+ 
++#include <array>
+ #include <atomic>
+ #include <cstdio>
+ #include <cstring>
+@@ -132,10 +134,12 @@ namespace ga2_texpacks
+                 const Color fill = n ? Color{uint8_t(sum[0] / n), uint8_t(sum[1] / n), uint8_t(sum[2] / n), uint8_t(sum[3] / n)}
+                                      : Color{0, 0, 0, 0};
+                 ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, fill);
+-                const int side = std::min(spot.w, spot.h) * k;
+-                const Rectangle dst{float(spot.x * k + (spot.w * k - side) / 2), float(spot.y * k + (spot.h * k - side) / 2),
+-                                    float(side), float(side)};
+-                ImageDraw(&out, *art, Rectangle{0, 0, float(art->width), float(art->height)}, dst, WHITE);
++                // The icon's visible part, fitted into the spot keeping its shape.
++                const Rectangle src = GetImageAlphaBorder(*art, 0.05f);
++                const float scale = std::min(spot.w * k / src.width, spot.h * k / src.height);
++                const float dw = src.width * scale, dh = src.height * scale;
++                const Rectangle dst{spot.x * k + (spot.w * k - dw) * 0.5f, spot.y * k + (spot.h * k - dh) * 0.5f, dw, dh};
++                ImageDraw(&out, *art, src, dst, WHITE);
+                 drew = true;
+             }
+             return drew;
+@@ -204,7 +208,25 @@ namespace ga2_texpacks
+             out.resize(size_t(w) * h);
+             uint32_t palette[256] = {};
+             const bool p8 = psm == 0x13u || psm == 0x1Bu, p4 = psm == 0x14u || psm == 0x24u || psm == 0x2Cu;
+-            if (p8 || p4)
++            const uint32_t cld = uint32_t((tex0 >> 61) & 7u), csm = uint32_t((tex0 >> 55) & 1u), csa = uint32_t((tex0 >> 56) & 0x1Fu);
++            std::array<uint16_t, 512> buffer{};
++            if ((p8 || p4) && cld == 0u && ga2_gs::clutSnapshot(buffer))
++            {
++                // The palette loaded earlier (CLD = 0 reuses the GS CLUT buffer),
++                // looked up like GSCpuBackend::LookupCLUT.
++                const bool sixteen = cpsm == 0x02u || cpsm == 0x0Au;
++                const uint32_t base = (csa & (sixteen ? 0x1Fu : 0x0Fu)) << 4;
++                for (uint32_t i = 0; i < (p8 ? 256u : 16u); ++i)
++                {
++                    uint32_t index = (base + i) & (sixteen ? 0x1FFu : 0xFFu);
++                    if (!sixteen && csm == 0u && p8)
++                        index = std::min((i & 0xF0u) + base, 240u) + (i & 0x0Fu);
++                    const uint32_t raw = uint32_t(buffer[index]) | uint32_t(buffer[index + 256u]) << 16;
++                    palette[i] = sixteen ? expand16(buffer[index]) : cpsm == 0x01u ? (raw & 0x00FFFFFFu) | 0x80000000u : raw;
++                }
++            }
++            else if (p8 || p4)
++                // This TEX0 loads its palette from CBP now (CSM1 layout).
+                 for (uint32_t i = 0; i < (p8 ? 256u : 16u); ++i)
+                     palette[i] = clutEntry(vram, cbp, cpsm, p8, i);
+             for (uint32_t oy = 0; oy < h; ++oy)
+diff --git a/ps2xRuntime/src/lib/ps2_audio.cpp b/ps2xRuntime/src/lib/ps2_audio.cpp
+index 41c864c..22ddfc2 100644
+--- a/ps2xRuntime/src/lib/ps2_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_audio.cpp
+@@ -202,6 +202,18 @@ bool PS2AudioBackend::submitSpuPcm(std::span<const int16_t> samples, uint32_t sa
+     }
+     bool result;
+     { std::lock_guard callbackLock(Impl::callbackMutex); result = m_impl->pcm.push(samples); }
++    // GA2_PERF: output queue health every 5 s (underruns and drops are audible
++    // as clicks).
++    static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++    static auto lastReport = std::chrono::steady_clock::now();
++    if (perf && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(5))
++    {
++        lastReport = std::chrono::steady_clock::now();
++        std::lock_guard callbackLock(Impl::callbackMutex);
++        std::fprintf(stderr, "[audio] queued %zu frames, underruns %llu (%llu frames), dropped %llu frames\n",
++                     m_impl->pcm.queuedFrames(), (unsigned long long)m_impl->pcm.underruns(),
++                     (unsigned long long)m_impl->pcm.underrunFrames(), (unsigned long long)m_impl->pcm.droppedFrames());
++    }
+     return observe(result);
+ #endif
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index a59cfba..6a4b53f 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -273,35 +273,48 @@ namespace ps2_disc
+ 
+     namespace
+     {
++        // $GA2_MODS: mod roots separated by ';', highest priority first; each
++        // holds <disc program>/<disc path> files. Lower-priority roots are
++        // applied first so a higher one replaces the same file.
+         void applyMods(Disc &disc, uint64_t imageSize)
+         {
+-            const char *root = std::getenv("GA2_MODS");
+-            if (!root || !*root || disc.bootKey.empty()) return;
+-            const std::filesystem::path dir = std::filesystem::path(root) / disc.bootKey;
+-            std::error_code error;
+-            if (!std::filesystem::is_directory(dir, error)) return;
++            const char *list = std::getenv("GA2_MODS");
++            if (!list || !*list || disc.bootKey.empty()) return;
++            std::vector<std::filesystem::path> roots;
++            for (std::string_view rest = list; !rest.empty();)
++            {
++                const size_t end = rest.find(';');
++                if (end != 0) roots.emplace_back(std::string(rest.substr(0, end)));
++                rest = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
++            }
+             uint64_t next = (imageSize + 2047u) / 2048u * 2048u;
+-            size_t count = 0u;
+-            for (const auto &entry : std::filesystem::recursive_directory_iterator(dir, error))
++            for (auto root = roots.rbegin(); root != roots.rend(); ++root)
+             {
+-                if (!entry.is_regular_file(error)) continue;
+-                const std::string key = pathKey(std::filesystem::relative(entry.path(), dir, error).generic_string());
+-                const uint64_t size = entry.file_size(error);
+-                if (key.empty() || error || size > UINT32_MAX)
++                const std::filesystem::path dir = *root / disc.bootKey;
++                std::error_code error;
++                if (!std::filesystem::is_directory(dir, error)) continue;
++                size_t count = 0u;
++                for (const auto &entry : std::filesystem::recursive_directory_iterator(dir, error))
+                 {
+-                    std::fprintf(stderr, "[mods] skipped %s\n", entry.path().string().c_str());
+-                    continue;
++                    if (!entry.is_regular_file(error)) continue;
++                    const std::string key = pathKey(std::filesystem::relative(entry.path(), dir, error).generic_string());
++                    const uint64_t size = entry.file_size(error);
++                    if (key.empty() || error || size > UINT32_MAX)
++                    {
++                        std::fprintf(stderr, "[mods] skipped %s\n", entry.path().string().c_str());
++                        continue;
++                    }
++                    const uint64_t lba = next / 2048u;
++                    if (lba > UINT32_MAX) break;
++                    disc.files[key] = File{static_cast<uint32_t>(size), {{static_cast<uint32_t>(lba), static_cast<uint32_t>(size)}}};
++                    const uint64_t span = std::max<uint64_t>(2048u, (size + 2047u) / 2048u * 2048u);
++                    disc.overlays.push_back(Overlay{next, next + span, entry.path(), size});
++                    next += span;
++                    ++count;
+                 }
+-                const uint64_t lba = next / 2048u;
+-                if (lba > UINT32_MAX) break;
+-                disc.files[key] = File{static_cast<uint32_t>(size), {{static_cast<uint32_t>(lba), static_cast<uint32_t>(size)}}};
+-                const uint64_t span = std::max<uint64_t>(2048u, (size + 2047u) / 2048u * 2048u);
+-                disc.overlays.push_back(Overlay{next, next + span, entry.path(), size});
+-                next += span;
+-                ++count;
++                if (count)
++                    std::fprintf(stderr, "[mods] %zu file(s) from %s\n", count, dir.string().c_str());
+             }
+-            if (count)
+-                std::fprintf(stderr, "[mods] %zu file(s) from %s\n", count, dir.string().c_str());
+         }
+ 
+         // Validates an image against its manifest (digests, geometry, file
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+index 901f6ae..dd6c4cb 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.h
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -52,7 +52,8 @@ namespace ps2_disc
+     // as open (at most once per 30 guest vsyncs while the changer is armed).
+     [[nodiscard]] bool trayOpenNow();
+     [[nodiscard]] std::string pathKey(std::string_view guestPath);
+-    // Mods: files under $GA2_MODS/<disc program, e.g. SLPM_662.43>/ replace
++    // Mods: files under each $GA2_MODS root (";"-separated, highest priority
++    // first)/<disc program, e.g. SLPM_662.43>/ replace
+     // (or add) disc files with the same path. findFile hands out sectors past
+     // the image end for them; readOverlay serves those sectors. Returns false
+     // when no mod file covers the position.
+diff --git a/ps2xRuntime/src/lib/ps2_pcm_queue.h b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+index 535cc38..5867d5f 100644
+--- a/ps2xRuntime/src/lib/ps2_pcm_queue.h
++++ b/ps2xRuntime/src/lib/ps2_pcm_queue.h
+@@ -77,14 +77,27 @@ public:
+         m_count -= consumed;
+         m_phase -= static_cast<double>(consumed);
+         if (written < frames)
++        {
+             m_phase = 0.0; // restart cleanly after an underrun
++            if (m_started)
++            {
++                ++m_underruns;
++                m_underrunFrames += frames - written;
++            }
++        }
++        m_started = m_started || written > 0;
+     }
+     void clear() noexcept { m_head = m_count = 0; m_phase = 0.0; }
+     size_t queuedFrames() const noexcept { return m_count; }
+     uint64_t droppedFrames() const noexcept { return m_dropped; }
++    // Device callbacks that ran out of queued audio (after the first sound)
++    // and the frames they zero-filled.
++    uint64_t underruns() const noexcept { return m_underruns; }
++    uint64_t underrunFrames() const noexcept { return m_underrunFrames; }
+ private:
+     std::array<int16_t, CapacityFrames * 2u> m_samples{};
+     size_t m_head = 0, m_count = 0;
+     double m_phase = 0.0; // fractional read position past m_head
+-    uint64_t m_dropped = 0;
++    uint64_t m_dropped = 0, m_underruns = 0, m_underrunFrames = 0;
++    bool m_started = false;
+ };
+-- 
+2.55.0
+

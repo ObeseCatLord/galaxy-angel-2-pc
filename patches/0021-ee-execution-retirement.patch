@@ -1,0 +1,1412 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 771f0fa..844a13e 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -116,9 +116,20 @@ struct GuestInvocation
+     bool executionFailed = false;
+ };
+ 
++// Value identity of one activation and its ordinary/invocation context.
++// Parents remain accessible beneath nested children until actual retirement.
++struct EeExecutionOwner
++{
++    int threadId = 0;
++    uint64_t lifetime = 0;
++    uint64_t invocationSequence = 0;
++    bool operator==(const EeExecutionOwner &) const = default;
++};
++
+ struct GuestThread
+ {
+     int id = 0;
++    uint64_t executionLifetime = 0;
+     R5900Context context{};
+     uint32_t entry = 0;
+     uint32_t stack = 0;
+@@ -331,6 +342,14 @@ public:
+ 
+     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
+     int cancelAlarm(int id);
++    // Serialized executor queries; keys never retain a CPU/container pointer.
++    [[nodiscard]] EeExecutionOwner currentExecutionOwner() const noexcept;
++    [[nodiscard]] bool hasExecutionAccess(const EeExecutionOwner &owner) const noexcept;
++    // One controller; callbacks cannot throw, execute guests or alter scheduler
++    // containers. Notification follows successful ordinary-context detachment.
++    [[nodiscard]] bool setExecutionRetirementObserver(const void *owner,
++        std::function<void(const EeExecutionOwner &)> observer);
++    void clearExecutionRetirementObserver(const void *owner) noexcept;
+     void queueInvocation(GuestInvocation invocation);
+     void observeInvocationReturn(R5900Context *context) noexcept;
+     void failInvocation(R5900Context *context) noexcept;
+@@ -406,6 +425,7 @@ private:
+     void validateIsolatedInvocationStack(uint32_t stackTop) const;
+     struct InvocationStackChoice { uint32_t top, begin, end; };
+     [[nodiscard]] InvocationStackChoice selectInvocationStack();
++    void runDispatcher();
+     void finishRun() noexcept;
+     [[nodiscard]] int allocateThreadId();
+     GuestThread &acquireInvocationThread();
+@@ -414,6 +434,9 @@ private:
+     [[nodiscard]] GuestThread *selectReady();
+     void makeRunning(GuestThread &thread);
+     void makeDormant(GuestThread &thread);
++    [[nodiscard]] uint64_t reserveExecutionLifetime();
++    void retireOrdinaryContexts();
++    void checkInvocationSequenceCapacity(size_t count) const;
+     void removeFromWaitObject(GuestThread &thread);
+     [[noreturn]] void blockCurrent(EeWaitState wait);
+     void makeReady(GuestThread &thread, int result, bool interruptSafe);
+@@ -478,6 +501,11 @@ private:
+     std::deque<GuestInvocation> m_pendingInvocations;
+     uint64_t m_eventSequence = 0;
+     uint64_t m_invocationSequence = 0;
++    // Never reset: guest thread IDs and invocation sequences can repeat.
++    uint64_t m_executionLifetimeSequence = 0;
++    bool m_coldLoadRequiresReset = false;
++    const void *m_executionRetirementOwner = nullptr;
++    std::function<void(const EeExecutionOwner &)> m_executionRetirementObserver;
+     uint64_t m_vsyncTick = 0;
+     uint32_t m_vsyncFlagAddress = 0;
+     uint32_t m_vsyncTickAddress = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 2523656..0094672 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -85,7 +85,11 @@ EeScheduler::~EeScheduler()
+ 
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ {
++    if (isRunning() || m_guestExecuting.load(std::memory_order_acquire))
++        throw std::logic_error("EE reset requires exclusive quiescence");
++    const uint64_t mainLifetime = reserveExecutionLifetime();
+     m_executorThread = std::this_thread::get_id();
++    retireOrdinaryContexts();
+     discardInvocations();
+     m_invocationStackTops.clear();
+     {
+@@ -143,6 +147,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ 
+     GuestThread main{};
+     main.id = kMainThreadId;
++    main.executionLifetime = mainLifetime;
+     main.context = mainContext;
+     main.entry = mainContext.pc;
+     // $sp is live execution state, not the stable initial stack descriptor
+@@ -157,12 +162,21 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+                   std::chrono::steady_clock::now() + kVBlankPeriod,
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
++    m_coldLoadRequiresReset = false;
+     publishSnapshot();
+ }
+ 
+-void EeScheduler::run() try
++void EeScheduler::run()
+ {
+     assertExecutor();
++    if (m_coldLoadRequiresReset)
++        throw std::logic_error("EE cold load requires a fresh scheduler reset before dispatch");
++    // A pre-dispatch rejection must not copy a retired main over a new ELF CPU.
++    runDispatcher();
++}
++
++void EeScheduler::runDispatcher() try
++{
+     m_running.store(true, std::memory_order_release);
+ 
+     while (!m_stopRequested.load(std::memory_order_acquire))
+@@ -190,7 +204,9 @@ void EeScheduler::run() try
+             }
+             else
+             {
++                const uint64_t lifetime = reserveExecutionLifetime();
+                 GuestThread *owner = &acquireInvocationThread();
++                owner->executionLifetime = lifetime;
+                 owner->status = EeThreadStatus::Running;
+                 m_currentThreadId = owner->id;
+                 renewTimeSlice();
+@@ -565,6 +581,8 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
+     {
+         return KE_NOT_DORMANT;
+     }
++    if (it->second.executionLifetime != 0u || !it->second.invocations.empty())
++        return KE_ERROR;
+     if (it->second.ownsStack)
+     {
+         ownedStack = it->second.stack;
+@@ -587,7 +605,12 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+         return KE_NOT_DORMANT;
+     }
+ 
++    // Failed cancellation must not overwrite still-retained old access.
++    if (target->executionLifetime != 0u || !target->invocations.empty())
++        return KE_ERROR;
++    const uint64_t lifetime = reserveExecutionLifetime();
+     target->context = R5900Context{};
++    target->executionLifetime = lifetime;
+     target->context.pc = target->entry;
+     target->arg = arg;
+     target->suspendCount = 0;
+@@ -1282,8 +1305,17 @@ void EeScheduler::cancelFailedInvocations(int ownerId) noexcept
+ void EeScheduler::queueInvocation(GuestInvocation invocation)
+ {
+     assertExecutor();
+-    invocation.sequence = ++m_invocationSequence;
+-    m_pendingInvocations.push_back(std::move(invocation));
++    try
++    {
++        checkInvocationSequenceCapacity(1u);
++        invocation.sequence = ++m_invocationSequence;
++        m_pendingInvocations.push_back(std::move(invocation));
++    }
++    catch (...)
++    {
++        try { if (invocation.onCancel) invocation.onCancel(); } catch (...) {}
++        throw;
++    }
+     m_checkpointPending.store(true, std::memory_order_release);
+ }
+ 
+@@ -1297,6 +1329,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+         invocation.executionFailed = invocation.executionFailed ||
+             std::any_of(owner->invocations.begin(), owner->invocations.end(),
+                         [](const GuestInvocation &parent) { return parent.executionFailed; });
++        checkInvocationSequenceCapacity(1u);
+         prepareInvocationStack(invocation);
+         invocation.sequence = ++m_invocationSequence;
+         owner->invocations.push_back(std::move(invocation));
+@@ -1318,6 +1351,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     assert(!invocations.empty());
+     try
+     {
++        checkInvocationSequenceCapacity(invocations.size());
+         const bool failedParent = std::any_of(owner->invocations.begin(), owner->invocations.end(),
+             [](const GuestInvocation &parent) { return parent.executionFailed; });
+         for (auto &invocation : invocations)
+@@ -1359,7 +1393,9 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
+ bool EeScheduler::retireInvocationStacksForColdLoad()
+ {
+     if (isRunning() || m_guestExecuting.load(std::memory_order_acquire)) return false;
++    retireOrdinaryContexts();
+     discardInvocations();
++    m_coldLoadRequiresReset = true;
+     m_invocationStackTops.clear();
+     m_invocationStackArenaBegin = m_invocationStackArenaEnd = 0u;
+     {
+@@ -1966,7 +2002,8 @@ GuestThread &EeScheduler::acquireInvocationThread()
+ {
+     for (auto &[id, candidate] : m_threads)
+     {
+-        if (id < 0 && candidate.status == EeThreadStatus::Dormant && candidate.invocations.empty())
++        if (id < 0 && candidate.status == EeThreadStatus::Dormant &&
++            candidate.executionLifetime == 0u && candidate.invocations.empty())
+         {
+             return candidate;
+         }
+@@ -2047,6 +2084,15 @@ void EeScheduler::makeDormant(GuestThread &item)
+     for (auto &invocation : item.invocations)
+         if (invocation.onCancel) invocation.onCancel();
+     item.invocations.clear();
++    const EeExecutionOwner retired{item.id, item.executionLifetime, 0u};
++    item.executionLifetime = 0u;
++    // The selector otherwise remains stale during a quiescent cold load.
++    if (m_currentThreadId == item.id) m_currentThreadId = 0;
++    if (retired.lifetime != 0u && m_executionRetirementObserver)
++    {
++        try { m_executionRetirementObserver(retired); }
++        catch (...) { /* Observer contract is nonthrowing; access already retired. */ }
++    }
+ }
+ 
+ void EeScheduler::removeFromWaitObject(GuestThread &item)
+@@ -2557,3 +2603,61 @@ void EeScheduler::publishIdleDebugContext()
+         publishDebugContext(selected->activeContext());
+     }
+ }
++
++uint64_t EeScheduler::reserveExecutionLifetime()
++{
++    if (m_executionLifetimeSequence == std::numeric_limits<uint64_t>::max())
++        throw std::overflow_error("EE execution lifetime exhausted");
++    return ++m_executionLifetimeSequence;
++}
++
++void EeScheduler::checkInvocationSequenceCapacity(size_t count) const
++{
++    if (count > std::numeric_limits<uint64_t>::max() - m_invocationSequence)
++        throw std::overflow_error("EE invocation sequence exhausted");
++}
++
++void EeScheduler::retireOrdinaryContexts()
++{
++    for (auto &[id, owner] : m_threads) makeDormant(owner);
++    m_currentThreadId = 0;
++}
++
++EeExecutionOwner EeScheduler::currentExecutionOwner() const noexcept
++{
++    const GuestThread *owner = currentThread();
++    if (!owner || owner->executionLifetime == 0u) return {};
++    return {owner->id, owner->executionLifetime,
++            owner->invocations.empty() ? 0u : owner->invocations.back().sequence};
++}
++
++bool EeScheduler::hasExecutionAccess(const EeExecutionOwner &key) const noexcept
++{
++    const GuestThread *owner = thread(key.threadId);
++    if (!owner || key.lifetime == 0u || owner->executionLifetime != key.lifetime)
++        return false;
++    if (key.invocationSequence == 0u) return true;
++    return std::any_of(owner->invocations.begin(), owner->invocations.end(),
++        [&key](const GuestInvocation &invocation)
++        { return invocation.sequence == key.invocationSequence; });
++}
++
++bool EeScheduler::setExecutionRetirementObserver(const void *owner,
++    std::function<void(const EeExecutionOwner &)> observer)
++{
++    if (!owner || !observer ||
++        (m_executionRetirementOwner && m_executionRetirementOwner != owner))
++        return false;
++    m_executionRetirementObserver = std::move(observer);
++    m_executionRetirementOwner = owner;
++    return true;
++}
++
++void EeScheduler::clearExecutionRetirementObserver(const void *owner) noexcept
++{
++    if (owner && m_executionRetirementOwner == owner)
++    {
++        m_executionRetirementObserver = {};
++        m_executionRetirementOwner = nullptr;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dcf3b94..a2d123e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -298,6 +298,7 @@ namespace ps2_stubs
+         ps2TraceGuestRangeWrite(rdram, packetAddress, static_cast<uint32_t>(packetSize), "SIF command packet", nullptr);
+         std::memcpy(first, packet, packetSize);
+ 
++        bool queueOwnsPacket = false;
+         try
+         {
+             GuestInvocation invocation{};
+@@ -321,12 +322,14 @@ namespace ps2_stubs
+             {
+                 runtime->guestFree(packetAddress);
+             };
++            // Queue submission settles onCancel even when admission throws.
++            queueOwnsPacket = true;
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+             return true;
+         }
+         catch (...)
+         {
+-            runtime->guestFree(packetAddress);
++            if (!queueOwnsPacket) runtime->guestFree(packetAddress);
+             return false;
+         }
+     }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 8b5b29d..31d4097 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -29,6 +29,8 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
++    src/ee_owner_tests21.cpp
++    src/ps2_execution_counter_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_invocation_stack_tests.cpp
+     src/ps2_idle_irq_stack_tests.cpp
+diff --git a/ps2xTest/src/ee_owner_tests21.cpp b/ps2xTest/src/ee_owner_tests21.cpp
+new file mode 100644
+index 0000000..1926b89
+--- /dev/null
++++ b/ps2xTest/src/ee_owner_tests21.cpp
+@@ -0,0 +1,918 @@
++// Private candidate tests for EE21.  Do not copy into the source tree until
++// main applies the matching scheduler draft and resolves link-time behavior.
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kReturnEntry = 0x00190000u;
++    constexpr uint32_t kParentEntry = 0x00190010u;
++    constexpr uint32_t kParentResume = 0x00190020u;
++    constexpr uint32_t kChildEntry = 0x00190030u;
++    constexpr uint32_t kChildResume = 0x00190040u;
++    constexpr uint32_t kWaitEntry = 0x00190050u;
++    constexpr uint32_t kWakeEntry = 0x00190060u;
++    constexpr uint32_t kWaitResume = 0x00190070u;
++    constexpr uint32_t kExitEntry = 0x00190080u;
++    constexpr uint32_t kInternalEntry = 0x00190090u;
++    constexpr uint32_t kBusyLoadEntry = 0x001900A0u;
++    constexpr uint32_t kSuspendEntry = 0x001900B0u;
++    constexpr uint32_t kSuspendResume = 0x001900C0u;
++    constexpr uint32_t kResumeWorker = 0x001900D0u;
++    constexpr uint32_t kInternalDriver = 0x001900E0u;
++    constexpr uint32_t kInternalSleep = 0x001900F0u;
++    constexpr uint32_t kInternalTerminate = 0x00190100u;
++    constexpr uint32_t kInternalNew = 0x00190110u;
++    constexpr uint32_t kParentInvocationEntry = 0x00190120u;
++    constexpr uint32_t kParentInvocationResume = 0x00190130u;
++    constexpr uint32_t kWorkerController = 0x00190140u;
++    constexpr uint32_t kWorkerEntry = 0x00190150u;
++    constexpr uint32_t kWorkerInvocation = 0x00190160u;
++    constexpr uint32_t kWorkerTerminate = 0x00190170u;
++    constexpr uint32_t kMarker = 0x0001F000u;
++
++    struct Env
++    {
++        std::vector<uint8_t> ram = std::vector<uint8_t>(PS2_RAM_SIZE);
++        PS2Runtime runtime;
++    };
++
++    struct RetireLog
++    {
++        std::array<EeExecutionOwner, 8> owners{};
++        size_t count = 0u;
++
++        void append(const EeExecutionOwner &owner) noexcept
++        {
++            if (count < owners.size()) owners[count++] = owner;
++        }
++
++        [[nodiscard]] size_t matches(const EeExecutionOwner &owner) const noexcept
++        {
++            size_t result = 0u;
++            for (size_t i = 0u; i != count; ++i)
++                result += owners[i] == owner ? 1u : 0u;
++            return result;
++        }
++    };
++
++    struct Trace
++    {
++        EeExecutionOwner ordinary{};
++        EeExecutionOwner parent{};
++        EeExecutionOwner child{};
++        EeExecutionOwner retainedInternal{};
++        EeExecutionOwner replacementInternal{};
++        EeExecutionOwner workerOrdinary{};
++        EeExecutionOwner workerInvocation{};
++        std::array<EeExecutionOwner, 4> internalOwners{};
++        size_t internalCount = 0u;
++        RetireLog retired{};
++        bool parentAccessibleInChild = false;
++        bool ordinaryAccessibleInChild = false;
++        bool childIsCurrent = false;
++        bool childDetachedAfterChild = false;
++        bool parentAccessibleAfterChild = false;
++        bool ordinaryAccessibleAfterChild = false;
++        bool parentDetachedAfterParent = false;
++        bool ordinaryAccessibleAfterParent = false;
++        bool absentInvocationRejected = false;
++        bool checkedParentReturned = false;
++        bool waitAccessible = false;
++        bool waitResumed = false;
++        bool wakeRan = false;
++        bool suspendAccessible = false;
++        bool suspendResumed = false;
++        bool checkedChildReturned = false;
++        bool busyLoadRejected = false;
++        bool internalCancelThrows = true;
++        bool workerCancelThrows = true;
++        int internalCancelCount = 0;
++        int workerCancelCount = 0;
++        int retainedInternalId = 0;
++        int workerId = 0;
++        int selectorAtRetirement = -1;
++    };
++    Trace g_trace;
++
++    void setReg(R5900Context &ctx, int reg, uint32_t value)
++    {
++        SET_GPR_U32(&ctx, reg, value);
++    }
++
++    uint32_t read32(const uint8_t *ram, uint32_t address)
++    {
++        uint32_t value = 0u;
++        std::memcpy(&value, ram + address, sizeof(value));
++        return value;
++    }
++
++    void write32(uint8_t *ram, uint32_t address, uint32_t value)
++    {
++        std::memcpy(ram + address, &value, sizeof(value));
++    }
++
++    bool sameContext(const R5900Context &left, const R5900Context &right)
++    {
++        constexpr size_t kDefinedCpuBytes = offsetof(R5900Context, fcr31) + sizeof(left.fcr31);
++        return std::memcmp(&left, &right, kDefinedCpuBytes) == 0;
++    }
++
++    void returnEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_trace.ordinary = runtime->eeScheduler().currentExecutionOwner();
++        ctx->pc = 0u;
++    }
++
++    void parentEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.ordinary = scheduler.currentExecutionOwner();
++        GuestInvocation parent{};
++        parent.kind = GuestInvocationKind::RpcCallback;
++        parent.context = *ctx;
++        parent.context.pc = kParentInvocationEntry;
++        parent.requireGuestReturn = true;
++        ctx->pc = kParentResume;
++        scheduler.invokeCurrent(std::move(parent));
++    }
++
++    void parentInvocationEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.parent = scheduler.currentExecutionOwner();
++        GuestInvocation child{};
++        child.kind = GuestInvocationKind::RpcCallback;
++        child.context = *ctx;
++        child.context.pc = kChildEntry;
++        child.requireGuestReturn = true;
++        ctx->pc = kParentInvocationResume;
++        scheduler.invokeCurrent(std::move(child));
++    }
++
++    void childEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.child = scheduler.currentExecutionOwner();
++        g_trace.childIsCurrent = scheduler.currentExecutionOwner() == g_trace.child;
++        g_trace.parentAccessibleInChild = scheduler.hasExecutionAccess(g_trace.parent);
++        g_trace.ordinaryAccessibleInChild = scheduler.hasExecutionAccess(g_trace.ordinary);
++        ctx->pc = kChildResume;
++    }
++
++    void childResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = 0u;
++        runtime->observeGuestReturn(ctx, 0u);
++        g_trace.checkedChildReturned = true;
++    }
++
++    void parentInvocationResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.childDetachedAfterChild = !scheduler.hasExecutionAccess(g_trace.child);
++        g_trace.parentAccessibleAfterChild = scheduler.hasExecutionAccess(g_trace.parent);
++        g_trace.ordinaryAccessibleAfterChild = scheduler.hasExecutionAccess(g_trace.ordinary);
++        ctx->pc = 0u;
++        runtime->observeGuestReturn(ctx, 0u);
++        g_trace.checkedParentReturned = true;
++    }
++
++    void parentResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const EeExecutionOwner absent{g_trace.ordinary.threadId, g_trace.ordinary.lifetime,
++                                      g_trace.child.invocationSequence + g_trace.parent.invocationSequence + 1u};
++        g_trace.parentDetachedAfterParent = !scheduler.hasExecutionAccess(g_trace.parent);
++        g_trace.ordinaryAccessibleAfterParent = scheduler.hasExecutionAccess(g_trace.ordinary);
++        g_trace.absentInvocationRejected = !scheduler.hasExecutionAccess(absent);
++        write32(scheduler.rdram(), kMarker, g_trace.ordinaryAccessibleAfterParent ? 1u : 0u);
++        ctx->pc = 0u;
++    }
++
++    void waitEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.ordinary = scheduler.currentExecutionOwner();
++        EeThreadCreateParams wake{};
++        wake.entry = kWakeEntry;
++        wake.stack = 0x001A0000u;
++        wake.stackSize = 0x1000u;
++        wake.priority = 10;
++        const int id = scheduler.createThread(wake);
++        scheduler.startThread(id, 0u, *ctx, false);
++        ctx->pc = kWaitResume;
++        scheduler.sleepCurrent();
++    }
++
++    void wakeEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.waitAccessible = scheduler.hasExecutionAccess(g_trace.ordinary);
++        g_trace.wakeRan = true;
++        scheduler.wakeupThread(EeScheduler::kMainThreadId, false);
++        ctx->pc = 0u;
++    }
++
++    void waitResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_trace.waitResumed = runtime->eeScheduler().hasExecutionAccess(g_trace.ordinary);
++        ctx->pc = 0u;
++    }
++
++    void exitEntry(uint8_t *, R5900Context *, PS2Runtime *runtime)
++    {
++        g_trace.ordinary = runtime->eeScheduler().currentExecutionOwner();
++        runtime->eeScheduler().exitCurrent(false);
++    }
++
++    void internalEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const EeExecutionOwner owner = runtime->eeScheduler().currentExecutionOwner();
++        if (g_trace.internalCount < g_trace.internalOwners.size())
++            g_trace.internalOwners[g_trace.internalCount++] = owner;
++        ctx->pc = 0u;
++    }
++
++    std::string g_busyElfPath;
++    void busyLoadEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_trace.ordinary = runtime->eeScheduler().currentExecutionOwner();
++        g_trace.busyLoadRejected = !runtime->loadELF(g_busyElfPath);
++        ctx->pc = 0u;
++    }
++
++    void suspendEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.ordinary = scheduler.currentExecutionOwner();
++        EeThreadCreateParams worker{};
++        worker.entry = kResumeWorker;
++        worker.stack = 0x001A2000u;
++        worker.stackSize = 0x1000u;
++        worker.priority = 10;
++        const int id = scheduler.createThread(worker);
++        scheduler.startThread(id, 0u, *ctx, false);
++        ctx->pc = kSuspendResume;
++        (void)scheduler.suspendThread(EeScheduler::kMainThreadId, false);
++    }
++
++    void resumeWorker(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.suspendAccessible = scheduler.hasExecutionAccess(g_trace.ordinary);
++        (void)scheduler.resumeThread(EeScheduler::kMainThreadId, false);
++        ctx->pc = 0u;
++    }
++
++    void suspendResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_trace.suspendResumed = runtime->eeScheduler().hasExecutionAccess(g_trace.ordinary);
++        ctx->pc = 0u;
++    }
++
++    void internalDriver(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        GuestInvocation child{};
++        child.kind = GuestInvocationKind::RpcCallback;
++        child.context = *ctx;
++        child.context.pc = kInternalSleep;
++        child.onCancel = []
++        {
++            ++g_trace.internalCancelCount;
++            if (g_trace.internalCancelThrows)
++            {
++                g_trace.internalCancelThrows = false;
++                throw std::runtime_error("EE21 internal cancellation");
++            }
++        };
++        runtime->eeScheduler().queueInvocation(std::move(child));
++        ctx->pc = kInternalTerminate;
++        runtime->eeScheduler().sleepCurrent();
++    }
++
++    void internalSleep(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        const EeExecutionOwner active = scheduler.currentExecutionOwner();
++        g_trace.retainedInternal = {active.threadId, active.lifetime, 0u};
++        g_trace.retainedInternalId = active.threadId;
++        (void)scheduler.wakeupThread(EeScheduler::kMainThreadId, false);
++        ctx->pc = kInternalSleep;
++        scheduler.sleepCurrent();
++    }
++
++    void internalTerminate(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = 0u;
++        uint32_t ownedStack = 0u;
++        (void)runtime->eeScheduler().terminateThread(g_trace.retainedInternalId, ownedStack, false);
++    }
++
++    void internalNew(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const EeExecutionOwner active = runtime->eeScheduler().currentExecutionOwner();
++        g_trace.replacementInternal = {active.threadId, active.lifetime, 0u};
++        ctx->pc = 0u;
++    }
++
++    void workerController(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        EeThreadCreateParams worker{};
++        worker.entry = kWorkerEntry;
++        worker.stack = 0x001A4000u;
++        worker.stackSize = 0x8000u;
++        worker.priority = 10;
++        g_trace.workerId = scheduler.createThread(worker);
++        if (g_trace.workerId <= EeScheduler::kMainThreadId)
++        {
++            ctx->pc = 0u;
++            return;
++        }
++        if (scheduler.startThread(g_trace.workerId, 0u, *ctx, false) != 0)
++        {
++            ctx->pc = 0u;
++            return;
++        }
++        ctx->pc = kWorkerTerminate;
++        scheduler.sleepCurrent();
++    }
++
++    void workerEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        GuestInvocation invocation{};
++        invocation.kind = GuestInvocationKind::RpcCallback;
++        invocation.context = *ctx;
++        invocation.context.pc = kWorkerInvocation;
++        invocation.requireGuestReturn = true;
++        invocation.onCancel = []
++        {
++            ++g_trace.workerCancelCount;
++            if (g_trace.workerCancelThrows)
++            {
++                g_trace.workerCancelThrows = false;
++                throw std::runtime_error("EE21 worker cancellation");
++            }
++        };
++        runtime->eeScheduler().invokeCurrent(std::move(invocation));
++    }
++
++    void workerInvocation(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        g_trace.workerInvocation = scheduler.currentExecutionOwner();
++        g_trace.workerOrdinary = {g_trace.workerInvocation.threadId,
++                                  g_trace.workerInvocation.lifetime, 0u};
++        (void)scheduler.wakeupThread(EeScheduler::kMainThreadId, false);
++        ctx->pc = kWorkerInvocation;
++        scheduler.sleepCurrent();
++    }
++
++    void workerTerminate(uint8_t *, R5900Context *, PS2Runtime *runtime)
++    {
++        uint32_t ownedStack = 0u;
++        (void)runtime->eeScheduler().terminateThread(g_trace.workerId, ownedStack, false);
++    }
++
++    struct TempElf
++    {
++        std::filesystem::path directory;
++        std::filesystem::path path;
++
++        TempElf(uint32_t firstAddress, uint32_t secondAddress, uint32_t secondSize)
++        {
++            directory = std::filesystem::temp_directory_path() / "ps2-ee-owner21";
++            std::filesystem::create_directories(directory);
++            path = directory / ("fixture-" + std::to_string(firstAddress) + "-" +
++                                std::to_string(secondAddress) + ".elf");
++            std::vector<uint8_t> bytes(124u, 0u);
++            const auto u16 = [&](size_t at, uint16_t value) { std::memcpy(bytes.data() + at, &value, 2u); };
++            const auto u32 = [&](size_t at, uint32_t value) { std::memcpy(bytes.data() + at, &value, 4u); };
++            u32(0u, 0x464C457Fu); bytes[4] = bytes[5] = bytes[6] = 1u;
++            u16(16u, 2u); u16(18u, 8u); u32(20u, 1u); u32(24u, firstAddress);
++            u32(28u, 52u); u16(40u, 52u); u16(42u, 32u); u16(44u, 2u);
++            for (uint32_t i = 0u; i != 2u; ++i)
++            {
++                const size_t at = 52u + i * 32u;
++                u32(at, 1u); u32(at + 4u, 116u + i * 4u);
++                u32(at + 8u, i == 0u ? firstAddress : secondAddress);
++                u32(at + 16u, 4u); u32(at + 20u, i == 0u ? 4u : secondSize);
++                u32(at + 24u, 6u); u32(at + 28u, 16u);
++            }
++            u32(116u, 0x11223344u); u32(120u, 0x55667788u);
++            std::ofstream out(path, std::ios::binary);
++            out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++            if (!out) throw std::runtime_error("EE21 synthetic ELF write failed");
++        }
++    };
++
++    void resetAndBind(Env &env, R5900Context &main, uint32_t pc)
++    {
++        main = R5900Context{};
++        main.pc = pc;
++        setReg(main, 29, 0x01FF0000u);
++        env.runtime.eeScheduler().reset(env.ram.data(), main);
++        env.runtime.eeScheduler().bindMainContextForSyscall(main, env.ram.data());
++    }
++}
++
++void register_ee_owner_tests21()
++{
++    MiniTest::Case("EEExecutionOwner21", [](TestCase &tc)
++    {
++        tc.Run("ordinary execution publishes a value owner then retires it once", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kReturnEntry, returnEntry);
++            R5900Context main{};
++            main.pc = kReturnEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    g_trace.selectorAtRetirement = scheduler.currentThreadId();
++                    g_trace.retired.append(owner);
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }),
++                "first observer registration must succeed");
++            scheduler.run();
++            t.IsTrue(g_trace.ordinary.lifetime != 0u, "actual guest entry must observe a live ordinary owner");
++            t.IsFalse(env.runtime.eeScheduler().hasExecutionAccess(g_trace.ordinary),
++                      "ordinary return must retire captured access");
++            t.Equals(g_trace.retired.count, size_t{1}, "ordinary return must notify exactly once");
++            if (g_trace.retired.count != 0u) t.Equals(g_trace.retired.owners[0], g_trace.ordinary,
++                                                   "observer must receive the retired value owner");
++            t.Equals(g_trace.selectorAtRetirement, 0,
++                     "retirement observer must not observe a stale current-thread selector");
++        });
++
++        tc.Run("nested child keeps parent access until child and parent detach", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kParentEntry, parentEntry);
++            env.runtime.registerFunction(kParentInvocationEntry, parentInvocationEntry);
++            env.runtime.registerFunction(kParentInvocationResume, parentInvocationResume);
++            env.runtime.registerFunction(kParentResume, parentResume);
++            env.runtime.registerFunction(kChildEntry, childEntry);
++            env.runtime.registerFunction(kChildResume, childResume);
++            R5900Context main{}; main.pc = kParentEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            int observerToken = 0;
++            t.IsTrue(env.runtime.eeScheduler().setExecutionRetirementObserver(
++                &observerToken, [&scheduler = env.runtime.eeScheduler()](const EeExecutionOwner &owner)
++                {
++                    g_trace.retired.append(owner);
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }), "parent fixture must install a nonthrowing retirement observer");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_trace.ordinary.lifetime != 0u &&
++                         g_trace.parent.lifetime == g_trace.ordinary.lifetime &&
++                         g_trace.child.lifetime == g_trace.ordinary.lifetime,
++                     "nested invocations must inherit their ordinary activation lifetime");
++            t.IsTrue(g_trace.parent.invocationSequence != 0u &&
++                         g_trace.child.invocationSequence != 0u &&
++                         g_trace.child.invocationSequence != g_trace.parent.invocationSequence,
++                     "parent and child must have separate nonzero invocation sequences");
++            t.IsTrue(g_trace.checkedChildReturned && g_trace.checkedParentReturned &&
++                         g_trace.childIsCurrent && g_trace.parentAccessibleInChild &&
++                         g_trace.ordinaryAccessibleInChild,
++                     "actual child execution must retain both invocation-parent and ordinary access");
++            t.IsTrue(g_trace.childDetachedAfterChild && g_trace.parentAccessibleAfterChild &&
++                         g_trace.ordinaryAccessibleAfterChild,
++                     "after the checked child returns only its parent and ordinary owner remain live");
++            t.IsTrue(g_trace.parentDetachedAfterParent && g_trace.ordinaryAccessibleAfterParent &&
++                         g_trace.absentInvocationRejected && read32(env.ram.data(), kMarker) == 1u,
++                     "after the checked parent returns only the ordinary owner remains live");
++            t.IsFalse(env.runtime.eeScheduler().hasExecutionAccess(g_trace.ordinary),
++                      "ordinary completion must retire the final ancestor value owner");
++        });
++
++        tc.Run("wait, lifecycle reuse, and observer ownership retain exact access", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kWaitEntry, waitEntry);
++            env.runtime.registerFunction(kWakeEntry, wakeEntry);
++            env.runtime.registerFunction(kWaitResume, waitResume);
++            R5900Context main{}; main.pc = kWaitEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            int first = 0, second = 0;
++            t.IsTrue(env.runtime.eeScheduler().setExecutionRetirementObserver(&first,
++                [&scheduler = env.runtime.eeScheduler()](const EeExecutionOwner &owner)
++                {
++                    g_trace.retired.append(owner);
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }),
++                "observer owner must install");
++            t.IsFalse(env.runtime.eeScheduler().setExecutionRetirementObserver(&second,
++                [](const EeExecutionOwner &) {}), "second live observer must be rejected");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_trace.wakeRan && g_trace.waitAccessible && g_trace.waitResumed,
++                     "waiting ordinary owner must remain accessible until wake/resume");
++            env.runtime.eeScheduler().clearExecutionRetirementObserver(&second);
++            t.IsFalse(env.runtime.eeScheduler().setExecutionRetirementObserver(&second,
++                [](const EeExecutionOwner &) {}), "foreign observer clear must not remove owner");
++            env.runtime.eeScheduler().clearExecutionRetirementObserver(&first);
++            RetireLog successorRetired{};
++            t.IsTrue(env.runtime.eeScheduler().setExecutionRetirementObserver(&second,
++                [&successorRetired](const EeExecutionOwner &owner) { successorRetired.append(owner); }),
++                "owner clear must permit successor registration");
++
++            R5900Context direct{};
++            resetAndBind(env, direct, kReturnEntry);
++            const EeExecutionOwner beforeReset = env.runtime.eeScheduler().currentExecutionOwner();
++            env.runtime.eeScheduler().reset(env.ram.data(), direct);
++            env.runtime.eeScheduler().bindMainContextForSyscall(direct, env.ram.data());
++            const EeExecutionOwner afterReset = env.runtime.eeScheduler().currentExecutionOwner();
++            t.IsTrue(beforeReset.lifetime != 0u && afterReset.lifetime > beforeReset.lifetime,
++                     "reset must provide a fresh monotonic ordinary lifetime");
++            t.IsFalse(env.runtime.eeScheduler().hasExecutionAccess(beforeReset),
++                      "reset must revoke the old value owner");
++            t.Equals(successorRetired.matches(beforeReset), size_t{1},
++                     "direct reset must retain and report its exact installed-owner retirement once");
++
++            EeThreadCreateParams worker{};
++            worker.entry = kReturnEntry;
++            worker.stack = 0x001B0000u;
++            worker.stackSize = 0x1000u;
++            worker.priority = 10;
++            const int workerId = env.runtime.eeScheduler().createThread(worker);
++            t.IsTrue(workerId > EeScheduler::kMainThreadId, "ordinary worker creation must succeed");
++            t.Equals(env.runtime.eeScheduler().startThread(workerId, 0u, direct, false), 0,
++                     "ordinary worker start must publish a lifetime");
++            const GuestThread *firstWorker = env.runtime.eeScheduler().thread(workerId);
++            const EeExecutionOwner firstWorkerOwner{workerId,
++                firstWorker ? firstWorker->executionLifetime : 0u, 0u};
++            t.IsTrue(env.runtime.eeScheduler().hasExecutionAccess(firstWorkerOwner),
++                     "started dormant worker must expose value ownership before termination");
++            uint32_t ownedStack = 0u;
++            t.Equals(env.runtime.eeScheduler().terminateThread(workerId, ownedStack, false), 0,
++                     "ordinary worker termination must detach ownership");
++            t.IsFalse(env.runtime.eeScheduler().hasExecutionAccess(firstWorkerOwner),
++                      "terminated worker must revoke its old value owner");
++            t.Equals(env.runtime.eeScheduler().startThread(workerId, 0u, direct, false), 0,
++                     "a terminated worker may restart after complete retirement");
++            const GuestThread *secondWorker = env.runtime.eeScheduler().thread(workerId);
++            const EeExecutionOwner secondWorkerOwner{workerId,
++                secondWorker ? secondWorker->executionLifetime : 0u, 0u};
++            t.IsTrue(secondWorkerOwner.lifetime > firstWorkerOwner.lifetime &&
++                         env.runtime.eeScheduler().hasExecutionAccess(secondWorkerOwner),
++                     "same thread ID restart must receive a fresh accessible lifetime");
++            t.Equals(env.runtime.eeScheduler().terminateThread(workerId, ownedStack, false), 0,
++                     "restarted worker termination must succeed");
++            t.Equals(env.runtime.eeScheduler().deleteThread(workerId, ownedStack), 0,
++                     "dormant worker deletion must remove the retired record");
++            t.IsNull(env.runtime.eeScheduler().thread(workerId),
++                     "deletion must leave no stale access record for the retired worker");
++        });
++
++        tc.Run("ordinary exit and queued dispatcher calls retire through actual scheduler paths", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kExitEntry, exitEntry);
++            R5900Context main{};
++            main.pc = kExitEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    g_trace.retired.append(owner);
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }), "exit fixture must install a nonthrowing observer");
++            scheduler.run();
++            t.IsFalse(scheduler.hasExecutionAccess(g_trace.ordinary),
++                      "actual exitCurrent must retire the ordinary owner");
++            t.Equals(g_trace.retired.matches(g_trace.ordinary), size_t{1},
++                     "actual exitCurrent must notify the owner exactly once");
++
++            g_trace = {};
++            env.runtime.registerFunction(kInternalEntry, internalEntry);
++            main = R5900Context{};
++            main.pc = 0u;
++            scheduler.reset(env.ram.data(), main);
++            scheduler.clearExecutionRetirementObserver(&observerToken);
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    if (owner.threadId < 0 && g_trace.internalCount == 2u) scheduler.requestStop();
++                }), "internal fixture must replace its observer");
++            for (uint64_t tag = 1u; tag <= 2u; ++tag)
++            {
++                GuestInvocation call{};
++                call.kind = GuestInvocationKind::RpcCallback;
++                call.tag = tag;
++                call.context.pc = kInternalEntry;
++                scheduler.queueInvocation(std::move(call));
++            }
++            scheduler.run();
++            t.Equals(g_trace.internalCount, size_t{2}, "two queued calls must both execute");
++            if (g_trace.internalCount == 2u)
++            {
++                t.IsTrue(g_trace.internalOwners[0].threadId < 0 &&
++                             g_trace.internalOwners[0].threadId == g_trace.internalOwners[1].threadId,
++                         "normal internal dispatch must reuse its dormant dispatcher record");
++                t.IsTrue(g_trace.internalOwners[1].lifetime > g_trace.internalOwners[0].lifetime,
++                         "normal dispatcher-record reuse must receive a fresh lifetime");
++            }
++        });
++
++        tc.Run("suspend then resume preserves live ordinary access", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kSuspendEntry, suspendEntry);
++            env.runtime.registerFunction(kSuspendResume, suspendResume);
++            env.runtime.registerFunction(kResumeWorker, resumeWorker);
++            R5900Context main{};
++            main.pc = kSuspendEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }), "suspend fixture must install a nonthrowing observer");
++            scheduler.run();
++            t.IsTrue(g_trace.suspendAccessible && g_trace.suspendResumed,
++                     "ordinary access must remain live across actual suspend and resume");
++            t.IsFalse(scheduler.hasExecutionAccess(g_trace.ordinary),
++                      "ordinary owner must retire after its resumed return");
++        });
++
++        tc.Run("failed internal cancellation cannot be deleted or reused before retirement", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kInternalDriver, internalDriver);
++            env.runtime.registerFunction(kInternalSleep, internalSleep);
++            env.runtime.registerFunction(kInternalTerminate, internalTerminate);
++            env.runtime.registerFunction(kInternalNew, internalNew);
++            R5900Context main{};
++            main.pc = kInternalDriver;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    g_trace.retired.append(owner);
++                    if (owner.threadId < 0 && owner != g_trace.retainedInternal)
++                        scheduler.requestStop();
++                }), "internal-cancellation fixture must install a nonthrowing observer");
++            bool cancellationThrew = false;
++            try { scheduler.run(); }
++            catch (const std::runtime_error &) { cancellationThrew = true; }
++            t.IsTrue(cancellationThrew && g_trace.retainedInternal.lifetime != 0u,
++                     "main termination must observe the internal child's real cancellation throw");
++            t.IsTrue(scheduler.hasExecutionAccess(g_trace.retainedInternal),
++                     "throwing internal cancellation must retain ordinary access");
++            uint32_t ownedStack = 0u;
++            t.IsTrue(scheduler.deleteThread(g_trace.retainedInternalId, ownedStack) != 0,
++                     "retained dormant internal owner must reject deletion");
++
++            scheduler.discardInvocations();
++            t.Equals(g_trace.internalCancelCount, 2,
++                     "public discard must retry and clear the retained internal callback once");
++            t.IsTrue(scheduler.hasExecutionAccess(g_trace.retainedInternal),
++                     "discarded frames must not silently erase retained ordinary ownership");
++            GuestInvocation replacement{};
++            replacement.kind = GuestInvocationKind::RpcCallback;
++            replacement.context.pc = kInternalNew;
++            scheduler.queueInvocation(std::move(replacement));
++            scheduler.run();
++            t.IsTrue(g_trace.replacementInternal.threadId < 0 &&
++                         g_trace.replacementInternal.threadId != g_trace.retainedInternal.threadId &&
++                         g_trace.replacementInternal.lifetime > g_trace.retainedInternal.lifetime,
++                     "new queued child must use a fresh dispatcher record and lifetime");
++            t.IsTrue(scheduler.hasExecutionAccess(g_trace.retainedInternal),
++                     "old internal ownership must survive until explicit successful retirement");
++            t.IsTrue(scheduler.retireInvocationStacksForColdLoad(),
++                     "quiescent cold retirement must finally settle retained internal ownership");
++            t.IsFalse(scheduler.hasExecutionAccess(g_trace.retainedInternal),
++                      "successful cold retirement must revoke retained internal ownership");
++            t.Equals(g_trace.retired.matches(g_trace.retainedInternal), size_t{1},
++                     "retained internal owner must notify exactly once on successful retirement");
++        });
++
++        tc.Run("retained positive worker rejects delete and restart until one cold retirement", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            env.runtime.registerFunction(kWorkerController, workerController);
++            env.runtime.registerFunction(kWorkerEntry, workerEntry);
++            env.runtime.registerFunction(kWorkerInvocation, workerInvocation);
++            env.runtime.registerFunction(kWorkerTerminate, workerTerminate);
++            R5900Context main{};
++            main.pc = kWorkerController;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [](const EeExecutionOwner &owner) { g_trace.retired.append(owner); }),
++                "positive-worker fixture must install a nonthrowing retirement observer");
++
++            bool cancellationThrew = false;
++            try { scheduler.run(); }
++            catch (const std::runtime_error &) { cancellationThrew = true; }
++            const GuestThread *retained = scheduler.thread(g_trace.workerId);
++            t.IsTrue(cancellationThrew && g_trace.workerId > EeScheduler::kMainThreadId &&
++                         g_trace.workerInvocation.invocationSequence != 0u &&
++                         g_trace.workerOrdinary.lifetime != 0u,
++                     "actual positive worker must expose its installed throwing invocation");
++            t.IsTrue(retained && retained->status == EeThreadStatus::Dormant &&
++                         retained->executionLifetime == g_trace.workerOrdinary.lifetime &&
++                         !retained->invocations.empty() &&
++                         scheduler.hasExecutionAccess(g_trace.workerOrdinary) &&
++                         scheduler.hasExecutionAccess(g_trace.workerInvocation),
++                     "throwing cancellation must preserve the exact dormant worker record and keys");
++            uint32_t ownedStack = 0u;
++            t.Equals(scheduler.deleteThread(g_trace.workerId, ownedStack), -1,
++                     "positive retained worker deletion must reach the execution-lifetime guard");
++            t.Equals(scheduler.startThread(g_trace.workerId, 0u, main, false), -1,
++                     "positive retained worker restart must reach the execution-lifetime guard");
++            t.Equals(g_trace.retired.matches(g_trace.workerOrdinary), size_t{0},
++                     "rejected delete and restart must not notify retirement");
++
++            scheduler.discardInvocations();
++            retained = scheduler.thread(g_trace.workerId);
++            t.Equals(g_trace.workerCancelCount, 2,
++                     "quiescent discard must retry and clear the retained worker invocation once");
++            t.IsTrue(retained && retained->executionLifetime == g_trace.workerOrdinary.lifetime &&
++                         retained->invocations.empty() && scheduler.hasExecutionAccess(g_trace.workerOrdinary) &&
++                         !scheduler.hasExecutionAccess(g_trace.workerInvocation),
++                     "successful discard clears frames while the retained positive worker lifetime remains live");
++            t.Equals(scheduler.deleteThread(g_trace.workerId, ownedStack), -1,
++                     "cleared frames alone must not permit positive retained-worker deletion");
++            t.Equals(scheduler.startThread(g_trace.workerId, 0u, main, false), -1,
++                     "cleared frames alone must not permit positive retained-worker restart");
++            t.Equals(g_trace.retired.matches(g_trace.workerOrdinary), size_t{0},
++                     "discard and rejected lifecycle operations must not publish false retirement");
++
++            t.IsTrue(scheduler.retireInvocationStacksForColdLoad(),
++                     "quiescent cold retirement must settle the retained ordinary worker");
++            t.IsFalse(scheduler.hasExecutionAccess(g_trace.workerOrdinary),
++                      "successful cold retirement must revoke the old positive worker owner");
++            t.Equals(g_trace.retired.matches(g_trace.workerOrdinary), size_t{1},
++                     "successful cold retirement must notify the old positive worker exactly once");
++            t.Equals(scheduler.startThread(g_trace.workerId, 0u, main, false), 0,
++                     "retired positive worker may restart normally");
++            const GuestThread *restarted = scheduler.thread(g_trace.workerId);
++            const EeExecutionOwner restartedOwner{g_trace.workerId,
++                restarted ? restarted->executionLifetime : 0u, 0u};
++            t.IsTrue(restartedOwner.lifetime > g_trace.workerOrdinary.lifetime &&
++                         scheduler.hasExecutionAccess(restartedOwner),
++                     "normal restart must publish a fresh positive worker lifetime");
++            t.Equals(scheduler.terminateThread(g_trace.workerId, ownedStack, false), 0,
++                     "normally restarted worker must terminate after old lifetime retirement");
++            t.Equals(scheduler.deleteThread(g_trace.workerId, ownedStack), 0,
++                     "normally restarted and retired positive worker must delete");
++        });
++
++        tc.Run("busy loader call rejects without disturbing ordinary execution", [](TestCase &t)
++        {
++            g_trace = {};
++            Env env;
++            t.IsTrue(env.runtime.memory().initialize(), "busy-load fixture requires RDRAM");
++            TempElf image(0x00104000u, 0x00105000u, 4u);
++            g_busyElfPath = image.path.string();
++            env.runtime.registerFunction(kBusyLoadEntry, busyLoadEntry);
++            R5900Context main{};
++            main.pc = kBusyLoadEntry;
++            env.runtime.eeScheduler().reset(env.ram.data(), main);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&scheduler](const EeExecutionOwner &owner)
++                {
++                    if (owner == g_trace.ordinary) scheduler.requestStop();
++                }), "busy-load fixture must install a nonthrowing observer");
++            scheduler.run();
++            t.IsTrue(g_trace.busyLoadRejected, "active guest execution must reject cold loading");
++            t.IsFalse(scheduler.hasExecutionAccess(g_trace.ordinary),
++                      "rejected busy load must not prevent ordinary return retirement");
++        });
++
++        tc.Run("cold ELF loading retires before writes and failed later segments require reset", [](TestCase &t)
++        {
++            Env env;
++            t.IsTrue(env.runtime.memory().initialize(), "loader requires actual RDRAM backing");
++            R5900Context main{};
++            resetAndBind(env, main, kReturnEntry);
++            const EeExecutionOwner old = env.runtime.eeScheduler().currentExecutionOwner();
++            int observerToken = 0;
++            RetireLog retired{};
++            t.IsTrue(env.runtime.eeScheduler().setExecutionRetirementObserver(
++                &observerToken, [&retired](const EeExecutionOwner &owner) { retired.append(owner); }),
++                "loader observer registration must succeed");
++            TempElf valid(0x00100000u, 0x00101000u, 4u);
++            t.IsTrue(env.runtime.loadELF(valid.path.string()), "cold synthetic ELF must load");
++            t.Equals(read32(env.runtime.memory().getRDRAM(), 0x00100000u), 0x11223344u,
++                     "successful cold load must write its first segment");
++            t.IsFalse(env.runtime.eeScheduler().hasExecutionAccess(old),
++                      "cold load must retire old execution before segment writes");
++            t.Equals(retired.count, size_t{1}, "cold load must notify once for the old ordinary owner");
++
++            const R5900Context loadedCpu = env.runtime.cpu();
++            bool validRunRejected = false;
++            try { env.runtime.eeScheduler().run(); }
++            catch (const std::logic_error &) { validRunRejected = true; }
++            t.IsTrue(validRunRejected, "cold-loaded scheduler must reject dispatch until reset");
++            t.IsTrue(sameContext(env.runtime.cpu(), loadedCpu),
++                     "rejected dispatch after successful load must preserve every loaded CPU field");
++
++            env.runtime.eeScheduler().reset(env.ram.data(), env.runtime.cpu());
++            env.runtime.eeScheduler().bindMainContextForSyscall(env.runtime.cpu(), env.ram.data());
++            const EeExecutionOwner afterSuccessfulReset = env.runtime.eeScheduler().currentExecutionOwner();
++            t.IsTrue(afterSuccessfulReset.lifetime > old.lifetime &&
++                         env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId)->context.pc == loadedCpu.pc,
++                     "reset must consume the new successful-load context with a fresh lifetime");
++
++            TempElf malformed(0x00102000u, PS2_RAM_SIZE - 2u, 8u);
++            const uint32_t firstCanary = read32(env.runtime.memory().getRDRAM(), 0x00102000u);
++            t.Equals(firstCanary, 0u, "malformed-load first segment must begin as an observable canary");
++            t.IsFalse(env.runtime.loadELF(malformed.path.string()), "late malformed segment must fail");
++            t.Equals(read32(env.runtime.memory().getRDRAM(), 0x00102000u), 0x11223344u,
++                     "documented partial failure must expose the first write");
++            const R5900Context partiallyLoadedCpu = env.runtime.cpu();
++            bool failedRunRejected = false;
++            try { env.runtime.eeScheduler().run(); }
++            catch (const std::logic_error &) { failedRunRejected = true; }
++            t.IsTrue(failedRunRejected, "partially failed cold load must also reject dispatch until reset");
++            t.IsTrue(sameContext(env.runtime.cpu(), partiallyLoadedCpu),
++                     "rejected dispatch after partial load must preserve every new CPU field");
++            env.runtime.eeScheduler().reset(env.ram.data(), env.runtime.cpu());
++            env.runtime.eeScheduler().bindMainContextForSyscall(env.runtime.cpu(), env.ram.data());
++            const EeExecutionOwner afterPartialReset = env.runtime.eeScheduler().currentExecutionOwner();
++            t.IsTrue(afterPartialReset.lifetime > afterSuccessfulReset.lifetime &&
++                         env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId)->context.pc == partiallyLoadedCpu.pc,
++                     "reset after partial load must consume its intended context with another fresh lifetime");
++        });
++
++        tc.Run("throwing queued cancellation retries through actual cold-discard cleanup", [](TestCase &t)
++        {
++            Env env;
++            R5900Context main{};
++            resetAndBind(env, main, kReturnEntry);
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            int observerToken = 0;
++            RetireLog retired{};
++            t.IsTrue(scheduler.setExecutionRetirementObserver(
++                &observerToken, [&retired](const EeExecutionOwner &owner) { retired.append(owner); }),
++                "throwing-cancel fixture must install its observer");
++            const EeExecutionOwner oldMain = scheduler.currentExecutionOwner();
++            bool throwOnce = true;
++            int cancelCount = 0;
++            GuestInvocation pending{};
++            pending.onCancel = [&]
++            {
++                ++cancelCount;
++                if (throwOnce)
++                {
++                    throwOnce = false;
++                    throw std::runtime_error("EE21 test cancellation");
++                }
++            };
++            scheduler.queueInvocation(std::move(pending));
++
++            bool cancellationThrew = false;
++            try { (void)scheduler.retireInvocationStacksForColdLoad(); }
++            catch (const std::runtime_error &) { cancellationThrew = true; }
++            t.IsTrue(cancellationThrew, "throwing queued cancellation must escape cold-discard cleanup");
++            t.IsFalse(scheduler.hasExecutionAccess(oldMain),
++                      "cold retirement must not leave the old ordinary owner accessible");
++            t.Equals(retired.matches(oldMain), size_t{1},
++                     "failed pending cancellation must not duplicate ordinary retirement notice");
++
++            t.IsTrue(scheduler.retireInvocationStacksForColdLoad(),
++                     "later successful cold retirement must retry queued cancellation cleanup");
++            t.Equals(cancelCount, 2, "later retirement must retry the queued callback exactly once");
++            t.Equals(retired.matches(oldMain), size_t{1},
++                     "successful retry must retain exactly one old ordinary retirement notice");
++            scheduler.reset(env.ram.data(), main);
++            scheduler.bindMainContextForSyscall(main, env.ram.data());
++            t.IsTrue(scheduler.currentExecutionOwner().lifetime > oldMain.lifetime,
++                     "reset after successful cleanup must establish a new ordinary lifetime");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 35729aa..923231b 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -12,6 +12,8 @@ void register_ps2_deci2_tests();
+ void register_ps2_disc_mount_tests();
+ #endif
+ void register_ps2_runtime_kernel_tests();
++void register_ee_owner_tests21();
++void register_ps2_execution_counter_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_invocation_stack_tests();
+ void register_ps2_idle_irq_stack_tests();
+@@ -40,6 +42,8 @@ int main()
+     register_ps2_disc_mount_tests();
+ #endif
+     register_ps2_runtime_kernel_tests();
++    register_ee_owner_tests21();
++    register_ps2_execution_counter_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_invocation_stack_tests();
+     register_ps2_idle_irq_stack_tests();
+diff --git a/ps2xTest/src/ps2_execution_counter_tests.cpp b/ps2xTest/src/ps2_execution_counter_tests.cpp
+new file mode 100644
+index 0000000..bdd1684
+--- /dev/null
++++ b/ps2xTest/src/ps2_execution_counter_tests.cpp
+@@ -0,0 +1,136 @@
++// Authored synthetic tests; no production counter controls or layout casts.
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
++#include <cstddef>
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++struct InvocationCounterTag {
++    using type=uint64_t EeScheduler::*;
++    friend type accessMember(InvocationCounterTag);
++};
++struct LifetimeCounterTag {
++    using type=uint64_t EeScheduler::*;
++    friend type accessMember(LifetimeCounterTag);
++};
++struct PendingTag {
++    using type=std::deque<GuestInvocation> EeScheduler::*;
++    friend type accessMember(PendingTag);
++};
++template<class Tag,typename Tag::type Pointer> struct ExplicitMemberAccess {
++    friend typename Tag::type accessMember(Tag){return Pointer;}
++};
++// C++20 [temp.spec]/6 explicit-instantiation access exception. Definitions and
++// helpers stay in this TU; the class/header and production APIs remain intact.
++template struct ExplicitMemberAccess<InvocationCounterTag,&EeScheduler::m_invocationSequence>;
++template struct ExplicitMemberAccess<LifetimeCounterTag,&EeScheduler::m_executionLifetimeSequence>;
++template struct ExplicitMemberAccess<PendingTag,&EeScheduler::m_pendingInvocations>;
++uint64_t& invocationCounter(EeScheduler&s){return s.*accessMember(InvocationCounterTag{});}
++uint64_t& lifetimeCounter(EeScheduler&s){return s.*accessMember(LifetimeCounterTag{});}
++const std::deque<GuestInvocation>& pending(const EeScheduler&s){return s.*accessMember(PendingTag{});}
++constexpr uint64_t kMax=std::numeric_limits<uint64_t>::max();
++constexpr uint32_t kNever=0x00197000u;
++unsigned entered=0;
++void neverEntry(uint8_t*,R5900Context*ctx,PS2Runtime*){++entered;ctx->pc=0;}
++bool sameCpu(const R5900Context&a,const R5900Context&b){
++    return std::memcmp(&a,&b,offsetof(R5900Context,fcr31)+sizeof(a.fcr31))==0;
++}
++struct Env {
++    std::vector<uint8_t>ram=std::vector<uint8_t>(PS2_RAM_SIZE,0xA5);
++    PS2Runtime runtime;
++    R5900Context main{};
++    Env(){
++        main.pc=kNever;SET_GPR_U32(&main,29,0x01FF0000u);
++        runtime.eeScheduler().reset(ram.data(),main);
++        runtime.eeScheduler().bindMainContextForSyscall(main,ram.data());
++    }
++};
++bool overflowMatches(const std::exception&e,const char*message){
++    return dynamic_cast<const std::overflow_error*>(&e)&&std::string(e.what())==message;
++}
++GuestInvocation invocation(int&cancelled,bool throwing=false){
++    GuestInvocation g{};g.context.pc=kNever;
++    g.onCancel=[&cancelled,throwing]{++cancelled;if(throwing)throw std::runtime_error("distinct cancellation fault");};
++    return g;
++}
++}
++
++void register_ps2_execution_counter_tests(){
++    MiniTest::Case("EEExecutionCounter",[](TestCase&tc){
++        tc.Run("queued sequence exhaustion cancels once and preserves original fault",[](TestCase&t){
++            Env e;auto&s=e.runtime.eeScheduler();
++            const auto owner=s.currentExecutionOwner();const auto cpu=*s.currentContext();
++            const auto runtimeCpu=e.runtime.cpu();const auto ram=e.ram;const auto size=pending(s).size();
++            invocationCounter(s)=kMax;int cancelled=0;bool original=false;
++            try{s.queueInvocation(invocation(cancelled,true));}
++            catch(const std::exception&x){original=overflowMatches(x,"EE invocation sequence exhausted");}
++            t.IsTrue(original,"queue rejection must preserve overflow despite throwing cancellation");
++            t.Equals(cancelled,1,"rejected queued ownership must cancel exactly once");
++            t.Equals(invocationCounter(s),kMax,"queued sequence must not wrap");
++            t.Equals(pending(s).size(),size,"rejection must not insert or remove queued work");
++            t.IsTrue(s.currentExecutionOwner()==owner&&sameCpu(*s.currentContext(),cpu)&&
++                sameCpu(e.runtime.cpu(),runtimeCpu)&&e.ram==ram,"queue rejection must preserve owner and CPU/RAM");
++        });
++        tc.Run("checked child and sequence exhaustion reject before stack preparation",[](TestCase&t){
++            for(bool group:{false,true}){
++                Env e;auto&s=e.runtime.eeScheduler();const auto owner=s.currentExecutionOwner();
++                const auto cpu=*s.currentContext();const auto ram=e.ram;
++                invocationCounter(s)=kMax;int cancelled=0;bool original=false;
++                try{
++                    if(group){std::vector<GuestInvocation>v;v.push_back(invocation(cancelled));v.push_back(invocation(cancelled));s.invokeCurrentSequence(std::move(v));}
++                    else s.invokeCurrent(invocation(cancelled));
++                }catch(const std::exception&x){original=overflowMatches(x,"EE invocation sequence exhausted");}
++                t.IsTrue(original,"child/group exhaustion must report the specific capacity fault");
++                t.Equals(cancelled,group?2:1,"every rejected child must cancel once");
++                t.Equals(invocationCounter(s),kMax,"child sequence must not wrap");
++                t.IsTrue(s.currentThread()->invocations.empty()&&s.currentExecutionOwner()==owner&&
++                    sameCpu(*s.currentContext(),cpu)&&e.ram==ram,"rejected children must not prepare frames or alter parent");
++            }
++        });
++        tc.Run("lifetime exhaustion rejects start and reset before retirement",[](TestCase&t){
++            Env e;auto&s=e.runtime.eeScheduler();const auto owner=s.currentExecutionOwner();
++            EeThreadCreateParams p{};p.entry=kNever;p.stack=0x001A0000u;p.stackSize=0x1000;p.priority=10;
++            const int id=s.createThread(p);t.IsTrue(id>0,"worker creation must succeed before seeding");
++            const auto cpu=*s.currentContext();const auto runtimeCpu=e.runtime.cpu();const auto ram=e.ram;
++            lifetimeCounter(s)=kMax;
++            for(bool reset:{false,true}){
++                bool original=false;
++                try{if(reset)s.reset(e.ram.data(),e.main);else s.startThread(id,0,e.main,false);}
++                catch(const std::exception&x){original=overflowMatches(x,"EE execution lifetime exhausted");}
++                t.IsTrue(original,"start/reset must reject actual exhausted lifetime capacity");
++                t.Equals(lifetimeCounter(s),kMax,"lifetime must not wrap");
++                t.IsTrue(s.hasExecutionAccess(owner)&&s.currentExecutionOwner()==owner&&
++                    s.thread(id)->status==EeThreadStatus::Dormant&&s.thread(id)->executionLifetime==0&&
++                    sameCpu(*s.currentContext(),cpu)&&sameCpu(e.runtime.cpu(),runtimeCpu)&&e.ram==ram,
++                    "start/reset exhaustion must preserve old owner and unactivated worker");
++            }
++        });
++        tc.Run("idle dispatcher exhaustion retains pending ownership without activation",[](TestCase&t){
++            Env e;auto&s=e.runtime.eeScheduler();
++            // A real dispatcher return from the reset main's PC0 retires it
++            // before pending-work activation. No STOP suppresses that path.
++            R5900Context idle{};s.reset(e.ram.data(),idle);
++            int cancelled=0;e.runtime.registerFunction(kNever,neverEntry);entered=0;
++            s.queueInvocation(invocation(cancelled));const auto seq=invocationCounter(s);
++            const auto pendingSize=pending(s).size();const auto ram=e.ram;
++            lifetimeCounter(s)=kMax;bool original=false;
++            try{s.run();}catch(const std::exception&x){original=overflowMatches(x,"EE execution lifetime exhausted");}
++            t.IsTrue(original,"actual idle dispatcher reservation must execute and reject capacity");
++            t.Equals(entered,0u,"queued guest must not execute on rejected activation");
++            t.Equals(cancelled,0,"pending job ownership must remain queued until explicit cancellation");
++            t.Equals(pending(s).size(),pendingSize,"failed activation must not dequeue work");
++            t.Equals(invocationCounter(s),seq,"failed activation must not change queued sequence");
++            t.Equals(lifetimeCounter(s),kMax,"dispatcher lifetime must not wrap");
++            t.IsTrue(!s.thread(-1)&&s.currentThreadId()==0&&e.ram==ram,
++                "exhaustion must not create or activate an internal owner or write guest RAM");
++            s.discardInvocations();t.Equals(cancelled,1,"later explicit teardown must settle queued ownership once");
++        });
++    });
++}

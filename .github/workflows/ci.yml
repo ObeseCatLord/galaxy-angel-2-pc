@@ -1,0 +1,71 @@
+# Builds and tests everything that does not need the games' discs: the
+# recompiler, the runtime, the launcher and the unit tests. The game
+# executables are made from code generated from your own discs, so they are
+# built by the release workflow (or locally), never here.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      GA2_PRIVATE_ROOT: ${{ github.workspace }}/private
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Dependencies
+        run: sudo tools/ci/deps-ubuntu.sh ci
+      - name: Runtime tree and paraLLEl-GS
+        run: |
+          git config --global user.name ci && git config --global user.email ci@localhost
+          tools/make_runtime_tree.sh
+          tools/fetch_parallel_gs.sh
+      - name: Configure
+        run: tools/configure_runtime.sh
+      - name: Build
+        run: cmake --build private/build/ga2-runtime --target ps2_recomp ps2_analyzer ps2_runtime ga2 ps2x_tests --parallel 4
+      - name: Unit tests
+        working-directory: private/worktrees/ga2-runtime/ps2xTest
+        run: GA2_GS=cpu ../../../build/ga2-runtime/ps2xTest/ps2x_tests
+      - name: Launcher version
+        run: private/build/ga2-runtime/ga2/bin/ga2 --version
+
+  windows:
+    name: Windows x86_64 (cross)
+    runs-on: ubuntu-24.04
+    env:
+      GA2_PRIVATE_ROOT: ${{ github.workspace }}/private
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Dependencies
+        run: |
+          sudo tools/ci/deps-ubuntu.sh ci
+          sudo apt-get install -y -q mingw-w64 llvm
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+      - name: Runtime tree and paraLLEl-GS
+        run: |
+          git config --global user.name ci && git config --global user.email ci@localhost
+          tools/make_runtime_tree.sh
+          tools/fetch_parallel_gs.sh
+      - name: Configure
+        run: |
+          GA2_COMPILERS=" " GA2_RUNTIME_BUILD=private/build/windows tools/configure_runtime.sh \
+            -DCMAKE_TOOLCHAIN_FILE=$PWD/tools/mingw-w64-toolchain.cmake -DPS2X_RUNTIME_SHARED=OFF \
+            -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build private/build/windows --target ps2_runtime ga2 --parallel 4

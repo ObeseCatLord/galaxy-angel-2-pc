@@ -1,0 +1,698 @@
+From fe2c47942e5e79c4f87084fdb60f57b1f6cb80e8 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:26:21 -0500
+Subject: [PATCH] ee: thread-safe GS interrupt posting, kernel-RAM pool guards,
+ panel IO sampling
+
+Code review 55 items C8, C1, C2, C9, B4, B6, B7 and the debug-panel thread note.
+
+- postEventAfterCycles reads the executor-private cycle clock only on the
+  executor thread (m_executorThread is atomic now); any other thread, such as
+  the GS interrupt sink after a GS render thread exists, queues the event for
+  the next checkpoint and logs once.
+- Stack and heap declarations inside the native SDK pools (0x20000-0x51000)
+  are refused like the invocation-stack arena; SetupHeap starts a heap that
+  would begin inside them after them. Test fixtures that put thread stacks
+  there moved to free RAM.
+- The invocation-stack arena warns when its last slot is keyed.
+- submitDmaSend hands delayed DMAC causes to the scheduler.
+- SetupThread keeps the segment of the argument block address in the argv
+  pointers it writes.
+- The disc image identity (a stat) is re-checked at most once per guest vsync;
+  an armed changer says so when the current disc also holds the program of
+  another registered disc instead of silently not switching.
+- The debug panel's IO tab no longer reads PS2Memory from the UI thread (the
+  register map races the game thread and reading a CHCR clears STR): the game
+  thread samples the non-CHCR rows once per vsync through a scheduler hook.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/ps2_debug_panel.h         |  7 ++
+ ps2xRuntime/include/runtime/ee_scheduler.h    |  8 +-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    | 38 +++++++-
+ .../src/lib/Kernel/Stubs/Helpers/Support.h    |  5 +
+ .../src/lib/Kernel/Syscalls/System.cpp        | 17 +++-
+ ps2xRuntime/src/lib/ps2_debug_panel.cpp       | 97 +++++++++++++------
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp        | 29 ++++++
+ ps2xTest/src/ee_owner_tests21.cpp             | 39 ++++++++
+ ps2xTest/src/ps2_disc_mount_tests.cpp         | 20 +++-
+ ps2xTest/src/ps2_invocation_stack_tests.cpp   |  8 +-
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 53 +++++++---
+ 11 files changed, 265 insertions(+), 56 deletions(-)
+
+diff --git a/ps2xRuntime/include/ps2_debug_panel.h b/ps2xRuntime/include/ps2_debug_panel.h
+index b9933d5..d26f6ea 100644
+--- a/ps2xRuntime/include/ps2_debug_panel.h
++++ b/ps2xRuntime/include/ps2_debug_panel.h
+@@ -2,6 +2,13 @@
+ #define PS2_DEBUG_PANEL_H
+ 
+ class PS2Runtime;
++class PS2Memory;
++
++// Game-thread hook (once per guest vsync): refreshes the IO-register values the
++// debug panel's IO tab shows, while that tab is being drawn. The UI thread must
++// not read PS2Memory's register map itself (it is mutated by the game thread,
++// and reading a channel CHCR clears STR).
++void ps2DebugPanelSampleIo(PS2Memory &memory);
+ 
+ class PS2DebugPanel
+ {
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f04b799..a7610dc 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -309,6 +309,9 @@ public:
+     // Delivers an event once the EE has executed `cycles` more cycles (device
+     // latency, e.g. a GS FINISH after the transfer that requested it).
+     void postEventAfterCycles(EeEvent event, uint64_t cycles);
++    // Optional once-per-guest-vsync callback run on the executor thread (the
++    // debug panel uses it to sample state that only that thread may read).
++    void setVsyncSampler(void (*sampler)(PS2Memory &)) { m_vsyncSampler.store(sampler, std::memory_order_release); }
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+@@ -519,7 +522,10 @@ private:
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+-    std::thread::id m_executorThread{};
++    // Written by reset() on the executor thread; read from any thread by
++    // postEventAfterCycles() to decide whether m_eeCycle may be read.
++    std::atomic<std::thread::id> m_executorThread{};
++    std::atomic<void (*)(PS2Memory &)> m_vsyncSampler{nullptr};
+     std::atomic<bool> m_running{false};
+     std::atomic<bool> m_guestExecuting{false};
+     std::atomic<bool> m_stopRequested{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index d21672d..012af96 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -99,7 +99,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     if (isRunning() || m_guestExecuting.load(std::memory_order_acquire))
+         throw std::logic_error("EE reset requires exclusive quiescence");
+     const uint64_t mainLifetime = reserveExecutionLifetime();
+-    m_executorThread = std::this_thread::get_id();
++    m_executorThread.store(std::this_thread::get_id(), std::memory_order_release);
+     retireOrdinaryContexts();
+     discardInvocations();
+     m_invocationStackTops.clear();
+@@ -469,6 +469,19 @@ void EeScheduler::requestStop()
+ 
+ void EeScheduler::postEventAfterCycles(EeEvent event, uint64_t cycles)
+ {
++    // m_eeCycle is owned by the executor thread. Device code (GS interrupt
++    // sink, DMA completion) calls this from the game thread today; a caller on
++    // any other thread (a future GS render thread, the debug panel) has no
++    // coherent cycle clock to offset from, so the event is queued for the next
++    // checkpoint instead of reading the clock racily.
++    if (m_executorThread.load(std::memory_order_acquire) != std::this_thread::get_id())
++    {
++        static std::atomic<bool> warned{false};
++        if (!warned.exchange(true, std::memory_order_relaxed))
++            std::fprintf(stderr, "[ee] postEventAfterCycles from a non-executor thread: delivered at the next checkpoint without a cycle delay\n");
++        postEvent(event);
++        return;
++    }
+     scheduleEvent(m_eeCycle + cycles, std::chrono::steady_clock::now(), event);
+ }
+ 
+@@ -1533,6 +1546,11 @@ void EeScheduler::validateInvocationStackDeclaration(uint32_t address, uint32_t
+         throw std::runtime_error("EE stack or heap declaration is not a bounded RAM range");
+     validateInvocationStackArenaClaim(address, bytes);
+     const uint64_t end = uint64_t(begin) + bytes;
++    // The native SDK pools (RPC packets/servers, TLS, boot mode) are fixed
++    // kernel-RAM claims like the arena: a guest stack inside them is corrupted
++    // by, and corrupts, the runtime's own records.
++    if (begin < ps2_kernel_ram::kNativeSdkPoolEnd && end > ps2_kernel_ram::kNativeSdkPoolBase)
++        throw std::runtime_error("EE stack or heap declaration overlaps the native SDK kernel-RAM pools");
+     const auto validate = [begin, end](const GuestInvocation &invocation)
+     {
+         if (invocation.stackReservationBegin < invocation.stackReservationEnd &&
+@@ -1675,6 +1693,18 @@ EeScheduler::InvocationStackChoice EeScheduler::selectInvocationStack()
+     }
+     validateIsolatedInvocationStack(top);
+     m_invocationStackTops.emplace(key, top);
++    if (m_invocationStackArenaEnd > m_invocationStackArenaBegin)
++    {
++        // Exhaustion with every slot live still ends the session (see the throw
++        // above), so say so when the last slot is taken.
++        const size_t capacity = (m_invocationStackArenaEnd - m_invocationStackArenaBegin) / kInvocationStackSize;
++        static bool warned = false;
++        if (!warned && m_invocationStackTops.size() >= capacity)
++        {
++            warned = true;
++            std::fprintf(stderr, "[ee] invocation stack arena at capacity: all %zu slots are keyed (owner/depth)\n", capacity);
++        }
++    }
+     return {top, top + 0x10u - kInvocationStackSize, top + 0x10u};
+ }
+ 
+@@ -2005,7 +2035,7 @@ uint8_t *EeScheduler::rdram() const noexcept
+ 
+ void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
+ {
+-    if (m_executorThread == std::thread::id{})
++    if (m_executorThread.load(std::memory_order_acquire) == std::thread::id{})
+     {
+         reset(rdram, ctx);
+         GuestThread *main = selectReady();
+@@ -2098,7 +2128,7 @@ void EeScheduler::publishSnapshot()
+ 
+ void EeScheduler::assertExecutor() const
+ {
+-    assert(m_executorThread == std::this_thread::get_id());
++    assert(m_executorThread.load(std::memory_order_acquire) == std::this_thread::get_id());
+ }
+ 
+ int EeScheduler::allocateThreadId()
+@@ -2511,6 +2541,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+                 }
+             }
+         }
++        if (const auto sampler = m_vsyncSampler.load(std::memory_order_acquire))
++            sampler(m_runtime.memory()); // debug-panel values, read on this (the game) thread
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         // VSINT latches at every vblank start until the guest writes it back (W1C).
+         m_runtime.memory().gs().csr.fetch_or(0x8ull, std::memory_order_acq_rel);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 306a4d4..425b6b0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include "../../../ps2_disc_mount.h"
++#include "runtime/ee_scheduler.h"
+ 
+ namespace
+ {
+@@ -1426,6 +1427,10 @@ namespace
+         mem.processPendingTransfers();
+ 
+         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
++        // A download resumed by processPendingTransfers completes with a latency; its
++        // delayed cause belongs to the scheduler, not to the next unrelated drain.
++        for (const auto &[cause, cycles] : mem.consumeDelayedDmacCauses())
++            runtime->eeScheduler().postDelayedDmac(cause, cycles);
+         if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
+         {
+             if (channelBase == 0x10008000u)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index c9e44c2..e579d13 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -540,7 +540,10 @@ namespace ps2_syscalls
+ 
+         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+         // crt0's argument block: { int argc; char *argv[16]; char text[256]; }.
+-        if (const uint32_t argsAddress = getRegU32(ctx, 7) & 0x1FFFFFFu;
++        // The argv pointers keep the caller's address segment (a KSEG0 block gets
++        // KSEG0 pointers); only the host-side writes use the physical offset.
++        const uint32_t argsGuest = getRegU32(ctx, 7);
++        if (const uint32_t argsAddress = argsGuest & 0x1FFFFFFu;
+             argsAddress != 0u && argsAddress + 0x144u <= PS2_RAM_SIZE)
+         {
+             uint8_t *block = rdram + argsAddress;
+@@ -548,7 +551,7 @@ namespace ps2_syscalls
+             for (const std::string &arg : PS2Runtime::guestArgs())
+             {
+                 if (argc == 16u || text + arg.size() + 1u > 0x144u) break;
+-                const uint32_t pointer = argsAddress + text;
++                const uint32_t pointer = argsGuest + text;
+                 std::memcpy(block + 4u + 4u * argc, &pointer, 4u);
+                 std::memcpy(block + text, arg.c_str(), arg.size() + 1u);
+                 text += static_cast<uint32_t>(arg.size()) + 1u;
+@@ -571,7 +574,15 @@ namespace ps2_syscalls
+             setReturnU32(ctx, 0u);
+             return;
+         }
+-        const uint32_t heapBase = static_cast<uint32_t>(alignedBase);
++        uint32_t heapBase = static_cast<uint32_t>(alignedBase);
++        // The native SDK pools sit in kernel RAM below the games' memory; a heap
++        // that would start inside them begins after them instead.
++        if (heapBase < ps2_kernel_ram::kNativeSdkPoolEnd && heapBase >= ps2_kernel_ram::kNativeSdkPoolBase)
++        {
++            std::fprintf(stderr, "[SetupHeap] base 0x%08x is inside the native SDK pools; starting at 0x%08x\n", heapBase,
++                         ps2_kernel_ram::kNativeSdkPoolEnd);
++            heapBase = ps2_kernel_ram::kNativeSdkPoolEnd;
++        }
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+diff --git a/ps2xRuntime/src/lib/ps2_debug_panel.cpp b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index c9aa2c6..0ee5b56 100644
+--- a/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -1933,38 +1933,54 @@ namespace
+         }
+     }
+ 
++    struct IoRegRow
++    {
++        const char *name;
++        uint32_t addr;
++        bool sampled; // false: reading it has side effects (channel CHCR clears STR)
++    };
++    constexpr IoRegRow kIoRows[] = {
++        {"D_STAT", 0x1000e010u, true},
++        {"VIF0_STAT", 0x10003800u, true},
++        {"VIF0_FBRST", 0x10003810u, true},
++        {"VIF0_ERR", 0x10003830u, true},
++        {"VIF1_STAT", 0x10003c00u, true},
++        {"VIF1_FBRST", 0x10003c10u, true},
++        {"VIF1_ERR", 0x10003c30u, true},
++        {"VIF0_CHCR", 0x10008000u, false},
++        {"VIF0_MADR", 0x10008010u, true},
++        {"VIF0_QWC", 0x10008020u, true},
++        {"VIF0_TADR", 0x10008030u, true},
++        {"VIF1_CHCR", 0x10009000u, false},
++        {"VIF1_MADR", 0x10009010u, true},
++        {"VIF1_QWC", 0x10009020u, true},
++        {"VIF1_TADR", 0x10009030u, true},
++        {"GIF_CHCR", 0x1000a000u, false},
++        {"GIF_MADR", 0x1000a010u, true},
++        {"GIF_QWC", 0x1000a020u, true},
++        {"GIF_TADR", 0x1000a030u, true},
++        {"IPU_FROM_CHCR", 0x1000b000u, true}, // IPU CHCRs read without side effects
++        {"IPU_TO_CHCR", 0x1000b400u, true},
++    };
++    constexpr size_t kIoRowCount = sizeof(kIoRows) / sizeof(kIoRows[0]);
++
++    // IO-tab values sampled by the game thread (ps2DebugPanelSampleIo).
++    std::atomic<bool> g_ioTabWanted{false};
++    std::mutex g_ioSampleMutex;
++    std::array<uint32_t, kIoRowCount> g_ioSample{};
++
+     void drawIoTab(PS2Runtime &runtime)
+     {
+-        PS2Memory &mem = runtime.memory();
++        runtime.eeScheduler().setVsyncSampler(&ps2DebugPanelSampleIo);
++        g_ioTabWanted.store(true, std::memory_order_relaxed);
+         ImGui::SeparatorText("DMA/VIF/GIF IO registers");
+-        struct RegRow
++        ImGui::TextDisabled("Sampled by the game thread once per vsync. Channel CHCRs are not shown: reading one clears STR.");
++
++        std::array<uint32_t, kIoRowCount> values;
+         {
+-            const char *name;
+-            uint32_t addr;
+-        };
+-        static constexpr RegRow rows[] = {
+-            {"D_STAT", 0x1000e010u},
+-            {"VIF0_STAT", 0x10003800u},
+-            {"VIF0_FBRST", 0x10003810u},
+-            {"VIF0_ERR", 0x10003830u},
+-            {"VIF1_STAT", 0x10003c00u},
+-            {"VIF1_FBRST", 0x10003c10u},
+-            {"VIF1_ERR", 0x10003c30u},
+-            {"VIF0_CHCR", 0x10008000u},
+-            {"VIF0_MADR", 0x10008010u},
+-            {"VIF0_QWC", 0x10008020u},
+-            {"VIF0_TADR", 0x10008030u},
+-            {"VIF1_CHCR", 0x10009000u},
+-            {"VIF1_MADR", 0x10009010u},
+-            {"VIF1_QWC", 0x10009020u},
+-            {"VIF1_TADR", 0x10009030u},
+-            {"GIF_CHCR", 0x1000a000u},
+-            {"GIF_MADR", 0x1000a010u},
+-            {"GIF_QWC", 0x1000a020u},
+-            {"GIF_TADR", 0x1000a030u},
+-            {"IPU_FROM_CHCR", 0x1000b000u},
+-            {"IPU_TO_CHCR", 0x1000b400u},
+-        };
++            std::lock_guard<std::mutex> lock(g_ioSampleMutex);
++            values = g_ioSample;
++        }
+ 
+         if (ImGui::BeginTable("ioregs", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+         {
+@@ -1972,15 +1988,19 @@ namespace
+             ImGui::TableSetupColumn("Addr");
+             ImGui::TableSetupColumn("Value");
+             ImGui::TableHeadersRow();
+-            for (const auto &row : rows)
++            for (size_t i = 0; i < kIoRowCount; ++i)
+             {
++                const IoRegRow &row = kIoRows[i];
+                 ImGui::TableNextRow();
+                 ImGui::TableNextColumn();
+                 ImGui::TextUnformatted(row.name);
+                 ImGui::TableNextColumn();
+                 ImGui::Text("0x%08X", row.addr);
+                 ImGui::TableNextColumn();
+-                ImGui::Text("0x%08X", mem.readIORegister(row.addr));
++                if (row.sampled)
++                    ImGui::Text("0x%08X", values[i]);
++                else
++                    ImGui::TextDisabled("-");
+             }
+             ImGui::EndTable();
+         }
+@@ -2176,6 +2196,23 @@ namespace
+ 
+ #endif
+ }
++
++#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
++void ps2DebugPanelSampleIo(PS2Memory &memory)
++{
++    if (!g_ioTabWanted.exchange(false, std::memory_order_relaxed))
++        return;
++    std::array<uint32_t, kIoRowCount> values{};
++    for (size_t i = 0; i < kIoRowCount; ++i)
++        if (kIoRows[i].sampled)
++            values[i] = memory.readIORegister(kIoRows[i].addr);
++    std::lock_guard<std::mutex> lock(g_ioSampleMutex);
++    g_ioSample = values;
++}
++#else
++void ps2DebugPanelSampleIo(PS2Memory &) {}
++#endif
++
+ void PS2DebugPanel::initialize()
+ {
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index f8e0d88..8c93d0d 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -69,6 +69,12 @@ namespace ps2_disc
+         // The changer runs in guest time (vsyncs), so host stalls cannot
+         // disarm it in the middle of a disc check.
+         uint64_t (*guestClock)() = nullptr;
++        // The image's identity (a stat) is re-checked at most once per guest
++        // vsync: findFile/generation/imageReadable run on every guest file open
++        // and every 2 KB read. Without a guest clock (tools, tests) every call
++        // checks. UINT64_MAX forces the next call to check.
++        constexpr uint64_t kCheckNow = UINT64_MAX;
++        uint64_t identityCheckedAt = kCheckNow;
+         uint64_t changerArmedAt = 0u;
+         bool changerEverArmed = false;
+         uint64_t trayOpenedAt = 0u;
+@@ -112,11 +118,18 @@ namespace ps2_disc
+             verifiedImage.clear(); files.clear();
+             discs.clear(); currentDisc = 0u;
+             mode = nextMode;
++            identityCheckedAt = kCheckNow;
+         }
+ 
+         void refreshIdentityLocked()
+         {
+             if (verifiedImage.empty()) return;
++            if (guestClock)
++            {
++                const uint64_t now = guestClock();
++                if (now == identityCheckedAt) return;
++                identityCheckedAt = now;
++            }
+             Identity current;
+             const auto &primary = discs.empty() ? verifiedImage : discs.front().image;
+             if (PS2Runtime::getIoPaths().cdImage != primary ||
+@@ -440,6 +453,7 @@ namespace ps2_disc
+             verifiedImage = discs[index].image;
+             verifiedIdentity = discs[index].identity;
+             files = std::move(discs[index].files);
++            identityCheckedAt = kCheckNow;
+         }
+     }
+ 
+@@ -461,6 +475,7 @@ namespace ps2_disc
+             if (mountGeneration != startGeneration || PS2Runtime::getIoPaths().cdImage != configured)
+                 throw std::runtime_error("disc mount changed during validation");
+             verifiedImage = configured; verifiedIdentity = disc.identity;
++            identityCheckedAt = kCheckNow;
+             mode = Mode::Verified; files = std::move(disc.files);
+             discs.clear(); currentDisc = 0u;
+             discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info, disc.bootKey, std::move(disc.overlays)});
+@@ -526,6 +541,7 @@ namespace ps2_disc
+     {
+         std::lock_guard lock(mutex);
+         guestClock = clock;
++        identityCheckedAt = kCheckNow;
+     }
+ 
+     void armChanger()
+@@ -561,6 +577,19 @@ namespace ps2_disc
+         {
+             file = entry->second;
+             if (image) *image = verifiedImage;
++            if (discs.size() >= 2u && changerArmedLocked())
++            {
++                // The current disc answers, so no disc is inserted. That is only
++                // ambiguous when another disc's program carries the same path:
++                // say so once instead of silently serving the wrong disc.
++                static std::string warned;
++                for (size_t index = 0u; index < discs.size(); ++index)
++                    if (index != currentDisc && discs[index].bootKey == key && warned != key)
++                    {
++                        warned = key;
++                        std::fprintf(stderr, "[disc] changer: %s is the program of another registered disc but the current disc also holds it; not switching\n", key.c_str());
++                    }
++            }
+             return true;
+         }
+         if (discs.size() < 2u || !changerArmedLocked()) return false;
+diff --git a/ps2xTest/src/ee_owner_tests21.cpp b/ps2xTest/src/ee_owner_tests21.cpp
+index 0c0d53f..03a2bd1 100644
+--- a/ps2xTest/src/ee_owner_tests21.cpp
++++ b/ps2xTest/src/ee_owner_tests21.cpp
+@@ -12,6 +12,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <stdexcept>
++#include <thread>
+ #include <string>
+ #include <vector>
+ 
+@@ -930,5 +931,43 @@ void register_ee_owner_tests21()
+             t.IsTrue(scheduler.currentExecutionOwner().lifetime > oldMain.lifetime,
+                      "reset after successful cleanup must establish a new ordinary lifetime");
+         });
++
++        tc.Run("postEventAfterCycles from a foreign thread queues for the next checkpoint instead of reading the cycle clock", [](TestCase &t)
++        {
++            Env env;
++            R5900Context main{};
++            main.pc = kReturnEntry;
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            scheduler.reset(env.ram.data(), main);
++            t.IsFalse(scheduler.checkpointDue(0u), "a freshly reset scheduler has no checkpoint pending");
++            // The thread that reset the scheduler owns the cycle clock: a far deadline is simply not due yet.
++            scheduler.postEventAfterCycles(EeEvent{EeEventType::ExternalWake, 1u, 1u}, 1000000000ull);
++            t.IsFalse(scheduler.checkpointDue(0u), "an executor-thread post keeps its cycle deadline");
++            std::thread foreign([&scheduler] {
++                scheduler.postEventAfterCycles(EeEvent{EeEventType::ExternalWake, 2u, 2u}, 1000000000ull);
++            });
++            foreign.join();
++            t.IsTrue(scheduler.checkpointDue(0u), "the foreign post becomes a pending event, not a deadline billions of cycles away");
++        });
++
++        tc.Run("a guest stack declaration inside the native SDK pools is refused", [](TestCase &t)
++        {
++            Env env;
++            R5900Context main{};
++            main.pc = kReturnEntry;
++            EeScheduler &scheduler = env.runtime.eeScheduler();
++            scheduler.reset(env.ram.data(), main);
++            EeThreadCreateParams params{};
++            params.entry = kReturnEntry;
++            params.priority = 10;
++            params.stackSize = 0x4000u;
++            params.stack = 0x00030000u;
++            bool refused = false;
++            try { (void)scheduler.createThread(params); }
++            catch (const std::runtime_error &) { refused = true; }
++            t.IsTrue(refused, "a stack inside the kernel-RAM pools must not be accepted");
++            params.stack = 0x00100000u;
++            t.IsTrue(scheduler.createThread(params) > 0, "a stack in user RAM is accepted");
++        });
+     });
+ }
+diff --git a/ps2xTest/src/ps2_disc_mount_tests.cpp b/ps2xTest/src/ps2_disc_mount_tests.cpp
+index e2380df..b2ead73 100644
+--- a/ps2xTest/src/ps2_disc_mount_tests.cpp
++++ b/ps2xTest/src/ps2_disc_mount_tests.cpp
+@@ -42,7 +42,8 @@ namespace
+         R5900Context cpu{};
+         PS2Runtime runtime;
+         PS2IopHostAdapter host{runtime};
+-        Env() { std::filesystem::create_directories(root); }
++        // A clock left behind by an earlier runtime would cache the identity check per "vsync" that never comes.
++        Env() { std::filesystem::create_directories(root); ps2_disc::setGuestClock(nullptr); }
+         ~Env()
+         {
+             // Explicitly unmount this fixture before restoring prior legacy paths.
+@@ -223,6 +224,23 @@ void register_ps2_disc_mount_tests()
+         t.IsFalse(ps2_disc::imageReadable(),"modified bytes require explicit SHA verification");
+         env.host.closeHostFile(old);
+     });
++    tc.Run("The image identity is re-checked once per guest vsync, not on every lookup", [](TestCase &t)
++    {
++        Env env; const auto image=env.root/"tick.iso", other=env.root/"tick-other.iso";
++        env.image(image,12u,3u,0x61u); env.image(other,12u,7u,0x62u);
++        const auto metadata=env.metadata(image,3u);
++        t.IsTrue(env.mount(image,metadata),"mount original image");
++        static uint64_t tick=100u;
++        ps2_disc::setGuestClock([]()->uint64_t{return tick;});
++        const uint64_t generation=ps2_disc::generation();
++        const auto timestamp=std::filesystem::last_write_time(image);
++        std::filesystem::last_write_time(other,timestamp);
++        std::filesystem::rename(other,image);
++        t.Equals(ps2_disc::generation(),generation,"within the same vsync the cached identity answers");
++        tick=101u;
++        t.IsTrue(ps2_disc::generation()!=generation,"the next vsync notices the replaced image");
++        ps2_disc::setGuestClock(nullptr);
++    });
+     tc.Run("Invalid metadata and missing/truncated configured images cannot fall back to loose files", [](TestCase &t)
+     {
+         Env env; const auto image=env.root/"small.iso"; env.image(image,12u,3u,0x44u);
+diff --git a/ps2xTest/src/ps2_invocation_stack_tests.cpp b/ps2xTest/src/ps2_invocation_stack_tests.cpp
+index 9226170..aa53ac5 100644
+--- a/ps2xTest/src/ps2_invocation_stack_tests.cpp
++++ b/ps2xTest/src/ps2_invocation_stack_tests.cpp
+@@ -180,7 +180,7 @@ namespace
+         EeScheduler &scheduler = runtime->eeScheduler();
+         EeThreadCreateParams wakeThread{};
+         wakeThread.entry = kWakeThreadEntry;
+-        wakeThread.stack = 0x0001A000u;
++        wakeThread.stack = 0x00002000u;
+         wakeThread.stackSize = 0x8000u;
+         wakeThread.priority = 10;
+         const int id = scheduler.createThread(wakeThread);
+@@ -434,7 +434,7 @@ namespace
+         writeU32(ram, kCheckedChildRuns, readU32(ram, kCheckedChildRuns) + 1u);
+         EeThreadCreateParams wake{};
+         wake.entry = kCheckedExternalWake;
+-        wake.stack = 0x0001A000u;
++        wake.stack = 0x00002000u;
+         wake.stackSize = 0x8000u;
+         wake.priority = 10;
+         const int id = runtime->eeScheduler().createThread(wake);
+@@ -460,7 +460,7 @@ namespace
+         {
+             EeThreadCreateParams wake{};
+             wake.entry = kWakeThreadEntry;
+-            wake.stack = 0x0001A000u;
++            wake.stack = 0x00002000u;
+             wake.stackSize = 0x8000u;
+             wake.priority = 10;
+             const int id = runtime->eeScheduler().createThread(wake);
+@@ -482,7 +482,7 @@ namespace
+                     kCheckedCalleeResume, PS2Runtime::GuestBranchKind::DirectCall, "failure before wait");
+             EeThreadCreateParams wake{};
+             wake.entry = kCheckedExternalWake;
+-            wake.stack = 0x0001A000u;
++            wake.stack = 0x00002000u;
+             wake.stackSize = 0x8000u;
+             wake.priority = 10;
+             const int id = runtime->eeScheduler().createThread(wake);
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 4139362..4610a6a 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -526,9 +526,9 @@ namespace
+             const int id = scheduler.createThread(params);
+             scheduler.startThread(id, 0u, *ctx, false);
+         };
+-        create(K_EVENT_FIFO_A, 0x21000u, 5);
+-        create(K_EVENT_FIFO_B, 0x22000u, 5);
+-        create(K_EVENT_FIFO_SIGNAL, 0x23000u, 10);
++        create(K_EVENT_FIFO_A, 0x71000u, 5);
++        create(K_EVENT_FIFO_B, 0x72000u, 5);
++        create(K_EVENT_FIFO_SIGNAL, 0x73000u, 10);
+         ctx->pc = 0u;
+     }
+ 
+@@ -647,9 +647,9 @@ void register_ps2_runtime_kernel_tests()
+             env.ctx.pc = K_SCHED_MAIN;
+             EeScheduler &ee = env.runtime.eeScheduler();
+             ee.reset(env.rdram.data(), env.ctx);
+-            const int lowA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 20, 0});
+-            const int highA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x21000u, 0x800u, 0, 5, 0});
+-            const int highB = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x22000u, 0x800u, 0, 5, 0});
++            const int lowA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x70000u, 0x800u, 0, 20, 0});
++            const int highA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x71000u, 0x800u, 0, 5, 0});
++            const int highB = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x72000u, 0x800u, 0, 5, 0});
+             ee.startThread(lowA, 0, env.ctx, false);
+             ee.startThread(highA, 0, env.ctx, false);
+             ee.startThread(highB, 0, env.ctx, false);
+@@ -675,7 +675,7 @@ void register_ps2_runtime_kernel_tests()
+             ee.reset(env.rdram.data(), env.ctx);
+             ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+ 
+-            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
++            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x74000u, 0x800u,
+                                                                  0u, 20, 0u});
+             t.Equals(ee.startThread(id, 0xCAFEu, env.ctx, false), KE_OK, "StartThread should make a dormant thread ready");
+             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Ready, "started thread should be in one ready queue");
+@@ -823,8 +823,8 @@ void register_ps2_runtime_kernel_tests()
+ 
+             EeScheduler &ee = env.runtime.eeScheduler();
+             ee.reset(env.rdram.data(), env.ctx);
+-            const int first = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+-            const int second = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 5, 0});
++            const int first = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x70000u, 0x800u, 0, 5, 0});
++            const int second = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x71000u, 0x800u, 0, 5, 0});
+             ee.startThread(first, 0, env.ctx, false);
+             ee.startThread(second, 0, env.ctx, false);
+             ee.run();
+@@ -846,8 +846,8 @@ void register_ps2_runtime_kernel_tests()
+ 
+             EeScheduler &ee = env.runtime.eeScheduler();
+             ee.reset(env.rdram.data(), env.ctx);
+-            const int low = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 20, 0});
+-            gSchedulerCreatedId = ee.createThread(EeThreadCreateParams{0, K_SCHED_HIGH, 0x21000u, 0x800u, 0, 5, 0});
++            const int low = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x70000u, 0x800u, 0, 20, 0});
++            gSchedulerCreatedId = ee.createThread(EeThreadCreateParams{0, K_SCHED_HIGH, 0x71000u, 0x800u, 0, 5, 0});
+             ee.startThread(low, 0, env.ctx, false);
+             ee.run();
+ 
+@@ -874,9 +874,9 @@ void register_ps2_runtime_kernel_tests()
+             EeScheduler &ee = env.runtime.eeScheduler();
+             ee.reset(env.rdram.data(), env.ctx);
+             gSchedulerSemaphoreId = ee.createSemaphore(0, 1, 0, 0);
+-            const int waiterA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+-            const int waiterB = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 5, 0});
+-            const int signaler = ee.createThread(EeThreadCreateParams{0, K_SCHED_SIGNAL, 0x22000u, 0x800u, 0, 20, 0});
++            const int waiterA = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x70000u, 0x800u, 0, 5, 0});
++            const int waiterB = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x71000u, 0x800u, 0, 5, 0});
++            const int signaler = ee.createThread(EeThreadCreateParams{0, K_SCHED_SIGNAL, 0x72000u, 0x800u, 0, 20, 0});
+             ee.startThread(waiterA, 0, env.ctx, false);
+             ee.startThread(waiterB, 0, env.ctx, false);
+             ee.startThread(signaler, 0, env.ctx, false);
+@@ -1126,6 +1126,31 @@ void register_ps2_runtime_kernel_tests()
+             t.Equals(setupSp & 0xFu, 0u, "SetupThread should always return a 16-byte aligned stack pointer");
+         });
+ 
++        tc.Run("SetupThread argv pointers keep the segment of the argument block address", [](TestCase &t)
++        {
++            TestEnv env;
++            const auto previous = PS2Runtime::guestArgs();
++            PS2Runtime::setGuestArgs({"cdrom0:\\GAME.ELF", "arg"});
++            constexpr uint32_t kBlock = 0x00300000u;
++            for (const uint32_t segment : {0x00000000u, 0x80000000u, 0xA0000000u})
++            {
++                std::memset(env.rdram.data() + kBlock, 0, 0x144u);
++                env.ctx.pc = 0x00100000u;
++                setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
++                setRegU32(env.ctx, 4, 0x0036A7F0u);
++                setRegU32(env.ctx, 5, 0xFFFFFFFFu);
++                setRegU32(env.ctx, 6, 0x00020000u);
++                setRegU32(env.ctx, 7, segment | kBlock);
++                t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime), "SetupThread dispatches");
++                uint32_t argc = 0u, argv0 = 0u;
++                std::memcpy(&argc, env.rdram.data() + kBlock, 4u);
++                std::memcpy(&argv0, env.rdram.data() + kBlock + 4u, 4u);
++                t.Equals(argc, 2u, "both arguments are stored");
++                t.Equals(argv0, segment | (kBlock + 0x44u), "argv[0] points into the block through the caller's segment");
++            }
++            PS2Runtime::setGuestArgs(previous);
++        });
++
+         tc.Run("SetupThread exposes stable main stack metadata through ReferThreadStatus", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.55.0
+

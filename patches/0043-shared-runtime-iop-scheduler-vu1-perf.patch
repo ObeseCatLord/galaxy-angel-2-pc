@@ -1,0 +1,403 @@
+From cf815d534ba5f5b920408ec7f7f1b62df674f34c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:03:34 -0500
+Subject: [PATCH] ga2: shared runtime option for fast builds, IOP scheduler
+ walk, VU1 perf counters
+
+- PS2X_RUNTIME_SHARED builds ps2_runtime as a shared library (PIC
+  everywhere, Granite PIC, -Bsymbolic-functions, no relink of executables
+  on library changes). A runtime/IOP .cpp change now rebuilds one library
+  instead of relinking five ~400 MB recompiled executables.
+- The program's function table symbols are weak references from the
+  runtime, so tools without a program (and a shared runtime) still load.
+- IOP scheduler: per-timeslice walks use an id-ordered thread vector
+  instead of the std::map (10% of CPU in a VU-heavy scene), wake and select
+  in one pass, dead-thread cleanup only when a thread died.
+- GA2_PERF also reports VU1 runs, VU cycles and host time per second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |  8 ++++
+ ps2xIOP/src/emulator/core/iop_kernel.cpp      | 39 ++++++++++++-------
+ ps2xIOP/src/emulator/core/iop_kernel.h        |  5 +++
+ ps2xRuntime/CMakeLists.txt                    | 17 +++++++-
+ ps2xRuntime/include/ps2_runtime.h             | 15 +++++--
+ ps2xRuntime/include/runtime/ps2_vu1.h         |  7 ++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |  9 ++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  3 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp       | 31 +++++++++++++++
+ ps2xRuntime/src/runner/register_functions.cpp |  4 +-
+ ps2xTest/CMakeLists.txt                       |  4 ++
+ ps2xTest/src/test_function_table.cpp          | 11 ++++--
+ 12 files changed, 125 insertions(+), 28 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c7c7af5..dd0a14d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,6 +17,14 @@ option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
+ option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
+ option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
+ option(PS2X_BUILD_TEST "Build ps2xTest" ON)
++# Shared ps2_runtime: changing the runtime relinks one library instead of
++# every (very large) recompiled game executable.
++option(PS2X_RUNTIME_SHARED "Build ps2_runtime as a shared library" OFF)
++if(PS2X_RUNTIME_SHARED)
++    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++    # Executables need not relink when only the runtime library changes.
++    set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
++endif()
+ option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
+ 
+ if(ANDROID)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 75b7f97..be0c265 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -45,9 +45,17 @@ namespace ps2x::iop::detail
+         return m_nextRpcLifetimeGeneration++;
+     }
+ 
++    void IopKernel::rebuildThreadList()
++    {
++        m_threadList.clear();
++        for (auto &[id, thread] : m_threads)
++            m_threadList.push_back(&thread);
++    }
++
+     void IopKernel::reset()
+     {
+         m_threads.clear();
++        m_threadList.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+         m_nextThreadId = 1;
+@@ -94,6 +102,7 @@ namespace ps2x::iop::detail
+             }
+             const int id = thread.id;
+             m_threads.emplace(id, std::move(thread));
++            rebuildThreadList();
+             setV0(id);
+             return true;
+         }
+@@ -109,6 +118,7 @@ namespace ps2x::iop::detail
+             if (it->second.stackBase != 0u)
+                 (void)m_memory.freeAllocation(it->second.stackBase);
+             m_threads.erase(it);
++            rebuildThreadList();
+             setV0(0);
+             return true;
+         }
+@@ -817,20 +827,15 @@ namespace ps2x::iop::detail
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        for (auto &[id, thread] : m_threads)
+-        {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
+-        }
+-
++        // One pass: wake expired delays and pick the highest-priority ready
++        // thread (lowest priority value, then lowest id).
+         IopThread *next = nullptr;
+-        for (auto &[id, thread] : m_threads)
++        for (IopThread *thread : m_threadList)
+         {
+-            if (thread.state != IopThreadState::Ready)
+-                continue;
+-            if (next == nullptr || thread.priority < next->priority ||
+-                (thread.priority == next->priority && thread.id < next->id))
+-                next = &thread;
++            if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
++                thread->state = IopThreadState::Ready;
++            if (thread->state == IopThreadState::Ready && (next == nullptr || thread->priority < next->priority))
++                next = thread; // id order: the first of equal priority wins
+         }
+         if (next == nullptr)
+             return nullptr;
+@@ -845,10 +850,10 @@ namespace ps2x::iop::detail
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
+         uint64_t nextWake = fallback;
+-        for (const auto &[id, thread] : m_threads)
++        for (const IopThread *thread : m_threadList)
+         {
+-            if (thread.state == IopThreadState::Delay)
+-                nextWake = std::min(nextWake, thread.wakeCycle);
++            if (thread->state == IopThreadState::Delay)
++                nextWake = std::min(nextWake, thread->wakeCycle);
+         }
+         return nextWake;
+     }
+@@ -865,6 +870,9 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
++        if (std::none_of(m_threadList.begin(), m_threadList.end(),
++                         [](const IopThread *thread) { return thread->state == IopThreadState::Dead; }))
++            return;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -876,6 +884,7 @@ namespace ps2x::iop::detail
+                 (void)m_memory.freeAllocation(thread->second.stackBase);
+             thread = m_threads.erase(thread);
+         }
++        rebuildThreadList();
+     }
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index de7cd07..4c86d50 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <vector>
+ #include <optional>
+ 
+ namespace ps2x::iop::detail
+@@ -147,6 +148,10 @@ namespace ps2x::iop::detail
+ 
+         IopMemory &m_memory;
+         std::map<int, IopThread> m_threads;
++        // m_threads in id order, for the per-timeslice scheduler walks (map
++        // node pointers are stable); rebuilt whenever a thread is added/removed.
++        std::vector<IopThread *> m_threadList;
++        void rebuildThreadList();
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         uint32_t m_nextThreadId = 1;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index a8b8d43..3c4990c 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -375,7 +375,12 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
+     )
+ endfunction()
+ 
+-add_library(ps2_runtime STATIC
++if(PS2X_RUNTIME_SHARED)
++    set(PS2X_RUNTIME_LIBRARY_TYPE SHARED)
++else()
++    set(PS2X_RUNTIME_LIBRARY_TYPE STATIC)
++endif()
++add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/game_overrides.cpp
+     src/lib/gs/ps2_gif_arbiter.cpp
+     src/lib/ps2_audio.cpp
+@@ -521,12 +526,22 @@ if(TARGET OpenSSL::Crypto)
+     target_compile_definitions(ps2_runtime PRIVATE PS2X_DISC_SHA256=1)
+ endif()
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++if(PS2X_RUNTIME_SHARED AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++    # Calls inside the library stay direct; the function table symbols come
++    # from the executable at load time.
++    target_compile_options(ps2_runtime PRIVATE -fno-semantic-interposition)
++    target_link_options(ps2_runtime PRIVATE "LINKER:-Bsymbolic-functions")
++endif()
+ 
+ # paraLLEl-GS (Vulkan compute GS, LGPL-3.0+): built standalone from an external
+ # checkout when PS2X_PGS_DIR points at it.
+ set(PS2X_PGS_DIR "" CACHE PATH "paraLLEl-GS checkout (with Granite) for the GPU GS")
+ if(PS2X_PGS_DIR AND EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt")
+     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    if(PS2X_RUNTIME_SHARED)
++        # Granite forces non-PIC objects unless asked; a shared runtime needs PIC.
++        set(GRANITE_POSITION_INDEPENDENT ON CACHE BOOL "" FORCE)
++    endif()
+     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+     target_link_libraries(ps2_runtime PRIVATE parallel-gs)
+     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_PGS=1)
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 11b8fec..46e6f75 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -593,9 +593,16 @@ private:
+ };
+ 
+ // Generated by ps2xRecomp in ps2xRuntime/src/runner/register_functions.cpp.
+-extern const uint32_t g_ps2RecompiledFunctionTableBase;
+-extern const uint32_t g_ps2RecompiledFunctionTableEnd;
+-extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
+-extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
++// Defined by the recompiled program. Weak so tools that link the runtime
++// without a program (and a shared runtime) still load.
++#if defined(__GNUC__) || defined(__clang__)
++#define PS2X_PROGRAM_SYMBOL __attribute__((weak))
++#else
++#define PS2X_PROGRAM_SYMBOL
++#endif
++extern const uint32_t g_ps2RecompiledFunctionTableBase PS2X_PROGRAM_SYMBOL;
++extern const uint32_t g_ps2RecompiledFunctionTableEnd PS2X_PROGRAM_SYMBOL;
++extern const uint32_t g_ps2RecompiledFunctionTableSlotCount PS2X_PROGRAM_SYMBOL;
++extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[] PS2X_PROGRAM_SYMBOL;
+ 
+ #endif // PS2_RUNTIME_H
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 2fda642..2c41c9d 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -260,6 +260,13 @@ private:
+     uint64_t m_nextCommitCycle = ~0ull;
+     void noteReady(uint64_t cycle) { if (cycle < m_nextCommitCycle) m_nextCommitCycle = cycle; }
+     void commitReadyPipelinesSlow();
++
++public:
++    struct PerfSample { uint64_t runs, cycles, nanos; };
++    // Counters since the previous call (only collected with GA2_PERF).
++    static PerfSample takePerfSample();
++
++private:
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
+     uint32_t m_currentUpperInstruction = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 8b27a6b..f192a30 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2371,10 +2371,15 @@ void EeScheduler::processEvent(const EeEvent &event)
+                 const double seconds = std::chrono::duration<double>(now - last).count();
+                 if (seconds >= 5.0)
+                 {
+-                    std::fprintf(stderr, "[ga2 perf] vsync=%llu rate=%.2f/s (%.0f%% speed)\n",
++                    const auto vu1 = VU1Interpreter::takePerfSample();
++                    std::fprintf(stderr, "[ga2 perf] vsync=%llu rate=%.2f/s (%.0f%% speed) vu1: %.0f runs/s, "
++                                         "%.1f Mcycles/s, %.0f ms/s host, %.2f ns/cycle\n",
+                                  static_cast<unsigned long long>(m_vsyncTick),
+                                  static_cast<double>(m_vsyncTick - lastTick) / seconds,
+-                                 100.0 * static_cast<double>(m_vsyncTick - lastTick) / seconds / 59.94);
++                                 100.0 * static_cast<double>(m_vsyncTick - lastTick) / seconds / 59.94,
++                                 double(vu1.runs) / seconds, double(vu1.cycles) / seconds / 1e6,
++                                 double(vu1.nanos) / seconds / 1e6,
++                                 vu1.cycles ? double(vu1.nanos) / double(vu1.cycles) : 0.0);
+                     last = now;
+                     lastTick = m_vsyncTick;
+                 }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bf2e723..1a8a783 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1335,7 +1335,8 @@ namespace
+ {
+     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
+     {
+-        if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
++        if ((address & 3u) != 0u || &g_ps2RecompiledFunctionTableSlotCount == nullptr ||
++            g_ps2RecompiledFunctionTableSlotCount == 0u)
+         {
+             return false;
+         }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 45e8ab7..7303208 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -11,6 +11,8 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
+@@ -973,10 +975,39 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+         captureEnd(vuData, dataSize);
+ }
+ 
++namespace
++{
++    // GA2_PERF: VU1 microprogram runs, VU cycles and host time since last read.
++    const bool g_vu1Perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++    std::atomic<uint64_t> g_vu1Runs{0}, g_vu1Cycles{0}, g_vu1Nanos{0};
++}
++
++VU1Interpreter::PerfSample VU1Interpreter::takePerfSample()
++{
++    return {g_vu1Runs.exchange(0), g_vu1Cycles.exchange(0), g_vu1Nanos.exchange(0)};
++}
++
+ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    const auto perfStart = g_vu1Perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++    const uint64_t perfCycle = m_cycle;
++    struct PerfScope
++    {
++        const std::chrono::steady_clock::time_point start;
++        const uint64_t cycle;
++        const uint64_t &now;
++        ~PerfScope()
++        {
++            if (!g_vu1Perf) return;
++            g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
++            g_vu1Cycles.fetch_add(now - cycle, std::memory_order_relaxed);
++            g_vu1Nanos.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                     std::chrono::steady_clock::now() - start).count()),
++                                 std::memory_order_relaxed);
++        }
++    } perfScope{perfStart, perfCycle, m_cycle};
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+diff --git a/ps2xRuntime/src/runner/register_functions.cpp b/ps2xRuntime/src/runner/register_functions.cpp
+index 85cc2e3..dd2dabf 100644
+--- a/ps2xRuntime/src/runner/register_functions.cpp
++++ b/ps2xRuntime/src/runner/register_functions.cpp
+@@ -3,5 +3,5 @@
+ 
+ extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x00000000u;
+ extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x01000000u;
+-extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) >> 2;
+-PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[g_ps2RecompiledFunctionTableSlotCount] = {};
+\ No newline at end of file
++extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = 0x01000000u >> 2;
++PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[0x01000000u >> 2] = {};
+\ No newline at end of file
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 2aeaa1c..9e9d326 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -131,3 +131,7 @@ add_executable(ga2_vu1_replay src/ga2_vu1_replay.cpp)
+ target_link_libraries(ga2_vu1_replay PRIVATE ps2_runtime)
+ add_executable(ga2_vu1_gen src/ga2_vu1_gen.cpp)
+ target_link_libraries(ga2_vu1_gen PRIVATE ps2_runtime)
++
++if(PS2X_RUNTIME_SHARED)
++    target_link_options(ps2x_tests PRIVATE "LINKER:--export-dynamic-symbol=g_ps2RecompiledFunctionTable*")
++endif()
+diff --git a/ps2xTest/src/test_function_table.cpp b/ps2xTest/src/test_function_table.cpp
+index be6a888..833644b 100644
+--- a/ps2xTest/src/test_function_table.cpp
++++ b/ps2xTest/src/test_function_table.cpp
+@@ -4,15 +4,20 @@
+ #include <algorithm>
+ 
+ // For Unit tests link ps2_runtime without the generated runner source.
++namespace
++{
++    constexpr uint32_t kSlotCount = PS2_RAM_SIZE >> 2;
++}
++
+ extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x00000000u;
+ extern const uint32_t g_ps2RecompiledFunctionTableEnd = PS2_RAM_SIZE;
+-extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) >> 2;
++extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = kSlotCount;
+ 
+-PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[g_ps2RecompiledFunctionTableSlotCount] = {};
++PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[kSlotCount] = {};
+ 
+ void reset_ps2_test_function_table()
+ {
+     std::fill(g_ps2RecompiledFunctionTable,
+-              g_ps2RecompiledFunctionTable + g_ps2RecompiledFunctionTableSlotCount,
++              g_ps2RecompiledFunctionTable + kSlotCount,
+               nullptr);
+ }
+-- 
+2.55.0
+

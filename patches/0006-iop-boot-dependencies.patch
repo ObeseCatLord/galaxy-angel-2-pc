@@ -1,0 +1,928 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f33df44..8ad8184 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -66,6 +66,11 @@ if(PS2X_IOP_BUILD_TESTS)
+     target_link_libraries(ps2_iop_module_start_tests PRIVATE ps2_iop)
+     add_test(NAME ps2_iop_module_start_tests COMMAND ps2_iop_module_start_tests)
+ 
++    add_executable(ps2_iop_ioman_tests tests/iop_ioman_tests.cpp)
++    target_link_libraries(ps2_iop_ioman_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_ioman_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_ioman_tests COMMAND ps2_iop_ioman_tests)
++
+ endif()
+ 
+ install(TARGETS ps2_iop
+diff --git a/ps2xIOP/include/ps2x/iop/iop_types.h b/ps2xIOP/include/ps2x/iop/iop_types.h
+index 3491440..be0ad65 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_types.h
++++ b/ps2xIOP/include/ps2x/iop/iop_types.h
+@@ -125,6 +125,7 @@ namespace ps2x::iop
+         uint32_t sourceAddress = 0;
+         uint32_t destinationAddress = 0;
+         uint32_t size = 0;
++        uint32_t attributes = 0; // Original DMA flags; command provenance must survive transport.
+     };
+ 
+     struct DebugMetric
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..d184508 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -31,6 +31,7 @@ namespace ps2x::iop::detail
+         m_nextThreadId = 1;
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
++        m_systemStatusEventFlag = 0;
+         m_currentThread = nullptr;
+     }
+ 
+@@ -292,8 +293,10 @@ namespace ps2x::iop::detail
+             setV0(0);
+             return true;
+         }
+-        case 41:
+-            setV0(0);
++        case 41: // GetSystemStatusFlag: a shared event, not its current bits.
++            if (m_systemStatusEventFlag == 0 || !m_eventFlags.contains(m_systemStatusEventFlag))
++                m_systemStatusEventFlag = createInternalEventFlag(2u, 0u, 0u); // EA_MULTI
++            setV0(m_systemStatusEventFlag);
+             return true;
+         default:
+             return false;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..7816785 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -98,6 +98,7 @@ namespace ps2x::iop::detail
+         uint32_t m_nextThreadId = 1;
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
++        int m_systemStatusEventFlag = 0;
+         IopThread *m_currentThread = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+index da3be3b..f500211 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -42,17 +42,19 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 6: // EnableIntr
+-            m_enabled[static_cast<int>(a0)] = true;
+-            if (a0 < 32u)
+-                m_memory.setInterruptMask(m_memory.interruptMask() | (1u << a0));
++            // The low byte selects the IRQ; upper bits describe DMA modes.
++            // Original SIFCMD enables IRQ43 with 0x200 | 43.
++            m_enabled[static_cast<int>(a0 & 0xFFu)] = true;
++            if ((a0 & 0xFFu) < 32u)
++                m_memory.setInterruptMask(m_memory.interruptMask() | (1u << (a0 & 0xFFu)));
+             setV0(0u);
+             return true;
+         case 7: // DisableIntr
+             if (a1 != 0u)
+                 m_memory.write32(a1, a0);
+-            if (a0 < 32u)
+-                m_memory.setInterruptMask(m_memory.interruptMask() & ~(1u << a0));
+-            m_enabled[static_cast<int>(a0)] = false;
++            if ((a0 & 0xFFu) < 32u)
++                m_memory.setInterruptMask(m_memory.interruptMask() & ~(1u << (a0 & 0xFFu)));
++            m_enabled[static_cast<int>(a0 & 0xFFu)] = false;
+             setV0(0u);
+             return true;
+         case 8: // CpuDisableIntr
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 3eb4119..d6dbc23 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -3,24 +3,105 @@
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
++#include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
++#include <cctype>
++#include <limits>
++#include <string_view>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+-    IopIoman::IopIoman(IopMemory &memory) noexcept
+-        : m_memory(memory)
++    namespace
+     {
++        constexpr size_t kMaxDevices = 16u;
++        constexpr size_t kMaxDescriptors = 16u;
++        constexpr size_t kMaxPathLength = 1024u;
++
++        constexpr int32_t kErrorIo = -5;
++        constexpr int32_t kErrorBadFile = -9;
++        constexpr int32_t kErrorFault = -14;
++        constexpr int32_t kErrorInvalid = -22;
++        constexpr int32_t kErrorTooManyFiles = -24;
++        constexpr int32_t kErrorReadOnly = -30;
++        constexpr int32_t kErrorUnsupported = -48;
++        constexpr int32_t kErrorNoEntry = -2;
++
++        constexpr uint32_t kOpenReadOnly = 0x0001u;
++        constexpr uint32_t kOpenWriteOnly = 0x0002u;
++        constexpr uint32_t kOpenReadWrite = 0x0003u;
++        constexpr uint32_t kOpenNonBlocking = 0x0010u;
++        constexpr uint32_t kOpenAppend = 0x0100u;
++        constexpr uint32_t kOpenCreate = 0x0200u;
++        constexpr uint32_t kOpenTruncate = 0x0400u;
++        constexpr uint32_t kOpenExclusive = 0x0800u;
++        constexpr uint32_t kOpenNoWait = 0x8000u;
++        constexpr uint32_t kOpenKnownFlags = kOpenReadWrite | kOpenNonBlocking | kOpenAppend |
++                                             kOpenCreate | kOpenTruncate | kOpenExclusive | kOpenNoWait;
++
++        constexpr int32_t kSeekSet = 0;
++        constexpr int32_t kSeekCur = 1;
++        constexpr int32_t kSeekEnd = 2;
++
++        std::string canonicalDeviceName(std::string_view name)
++        {
++            std::string result(name);
++            std::transform(result.begin(), result.end(), result.begin(), [](unsigned char value)
++                           { return static_cast<char>(std::tolower(value)); });
++            while (!result.empty() && std::isdigit(static_cast<unsigned char>(result.back())) != 0)
++                result.pop_back();
++            return result;
++        }
++    }
++
++    IopIoman::IopIoman(IopHost &host, IopMemory &memory) noexcept
++        : m_host(host), m_memory(memory)
++    {
++    }
++
++    IopIoman::~IopIoman()
++    {
++        reset();
+     }
+ 
+     void IopIoman::reset()
+     {
++        for (const Descriptor &descriptor : m_descriptors)
++            if (descriptor.hostHandle != 0u)
++                m_host.closeHostFile(descriptor.hostHandle);
++        m_descriptors.clear();
+         m_devices.clear();
+     }
+ 
++    bool IopIoman::readGuestPath(uint32_t address, std::string &path) const
++    {
++        path.clear();
++        if (address == 0u)
++            return false;
++
++        for (uint32_t index = 0u; index < kMaxPathLength; ++index)
++        {
++            if (address > std::numeric_limits<uint32_t>::max() - index ||
++                !m_memory.ownsRamRange(address + index, 1u))
++                return false;
++            const char value = static_cast<char>(m_memory.read8(address + index));
++            if (value == '\0')
++                return true;
++            path.push_back(value);
++        }
++        return false;
++    }
++
++    bool IopIoman::hasRegisteredDevice(std::string_view deviceName) const
++    {
++        const std::string wanted = canonicalDeviceName(deviceName);
++        return std::any_of(m_devices.begin(), m_devices.end(), [&](const Device &device)
++                           { return canonicalDeviceName(device.name) == wanted; });
++    }
++
+     bool IopIoman::dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor)
+     {
+-        constexpr size_t kMaxDevices = 16u;
+         const uint32_t a0 = cpu.gpr[4];
+         const auto setV0 = [&](uint32_t value)
+         {
+@@ -29,6 +110,182 @@ namespace ps2x::iop::detail
+ 
+         switch (ordinal)
+         {
++        case 4: // open
++        {
++            std::string guestPath;
++            if (!readGuestPath(a0, guestPath))
++            {
++                setV0(static_cast<uint32_t>(kErrorFault));
++                return true;
++            }
++
++            const uint32_t flags = cpu.gpr[5];
++            if ((flags & ~kOpenKnownFlags) != 0u || (flags & kOpenReadWrite) == 0u ||
++                (flags & kOpenNonBlocking) != 0u || (flags & kOpenNoWait) != 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorInvalid));
++                return true;
++            }
++            if ((flags & kOpenReadWrite) != kOpenReadOnly ||
++                (flags & (kOpenAppend | kOpenCreate | kOpenTruncate | kOpenExclusive)) != 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorReadOnly));
++                return true;
++            }
++
++            const ParsedPs2Path parsed = parsePs2Path(guestPath);
++            if (!parsed || parsed.device == Ps2PathDevice::NativeHost)
++            {
++                setV0(static_cast<uint32_t>(kErrorInvalid));
++                return true;
++            }
++            if (hasRegisteredDevice(parsed.deviceName))
++            {
++                // The original ioman passes an iop_file_t to this driver's
++                // callbacks. That ABI is not emulated yet, so never bypass it.
++                setV0(static_cast<uint32_t>(kErrorUnsupported));
++                return true;
++            }
++            auto slot = std::find_if(m_descriptors.begin(), m_descriptors.end(),
++                                     [](const Descriptor &descriptor)
++                                     { return descriptor.hostHandle == 0u; });
++            if (slot == m_descriptors.end() && m_descriptors.size() >= kMaxDescriptors)
++            {
++                setV0(static_cast<uint32_t>(kErrorTooManyFiles));
++                return true;
++            }
++
++            const std::string hostPath = m_host.translateGuestPath(guestPath);
++            if (hostPath.empty())
++            {
++                setV0(static_cast<uint32_t>(kErrorNoEntry));
++                return true;
++            }
++            const uint64_t hostHandle = m_host.openHostFile(hostPath);
++            if (hostHandle == 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorNoEntry));
++                return true;
++            }
++
++            uint64_t size = 0u;
++            if (!m_host.hostFileSize(hostHandle, size))
++            {
++                m_host.closeHostFile(hostHandle);
++                setV0(static_cast<uint32_t>(kErrorIo));
++                return true;
++            }
++
++            if (slot == m_descriptors.end())
++            {
++                m_descriptors.push_back({hostHandle, 0u, size});
++                slot = m_descriptors.end() - 1;
++            }
++            else
++            {
++                *slot = {hostHandle, 0u, size};
++            }
++            setV0(static_cast<uint32_t>(slot - m_descriptors.begin()));
++            return true;
++        }
++        case 5: // close
++        {
++            const int32_t descriptor = static_cast<int32_t>(a0);
++            if (descriptor < 0 || static_cast<size_t>(descriptor) >= m_descriptors.size() ||
++                m_descriptors[descriptor].hostHandle == 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorBadFile));
++                return true;
++            }
++            m_host.closeHostFile(m_descriptors[descriptor].hostHandle);
++            m_descriptors[descriptor] = {};
++            setV0(0u);
++            return true;
++        }
++        case 6: // read
++        {
++            const int32_t descriptor = static_cast<int32_t>(a0);
++            const uint32_t destination = cpu.gpr[5];
++            const uint32_t count = cpu.gpr[6];
++            if (descriptor < 0 || static_cast<size_t>(descriptor) >= m_descriptors.size() ||
++                m_descriptors[descriptor].hostHandle == 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorBadFile));
++                return true;
++            }
++            if (count != 0u && !m_memory.ownsRamRange(destination, count))
++            {
++                setV0(static_cast<uint32_t>(kErrorFault));
++                return true;
++            }
++
++            Descriptor &entry = m_descriptors[descriptor];
++            if (count == 0u || entry.offset >= entry.size)
++            {
++                setV0(0u);
++                return true;
++            }
++            const size_t wanted = static_cast<size_t>(std::min<uint64_t>(count, entry.size - entry.offset));
++            std::vector<uint8_t> bytes(wanted);
++            size_t bytesRead = 0u;
++            if (!m_host.readHostFile(entry.hostHandle, entry.offset, bytes.data(), wanted, bytesRead) ||
++                bytesRead > wanted)
++            {
++                setV0(static_cast<uint32_t>(kErrorIo));
++                return true;
++            }
++            if (bytesRead != 0u && !m_memory.writeRam(destination, bytes.data(), bytesRead))
++            {
++                setV0(static_cast<uint32_t>(kErrorFault));
++                return true;
++            }
++            entry.offset += bytesRead;
++            setV0(static_cast<uint32_t>(bytesRead));
++            return true;
++        }
++        case 8: // lseek
++        {
++            const int32_t descriptor = static_cast<int32_t>(a0);
++            if (descriptor < 0 || static_cast<size_t>(descriptor) >= m_descriptors.size() ||
++                m_descriptors[descriptor].hostHandle == 0u)
++            {
++                setV0(static_cast<uint32_t>(kErrorBadFile));
++                return true;
++            }
++
++            const int32_t offset = static_cast<int32_t>(cpu.gpr[5]);
++            const int32_t whence = static_cast<int32_t>(cpu.gpr[6]);
++            const Descriptor &entry = m_descriptors[descriptor];
++            uint64_t base = 0u;
++            switch (whence)
++            {
++            case kSeekSet:
++                break;
++            case kSeekCur:
++                base = entry.offset;
++                break;
++            case kSeekEnd:
++                base = entry.size;
++                break;
++            default:
++                setV0(static_cast<uint32_t>(kErrorInvalid));
++                return true;
++            }
++            if (base > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
++                (offset < 0 && base < static_cast<uint64_t>(-static_cast<int64_t>(offset))) ||
++                (offset > 0 && base > static_cast<uint64_t>(std::numeric_limits<int32_t>::max() - offset)))
++            {
++                setV0(static_cast<uint32_t>(kErrorInvalid));
++                return true;
++            }
++
++            const uint64_t next = offset < 0
++                                      ? base - static_cast<uint64_t>(-static_cast<int64_t>(offset))
++                                      : base + static_cast<uint64_t>(offset);
++            m_descriptors[descriptor].offset = next;
++            setV0(static_cast<uint32_t>(next));
++            return true;
++        }
+         case 20: // AddDrv
+         {
+             if (a0 == 0u || m_devices.size() >= kMaxDevices)
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.h b/ps2xIOP/src/emulator/imports/iop_ioman.h
+index 182f786..dbe83d1 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.h
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.h
+@@ -1,7 +1,10 @@
+ #pragma once
+ 
++#include "ps2x/iop/iop_host.h"
++
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -13,7 +16,11 @@ namespace ps2x::iop::detail
+     class IopIoman
+     {
+     public:
+-        explicit IopIoman(IopMemory &memory) noexcept;
++        IopIoman(IopHost &host, IopMemory &memory) noexcept;
++        ~IopIoman();
++
++        IopIoman(const IopIoman &) = delete;
++        IopIoman &operator=(const IopIoman &) = delete;
+ 
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+@@ -26,7 +33,19 @@ namespace ps2x::iop::detail
+             std::string name;
+         };
+ 
++        struct Descriptor
++        {
++            uint64_t hostHandle = 0u;
++            uint64_t offset = 0u;
++            uint64_t size = 0u;
++        };
++
++        [[nodiscard]] bool readGuestPath(uint32_t address, std::string &path) const;
++        [[nodiscard]] bool hasRegisteredDevice(std::string_view deviceName) const;
++
++        IopHost &m_host;
+         IopMemory &m_memory;
+         std::vector<Device> m_devices;
++        std::vector<Descriptor> m_descriptors;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 8cf082f..85cfd5c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -106,7 +106,7 @@ namespace ps2x::iop::detail
+               heaplib(memory),
+               intrman(memory),
+               timrman(),
+-              ioman(memory),
++              ioman(host, memory),
+               cpuCore(memory),
+               imports(memory),
+               loadcore(memory, imports)
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index c99f786..26456d8 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "emulator/core/iop_memory.h"
+ #include "emulator/imports/iop_cdvd.h"
+ #include "emulator/imports/iop_imports.h"
++#include "emulator/imports/iop_intrman.h"
+ #include "emulator/imports/iop_loadcore.h"
+ #include "emulator/imports/iop_timrman.h"
+ #include "emulator/services/iop_rpc.h"
+@@ -207,6 +208,75 @@ namespace
+                expect(static_cast<int32_t>(cpu.gpr[2]) == expected, "PollEventFlag returned an unexpected result");
+     }
+ 
++    bool testFlaggedDmaInterrupt()
++    {
++        IopMemory memory;
++        IopIntrman intrman(memory);
++        RecordingExecutor executor;
++        IopCpuState cpu{};
++        cpu.gpr[4] = 43u;
++        cpu.gpr[5] = 1u;
++        cpu.gpr[6] = 0x1000u;
++        cpu.gpr[7] = 0x2000u;
++        cpu.gpr[28] = 0x3000u;
++        if (!expect(intrman.dispatchImport(4u, cpu, executor), "DMA IRQ registration unhandled")) return false;
++        cpu = {};
++        cpu.gpr[4] = 0x22Bu;
++        if (!expect(intrman.dispatchImport(6u, cpu, executor), "flagged DMA IRQ enable unhandled") ||
++            !expect(intrman.dispatchInterrupt(43, executor) && executor.calls == 1u &&
++                    executor.lastAddress == 0x1000u && executor.lastArgument == 0x2000u &&
++                    executor.lastGp == 0x3000u, "DMA modes changed handler identity/GP")) return false;
++        if (!expect(!intrman.dispatchInterrupt(0x22B, executor), "mode bits became another IRQ")) return false;
++        cpu = {};
++        cpu.gpr[4] = 0x22Bu;
++        if (!expect(intrman.dispatchImport(7u, cpu, executor) && !intrman.dispatchInterrupt(43, executor),
++                    "flagged disable left DMA callback enabled")) return false;
++        cpu.gpr[4] = 43u;
++        if (!expect(intrman.dispatchImport(6u, cpu, executor) && intrman.dispatchInterrupt(43, executor),
++                    "plain enable did not share flagged IRQ state")) return false;
++        intrman.reset();
++        return expect(!intrman.dispatchInterrupt(43, executor), "reset retained DMA callback");
++    }
++
++    bool testSystemStatusEvent()
++    {
++        IopMemory memory;
++        IopKernel kernel(memory);
++        kernel.reset();
++        const int userEvent = kernel.createInternalEventFlag(0u, 0u, 0x55u);
++        IopCpuState cpu{};
++        if (!expect(kernel.dispatchThreadImport(41u, cpu, 0u), "system status import unhandled")) return false;
++        const int systemEvent = int(cpu.gpr[2]);
++        if (!expect(systemEvent > 0 && systemEvent != userEvent,
++                    "system status flag is not an independent event")) return false;
++        if (!pollEvent(kernel, systemEvent, 0x100u, 0x2000u, -418)) return false;
++        if (!expect(kernel.setInternalEventFlag(systemEvent, 0x900u), "system status event rejected bits")) return false;
++        cpu = {};
++        if (!expect(kernel.dispatchThreadImport(41u, cpu, 0u) && int(cpu.gpr[2]) == systemEvent,
++                    "system status callers do not share one event")) return false;
++        if (!pollEvent(kernel, systemEvent, 0x900u, 0x2000u, 0) ||
++            !expect(memory.read32(0x2000u) == 0x900u, "system status bits do not reach event API")) return false;
++        cpu = {};
++        cpu.gpr[4] = uint32_t(systemEvent);
++        cpu.gpr[5] = ~0x100u;
++        if (!expect(kernel.dispatchEventImport(8u, cpu), "system status clear unhandled") ||
++            !pollEvent(kernel, systemEvent, 0x100u, 0x2000u, -418) ||
++            !pollEvent(kernel, systemEvent, 0x800u, 0x2000u, 0)) return false;
++        kernel.reset();
++        cpu = {};
++        if (!expect(kernel.dispatchThreadImport(41u, cpu, 0u), "system status unavailable after reset")) return false;
++        const int resetEvent = int(cpu.gpr[2]);
++        if (!pollEvent(kernel, resetEvent, 0x800u, 0x2000u, -418)) return false;
++        cpu = {};
++        cpu.gpr[4] = uint32_t(resetEvent);
++        if (!expect(kernel.dispatchEventImport(5u, cpu) && cpu.gpr[2] == 0u,
++                    "test event deletion failed")) return false;
++        cpu = {};
++        return expect(kernel.dispatchThreadImport(41u, cpu, 0u) && cpu.gpr[2] > 0u &&
++                      int(cpu.gpr[2]) != resetEvent,
++                      "deleted system event left a stale cached handle");
++    }
++
+     bool testCdvdSpecialControl()
+     {
+         NullHost host;
+@@ -558,7 +628,7 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testCdvdReadBufferOwnership() || !testDvdSectorTransfer() || !testCdvdSubcommandFifo() || !testTimrmanPeriodicCallback())
++        !testCdvdReadBufferOwnership() || !testDvdSectorTransfer() || !testCdvdSubcommandFifo() || !testSystemStatusEvent() || !testFlaggedDmaInterrupt() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+new file mode 100644
+index 0000000..71563b6
+--- /dev/null
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -0,0 +1,353 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_ioman.h"
++#include "emulator/services/iop_rpc.h"
++#include "ps2x/iop/iop_host.h"
++
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++
++    constexpr int32_t kErrorBadFile = -9;
++    constexpr int32_t kErrorFault = -14;
++    constexpr int32_t kErrorInvalid = -22;
++    constexpr int32_t kErrorReadOnly = -30;
++    constexpr int32_t kErrorUnsupported = -48;
++    constexpr int32_t kErrorNoEntry = -2;
++
++    class Host final : public IopHost
++    {
++    public:
++        struct File
++        {
++            std::vector<uint8_t> bytes;
++            bool shortRead = false;
++            bool failRead = false;
++        };
++
++        bool readGuest(uint32_t, void *, size_t) const override { return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { return false; }
++        bool zeroGuest(uint32_t, size_t) override { return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 0u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind) const override { return {}; }
++        std::string translateGuestPath(std::string_view path) const override
++        {
++            ++translateCalls;
++            const auto found = translations.find(std::string(path));
++            return found == translations.end() ? std::string{} : found->second;
++        }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            const auto found = files.find(std::string(path));
++            if (found == files.end())
++                return 0u;
++            handles.emplace(++nextHandle, &found->second);
++            return nextHandle;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            const auto found = handles.find(handle);
++            if (found == handles.end())
++                return false;
++            size = found->second->bytes.size();
++            return true;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
++                          size_t &bytesRead) override
++        {
++            bytesRead = 0u;
++            const auto found = handles.find(handle);
++            if (found == handles.end() || offset > found->second->bytes.size() ||
++                size > found->second->bytes.size() - offset)
++                return false;
++            if (found->second->failRead)
++            {
++                if (size != 0u)
++                    std::memset(destination, 0xCC, size);
++                return false;
++            }
++            bytesRead = found->second->shortRead && size != 0u ? size - 1u : size;
++            if (bytesRead != 0u)
++                std::memcpy(destination, found->second->bytes.data() + offset, bytesRead);
++            return true;
++        }
++        void closeHostFile(uint64_t handle) override
++        {
++            closes.push_back(handle);
++            handles.erase(handle);
++        }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        {
++            return false;
++        }
++        void log(LogLevel, std::string_view) override {}
++
++        mutable uint32_t translateCalls = 0u;
++        std::map<std::string, std::string> translations;
++        std::map<std::string, File> files;
++        std::map<uint64_t, File *> handles;
++        std::vector<uint64_t> closes;
++        uint64_t nextHandle = 0u;
++    };
++
++    class Executor final : public IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++        {
++            return 0u;
++        }
++    };
++
++    bool expect(bool condition, std::string_view message)
++    {
++        if (condition)
++            return true;
++        std::cerr << "FAIL: " << message << '\n';
++        return false;
++    }
++
++    int32_t result(const IopCpuState &cpu)
++    {
++        return static_cast<int32_t>(cpu.gpr[2]);
++    }
++
++    bool writeString(IopMemory &memory, uint32_t address, std::string_view value)
++    {
++        if (!memory.writeRam(address, value.data(), value.size()))
++            return false;
++        memory.write8(address + value.size(), 0u);
++        return true;
++    }
++
++    int32_t callOpen(IopIoman &ioman, Executor &executor, uint32_t path, uint32_t flags)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = path;
++        cpu.gpr[5] = flags;
++        return ioman.dispatchImport(4u, cpu, executor) ? result(cpu) : kErrorInvalid;
++    }
++
++    int32_t callClose(IopIoman &ioman, Executor &executor, int32_t descriptor)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = static_cast<uint32_t>(descriptor);
++        return ioman.dispatchImport(5u, cpu, executor) ? result(cpu) : kErrorInvalid;
++    }
++
++    int32_t callRead(IopIoman &ioman, Executor &executor, int32_t descriptor, uint32_t destination, uint32_t count)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = static_cast<uint32_t>(descriptor);
++        cpu.gpr[5] = destination;
++        cpu.gpr[6] = count;
++        return ioman.dispatchImport(6u, cpu, executor) ? result(cpu) : kErrorInvalid;
++    }
++
++    int32_t callSeek(IopIoman &ioman, Executor &executor, int32_t descriptor, int32_t offset, int32_t whence)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = static_cast<uint32_t>(descriptor);
++        cpu.gpr[5] = static_cast<uint32_t>(offset);
++        cpu.gpr[6] = static_cast<uint32_t>(whence);
++        return ioman.dispatchImport(8u, cpu, executor) ? result(cpu) : kErrorInvalid;
++    }
++
++    bool bytesEqual(const IopMemory &memory, uint32_t address, std::initializer_list<uint8_t> expected)
++    {
++        uint32_t index = 0u;
++        for (const uint8_t value : expected)
++            if (memory.read8(address + index++) != value)
++                return false;
++        return true;
++    }
++
++    bool testDescriptorIndependenceAndSeekBoundaries()
++    {
++        Host host;
++        host.translations["rom0:SECRMAN"] = "firmware/SECRMAN";
++        host.files["firmware/SECRMAN"].bytes = {'A', 'B', 'C', 'D'};
++        IopMemory memory;
++        IopIoman ioman(host, memory);
++        Executor executor;
++        constexpr uint32_t path = 0x1000u;
++        constexpr uint32_t output = 0x1100u;
++        if (!writeString(memory, path, "rom0:SECRMAN") || !memory.zeroRam(output, 33u))
++            return false;
++        const int32_t first = callOpen(ioman, executor, path, 1u);
++        const int32_t second = callOpen(ioman, executor, path, 1u);
++        if (!expect(first == 0 && second == 1, "open did not allocate independent descriptors") ||
++            !expect(callRead(ioman, executor, first, output, 2u) == 2, "first descriptor did not read two bytes") ||
++            !expect(bytesEqual(memory, output, {'A', 'B'}), "first descriptor read wrong bytes") ||
++            !expect(callRead(ioman, executor, second, output + 8u, 1u) == 1, "second descriptor did not read") ||
++            !expect(bytesEqual(memory, output + 8u, {'A'}), "second descriptor inherited first offset") ||
++            !expect(callSeek(ioman, executor, first, -1, 1) == 1, "SEEK_CUR did not return expected offset") ||
++            !expect(callRead(ioman, executor, first, output + 16u, 2u) == 2, "seeked descriptor did not read") ||
++            !expect(bytesEqual(memory, output + 16u, {'B', 'C'}), "seeked descriptor read wrong bytes") ||
++            !expect(callSeek(ioman, executor, second, -1, 2) == 3, "SEEK_END did not return expected offset") ||
++            !expect(callRead(ioman, executor, second, output + 24u, 2u) == 1, "short EOF read did not return one byte") ||
++            !expect(bytesEqual(memory, output + 24u, {'D'}), "short EOF read returned wrong byte"))
++            return false;
++
++        memory.write8(output + 32u, 0xA5u);
++        return expect(callSeek(ioman, executor, first, 0, 2) == 4, "SEEK_END did not reach EOF") &&
++               expect(callRead(ioman, executor, first, output + 32u, 1u) == 0, "EOF read did not return zero") &&
++               expect(memory.read8(output + 32u) == 0xA5u, "EOF read modified destination") &&
++               expect(callSeek(ioman, executor, first, 2, 2) == 6, "seek past EOF was rejected") &&
++               expect(callRead(ioman, executor, first, output + 32u, 1u) == 0 &&
++                      memory.read8(output + 32u) == 0xA5u, "read past EOF did not preserve destination") &&
++               expect(callSeek(ioman, executor, first, -5, 0) == kErrorInvalid, "negative SEEK_SET was accepted") &&
++               expect(callSeek(ioman, executor, first, 0, 3) == kErrorInvalid, "invalid whence was accepted") &&
++               expect(callSeek(ioman, executor, first, INT32_MAX, 1) == kErrorInvalid,
++                      "overflowing SEEK_CUR was accepted");
++    }
++
++    bool testShortAndFailedReadPoison()
++    {
++        Host host;
++        host.translations["rom0:SECRMAN"] = "firmware/SECRMAN";
++        host.files["firmware/SECRMAN"].bytes = {'1', '2', '3', '4'};
++        IopMemory memory;
++        IopIoman ioman(host, memory);
++        Executor executor;
++        constexpr uint32_t path = 0x1200u;
++        constexpr uint32_t output = 0x1300u;
++        if (!writeString(memory, path, "rom0:SECRMAN"))
++            return false;
++        const int32_t descriptor = callOpen(ioman, executor, path, 1u);
++        if (!expect(descriptor == 0, "open failed") || !memory.writeRam(output, "\xA5\xA5\xA5\xA5", 4u))
++            return false;
++        host.files["firmware/SECRMAN"].shortRead = true;
++        if (!expect(callRead(ioman, executor, descriptor, output, 3u) == 2, "short host read returned wrong count") ||
++            !expect(bytesEqual(memory, output, {'1', '2', 0xA5}), "short host read wrote beyond returned count"))
++            return false;
++
++        host.files["firmware/SECRMAN"].shortRead = false;
++        host.files["firmware/SECRMAN"].failRead = true;
++        if (!memory.writeRam(output, "\x5A\x5A", 2u))
++            return false;
++        return expect(callRead(ioman, executor, descriptor, output, 2u) == -5, "failed host read did not return EIO") &&
++               expect(bytesEqual(memory, output, {0x5A, 0x5A}), "failed host read poisoned guest memory") &&
++               expect(callSeek(ioman, executor, descriptor, 0, 1) == 2, "failed host read advanced descriptor offset");
++    }
++
++    bool testInvalidInputsAndHandleRevocation()
++    {
++        Host host;
++        host.translations["rom0:SECRMAN"] = "firmware/SECRMAN";
++        host.files["firmware/SECRMAN"].bytes = {'X'};
++        IopMemory memory;
++        IopIoman ioman(host, memory);
++        Executor executor;
++        constexpr uint32_t path = 0x1400u;
++        constexpr uint32_t output = 0x1500u;
++        if (!writeString(memory, path, "rom0:SECRMAN"))
++            return false;
++        memory.write8(output, 0u);
++        if (!expect(callOpen(ioman, executor, IopMemory::RamSize, 1u) == kErrorFault, "invalid path range was accepted") ||
++            !expect(writeString(memory, path + 0x40u, "unknown0:FILE") &&
++                        callOpen(ioman, executor, path + 0x40u, 1u) == kErrorInvalid,
++                    "unknown device path was accepted") ||
++            !expect(writeString(memory, path + 0x80u, "C:\\not-guest") &&
++                        callOpen(ioman, executor, path + 0x80u, 1u) == kErrorInvalid,
++                    "native host path was accepted") ||
++            !expect(callOpen(ioman, executor, path, 2u) == kErrorReadOnly, "write-only open was accepted") ||
++            !expect(callOpen(ioman, executor, path, 0u) == kErrorInvalid, "zero access mode was accepted") ||
++            !expect(callOpen(ioman, executor, path, 0x40000001u) == kErrorInvalid, "unknown open flag was accepted") ||
++            !expect(callOpen(ioman, executor, path, 1u) == 0, "valid open failed") ||
++            !expect(callRead(ioman, executor, 0, IopMemory::RamSize - 1u, 2u) == kErrorFault,
++                    "invalid read destination was accepted") ||
++            !expect(callClose(ioman, executor, 0) == 0, "close failed") ||
++            !expect(callRead(ioman, executor, 0, output, 1u) == kErrorBadFile, "closed descriptor remained valid") ||
++            !expect(host.handles.empty(), "close did not revoke host handle"))
++            return false;
++
++        for (uint32_t iteration = 0u; iteration < 32u; ++iteration)
++        {
++            const int32_t descriptor = callOpen(ioman, executor, path, 1u);
++            if (!expect(descriptor == 0, "closed descriptor slot was not reused") ||
++                !expect(callClose(ioman, executor, descriptor) == 0, "sequential close failed"))
++                return false;
++        }
++        const int32_t reopened = callOpen(ioman, executor, path, 1u);
++        ioman.reset();
++        return expect(reopened == 0, "closed descriptor slot was not retained safely") &&
++               expect(host.handles.empty(), "reset did not revoke host handle") &&
++               expect(callRead(ioman, executor, reopened, output, 1u) == kErrorBadFile,
++                      "reset descriptor remained valid") &&
++               expect(host.closes.size() == 34u, "close/reset did not close each host handle");
++    }
++
++    bool testMissingAndRegisteredDeviceRoute()
++    {
++        Host host;
++        IopMemory memory;
++        IopIoman ioman(host, memory);
++        Executor executor;
++        constexpr uint32_t path = 0x1600u;
++        constexpr uint32_t driver = 0x1700u;
++        constexpr uint32_t name = 0x1800u;
++        if (!writeString(memory, path, "rom0:SECRMAN") || !writeString(memory, name, "rom"))
++            return false;
++        memory.write32(driver, name);
++        memory.write32(driver + 16u, driver + 0x40u);
++        memory.write32(driver + 0x40u, 0u);
++        if (!expect(callOpen(ioman, executor, path, 1u) == kErrorNoEntry, "missing rom0 path did not return ENOENT"))
++            return false;
++
++        IopCpuState add{};
++        add.gpr[4] = driver;
++        if (!expect(ioman.dispatchImport(20u, add, executor) && result(add) == 0, "AddDrv failed") )
++            return false;
++        const uint32_t translationsBefore = host.translateCalls;
++        return expect(callOpen(ioman, executor, path, 1u) == kErrorUnsupported,
++                      "registered rom driver was bypassed") &&
++               expect(host.translateCalls == translationsBefore, "registered device consulted host path translation");
++    }
++
++    bool testDestructorRevokesHostHandle()
++    {
++        Host host;
++        host.translations["rom0:SECRMAN"] = "firmware/SECRMAN";
++        host.files["firmware/SECRMAN"].bytes = {'X'};
++        IopMemory memory;
++        Executor executor;
++        constexpr uint32_t path = 0x1900u;
++        if (!writeString(memory, path, "rom0:SECRMAN"))
++            return false;
++        {
++            IopIoman ioman(host, memory);
++            if (!expect(callOpen(ioman, executor, path, 1u) == 0, "open for destructor cleanup failed"))
++                return false;
++        }
++        return expect(host.handles.empty(), "destructor did not revoke host handle") &&
++               expect(host.closes.size() == 1u, "destructor did not close host handle once");
++    }
++}
++
++int main()
++{
++    return testDescriptorIndependenceAndSeekBoundaries() &&
++                   testShortAndFailedReadPoison() &&
++                   testInvalidInputsAndHandleRevocation() &&
++                   testMissingAndRegisteredDeviceRoute() &&
++                   testDestructorRevokesHostHandle()
++               ? 0
++               : 1;
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..993821b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -712,6 +712,7 @@ namespace ps2_stubs
+                                                                         xfer.src,
+                                                                         xfer.dest,
+                                                                         static_cast<uint32_t>(xfer.size),
++                                                                        static_cast<uint32_t>(xfer.attr),
+                                                                     });
+                 }
+                 const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
+@@ -729,6 +730,7 @@ namespace ps2_stubs
+                                                                         xfer.src,
+                                                                         xfer.dest,
+                                                                         static_cast<uint32_t>(xfer.size),
++                                                                        static_cast<uint32_t>(xfer.attr),
+                                                                     });
+                 }
+             }

@@ -1,0 +1,792 @@
+From 0a829310d451175563191e70cb6ae4d827ca24bd Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 02:12:17 -0500
+Subject: [PATCH] vr: HUD panel (GA2_VR_HUD_PANEL=1, default off): the 2D
+ overlay on a flat panel
+
+In stereo 3D scenes the HUD, dialogue box and menus are drawn on a panel at a
+fixed distance instead of baked into the eye images at infinity.
+
+- gs_pgs.cpp: a third paraLLEl-GS instance (eyes[2], own device) gets the same
+  packets; the eye instances skip UI primitives, it draws only them into an
+  RGBA image (Hacks::ui_layer, parallel-gs branch vr-hud). Split only while the
+  frame is a stereo frame; frames carry a flag saying they were split, so the
+  panel and the baked UI never show together. Snapshots are taken at the game's
+  scene -> scanout copy, so a UI image matches the eye frames on screen.
+  GA2_VR_HUD_SSAA (default 1; 4 = 1280x960 image, about +1 ms per vsync).
+- ga2_vr.cpp: after each eye's scene image, the panel as a quad seen from the
+  pose and field of view the frame is submitted with (premultiplied blend,
+  alpha 0x80 = 1.0), then the hands. Angular size of the theater screen at
+  GA2_VR_HUD_DISTANCE (1.6 m), centre GA2_VR_HUD_HEIGHT (-0.1 m), fixed in the
+  play space (GA2_VR_HUD_LOCK=head: with the head pose), GA2_VR_HUD_SIZE and
+  GA2_VR_HUD_GAIN. GA2_VR_EYE_SIZE=<w>x<h> sets the swapchain size
+  (diagnostics: Monado's simulated headset recommends 320x240).
+- GA2_VR_HUD_DEBUG=1 (no headset): scene + UI instances on the desktop, always
+  split; GA2_VR_HUD_DUMP=<prefix> writes -scene.png, -ui.png, -comp.png;
+  GA2_PERF=1 prints the classifier counters.
+- ga2_pgs::takeEyeFrame gets an optional uiSplit out parameter, new
+  uiLayer() / takeUiFrame(); ga2_vr setEyeFrame/setUiFrame. No change to
+  headers the game code includes (ga2_stereo.h, ps2_runtime.h).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |   9 +-
+ ps2xRuntime/src/lib/ga2_vr.cpp          | 119 +++++++++-
+ ps2xRuntime/src/lib/ga2_vr.h            |   7 +-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       | 303 ++++++++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_runtime.cpp     |  32 ++-
+ 5 files changed, 438 insertions(+), 32 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index c3699b0..dde837c 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -48,6 +48,13 @@ namespace ga2_pgs
+     // VR single-pass stereo: a right-eye GS instance runs (GA2_VR=1); each
+     // eye's newest frame with the stereo setup it was rendered with.
+     bool stereo();
++    // uiSplit (optional): the frame was drawn without its UI layer (see takeUiFrame).
+     bool takeEyeFrame(int eye, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup);
++                      ga2_stereo::Setup &setup, bool *uiSplit = nullptr);
++    // HUD panel (GA2_VR_HUD_PANEL=1 with the stereo instances): a third GS instance draws the 2D overlay (HUD,
++    // dialogue, menus) alone into an RGBA image, alpha as the game wrote it (0x80 = opaque), transparent black
++    // elsewhere; while a frame is split (3D stereo scene) the eye frames leave the overlay out.
++    bool uiLayer();
++    // Newest UI layer image; uiSplit: the eye frames of the same game frame lack their overlay.
++    bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit);
+ }
+diff --git a/ps2xRuntime/src/lib/ga2_vr.cpp b/ps2xRuntime/src/lib/ga2_vr.cpp
+index 1439f94..6938127 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.cpp
++++ b/ps2xRuntime/src/lib/ga2_vr.cpp
+@@ -170,7 +170,7 @@ namespace ga2_vr
+ 
+         struct Renderer
+         {
+-            GLuint quad = 0, frame = 0, sky = 0, beam = 0, dot = 0, cursor = 0;
++            GLuint quad = 0, hud = 0, frame = 0, sky = 0, beam = 0, dot = 0, cursor = 0;
+             GLuint vao = 0, vbo = 0, skyVao = 0, skyVbo = 0;
+             GLuint skyTexture = 0;
+             bool ready = false;
+@@ -222,6 +222,21 @@ uniform vec2 extent; // picture size / texture size
+ out vec4 o;
+ void main() { o = vec4(texture(tex, v_uv * extent).rgb, 1.0); })";
+ 
++        // The HUD panel: the UI layer's image as the GS wrote it, straight from the render target (alpha 0x80 = opaque,
++        // colour already weighted by the alpha of blended draws), blended premultiplied over the scene.
++        const char *kHudFs = R"(#version 330
++in vec2 v_uv;
++uniform sampler2D tex;
++uniform vec2 extent;
++uniform float gain;
++out vec4 o;
++void main()
++{
++    vec4 t = texture(tex, v_uv * extent);
++    float a = clamp(t.a * (255.0 / 128.0), 0.0, 1.0);
++    o = vec4(min(t.rgb * gain, vec3(1.0)), a);
++})";
++
+         // A soft cyan glow around the screen (uv 0..1 over a slightly larger quad).
+         const char *kFrameFs = R"(#version 330
+ in vec2 v_uv;
+@@ -344,6 +359,7 @@ void main() {
+             if (g_gl.ready)
+                 return;
+             g_gl.quad = compile(kMeshVs, kQuadFs, "screen");
++            g_gl.hud = compile(kMeshVs, kHudFs, "hud");
+             g_gl.frame = compile(kMeshVs, kFrameFs, "frame");
+             g_gl.sky = compile(kSkyVs, kSkyFs, "sky");
+             g_gl.beam = compile(kMeshVs, kBeamFs, "laser");
+@@ -788,6 +804,14 @@ void main() {
+                 auto &eye = g_xr.eyes[i];
+                 eye.width = int(g_xr.configs[i].recommendedImageRectWidth);
+                 eye.height = int(g_xr.configs[i].recommendedImageRectHeight);
++                // GA2_VR_EYE_SIZE=<w>x<h> (diagnostics): the swapchain size, e.g. to read text in dumps from the
++                // simulated headset, whose recommended size is 320x240.
++                if (const char *sz = std::getenv("GA2_VR_EYE_SIZE"); sz && *sz)
++                {
++                    int w = 0, h = 0;
++                    if (std::sscanf(sz, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
++                        eye.width = w, eye.height = h;
++                }
+                 XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                 info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                 info.format = format;
+@@ -1000,9 +1024,53 @@ void main() {
+             int texWidth = 0, texHeight = 0;
+             float srcWidth = 0, srcHeight = 0;
+             ga2_stereo::Setup setup;
++            bool uiSplit = false; // drawn without the 2D overlay (HUD panel)
+         };
+         EyeImage g_eyeImages[2];
+ 
++        // ---- HUD panel (GA2_VR_HUD_PANEL=1) ---------------------------------------
++        struct UiImage
++        {
++            GLuint texture = 0;
++            int texWidth = 0, texHeight = 0;
++            bool uiSplit = false;
++        };
++        UiImage g_uiImage;
++
++        float envFloat(const char *name, float fallback, float lo, float hi)
++        {
++            const char *v = std::getenv(name);
++            const float f = v && *v ? float(std::atof(v)) : fallback;
++            return std::min(std::max(f, lo), hi);
++        }
++
++        // The panel keeps the angular size of the theater screen at its distance (4:3, as the game picture is
++        // shown there) and sits a little below eye level. Fixed in the play space (the recentred anchor, like the
++        // theater screen) or, with GA2_VR_HUD_LOCK=head, in front of the head pose the frame was rendered with.
++        struct HudPanel
++        {
++            bool enabled = false, headLock = false;
++            float distance = 1.6f, centerY = -0.1f, halfHeight = 0.0f, halfWidth = 0.0f, gain = 1.0f;
++        };
++        const HudPanel &hudPanel()
++        {
++            static const HudPanel panel = [] {
++                HudPanel p;
++                const char *v = std::getenv("GA2_VR_HUD_PANEL");
++                p.enabled = v && std::strcmp(v, "1") == 0;
++                const char *lock = std::getenv("GA2_VR_HUD_LOCK");
++                p.headLock = lock && std::strcmp(lock, "head") == 0;
++                p.distance = envFloat("GA2_VR_HUD_DISTANCE", 1.6f, 0.4f, 20.0f);
++                p.centerY = envFloat("GA2_VR_HUD_HEIGHT", -0.1f, -2.0f, 2.0f);
++                const float size = envFloat("GA2_VR_HUD_SIZE", 1.0f, 0.1f, 10.0f);
++                p.halfHeight = 0.5f * kScreenHeight * (p.distance / kScreenDistance) * size;
++                p.halfWidth = p.halfHeight * (4.0f / 3.0f);
++                p.gain = envFloat("GA2_VR_HUD_GAIN", 1.0f, 0.1f, 4.0f);
++                return p;
++            }();
++            return panel;
++        }
++
+         // Game units per metre (GA2_VR_SCALE): the size the 3D world appears.
+         float unitsPerMetre()
+         {
+@@ -1021,6 +1089,44 @@ void main() {
+                    g_eyeImages[0].setup.active && g_eyeImages[1].setup.active;
+         }
+ 
++        // The HUD panel over an eye's stereo frame: the UI layer image as a quad at a fixed distance, alpha blended,
++        // seen from the pose the frame is submitted with (viewProj), so both eyes get their parallax at that
++        // distance and the compositor reprojects it with the scene.
++        void drawHudPanel(const M4 &viewProj, const ga2_stereo::Setup &st)
++        {
++            const HudPanel &h = hudPanel();
++            M4 model;
++            if (h.headLock)
++                std::memcpy(model.m, st.headAnchor, sizeof(model.m));
++            glDisable(GL_CULL_FACE);
++            glDisable(GL_DEPTH_TEST);
++            glDepthMask(GL_FALSE);
++            glEnable(GL_BLEND);
++            glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
++            glUseProgram(g_gl.hud);
++            setMatrix(g_gl.hud, "mvp", mul(viewProj, model));
++            glActiveTexture(GL_TEXTURE0);
++            glBindTexture(GL_TEXTURE_2D, g_uiImage.texture);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            glUniform1i(glGetUniformLocation(g_gl.hud, "tex"), 0);
++            glUniform2f(glGetUniformLocation(g_gl.hud, "extent"), 1.0f, 1.0f);
++            glUniform1f(glGetUniformLocation(g_gl.hud, "gain"), h.gain);
++            rect(V3{0.0f, h.centerY, -h.distance}, V3{h.halfWidth, 0, 0}, V3{0, h.halfHeight, 0}, false);
++            glDisable(GL_BLEND);
++            glDepthMask(GL_TRUE);
++            glUseProgram(0);
++            glBindVertexArray(0);
++        }
++
++        // The panel is drawn over this eye's frame (both eyes' frames lack their overlay, the overlay arrived).
++        bool hudPanelShowing(const EyeImage &image)
++        {
++            return hudPanel().enabled && image.uiSplit && g_uiImage.texture && g_uiImage.uiSplit;
++        }
++
+         // An eye's pose in the setup: the head pose moved by -+ipd/2 along its x axis.
+         XrPosef eyePose(const ga2_stereo::Setup &s, int eye)
+         {
+@@ -1075,11 +1181,16 @@ void main() {
+     uint16_t padButtons() { return g_xr.pad; }
+ 
+     void setEyeFrame(int eye, uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight,
+-                     const ga2_stereo::Setup &setup)
++                     const ga2_stereo::Setup &setup, bool uiSplit)
+     {
+         if (eye < 0 || eye > 1)
+             return;
+-        g_eyeImages[eye] = EyeImage{texture, texWidth, texHeight, srcWidth, srcHeight, setup};
++        g_eyeImages[eye] = EyeImage{texture, texWidth, texHeight, srcWidth, srcHeight, setup, uiSplit};
++    }
++
++    void setUiFrame(uint32_t texture, int texWidth, int texHeight, bool uiSplit)
++    {
++        g_uiImage = UiImage{texture, texWidth, texHeight, uiSplit};
+     }
+ 
+     void renderHeadset(uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight, bool wide)
+@@ -1283,6 +1394,8 @@ void main() {
+                                               submitPose.orientation.w},
+                                             V3{submitPose.position.x, submitPose.position.y, submitPose.position.z}));
+                         const M4 handProj = projection(st.tanLeft, st.tanRight, st.tanUp, st.tanDown, 0.05f, 100.0f);
++                        if (hudPanelShowing(image))
++                            drawHudPanel(mul(handProj, inverseRigid(submitWorld)), st);
+                         glDisable(GL_DEPTH_TEST);
+                         glEnable(GL_BLEND);
+                         glBlendFunc(GL_ONE, GL_ONE);
+diff --git a/ps2xRuntime/src/lib/ga2_vr.h b/ps2xRuntime/src/lib/ga2_vr.h
+index e619de7..e14906c 100644
+--- a/ps2xRuntime/src/lib/ga2_vr.h
++++ b/ps2xRuntime/src/lib/ga2_vr.h
+@@ -45,8 +45,13 @@ namespace ga2_vr
+     // frame (GL texture; the picture is srcWidth x srcHeight of it) with the
+     // stereo setup it was rendered with. 3D scenes show these full-view in
+     // their eyes instead of the theater screen.
++    //
++    // uiSplit: the frame was drawn without its 2D overlay (HUD panel, GA2_VR_HUD_PANEL=1); the overlay arrives
++    // through setUiFrame and is drawn on a panel in front of the eyes.
+     void setEyeFrame(int eye, uint32_t texture, int texWidth, int texHeight, float srcWidth, float srcHeight,
+-                     const ga2_stereo::Setup &setup);
++                     const ga2_stereo::Setup &setup, bool uiSplit = false);
++    // The newest UI layer image (RGBA with the game's alpha, 0x80 = opaque; GL texture) for the HUD panel.
++    void setUiFrame(uint32_t texture, int texWidth, int texHeight, bool uiSplit);
+ 
+     // Controller buttons as PS2 pad bits (active-high).
+     uint16_t padButtons();
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 8703786..7c54f9f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -23,6 +23,7 @@
+ #include <cstring>
+ #include <mutex>
+ #include <string>
++#include <vector>
+ 
+ using namespace Vulkan;
+ using namespace ParallelGS;
+@@ -121,6 +122,7 @@ namespace
+         VkFormat format = VK_FORMAT_UNDEFINED;
+         bool pending = false;
+         ga2_stereo::Setup setup; // the stereo setup of the copied frame
++        bool uiSplit = false;    // the frame was drawn without its UI layer (HUD panel)
+     };
+ 
+     // One GS instance per eye. Eye 0 is the only one outside VR stereo; eye
+@@ -142,6 +144,7 @@ namespace
+         uint32_t frameWidth = 0, frameHeight = 0;
+         bool frameFresh = false;
+         bool frameBgra = false;
++        bool frameUiSplit = false;
+         ga2_stereo::Setup frameSetup, takenSetup;
+     };
+ 
+@@ -150,8 +153,24 @@ namespace
+         std::mutex mutex;
+         bool tried = false;
+         bool ok = false;
+-        Eye eyes[2];
++        // eyes[2] is the HUD panel's UI layer instance (GA2_VR_HUD_PANEL=1): same packets, draws only the 2D
++        // overlay into an image with alpha; the eye instances leave that overlay out.
++        Eye eyes[3];
+         uint32_t eyeCount = 1;
++        bool uiLayer = false;
++        uint32_t instanceCount() const { return eyeCount + (uiLayer ? 1u : 0u); }
++        Eye &instance(uint32_t i) { return i < eyeCount ? eyes[i] : eyes[2]; }
++        uint32_t uiSsaa = 1;
++        int uiHiresShift = 0;
++        // GA2_VR_HUD_DEBUG=1 (no headset needed): scene instance + UI layer instance on the desktop, always split;
++        // GA2_VR_HUD_DUMP=<prefix> writes <prefix>-scene.png, -ui.png (RGBA as scanned out) and -comp.png (the
++        // layers composited as ga2_vr does) from GA2_VR_HUD_DUMP_AT seconds on, GA2_VR_HUD_DUMP_COUNT sets, GA2_VR_HUD_DUMP_GAP (default 1) seconds apart.
++        bool hudDebug = false;
++        std::vector<uint8_t> dbgScene, dbgUi; // RGBA, newest frames (guarded by frameMutex)
++        uint32_t dbgSceneW = 0, dbgSceneH = 0, dbgUiW = 0, dbgUiH = 0;
++        std::chrono::steady_clock::time_point dbgStart = std::chrono::steady_clock::now();
++        std::chrono::steady_clock::time_point dbgLast{};
++        int dbgDumped = 0;
+         std::vector<uint8_t> downloadScratch;
+         uint32_t ssaa = 1;
+         uint32_t field = 0;
+@@ -231,6 +250,119 @@ namespace
+         std::filesystem::rename(tmp, path, ec);
+     }
+ 
++    // Minimal PNG writer (stored deflate blocks), for the HUD debug dumps.
++    void writePng(const std::string &path, const uint8_t *rgba, uint32_t w, uint32_t h)
++    {
++        static uint32_t table[256];
++        static bool init = false;
++        if (!init)
++        {
++            for (uint32_t n = 0; n < 256; ++n)
++            {
++                uint32_t c = n;
++                for (int k = 0; k < 8; ++k)
++                    c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
++                table[n] = c;
++            }
++            init = true;
++        }
++        auto crc = [&](const uint8_t *d, size_t n, uint32_t c = 0xFFFFFFFFu) {
++            for (size_t i = 0; i < n; ++i)
++                c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
++            return c;
++        };
++        std::vector<uint8_t> raw;
++        raw.reserve((size_t(w) * 4u + 1u) * h);
++        for (uint32_t y = 0; y < h; ++y)
++        {
++            raw.push_back(0);
++            raw.insert(raw.end(), rgba + size_t(y) * w * 4u, rgba + size_t(y + 1) * w * 4u);
++        }
++        std::vector<uint8_t> z = {0x78, 0x01};
++        uint32_t a = 1, b = 0;
++        for (size_t i = 0; i < raw.size(); i += 65535)
++        {
++            const size_t n = std::min<size_t>(65535, raw.size() - i);
++            z.push_back(i + n >= raw.size() ? 1 : 0);
++            z.push_back(uint8_t(n)), z.push_back(uint8_t(n >> 8));
++            z.push_back(uint8_t(~n)), z.push_back(uint8_t((~n) >> 8));
++            z.insert(z.end(), raw.begin() + i, raw.begin() + i + n);
++        }
++        for (uint8_t v : raw)
++        {
++            a = (a + v) % 65521u;
++            b = (b + a) % 65521u;
++        }
++        for (int sft = 24; sft >= 0; sft -= 8)
++            z.push_back(uint8_t(((b << 16 | a) >> sft) & 0xFF));
++        FILE *f = std::fopen(path.c_str(), "wb");
++        if (!f)
++            return;
++        auto be = [&](uint32_t v) {
++            const uint8_t d[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
++            std::fwrite(d, 1, 4, f);
++        };
++        auto chunk = [&](const char *type, const std::vector<uint8_t> &data) {
++            be(uint32_t(data.size()));
++            std::vector<uint8_t> td(type, type + 4);
++            td.insert(td.end(), data.begin(), data.end());
++            std::fwrite(td.data(), 1, td.size(), f);
++            be(~crc(td.data(), td.size()));
++        };
++        const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
++        std::fwrite(sig, 1, 8, f);
++        std::vector<uint8_t> ihdr = {uint8_t(w >> 24), uint8_t(w >> 16), uint8_t(w >> 8), uint8_t(w),
++                                     uint8_t(h >> 24), uint8_t(h >> 16), uint8_t(h >> 8), uint8_t(h), 8, 6, 0, 0, 0};
++        chunk("IHDR", ihdr);
++        chunk("IDAT", z);
++        chunk("IEND", {});
++        std::fclose(f);
++    }
++
++    void dumpHudDebugLocked(State &s)
++    {
++        const char *prefix = std::getenv("GA2_VR_HUD_DUMP");
++        if (!prefix || !*prefix)
++            return;
++        const auto now = std::chrono::steady_clock::now();
++        const double at = envInt("GA2_VR_HUD_DUMP_AT", 20);
++        const int count = std::max(1, envInt("GA2_VR_HUD_DUMP_COUNT", 1));
++        if (s.dbgDumped >= count || std::chrono::duration<double>(now - s.dbgStart).count() < at ||
++            std::chrono::duration<double>(now - s.dbgLast).count() < envInt("GA2_VR_HUD_DUMP_GAP", 1) || s.dbgUi.empty() || s.dbgScene.empty())
++            return;
++        s.dbgLast = now;
++        std::vector<uint8_t> scene, ui;
++        uint32_t sw, sh, uw, uh;
++        {
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            scene = s.dbgScene, ui = s.dbgUi;
++            sw = s.dbgSceneW, sh = s.dbgSceneH, uw = s.dbgUiW, uh = s.dbgUiH;
++        }
++        const std::string base = std::string(prefix) + (count > 1 ? "-" + std::to_string(s.dbgDumped) : "");
++        writePng(base + "-scene.png", scene.data(), sw, sh);
++        writePng(base + "-ui.png", ui.data(), uw, uh);
++        // The composite as the headset draws it (premultiplied over the scene, nearest-neighbour resample of the
++        // UI image to the scene size).
++        std::vector<uint8_t> comp(scene);
++        for (uint32_t y = 0; y < sh; ++y)
++            for (uint32_t x = 0; x < sw; ++x)
++            {
++                const uint8_t *u = &ui[(size_t(y * uh / sh) * uw + size_t(x * uw / sw)) * 4u];
++                const float a = std::min(1.0f, u[3] * (255.0f / 128.0f) / 255.0f);
++                uint8_t *c = &comp[(size_t(y) * sw + x) * 4u];
++                for (int k = 0; k < 3; ++k)
++                    c[k] = uint8_t(std::min(255.0f, c[k] * (1.0f - a) + u[k]));
++            }
++        writePng(base + "-comp.png", comp.data(), sw, sh);
++        std::fprintf(stderr, "[pgs] hud debug dump %s (scene %ux%u, ui %ux%u)\n", base.c_str(), sw, sh, uw, uh);
++        ++s.dbgDumped;
++    }
++
++    double elapsedSinceStat(const State &s)
++    {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - s.statStart).count();
++    }
++
+     State &state()
+     {
+         // Leaked on purpose: the device must outlive any thread still calling in.
+@@ -295,6 +427,7 @@ namespace
+         options.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8
+                                  : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+         s.ssaa = static_cast<uint32_t>(options.super_sampling);
++        const GSOptions eyeOptions = options;
+         if (!s.eyes[0].gs.init(&s.eyes[0].device, options))
+         {
+             std::fprintf(stderr, "[pgs] GSInterface init failed; using the software GS\n");
+@@ -309,6 +442,23 @@ namespace
+             else
+                 std::fprintf(stderr, "[pgs] second GS instance failed; VR stays in theater mode\n");
+         }
++        // HUD panel: a third instance for the 2D overlay (GA2_VR_HUD_PANEL=1, only with the two eye instances).
++        // It renders the overlay at its own super-sampling (GA2_VR_HUD_SSAA, default 1: the game's 640x480; 4 scans
++        // it out at 1280x960, smoother on a panel close to the eyes, for about 2 ms of EE-thread time per vsync).
++        s.hudDebug = envInt("GA2_VR_HUD_DEBUG", 0) == 1;
++        if ((s.eyeCount == 2 && envInt("GA2_VR_HUD_PANEL", 0) == 1) || s.hudDebug)
++        {
++            GSOptions uiOptions = eyeOptions;
++            const int u = envInt("GA2_VR_HUD_SSAA", 1);
++            uiOptions.super_sampling = u >= 16 ? SuperSampling::X16 : u >= 8 ? SuperSampling::X8
++                                       : u >= 4 ? SuperSampling::X4 : u >= 2 ? SuperSampling::X2 : SuperSampling::X1;
++            s.uiSsaa = static_cast<uint32_t>(uiOptions.super_sampling);
++            s.uiHiresShift = s.uiSsaa >= 16 ? 2 : s.uiSsaa >= 4 ? 1 : 0;
++            if (initDevice(s.eyes[2]) && s.eyes[2].gs.init(&s.eyes[2].device, uiOptions))
++                s.uiLayer = true;
++            else
++                std::fprintf(stderr, "[pgs] HUD panel: UI layer instance failed; the HUD stays in the eye images\n");
++        }
+         // The GA2 discs render into a 32-bit buffer, copy it with the GS's
+         // ordered dither into a 16-bit scanout buffer and draw the UI on top
+         // there (so backbuffer promotion cannot apply). Without the dither the
+@@ -317,17 +467,23 @@ namespace
+         Hacks hacks = {};
+         hacks.disable_dither = envInt("GA2_PGS_DITHER", 0) == 0;
+         hacks.replacements_cover_rect = true; // gs_texpacks identifies and replaces cached regions
+-        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        for (uint32_t e = 0; e < s.instanceCount(); ++e)
+         {
+-            s.eyes[e].hacks = hacks;
+-            s.eyes[e].gs.set_hacks(hacks);
+-            s.eyes[e].gs.set_texture_replacement_interface(ga2_texpacks::interface());
++            Eye &eye = s.instance(e);
++            eye.hacks = hacks;
++            if (s.uiLayer)
++                eye.hacks.ui_layer = e < s.eyeCount ? 1u : 2u;
++            eye.gs.set_hacks(eye.hacks);
++            eye.gs.set_texture_replacement_interface(ga2_texpacks::interface());
+         }
+         s.ok = true;
+         g_rendering.store(true, std::memory_order_release);
+         std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s%s\n",
+                      s.eyes[0].device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on",
+-                     s.eyeCount == 2 ? ", stereo (two instances)" : "");
++                     s.eyeCount == 2 ? (s.uiLayer ? ", stereo (two instances) + HUD panel layer" : ", stereo (two instances)")
++                                     : "");
++        if (s.uiLayer)
++            std::fprintf(stderr, "[pgs] HUD panel: UI layer instance ssaa=%u, scanout %ux\n", s.uiSsaa, 1u << s.uiHiresShift);
+         return true;
+     }
+ 
+@@ -344,7 +500,23 @@ namespace
+             eye.frameWidth = slot.width;
+             eye.frameHeight = slot.height;
+             eye.frameSetup = slot.setup;
++            eye.frameUiSplit = slot.uiSplit;
+             eye.frameFresh = true;
++            if (s.hudDebug && (&eye == &s.eyes[0] || &eye == &s.eyes[2]))
++            {
++                const bool isUi = &eye == &s.eyes[2];
++                auto &dst = isUi ? s.dbgUi : s.dbgScene;
++                dst.resize(pixels * 4u);
++                std::memcpy(dst.data(), src, pixels * 4u);
++                if (eye.frameBgra)
++                    for (size_t i = 0; i < pixels; ++i)
++                        std::swap(dst[i * 4u], dst[i * 4u + 2u]);
++                if (!isUi)
++                    for (size_t i = 0; i < pixels; ++i)
++                        dst[i * 4u + 3u] = 0xff;
++                (isUi ? s.dbgUiW : s.dbgSceneW) = slot.width;
++                (isUi ? s.dbgUiH : s.dbgSceneH) = slot.height;
++            }
+         }
+         eye.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
+         slot.pending = false;
+@@ -352,17 +524,22 @@ namespace
+         slot.fence.reset();
+     }
+ 
+-    // Asynchronous readback ring: never wait for the GPU on the game thread.
+-    void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup)
++    // Consume finished readbacks oldest first so the newest finished frame is the one presented.
++    void pollReadbackLocked(State &s, Eye &eye)
+     {
+-        // slotIndex is the oldest submission: consume finished slots oldest
+-        // first so the newest finished frame is the one presented.
+         for (int k = 0; k < 3; ++k)
+         {
+             ReadbackSlot &old = eye.slots[(eye.slotIndex + k) % 3];
+             if (old.pending && old.fence && old.fence->wait_timeout(0))
+                 consumeSlotLocked(s, eye, old);
+         }
++    }
++
++    // Asynchronous readback ring: never wait for the GPU on the game thread.
++    void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup, bool uiSplit)
++    {
++        // slotIndex is the oldest submission.
++        pollReadbackLocked(s, eye);
+         ReadbackSlot &slot = eye.slots[eye.slotIndex];
+         if (slot.pending)
+             return; // GPU is behind; drop this frame's copy
+@@ -391,6 +568,7 @@ namespace
+         slot.fence = std::move(fence);
+         slot.image = result.image;
+         slot.setup = setup;
++        slot.uiSplit = uiSplit;
+         slot.pending = true;
+         eye.slotIndex = (eye.slotIndex + 1u) % 3u;
+     }
+@@ -425,11 +603,12 @@ namespace ga2_pgs
+         gifCapture().write(path, data, size & ~size_t(15));
+         const bool changed = ga2_texpacks::takeChanged();
+         const auto t0 = std::chrono::steady_clock::now();
+-        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        for (uint32_t e = 0; e < s.instanceCount(); ++e)
+         {
++            Eye &eye = s.instance(e);
+             if (changed)
+-                s.eyes[e].gs.invalidate_all_cached_textures();
+-            s.eyes[e].gs.gif_transfer(path, data, size & ~size_t(15));
++                eye.gs.invalidate_all_cached_textures();
++            eye.gs.gif_transfer(path, data, size & ~size_t(15));
+         }
+         s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         ++s.packets;
+@@ -475,11 +654,12 @@ namespace ga2_pgs
+         if (!initLocked(s))
+             return;
+         s.eyes[0].gs.read_transfer_fifo(dst, qwords);
+-        // The right eye's GS completes the same download into scratch.
++        // The other instances' GS complete the same download into scratch.
+         if (s.eyeCount == 2)
+         {
+             s.downloadScratch.resize(size_t(qwords) * 16u);
+-            s.eyes[1].gs.read_transfer_fifo(s.downloadScratch.data(), qwords);
++            for (uint32_t e = 1; e < s.instanceCount(); ++e)
++                s.instance(e).gs.read_transfer_fifo(s.downloadScratch.data(), qwords);
+         }
+     }
+ 
+@@ -491,10 +671,11 @@ namespace ga2_pgs
+             return;
+         gifCapture().write(0xFFFFFFFFu, &r, sizeof(r));
+         const auto t0 = std::chrono::steady_clock::now();
+-        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        for (uint32_t e = 0; e < s.instanceCount(); ++e)
+         {
+-            s.eyes[e].gs.flush();
+-            auto &p = s.eyes[e].gs.get_priv_register_state();
++            Eye &inst = s.instance(e);
++            inst.gs.flush();
++            auto &p = inst.gs.get_priv_register_state();
+             put(p.pmode, r.pmode);
+             // NTSC default when the CRTC was never programmed.
+             put(p.smode1, r.smode1 ? r.smode1 : 0x0000000740814504ull);
+@@ -531,19 +712,57 @@ namespace ga2_pgs
+         // the frames that follow comes from the newest one being built.
+         const ga2_stereo::Setup shown = s.eyeCount == 2 ? ga2_stereo::displayed() : ga2_stereo::Setup{};
+         const ga2_stereo::Setup next = s.eyeCount == 2 ? ga2_stereo::building() : ga2_stereo::Setup{};
++        // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
++        // renders them in stereo.
++        const bool split = s.uiLayer && (next.active || s.hudDebug);
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+         {
+             Eye &eye = s.eyes[e];
+             const ScanoutResult result = eye.gs.vsync(info);
+             if (result.image)
+-                readbackLocked(s, eye, result, shown);
++                readbackLocked(s, eye, result, shown, s.uiLayer && eye.gs.displayed_frame_ui_split());
+             const float shift = ga2_stereo::shiftPerQ(next, int(e));
+-            if (shift != eye.hacks.stereo_shift_q)
++            if (shift != eye.hacks.stereo_shift_q || split != eye.hacks.ui_layer_active)
+             {
+                 eye.hacks.stereo_shift_q = shift;
++                eye.hacks.ui_layer_active = split;
+                 eye.gs.set_hacks(eye.hacks);
+             }
+         }
++        if (s.uiLayer)
++        {
++            // The UI layer instance scans its target out whenever the game copies a frame to the scanout buffer
++            // (GSInterface::ui_scanout_blit), so each snapshot belongs to the frame that copy puts on screen.
++            Eye &ui = s.eyes[2];
++            VSyncInfo uiInfo = info;
++            uiInfo.high_resolution_scanout = s.uiHiresShift >= 1;
++            uiInfo.high_resolution_scanout_shift = s.uiHiresShift >= 2 ? 2u : 1u;
++            ui.gs.set_ui_snapshot_info(uiInfo);
++            ScanoutResult snapshot, newest;
++            while (ui.gs.take_ui_snapshot(snapshot))
++                newest = std::move(snapshot);
++            pollReadbackLocked(s, ui);
++            if (newest.image)
++                readbackLocked(s, ui, newest, shown, ui.gs.displayed_frame_ui_split());
++            if (split != ui.hacks.ui_layer_active)
++            {
++                ui.hacks.ui_layer_active = split;
++                ui.gs.set_hacks(ui.hacks);
++            }
++            if (std::getenv("GA2_PERF") && elapsedSinceStat(s) >= 5.0)
++            {
++                const auto st = ui.gs.consume_ui_stats();
++                const auto es = s.eyes[0].gs.consume_ui_stats();
++                std::fprintf(stderr,
++                             "[pgs] hud: ui instance %u snapshots, skipped %u, prims P1 s%u/u%u/c%u P2 s%u/u%u/c%u P3 s%u/u%u/c%u"
++                             " | scene instance P1 s%u/u%u P2 s%u/u%u, %u scene targets\n",
++                             st.snapshots, st.skipped, st.prims[1][0], st.prims[1][1], st.prims[1][2], st.prims[2][0],
++                             st.prims[2][1], st.prims[2][2], st.prims[3][0], st.prims[3][1], st.prims[3][2],
++                             es.prims[1][0], es.prims[1][1], es.prims[2][0], es.prims[2][1], es.scene_targets);
++            }
++        }
++        if (s.uiLayer && s.hudDebug)
++            dumpHudDebugLocked(s);
+         const auto t1 = std::chrono::steady_clock::now();
+         s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+         ++s.swaps;
+@@ -575,11 +794,45 @@ namespace ga2_pgs
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+     {
+         ga2_stereo::Setup setup;
+-        return takeEyeFrame(0, rgba, width, height, setup);
++        return takeEyeFrame(0, rgba, width, height, setup, nullptr);
++    }
++
++    bool uiLayer() { return state().uiLayer; }
++
++    bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit)
++    {
++        State &s = state();
++        if (!s.uiLayer)
++            return false;
++        Eye &eye = s.eyes[2];
++        bool bgra = false;
++        {
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            if (!eye.frameFresh)
++                return false;
++            rgba.swap(eye.frame);
++            width = eye.frameWidth;
++            height = eye.frameHeight;
++            bgra = eye.frameBgra;
++            uiSplit = eye.frameUiSplit;
++            eye.frameFresh = false;
++        }
++        // Straight RGBA with the alpha the game wrote (0x80 = opaque; ga2_vr scales it).
++        if (bgra)
++        {
++            auto *px = reinterpret_cast<uint32_t *>(rgba.data());
++            const size_t pixels = size_t(width) * height;
++            for (size_t i = 0; i < pixels; ++i)
++            {
++                const uint32_t p = px[i];
++                px[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
++            }
++        }
++        return true;
+     }
+ 
+     bool takeEyeFrame(int eyeIndex, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup)
++                      ga2_stereo::Setup &setup, bool *uiSplit)
+     {
+         State &s = state();
+         if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
+@@ -595,6 +848,8 @@ namespace ga2_pgs
+             height = eye.frameHeight;
+             bgra = eye.frameBgra;
+             setup = eye.frameSetup;
++            if (uiSplit)
++                *uiSplit = eye.frameUiSplit;
+             eye.frameFresh = false;
+         }
+         // Convert to opaque RGBA here, on the present thread.
+@@ -626,7 +881,9 @@ namespace ga2_pgs
+     void vsync(const GSRegisters &) {}
+     bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+     bool stereo() { return false; }
+-    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &) { return false; }
++    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *) { return false; }
++    bool uiLayer() { return false; }
++    bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 728b42a..021339d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -411,7 +411,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             static Texture2D s_eyeTex{};
+             uint32_t ew = 0u, eh = 0u;
+             ga2_stereo::Setup eyeSetup;
+-            if (ga2_pgs::takeEyeFrame(1, s_eyeFrame, ew, eh, eyeSetup) && ew && eh &&
++            bool eyeSplit = false;
++            if (ga2_pgs::takeEyeFrame(1, s_eyeFrame, ew, eh, eyeSetup, &eyeSplit) && ew && eh &&
+                 s_eyeFrame.size() >= size_t(ew) * eh * 4u)
+             {
+                 if (s_eyeTex.width != int(ew) || s_eyeTex.height != int(eh))
+@@ -424,10 +425,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                     SetTextureFilter(s_eyeTex, TEXTURE_FILTER_BILINEAR);
+                 }
+                 UpdateTexture(s_eyeTex, s_eyeFrame.data());
+-                ga2_vr::setEyeFrame(1, s_eyeTex.id, s_eyeTex.width, s_eyeTex.height, float(ew), float(eh), eyeSetup);
++                ga2_vr::setEyeFrame(1, s_eyeTex.id, s_eyeTex.width, s_eyeTex.height, float(ew), float(eh), eyeSetup,
++                                    eyeSplit);
++            }
++            // HUD panel: the UI layer's image (RGBA, alpha as the game wrote it).
++            static std::vector<uint8_t> s_uiFrame;
++            static Texture2D s_uiTex{};
++            uint32_t uw = 0u, uh = 0u;
++            bool uiSplit = false;
++            if (ga2_pgs::uiLayer() && ga2_pgs::takeUiFrame(s_uiFrame, uw, uh, uiSplit) && uw && uh &&
++                s_uiFrame.size() >= size_t(uw) * uh * 4u)
++            {
++                if (s_uiTex.width != int(uw) || s_uiTex.height != int(uh))
++                {
++                    std::fprintf(stderr, "[vr] HUD panel image %ux%u (was %dx%d)\n", uw, uh, s_uiTex.width, s_uiTex.height);
++                    if (s_uiTex.id)
++                        UnloadTexture(s_uiTex);
++                    Image image = GenImageColor(int(uw), int(uh), BLANK);
++                    s_uiTex = LoadTextureFromImage(image);
++                    UnloadImage(image);
++                    SetTextureFilter(s_uiTex, TEXTURE_FILTER_BILINEAR);
++                }
++                UpdateTexture(s_uiTex, s_uiFrame.data());
++                ga2_vr::setUiFrame(s_uiTex.id, s_uiTex.width, s_uiTex.height, uiSplit);
+             }
+         }
+-        if (ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
++        bool eye0Split = false;
++        if (ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
+         {
+             if (tex.width != int(w) || tex.height != int(h))
+             {
+@@ -441,7 +465,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             s_pgsWidth = w;
+             s_pgsHeight = h;
+             if (ga2_pgs::stereo())
+-                ga2_vr::setEyeFrame(0, tex.id, tex.width, tex.height, float(w), float(h), setup);
++                ga2_vr::setEyeFrame(0, tex.id, tex.width, tex.height, float(w), float(h), setup, eye0Split);
+             ps2_mouse::setFrame(s_pgsFrame.data(), w, h);
+         }
+         outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+-- 
+2.55.0
+

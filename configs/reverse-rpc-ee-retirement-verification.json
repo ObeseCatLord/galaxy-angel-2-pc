@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "source_status": "astra-reviewed-ee-lifetime-retirement-transport-pending",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "source_patch_prefix": 21,
+  "patch_file": "0021-ee-execution-retirement.patch",
+  "patch_sha256": "d862ddb51360c5fa781919cdad158f30ab212cd8ba1a4624d15868cb27e99bd0",
+  "reproduced_affected_files": 79,
+  "idempotent_primary_prefix": 21,
+  "review": {
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "production": "approved after cold-load CPU, retained lifecycle and queued-cancellation corrections",
+    "regressions": "approved after positive-ID retained worker and nonzero invocation ancestry corrections",
+    "disposition": "docs/reviews/reverse-rpc-ee-retirement.md"
+  },
+  "tests": {
+    "runtime": {
+      "passed": 543,
+      "failed": 0
+    },
+    "new_owner_rows": 10,
+    "new_counter_rows": 4,
+    "tooling": {
+      "passed": 27,
+      "failed": 0
+    },
+    "standalone_iop_suites": {
+      "passed": 11,
+      "failed": 0,
+      "source": "unchanged accepted20"
+    },
+    "negative_controls": [
+      "pre-fix CPU overwrite fails original GetNext cold-load rejection canary",
+      "pre-fix queued cancellation fails same counter suite (3/4 versus fixed4/4)",
+      "SIF catch-only mutant frees actual packet twice versus fixed once"
+    ]
+  },
+  "native": {
+    "accepted_binary_prefixes": 21,
+    "rebuild_21": "all five terminal exit0, exact SHA256/size in native-verification.json; no gameplay gate",
+    "host_submission": "default false until original EE transport integration",
+    "native_handler_reply_audio": "unverified"
+  },
+  "limits": "Existing scheduler execution lifetime and cold-load retirement only. No native EE RPC transport/reply/audio/playable or enhanced-feature gate."
+}

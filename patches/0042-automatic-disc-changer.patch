@@ -1,0 +1,814 @@
+From df6ee10b9aeb8682a29e952bfc04649887363347 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 14:30:01 -0500
+Subject: [PATCH] ga2: automatic disc changer, LoadExecPS2 handoff, crt0 argv,
+ shared cards
+
+A PC port has every disc up front, so the player never swaps discs:
+- ps2_disc holds a disc set (--extra-disc). While the changer is armed (a
+  game's disc-change scene calls PS2Runtime::armDiscChanger every frame), a
+  lookup that misses on the current disc inserts the registered disc that
+  has the file; open handles stay valid.
+- The IOP's sceCdStatus reports a tray open/close cycle while armed, which
+  is what the games' disc-change scenes wait for.
+- PS2Runtime::loadExecPS2 re-executes the native binary registered for the
+  requested program (--exec-target) with the same disc set (the disc holding
+  the program boots), memory card root and arguments.
+- SetupThread fills crt0's argument block (boot path + LoadExecPS2 args).
+- --mc-root selects one memory card folder for the whole set.
+- Disc images verified once are trusted later by file identity
+  (~/.cache/ga2/disc-verify.json), so startup does not hash 19 GB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/include/ps2x/iop/iop_host.h           |   3 +
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp     |   3 +-
+ ps2xRuntime/include/ps2_runtime.h             |  21 ++
+ .../src/lib/Kernel/Stubs/Helpers/Support.h    |   7 +-
+ .../src/lib/Kernel/Syscalls/System.cpp        |  17 ++
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp        | 251 ++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_disc_mount.h          |  31 ++-
+ ps2xRuntime/src/lib/ps2_iop_host.cpp          |  22 +-
+ ps2xRuntime/src/lib/ps2_iop_host.h            |   1 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  98 +++++++
+ ps2xRuntime/src/main.cpp                      |  49 ++++
+ 11 files changed, 464 insertions(+), 39 deletions(-)
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index f48b524..04db9a1 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -163,6 +163,9 @@ namespace ps2x::iop
+             return translated.empty() ? 0u : openHostFile(translated);
+         }
+         virtual bool findDiscFile(std::string_view, DiscFile &) const { return false; }
++        // Virtual disc tray: true while the drive should report an open tray
++        // (the host's automatic disc changer is cycling it).
++        virtual bool cdTrayOpen() { return false; }
+         virtual uint64_t discGeneration() const { return 0u; }
+         virtual bool hostFileSize(uint64_t handle, uint64_t &size) const = 0;
+         virtual bool readHostFile(uint64_t handle,
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 8777848..308c253 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -35,6 +35,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdTypePs2Dvd = 0x14u;
+         constexpr uint32_t kCdvdReadyComplete = 2u;
+         constexpr uint32_t kCdvdStatusPause = 0x0Au;
++        constexpr uint32_t kCdvdStatusTrayOpen = 0x01u; // SCECdStatShellOpen
+         constexpr uint32_t kCdvdInitExit = 5u;
+         constexpr uint32_t kCdvdCallbackRead = 1u;
+         constexpr uint32_t kCdvdCallbackSeek = 4u;
+@@ -309,7 +310,7 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 28: // sceCdStatus
+-                cpu.gpr[2] = kCdvdStatusPause;
++                cpu.gpr[2] = host.cdTrayOpen() ? kCdvdStatusTrayOpen : kCdvdStatusPause;
+                 return true;
+ 
+             case 37: // sceCdCallback
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index fec0887..11b8fec 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -381,6 +381,27 @@ public:
+ 
+     static const IoPaths &getIoPaths();
+     static void setIoPaths(const IoPaths &paths);
++    // A game's disc-change scene calls this every frame: the virtual drive then
++    // cycles its tray and inserts whichever registered disc the game asks for.
++    static void armDiscChanger();
++
++    // Another title-set executable this build can hand over to (a recompiled
++    // program is one native binary, so LoadExecPS2 of a different disc's ELF
++    // re-executes the matching binary with the same disc set and cards).
++    struct ExecTarget
++    {
++        std::string elfName;           // e.g. "SLPM_667.79"
++        std::filesystem::path binary;  // native binary for that ELF
++        std::filesystem::path bootElf; // extracted ELF it loads
++    };
++    static void addExecTarget(ExecTarget target);
++    // LoadExecPS2(path, argv): never returns on success; false when the
++    // program is not a registered target.
++    static bool loadExecPS2(const std::string &guestPath, const std::vector<std::string> &args);
++    // Program arguments the kernel hands to crt0 through SetupThread: argv[0]
++    // is the boot path, the rest come from the LoadExecPS2 that started us.
++    static void setGuestArgs(std::vector<std::string> args);
++    static const std::vector<std::string> &guestArgs();
+     static void configureIoPathsFromElf(const std::string &elfPath);
+ 
+     void SignalException(R5900Context *ctx, PS2Exception exception);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index d6e6fab..7d5f0af 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -179,7 +179,7 @@ namespace
+ 
+     std::filesystem::path getCdImagePath()
+     {
+-        return PS2Runtime::getIoPaths().cdImage;
++        return PS2Runtime::getIoPaths().cdImage.empty() ? std::filesystem::path{} : ps2_disc::currentImage();
+     }
+ 
+     bool tryGetCdImageTotalSectors(uint64_t &totalSectorsOut)
+@@ -343,9 +343,10 @@ namespace
+         {
+             ps2_disc::File file;
+             // sceCdlFILE cannot describe noncontiguous multi-extent files.
+-            if (!ps2_disc::findFile(ps2Path, file) || file.extents.size() != 1u)
++            std::filesystem::path image;
++            if (!ps2_disc::findFile(ps2Path, file, &image) || file.extents.size() != 1u)
+             { g_lastCdError = -1; return false; }
+-            entryOut = {getCdImagePath(), file.size, file.extents.front().lba, sectorsForBytes(file.size)};
++            entryOut = {image, file.size, file.extents.front().lba, sectorsForBytes(file.size)};
+             g_cdFilesByKey[cdPathKey(ps2Path)] = entryOut;
+             g_lastCdError = 0;
+             return true;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index a345c4b..60c6357 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -533,6 +533,23 @@ namespace ps2_syscalls
+         }
+ 
+         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
++        // crt0's argument block: { int argc; char *argv[16]; char text[256]; }.
++        if (const uint32_t argsAddress = getRegU32(ctx, 7) & 0x1FFFFFFu;
++            argsAddress != 0u && argsAddress + 0x144u <= PS2_RAM_SIZE)
++        {
++            uint8_t *block = rdram + argsAddress;
++            uint32_t argc = 0u, text = 0x44u;
++            for (const std::string &arg : PS2Runtime::guestArgs())
++            {
++                if (argc == 16u || text + arg.size() + 1u > 0x144u) break;
++                const uint32_t pointer = argsAddress + text;
++                std::memcpy(block + 4u + 4u * argc, &pointer, 4u);
++                std::memcpy(block + text, arg.c_str(), arg.size() + 1u);
++                text += static_cast<uint32_t>(arg.size()) + 1u;
++                ++argc;
++            }
++            std::memcpy(block, &argc, 4u);
++        }
+         setReturnU32(ctx, sp);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 7c465da..3b83208 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -10,12 +10,16 @@
+ #endif
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <limits>
+ #include <memory>
+ #include <mutex>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <vector>
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+@@ -40,6 +44,20 @@ namespace ps2_disc
+         };
+         Identity verifiedIdentity;
+         std::unordered_map<std::string, File> files;
++        // Other registered discs; `files`/`verifiedImage` always describe the
++        // current one, and the primary is kept here too once a second disc exists.
++        struct Disc
++        {
++            std::filesystem::path image;
++            Identity identity;
++            std::unordered_map<std::string, File> files;
++            DiscInfo info;
++        };
++        std::vector<Disc> discs;
++        size_t currentDisc = 0u;
++        std::chrono::steady_clock::time_point changerArmedAt{};
++        uint32_t trayPolls = 0u;
++        constexpr auto kChangerHold = std::chrono::milliseconds(500);
+ 
+         bool identity(const std::filesystem::path &path, Identity &result)
+         {
+@@ -75,6 +93,7 @@ namespace ps2_disc
+             ++mountGeneration;
+             if (mountGeneration == 0u) ++mountGeneration;
+             verifiedImage.clear(); files.clear();
++            discs.clear(); currentDisc = 0u;
+             mode = nextMode;
+         }
+ 
+@@ -82,7 +101,8 @@ namespace ps2_disc
+         {
+             if (verifiedImage.empty()) return;
+             Identity current;
+-            if (PS2Runtime::getIoPaths().cdImage != verifiedImage ||
++            const auto &primary = discs.empty() ? verifiedImage : discs.front().image;
++            if (PS2Runtime::getIoPaths().cdImage != primary ||
+                 !identity(verifiedImage, current) || current != verifiedIdentity)
+                 retireLocked(Mode::NeedsVerification);
+         }
+@@ -121,6 +141,66 @@ namespace ps2_disc
+ #endif
+         }
+ 
++        // Hashing a 4 GB image costs seconds per launch. A disc whose file
++        // identity (device, inode, size, mtime, ctime) matches an earlier
++        // successful verification is trusted without re-reading it.
++        std::filesystem::path digestCachePath()
++        {
++#ifdef _WIN32
++            const char *base = std::getenv("LOCALAPPDATA");
++            return base ? std::filesystem::path(base) / "ga2" / "disc-verify.json" : std::filesystem::path{};
++#else
++            if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
++                return std::filesystem::path(xdg) / "ga2" / "disc-verify.json";
++            const char *home = std::getenv("HOME");
++            return home ? std::filesystem::path(home) / ".cache" / "ga2" / "disc-verify.json" : std::filesystem::path{};
++#endif
++        }
++
++        nlohmann::json identityJson(const Identity &id)
++        {
++            return nlohmann::json::array({id.device, id.file, id.size, id.modified, id.changed,
++                                          id.modifiedFraction, id.changedFraction});
++        }
++
++        bool cachedDigestMatches(const std::filesystem::path &image, const Identity &id, std::string_view sha)
++        {
++            try
++            {
++                std::ifstream in(digestCachePath());
++                if (!in) return false;
++                const auto cache = nlohmann::json::parse(in);
++                const auto entry = cache.find(image.string());
++                return entry != cache.end() && entry->at("identity") == identityJson(id) &&
++                       entry->at("sha256").get<std::string>() == sha;
++            }
++            catch (const std::exception &) { return false; }
++        }
++
++        void rememberDigest(const std::filesystem::path &image, const Identity &id, std::string_view sha)
++        {
++            try
++            {
++                const auto path = digestCachePath();
++                if (path.empty()) return;
++                nlohmann::json cache = nlohmann::json::object();
++                if (std::ifstream in(path); in)
++                    cache = nlohmann::json::parse(in, nullptr, false);
++                if (!cache.is_object()) cache = nlohmann::json::object();
++                cache[image.string()] = {{"identity", identityJson(id)}, {"sha256", std::string(sha)}};
++                std::filesystem::create_directories(path.parent_path());
++                const auto temp = path.string() + ".tmp";
++                std::ofstream(temp) << cache.dump(1) << '\n';
++                std::filesystem::rename(temp, path);
++            }
++            catch (const std::exception &) {}
++        }
++
++        bool changerArmedLocked()
++        {
++            return std::chrono::steady_clock::now() - changerArmedAt < kChangerHold;
++        }
++
+         uint64_t unsignedField(const nlohmann::json &item, const char *name)
+         {
+             const auto &field = item.at(name);
+@@ -186,23 +266,17 @@ namespace ps2_disc
+         return mode != Mode::NeedsVerification;
+     }
+ 
+-    bool mount(const std::filesystem::path &image, const std::filesystem::path &manifest,
+-               std::string_view imageSha256, std::string_view manifestSha256, std::string &error)
++    namespace
+     {
+-        // Failure retires previously verified metadata, including same-path remounts.
+-        invalidate();
+-        uint64_t startGeneration;
+-        { std::lock_guard lock(mutex); mode = Mode::NeedsVerification; startGeneration = mountGeneration; }
+-        error.clear();
+-#ifndef PS2X_DISC_SHA256
+-        error = "verified disc mounts require OpenSSL Crypto SHA-256 support";
+-        return false;
+-#endif
+-        try
++        // Validates an image against its manifest (digests, geometry, file
++        // table); throws on any mismatch.
++        Disc loadDisc(const std::filesystem::path &image, const std::filesystem::path &manifest,
++                      std::string_view imageSha256, std::string_view manifestSha256)
+         {
+-            const auto configured = PS2Runtime::getIoPaths().cdImage;
+-            if (image.empty() || image.lexically_normal() != configured.lexically_normal())
+-                throw std::runtime_error("disc metadata image does not match configured mount");
++#ifndef PS2X_DISC_SHA256
++            (void)image; (void)manifest; (void)imageSha256; (void)manifestSha256;
++            throw std::runtime_error("verified disc mounts require OpenSSL Crypto SHA-256 support");
++#else
+             Identity before;
+             if (!identity(image, before)) throw std::runtime_error("disc image identity unavailable");
+             const uint64_t imageSize = before.size;
+@@ -214,7 +288,8 @@ namespace ps2_disc
+             std::string hash, snapshot;
+             if (!digestFile(manifest, hash, &snapshot) || hash != manifestSha256)
+                 throw std::runtime_error("disc metadata digest mismatch");
+-            if (!digestFile(image, hash) || hash != imageSha256)
++            const bool cached = cachedDigestMatches(image, before, imageSha256);
++            if (!cached && (!digestFile(image, hash) || hash != imageSha256))
+                 throw std::runtime_error("disc image digest mismatch");
+             const auto metadata = nlohmann::json::parse(snapshot);
+             if (unsignedField(metadata, "schema_version") != 1u ||
+@@ -224,7 +299,9 @@ namespace ps2_disc
+             const auto &entries = metadata.at("files");
+             if (!entries.is_array() || entries.empty() || entries.size() > 100000u)
+                 throw std::runtime_error("disc file table outside bounds");
+-            std::unordered_map<std::string, File> pending;
++            Disc disc;
++            disc.image = image;
++            disc.info = {image, manifest, std::string(imageSha256), std::string(manifestSha256)};
+             for (const auto &entry : entries)
+             {
+                 const std::string key = pathKey(entry.at("path").get<std::string>());
+@@ -245,32 +322,150 @@ namespace ps2_disc
+                     file.extents.push_back({static_cast<uint32_t>(lba), static_cast<uint32_t>(size)});
+                 }
+                 if (total != fileSize || unsignedField(entry, "lba") != file.extents.front().lba ||
+-                    !pending.emplace(key, std::move(file)).second)
++                    !disc.files.emplace(key, std::move(file)).second)
+                     throw std::runtime_error("duplicate/inconsistent disc file record");
+             }
+-            Identity after;
+-            if (!identity(image, after) || before != after)
++            if (!identity(image, disc.identity) || before != disc.identity)
+                 throw std::runtime_error("disc image changed during validation");
++            if (!cached)
++                rememberDigest(image, disc.identity, imageSha256);
++            return disc;
++#endif
++        }
++
++        void selectDiscLocked(size_t index)
++        {
++            if (discs.empty()) return;
++            // Park the current table, then expose the selected disc.
++            discs[currentDisc].files = std::move(files);
++            currentDisc = index;
++            verifiedImage = discs[index].image;
++            verifiedIdentity = discs[index].identity;
++            files = std::move(discs[index].files);
++        }
++    }
++
++    bool mount(const std::filesystem::path &image, const std::filesystem::path &manifest,
++               std::string_view imageSha256, std::string_view manifestSha256, std::string &error)
++    {
++        // Failure retires previously verified metadata, including same-path remounts.
++        invalidate();
++        uint64_t startGeneration;
++        { std::lock_guard lock(mutex); mode = Mode::NeedsVerification; startGeneration = mountGeneration; }
++        error.clear();
++        try
++        {
++            const auto configured = PS2Runtime::getIoPaths().cdImage;
++            if (image.empty() || image.lexically_normal() != configured.lexically_normal())
++                throw std::runtime_error("disc metadata image does not match configured mount");
++            Disc disc = loadDisc(image, manifest, imageSha256, manifestSha256);
+             std::lock_guard lock(mutex);
+             if (mountGeneration != startGeneration || PS2Runtime::getIoPaths().cdImage != configured)
+                 throw std::runtime_error("disc mount changed during validation");
+-            verifiedImage = configured; verifiedIdentity = after;
+-            mode = Mode::Verified; files = std::move(pending);
++            verifiedImage = configured; verifiedIdentity = disc.identity;
++            mode = Mode::Verified; files = std::move(disc.files);
++            discs.clear(); currentDisc = 0u;
++            discs.push_back(Disc{configured, verifiedIdentity, {}, disc.info});
+             return true;
+         }
+         catch (const std::exception &failure)
+         { error = failure.what(); return false; }
+     }
+ 
+-    bool findFile(std::string_view guestPath, File &file)
++    bool addDisc(const std::filesystem::path &image, const std::filesystem::path &manifest,
++                 std::string_view imageSha256, std::string_view manifestSha256, std::string &error)
++    {
++        error.clear();
++        uint64_t startGeneration;
++        {
++            std::lock_guard lock(mutex);
++            if (mode != Mode::Verified || discs.empty())
++            { error = "the boot disc must be mounted first"; return false; }
++            startGeneration = mountGeneration;
++        }
++        try
++        {
++            Disc disc = loadDisc(image, manifest, imageSha256, manifestSha256);
++            std::lock_guard lock(mutex);
++            if (mountGeneration != startGeneration)
++                throw std::runtime_error("disc mount changed during validation");
++            for (const auto &known : discs)
++                if (known.image == disc.image) return true;
++            discs.push_back(std::move(disc));
++            return true;
++        }
++        catch (const std::exception &failure)
++        { error = failure.what(); return false; }
++    }
++
++    std::filesystem::path currentImage()
++    {
++        std::lock_guard lock(mutex);
++        return discs.empty() ? PS2Runtime::getIoPaths().cdImage : verifiedImage;
++    }
++
++    std::vector<DiscInfo> registeredDiscs()
++    {
++        std::lock_guard lock(mutex);
++        std::vector<DiscInfo> out;
++        for (const auto &disc : discs) out.push_back(disc.info);
++        return out;
++    }
++
++    int discHolding(std::string_view guestPath)
++    {
++        const std::string key = pathKey(guestPath);
++        std::lock_guard lock(mutex);
++        for (size_t index = 0u; index < discs.size(); ++index)
++        {
++            const auto &table = index == currentDisc ? files : discs[index].files;
++            if (table.count(key)) return static_cast<int>(index);
++        }
++        return -1;
++    }
++
++    void armChanger()
++    {
++        std::lock_guard lock(mutex);
++        if (!changerArmedLocked()) trayPolls = 0u;
++        changerArmedAt = std::chrono::steady_clock::now();
++    }
++
++    bool trayOpenNow()
++    {
++        std::lock_guard lock(mutex);
++        // A disc-change scene resets its tray flags on entry, so keep cycling:
++        // open for one status poll, then closed for 29.
++        return changerArmedLocked() && trayPolls++ % 30u == 0u;
++    }
++
++    bool findFile(std::string_view guestPath, File &file, std::filesystem::path *image)
+     {
+         const std::string key = pathKey(guestPath);
+         std::lock_guard lock(mutex);
+         refreshIdentityLocked();
+         if (verifiedImage.empty() || mode != Mode::Verified) return false;
+-        const auto entry = files.find(key);
+-        if (entry == files.end()) return false;
+-        file = entry->second;
+-        return true;
++        if (const auto entry = files.find(key); entry != files.end())
++        {
++            file = entry->second;
++            if (image) *image = verifiedImage;
++            return true;
++        }
++        if (discs.size() < 2u || !changerArmedLocked()) return false;
++        // The game is asking for a disc it does not see: insert the registered
++        // disc that has the file (boot disc first, then registration order).
++        for (size_t index = 0u; index < discs.size(); ++index)
++        {
++            if (index == currentDisc) continue;
++            const auto entry = discs[index].files.find(key);
++            if (entry == discs[index].files.end()) continue;
++            file = entry->second;
++            selectDiscLocked(index);
++            if (image) *image = verifiedImage;
++            std::fprintf(stderr, "[disc] changer: inserted %s (for %s)\n",
++                         verifiedImage.filename().string().c_str(), key.c_str());
++            return true;
++        }
++        return false;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+index a12d2a9..e1ecb5d 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.h
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -19,6 +19,35 @@ namespace ps2_disc
+                              const std::filesystem::path &manifest,
+                              std::string_view imageSha256, std::string_view manifestSha256,
+                              std::string &error);
+-    [[nodiscard]] bool findFile(std::string_view guestPath, File &file);
++    // Registers another verified disc of the same title set (a multi-disc
++    // game, or a key disc). The primary mount stays the boot disc.
++    [[nodiscard]] bool addDisc(const std::filesystem::path &image,
++                               const std::filesystem::path &manifest,
++                               std::string_view imageSha256, std::string_view manifestSha256,
++                               std::string &error);
++    // Looks the file up on the current disc. While the disc changer is armed,
++    // a miss is retried on the other registered discs and the first disc that
++    // has the file becomes current (the player never swaps discs by hand).
++    // `image` receives the image that holds the returned extents.
++    [[nodiscard]] bool findFile(std::string_view guestPath, File &file,
++                                std::filesystem::path *image = nullptr);
++    // Image currently in the virtual drive (the primary until a change).
++    [[nodiscard]] std::filesystem::path currentImage();
++    struct DiscInfo
++    {
++        std::filesystem::path image, manifest;
++        std::string imageSha256, manifestSha256;
++    };
++    // Every registered disc, boot disc first (for handing the set to another
++    // executable).
++    [[nodiscard]] std::vector<DiscInfo> registeredDiscs();
++    // Index (into registeredDiscs) of the disc holding the file, or -1.
++    [[nodiscard]] int discHolding(std::string_view guestPath);
++    // Called every frame by a game's disc-change scene: arms the changer and
++    // the virtual tray for ~0.5 s.
++    void armChanger();
++    // Virtual tray for sceCdStatus: true on the polls where the tray should
++    // read as open (one poll in 30 while the changer is armed).
++    [[nodiscard]] bool trayOpenNow();
+     [[nodiscard]] std::string pathKey(std::string_view guestPath);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 9763e7f..83ec575 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -528,7 +528,8 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
+     case ps2x::iop::HostPathKind::CdRoot:
+         return paths.cdRoot.string();
+     case ps2x::iop::HostPathKind::CdImage:
+-        return paths.cdImage.string();
++        // The virtual drive may hold another registered disc of the set.
++        return paths.cdImage.empty() ? std::string{} : ps2_disc::currentImage().string();
+     case ps2x::iop::HostPathKind::HostRoot:
+         return paths.hostRoot.string();
+     case ps2x::iop::HostPathKind::MemoryCardRoot:
+@@ -594,6 +595,9 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+ uint64_t PS2IopHostAdapter::discGeneration() const
+ { return ps2_disc::generation(); }
+ 
++bool PS2IopHostAdapter::cdTrayOpen()
++{ return ps2_disc::trayOpenNow(); }
++
+ bool PS2IopHostAdapter::findDiscFile(std::string_view path, ps2x::iop::DiscFile &file) const
+ {
+     ps2_disc::File native;
+@@ -606,20 +610,26 @@ bool PS2IopHostAdapter::findDiscFile(std::string_view path, ps2x::iop::DiscFile
+ uint64_t PS2IopHostAdapter::openGuestFile(std::string_view path)
+ {
+     const auto parsed = ps2x::iop::parsePs2Path(path);
+-    const auto image = PS2Runtime::getIoPaths().cdImage;
+     const uint64_t generation = ps2_disc::generation();
+-    if (!parsed || parsed.device != ps2x::iop::Ps2PathDevice::Cdrom || image.empty())
++    if (!parsed || parsed.device != ps2x::iop::Ps2PathDevice::Cdrom || PS2Runtime::getIoPaths().cdImage.empty())
+         return IopHost::openGuestFile(path);
+     ps2_disc::File file;
+-    if (!ps2_disc::findFile(path, file) || generation != ps2_disc::generation()) return 0u;
++    std::filesystem::path image;
++    if (!ps2_disc::findFile(path, file, &image) || generation != ps2_disc::generation()) return 0u;
+     const uint64_t handle = openHostFile(image.string());
+     if (handle == 0u) return 0u;
+     bool accepted = false;
+     {
+         std::lock_guard lock(m_hostFileMutex);
+         auto &opened = m_hostFiles.at(handle);
+-        accepted = opened.generation == generation && generation == ps2_disc::generation();
+-        if (accepted) { opened.size = file.size; opened.extents = std::move(file.extents); }
++        // A disc other than the boot disc opens as a plain host file (generation 0).
++        accepted = (opened.generation == generation || opened.generation == 0u) && generation == ps2_disc::generation();
++        if (accepted)
++        {
++            opened.generation = generation;
++            opened.size = file.size;
++            opened.extents = std::move(file.extents);
++        }
+     }
+     if (!accepted) { closeHostFile(handle); return 0u; }
+     return handle;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index fe60353..90a1611 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -76,6 +76,7 @@ public:
+     uint64_t openHostFile(std::string_view path) override;
+     uint64_t openGuestFile(std::string_view path) override;
+     bool findDiscFile(std::string_view path, ps2x::iop::DiscFile &file) const override;
++    bool cdTrayOpen() override;
+     uint64_t discGeneration() const override;
+     bool hostFileSize(uint64_t handle, uint64_t &size) const override;
+     bool readHostFile(uint64_t handle,
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b1f592b..bf2e723 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -19,8 +19,15 @@
+ #include "Kernel/Syscalls/RPC.h"
+ #include "Kernel/Syscalls/System.h"
+ 
++#include <cctype>
++#include <cerrno>
+ #include <iostream>
+ #include <stdexcept>
++#ifdef _WIN32
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
+ #include <fstream>
+ #include <algorithm>
+ #include <array>
+@@ -1182,6 +1189,97 @@ const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
+     return runtimeIoPaths();
+ }
+ 
++void PS2Runtime::armDiscChanger()
++{
++    ps2_disc::armChanger();
++}
++
++namespace
++{
++    std::vector<PS2Runtime::ExecTarget> &execTargets()
++    {
++        static std::vector<PS2Runtime::ExecTarget> targets;
++        return targets;
++    }
++}
++
++namespace
++{
++    std::vector<std::string> &guestArgStorage()
++    {
++        static std::vector<std::string> args;
++        return args;
++    }
++}
++
++void PS2Runtime::setGuestArgs(std::vector<std::string> args)
++{
++    guestArgStorage() = std::move(args);
++}
++
++const std::vector<std::string> &PS2Runtime::guestArgs()
++{
++    return guestArgStorage();
++}
++
++void PS2Runtime::addExecTarget(ExecTarget target)
++{
++    execTargets().push_back(std::move(target));
++}
++
++bool PS2Runtime::loadExecPS2(const std::string &guestPath, const std::vector<std::string> &args)
++{
++    // "cdrom0:\SLPM_667.79;1" -> "SLPM_667.79"
++    std::string leaf = guestPath.substr(guestPath.find_last_of("\\/:") + 1u);
++    leaf = leaf.substr(0u, leaf.find(';'));
++    std::transform(leaf.begin(), leaf.end(), leaf.begin(), [](unsigned char c) { return char(std::toupper(c)); });
++    const auto &targets = execTargets();
++    const auto target = std::find_if(targets.begin(), targets.end(),
++                                     [&](const ExecTarget &t) { return t.elfName == leaf; });
++    std::cerr << "[exec] LoadExecPS2 " << guestPath;
++    for (const auto &arg : args) std::cerr << ' ' << arg;
++    std::cerr << std::endl;
++    if (target == targets.end())
++    {
++        std::cerr << "[exec] no native binary registered for " << leaf << std::endl;
++        return false;
++    }
++    // The disc holding the program boots; the rest of the set comes along.
++    const auto discs = ps2_disc::registeredDiscs();
++    const int boot = ps2_disc::discHolding(guestPath);
++    std::vector<std::string> argv{target->binary.string(), target->bootElf.string()};
++    for (size_t i = 0u; i < discs.size(); ++i)
++    {
++        if (int(i) != boot) continue;
++        argv.insert(argv.end(), {"--disc-image", discs[i].image.string(), "--disc-manifest", discs[i].manifest.string(),
++                                 "--disc-image-sha256", discs[i].imageSha256,
++                                 "--disc-manifest-sha256", discs[i].manifestSha256});
++    }
++    for (size_t i = 0u; i < discs.size(); ++i)
++        if (int(i) != boot)
++            argv.insert(argv.end(), {"--extra-disc", discs[i].image.string(), discs[i].manifest.string(),
++                                     discs[i].imageSha256, discs[i].manifestSha256});
++    if (const auto &mc = getIoPaths().mcRoot; !mc.empty())
++        argv.insert(argv.end(), {"--mc-root", mc.string()});
++    for (const auto &t : targets)
++        argv.insert(argv.end(), {"--exec-target", t.elfName, t.binary.string(), t.bootElf.string()});
++    for (const auto &arg : args)
++        argv.insert(argv.end(), {"--guest-arg", arg});
++    std::cerr << "[exec] handing over to " << target->binary.filename().string() << std::endl;
++    std::cout.flush();
++    std::cerr.flush();
++    std::vector<char *> raw;
++    for (auto &arg : argv) raw.push_back(arg.data());
++    raw.push_back(nullptr);
++#ifdef _WIN32
++    _execv(raw[0], raw.data());
++#else
++    execv(raw[0], raw.data());
++#endif
++    std::cerr << "[exec] exec failed: " << std::strerror(errno) << std::endl;
++    return false;
++}
++
+ void PS2Runtime::setIoPaths(const IoPaths &paths)
+ {
+     IoPaths normalized = paths;
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 30667b2..7f9eb23 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <iostream>
+ #include <string>
++#include <vector>
+ #include <filesystem>
+ #include <exception>
+ #include <algorithm>
+@@ -229,9 +230,48 @@ int main(int argc, char *argv[])
+ 
+         std::filesystem::path image, metadata;
+         std::string imageHash, metadataHash;
++        struct ExtraDisc { std::filesystem::path image, metadata; std::string imageHash, metadataHash; };
++        std::vector<ExtraDisc> extraDiscs;
++        std::vector<std::string> guestArgs{"cdrom0:\\" + std::filesystem::path(filePathStr).filename().string() + ";1"};
+         for (int index = 2; index < argc; ++index)
+         {
+             const std::string_view option(argv[index]);
++            // --extra-disc <image> <manifest> <image-sha256> <manifest-sha256>:
++            // another disc of the set, inserted automatically when the game asks.
++            // --exec-target <ELF name> <binary> <boot ELF>: LoadExecPS2 handoff.
++            if (option == "--exec-target")
++            {
++                if (index + 3 >= argc) throw std::runtime_error("--exec-target needs ELF name, binary and boot ELF");
++                PS2Runtime::addExecTarget({argv[index + 1], std::filesystem::absolute(argv[index + 2]).lexically_normal(),
++                                           std::filesystem::absolute(argv[index + 3]).lexically_normal()});
++                index += 3;
++                continue;
++            }
++            // --mc-root <dir>: memory card folder shared by every disc of the set.
++            if (option == "--mc-root")
++            {
++                if (++index >= argc) throw std::runtime_error("--mc-root needs a directory");
++                auto paths = PS2Runtime::getIoPaths();
++                paths.mcRoot = std::filesystem::absolute(argv[index]).lexically_normal();
++                PS2Runtime::setIoPaths(paths);
++                continue;
++            }
++            // --guest-arg <text>: program argument (from a LoadExecPS2 handoff).
++            if (option == "--guest-arg")
++            {
++                if (++index >= argc) throw std::runtime_error("--guest-arg needs a value");
++                guestArgs.push_back(argv[index]);
++                continue;
++            }
++            if (option == "--extra-disc")
++            {
++                if (index + 4 >= argc) throw std::runtime_error("--extra-disc needs image, manifest and both digests");
++                extraDiscs.push_back({std::filesystem::absolute(argv[index + 1]).lexically_normal(),
++                                      std::filesystem::absolute(argv[index + 2]).lexically_normal(),
++                                      argv[index + 3], argv[index + 4]});
++                index += 4;
++                continue;
++            }
+             if (option == "--disc-image" || option == "--disc-manifest" ||
+                 option == "--disc-image-sha256" || option == "--disc-manifest-sha256")
+             {
+@@ -242,6 +282,7 @@ int main(int argc, char *argv[])
+                 else metadataHash = argv[index];
+             }
+         }
++        PS2Runtime::setGuestArgs(guestArgs);
+         if (!image.empty() || !metadata.empty() || !imageHash.empty() || !metadataHash.empty())
+         {
+             if (image.empty() || metadata.empty() || imageHash.empty() || metadataHash.empty())
+@@ -252,7 +293,15 @@ int main(int argc, char *argv[])
+             if (!ps2_disc::mount(image, metadata, imageHash, metadataHash, error))
+                 throw std::runtime_error("disc mount failed: " + error);
+             std::cerr << "[disc mount] verified image and metadata, generation " << ps2_disc::generation() << '\n';
++            for (const auto &extra : extraDiscs)
++            {
++                if (!ps2_disc::addDisc(extra.image, extra.metadata, extra.imageHash, extra.metadataHash, error))
++                    throw std::runtime_error("extra disc " + extra.image.string() + ": " + error);
++                std::cerr << "[disc mount] registered " << extra.image.filename().string() << '\n';
++            }
+         }
++        else if (!extraDiscs.empty())
++            throw std::runtime_error("--extra-disc requires a mounted boot disc");
+         runtime.run();
+ 
+ #ifdef _DEBUG
+-- 
+2.55.0
+

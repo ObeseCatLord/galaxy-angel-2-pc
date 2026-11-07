@@ -1,0 +1,612 @@
+From d319bc78d73596f4e8d2904150f7a36b944825d8 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:19:44 -0500
+Subject: [PATCH] vu1: statically scheduled blocks in generated programs
+
+Generated VU1 programs split each chunk into blocks: runs of consecutive
+pairs with no branch, E/D/T bit, XGKICK or reserved instruction and nothing
+pending from a branch. The generator runs each block through stepPairAfter
+on a scratch VU from an idle pipeline to get every pair's issue cycle and the
+ready cycles the block leaves; at run time a guard checks that nothing issued
+before the block (register writes, FDIV/EFU results) can delay any pair, and
+the block then runs without per-pair ready tracking, stall loops or budget
+checks, writing the ready cycles once at the end. Otherwise the per-pair
+code runs as before. GA2_VU1GEN_BLOCKS=0 turns blocks off.
+
+ga2_vu1_check --reference: 0 mismatches on the Eigou 2 narration, Zettai
+map and battle, and Mugen 1 tutorial captures; narration replay ~14 ->
+~8.5 ns/VU cycle under the same (heavy) host load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h        |  61 +++++++
+ ps2xRuntime/include/runtime/ps2_vu1_step.inl | 168 +++++++++++++++++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp      | 144 ++++++++++++++++
+ ps2xTest/src/ga2_vu1_gen.cpp                 | 134 ++++++++++++++-
+ 4 files changed, 505 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 7007935..2d1231e 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -192,6 +192,67 @@ public:
+     bool resumesInDelaySlot() const { return m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot; }
+     StepResult stepGeneric(const StepArgs &args);
+ 
++    // ---- Statically scheduled blocks (ga2_vu1_gen)
++    // A block is a run of consecutive pairs with no branch, E/D/T bit,
++    // XGKICK or reserved instruction, entered at its first pair. When nothing
++    // issued before the block can delay any of its pairs (the guards), every
++    // pair issues at a fixed offset from the block's entry cycle, so the
++    // generator works the timing out ahead of time (scheduleBlockForCodegen
++    // runs the block through stepPairAfter on a scratch VU from an idle
++    // pipeline) and the block runs without ready-cycle bookkeeping.
++    enum class BlockGuardKind : uint8_t
++    {
++        Vf,      // m_vfReady[reg][lane] <= entry + offset
++        Vi,      // m_viReady[reg] <= entry + offset
++        Acc,     // m_accReady[lane] <= entry + offset
++        Fdiv,    // a pending FDIV result is ready by entry + offset
++        EfuUnit, // m_efuResourceReady <= entry + offset
++        EfuAll   // every pending EFU result is ready by entry + offset
++    };
++    struct BlockGuard
++    {
++        BlockGuardKind kind;
++        uint8_t reg;
++        uint8_t lane;
++        uint32_t offset;
++    };
++    enum class BlockFinalKind : uint8_t
++    {
++        Vf,
++        Vi,
++        Acc
++    };
++    struct BlockFinal
++    {
++        BlockFinalKind kind;
++        uint8_t reg;
++        uint8_t lane;
++        uint32_t offset; // ready cycle relative to the entry cycle
++    };
++    struct BlockSchedule
++    {
++        std::array<uint32_t, 64> issue{}; // issue cycle of each pair, relative to entry
++        uint32_t count = 0;
++        uint32_t regWriteReady = 0; // relative latest write ready cycle (0: none)
++        BlockGuard guards[160];
++        uint32_t guardCount = 0;
++        BlockFinal finals[160];
++        uint32_t finalCount = 0;
++    };
++    static constexpr uint32_t kMaxBlockPairs = 64u;
++    // Whether this pair may be part of a block.
++    static bool blockablePair(const DecodedInstructionPair &decoded);
++    static bool scheduleBlockForCodegen(const DecodedInstructionPair *pairs, uint32_t count, BlockSchedule &out);
++    // Generated code: whether the block may run on its schedule from now;
++    // lastIssue is the last pair's issue offset.
++    inline bool blockMayRun(const BlockGuard *guards, uint32_t guardCount, uint32_t lastIssue, const StepArgs &args) const;
++    // One pair of a block: stall cycles are known; no ready bookkeeping.
++    inline StepResult stepPairScheduled(const DecodedInstructionPair &decoded, uint32_t stallCycles, const StepArgs &args);
++    // After the block: its writes' ready cycles, as the pairs would have left them.
++    inline void finishBlock(uint64_t entryCycle, const BlockFinal *finals, uint32_t finalCount, uint32_t regWriteReady);
++    uint64_t currentCycle() const { return m_cycle; }
++    bool stopRequested() const { return m_stopRequested; }
++
+ private:
+ 
+     struct FlagPipelineEntry
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1_step.inl b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+index a85cc14..3f453f7 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1_step.inl
++++ b/ps2xRuntime/include/runtime/ps2_vu1_step.inl
+@@ -341,3 +341,171 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
+     advanceOneCycle();
+     return programEnded ? StepResult::Ended : StepResult::Continue;
+ }
++
++// ---- Statically scheduled blocks (see ps2_vu1.h)
++
++__attribute__((always_inline)) inline bool VU1Interpreter::blockMayRun(const BlockGuard *guards, uint32_t guardCount,
++                                                                        uint32_t lastIssue, const StepArgs &a) const
++{
++    const uint64_t entry = m_cycle;
++    if (entry + lastIssue >= a.budgetEnd || m_stopRequested)
++        return false;
++    bool ok = true;
++#pragma clang loop unroll(full)
++    for (uint32_t k = 0; k < guardCount; ++k)
++    {
++        const BlockGuard &g = guards[k];
++        const uint64_t limit = entry + g.offset;
++        switch (g.kind)
++        {
++        case BlockGuardKind::Vf:
++            ok = ok && m_vfReady[g.reg][g.lane] <= limit;
++            break;
++        case BlockGuardKind::Vi:
++            ok = ok && m_viReady[g.reg] <= limit;
++            break;
++        case BlockGuardKind::Acc:
++            ok = ok && m_accReady[g.lane] <= limit;
++            break;
++        case BlockGuardKind::Fdiv:
++            ok = ok && (!m_fdiv.valid || m_fdiv.readyCycle <= limit);
++            break;
++        case BlockGuardKind::EfuUnit:
++            ok = ok && m_efuResourceReady <= limit;
++            break;
++        case BlockGuardKind::EfuAll:
++            ok = ok && (!m_efu[0].valid || m_efu[0].readyCycle <= limit) && (!m_efu[1].valid || m_efu[1].readyCycle <= limit);
++            break;
++        }
++    }
++    return ok;
++}
++
++// stepPairAfter for a pair inside a block that may run on its schedule:
++// nothing can be pending from a branch, E bit or halt, the stall is known,
++// and the ready cycles are written once by finishBlock.
++__attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPairScheduled(const DecodedInstructionPair &decoded,
++                                                                                                uint32_t stallCycles,
++                                                                                                const StepArgs &a)
++{
++    (void)a;
++    if (stallCycles != 0u)
++        advanceTo(m_cycle + stallCycles);
++
++    uint8_t writtenVi = 0u;
++    int32_t oldVi = 0;
++    for (uint32_t reg = 1; reg < 16u; ++reg)
++    {
++        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
++        {
++            writtenVi = static_cast<uint8_t>(reg);
++            oldVi = m_state.vi[reg];
++            break;
++        }
++    }
++
++    const VfAccess upperWrite = decoded.upperUsage.vfWrite;
++    const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
++    const bool hasUpperWrite = upperWrite.reg != 0u;
++    const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++    const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
++    float oldUpperVf[4]{};
++    float oldLowerVf[4]{};
++    float oldAcc[4]{};
++    if (hasUpperWrite)
++        std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++    if (hasDistinctLowerWrite)
++        std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++    if (decoded.upperUsage.accWrite != 0u)
++        std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++
++    if (decoded.iBit)
++    {
++        execUpper(decoded.upper, decoded.flagMode);
++        float immediate = 0.0f;
++        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++        m_state.i = normalizeOperand(immediate);
++    }
++    else if (decoded.upperVfShadowReg != 0u)
++    {
++        float oldVf[4]{};
++        float upperVf[4]{};
++        std::memcpy(oldVf, m_state.vf[decoded.upperVfShadowReg], sizeof(oldVf));
++        execUpper(decoded.upper, decoded.flagMode);
++        std::memcpy(upperVf, m_state.vf[decoded.upperVfShadowReg], sizeof(upperVf));
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg], oldVf, sizeof(oldVf));
++        execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
++        std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
++    }
++    else
++    {
++        execUpper(decoded.upper, decoded.flagMode);
++        execLower(decoded.lower, a.vuData, a.dataSize, *a.gs, a.memory, decoded.upper);
++    }
++
++    m_viBranchBackupValid = false;
++
++    if (hasUpperWrite && upperWrite.lanes != 0u)
++    {
++        float *reg = m_state.vf[upperWrite.reg];
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((upperWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
++                reg[component] = oldUpperVf[component];
++    }
++    else if (hasUpperWrite)
++        std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
++    if (hasDistinctLowerWrite && lowerWrite.lanes != 0u)
++    {
++        float *reg = m_state.vf[lowerWrite.reg];
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((lowerWrite.lanes & ga2_vu1::laneForComponent(component)) == 0u)
++                reg[component] = oldLowerVf[component];
++    }
++    else if (hasDistinctLowerWrite)
++        std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
++    if (decoded.upperUsage.accWrite != 0u)
++    {
++        for (uint32_t component = 0; component < 4u; ++component)
++            if ((decoded.upperUsage.accWrite & ga2_vu1::laneForComponent(component)) == 0u)
++                m_state.acc[component] = oldAcc[component];
++    }
++    if (writtenVi != 0u)
++        m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
++    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++        recordViWriteForBranch(writtenVi, oldVi);
++
++    m_state.vf[0][0] = 0.0f;
++    m_state.vf[0][1] = 0.0f;
++    m_state.vf[0][2] = 0.0f;
++    m_state.vf[0][3] = 1.0f;
++    m_state.vi[0] = 0;
++
++    m_state.pc += 8u;
++    advanceOneCycle();
++    return StepResult::Continue;
++}
++
++__attribute__((always_inline)) inline void VU1Interpreter::finishBlock(uint64_t entryCycle, const BlockFinal *finals,
++                                                                        uint32_t finalCount, uint32_t regWriteReady)
++{
++#pragma clang loop unroll(full)
++    for (uint32_t k = 0; k < finalCount; ++k)
++    {
++        const BlockFinal &f = finals[k];
++        const uint64_t ready = entryCycle + f.offset;
++        switch (f.kind)
++        {
++        case BlockFinalKind::Vf:
++            m_vfReady[f.reg][f.lane] = ready;
++            break;
++        case BlockFinalKind::Vi:
++            m_viReady[f.reg] = ready;
++            break;
++        case BlockFinalKind::Acc:
++            m_accReady[f.lane] = ready;
++            break;
++        }
++    }
++    if (regWriteReady != 0u)
++        m_regWriteReady = std::max(m_regWriteReady, entryCycle + regWriteReady);
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 3528769..cbc6fbb 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1213,6 +1213,150 @@ bool VU1Interpreter::upperProducesFmacFlags(uint32_t upper)
+     return produced;
+ }
+ 
++bool VU1Interpreter::blockablePair(const DecodedInstructionPair &d)
++{
++    return !d.upperUsage.reserved && !d.lowerUsage.reserved && !d.eBit && !d.dBit && !d.tBit &&
++           d.lowerUsage.pipeline != PipelineBranch && d.lowerUsage.pipeline != PipelineXgkick;
++}
++
++bool VU1Interpreter::scheduleBlockForCodegen(const DecodedInstructionPair *pairs, uint32_t count, BlockSchedule &out)
++{
++    out = BlockSchedule{};
++    if (count == 0u || count > kMaxBlockPairs)
++        return false;
++    for (uint32_t i = 0; i < count; ++i)
++        if (!blockablePair(pairs[i]))
++            return false;
++
++    // Timing: run the block on a scratch VU whose pipelines are idle. Timing
++    // does not depend on data (branches and XGKICK are excluded), so every
++    // issue and ready cycle here holds for any entry that passes the guards.
++    static std::vector<uint8_t> code(0x4000u), data(0x4000u);
++    static GS gs;
++    auto vu = std::make_unique<VU1Interpreter>(Unit::VU1);
++    constexpr uint64_t kBase = 1000u;
++    vu->reset();
++    vu->m_cycle = kBase;
++    vu->m_state.cycles = kBase;
++    vu->m_activeVuData = data.data();
++    vu->m_activeVuDataSize = static_cast<uint32_t>(data.size());
++    vu->m_activeGs = &gs;
++    std::fill(data.begin(), data.end(), 0u);
++    const StepArgs args{code.data(), data.data(), static_cast<uint32_t>(data.size()), &gs, nullptr,
++                        static_cast<uint32_t>(code.size()), ~0ull};
++    for (uint32_t i = 0; i < count; ++i)
++    {
++        if (vu->stepPairAfter(pairs[i], PairEntry{false, false, false}, args) != StepResult::Continue || vu->m_stopRequested)
++            return false;
++        out.issue[i] = static_cast<uint32_t>(vu->m_cycle - 1u - kBase);
++    }
++    out.count = count;
++    out.regWriteReady = vu->m_regWriteReady > kBase ? static_cast<uint32_t>(vu->m_regWriteReady - kBase) : 0u;
++    auto addFinal = [&](BlockFinalKind kind, uint32_t reg, uint32_t lane, uint64_t ready) {
++        if (ready == 0u)
++            return true;
++        if (out.finalCount >= std::size(out.finals))
++            return false;
++        out.finals[out.finalCount++] = BlockFinal{kind, static_cast<uint8_t>(reg), static_cast<uint8_t>(lane),
++                                                  static_cast<uint32_t>(ready - kBase)};
++        return true;
++    };
++    for (uint32_t reg = 0; reg < 32u; ++reg)
++        for (uint32_t lane = 0; lane < 4u; ++lane)
++            if (!addFinal(BlockFinalKind::Vf, reg, lane, vu->m_vfReady[reg][lane]))
++                return false;
++    for (uint32_t reg = 0; reg < 16u; ++reg)
++        if (!addFinal(BlockFinalKind::Vi, reg, 0, vu->m_viReady[reg]))
++            return false;
++    for (uint32_t lane = 0; lane < 4u; ++lane)
++        if (!addFinal(BlockFinalKind::Acc, 0, lane, vu->m_accReady[lane]))
++            return false;
++
++    // Guards: whatever a pair consults that no earlier pair of the block has
++    // written must be ready by that pair's issue cycle (its first consultation
++    // has the smallest offset, so later ones follow).
++    bool vfWritten[32][4]{}, viWritten[16]{}, accWritten[4]{};
++    bool vfGuarded[32][4]{}, viGuarded[16]{}, accGuarded[4]{};
++    bool fdivIssued = false, efuIssued = false, fdivGuarded = false, efuUnitGuarded = false, efuAllGuarded = false;
++    auto addGuard = [&](BlockGuardKind kind, uint32_t reg, uint32_t lane, uint32_t offset) {
++        if (out.guardCount >= std::size(out.guards))
++            return false;
++        out.guards[out.guardCount++] = BlockGuard{kind, static_cast<uint8_t>(reg), static_cast<uint8_t>(lane), offset};
++        return true;
++    };
++    for (uint32_t i = 0; i < count; ++i)
++    {
++        const DecodedInstructionPair &p = pairs[i];
++        const uint32_t offset = out.issue[i];
++        for (const InstructionUsage *u : {&p.upperUsage, &p.lowerUsage})
++        {
++            for (uint32_t k = 0; k < u->vfReadCount && k < 2u; ++k)
++                for (uint32_t lane = 0; lane < 4u; ++lane)
++                {
++                    const uint32_t reg = u->vfRead[k].reg;
++                    // VF0 is never written, so its ready cycles stay zero.
++                    if (reg == 0u || (u->vfRead[k].lanes & ga2_vu1::laneForComponent(lane)) == 0u ||
++                        vfWritten[reg][lane] || vfGuarded[reg][lane])
++                        continue;
++                    vfGuarded[reg][lane] = true;
++                    if (!addGuard(BlockGuardKind::Vf, reg, lane, offset))
++                        return false;
++                }
++            for (uint32_t reg = 1; reg < 16u; ++reg)
++                if ((u->viRead & (1u << reg)) != 0u && !viWritten[reg] && !viGuarded[reg])
++                {
++                    viGuarded[reg] = true;
++                    if (!addGuard(BlockGuardKind::Vi, reg, 0, offset))
++                        return false;
++                }
++            for (uint32_t lane = 0; lane < 4u; ++lane)
++                if ((u->accRead & ga2_vu1::laneForComponent(lane)) != 0u && !accWritten[lane] && !accGuarded[lane])
++                {
++                    accGuarded[lane] = true;
++                    if (!addGuard(BlockGuardKind::Acc, 0, lane, offset))
++                        return false;
++                }
++        }
++        const InstructionUsage &low = p.lowerUsage;
++        if ((low.pipeline == PipelineFdiv || low.waitQ) && !fdivIssued && !fdivGuarded)
++        {
++            fdivGuarded = true;
++            if (!addGuard(BlockGuardKind::Fdiv, 0, 0, offset))
++                return false;
++        }
++        if (low.pipeline == PipelineEfu && !efuIssued && !efuUnitGuarded)
++        {
++            efuUnitGuarded = true;
++            if (!addGuard(BlockGuardKind::EfuUnit, 0, 0, offset))
++                return false;
++        }
++        if (low.waitP && !efuAllGuarded)
++        {
++            efuAllGuarded = true;
++            if (!addGuard(BlockGuardKind::EfuAll, 0, 0, offset))
++                return false;
++        }
++        // Writes, as markPairWrites records them.
++        if (low.vfWrite.reg != 0u && p.suppressedLowerVf != low.vfWrite.reg)
++            for (uint32_t lane = 0; lane < 4u; ++lane)
++                if ((low.vfWrite.lanes & ga2_vu1::laneForComponent(lane)) != 0u)
++                    vfWritten[low.vfWrite.reg][lane] = true;
++        if (p.upperUsage.vfWrite.reg != 0u)
++            for (uint32_t lane = 0; lane < 4u; ++lane)
++                if ((p.upperUsage.vfWrite.lanes & ga2_vu1::laneForComponent(lane)) != 0u)
++                    vfWritten[p.upperUsage.vfWrite.reg][lane] = true;
++        for (uint32_t reg = 1; reg < 16u; ++reg)
++            if ((low.viWrite & (1u << reg)) != 0u)
++                viWritten[reg] = true;
++        for (uint32_t lane = 0; lane < 4u; ++lane)
++            if ((p.upperUsage.accWrite & ga2_vu1::laneForComponent(lane)) != 0u)
++                accWritten[lane] = true;
++        fdivIssued = fdivIssued || low.pipeline == PipelineFdiv;
++        efuIssued = efuIssued || low.pipeline == PipelineEfu;
++    }
++    return true;
++}
++
+ VU1Interpreter::StepResult VU1Interpreter::stepGeneric(const StepArgs &args)
+ {
+     return stepPair(getDecodedInstructionPairForPc(args.vuCode, args.codeSize, args.memory, m_state.pc), args);
+diff --git a/ps2xTest/src/ga2_vu1_gen.cpp b/ps2xTest/src/ga2_vu1_gen.cpp
+index 7c270a7..8f416a6 100644
+--- a/ps2xTest/src/ga2_vu1_gen.cpp
++++ b/ps2xTest/src/ga2_vu1_gen.cpp
+@@ -20,6 +20,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <string>
++#include <unordered_map>
+ #include <utility>
+ 
+ namespace
+@@ -231,6 +232,39 @@ namespace
+         return std::string(head) + ".lowerUsage=" + usage(p.lowerUsage) + ",.upperUsage=" + usage(p.upperUsage) + tail;
+     }
+ 
++    const char *guardKind(VU::BlockGuardKind k)
++    {
++        switch (k)
++        {
++        case VU::BlockGuardKind::Vf: return "Vf";
++        case VU::BlockGuardKind::Vi: return "Vi";
++        case VU::BlockGuardKind::Acc: return "Acc";
++        case VU::BlockGuardKind::Fdiv: return "Fdiv";
++        case VU::BlockGuardKind::EfuUnit: return "EfuUnit";
++        case VU::BlockGuardKind::EfuAll: return "EfuAll";
++        }
++        return "Vf";
++    }
++
++    const char *finalKind(VU::BlockFinalKind k)
++    {
++        switch (k)
++        {
++        case VU::BlockFinalKind::Vf: return "Vf";
++        case VU::BlockFinalKind::Vi: return "Vi";
++        case VU::BlockFinalKind::Acc: return "Acc";
++        }
++        return "Vf";
++    }
++
++    // A statically scheduled block starting at a chunk pair (see ps2_vu1.h).
++    struct Block
++    {
++        uint32_t first = 0;
++        std::vector<uint32_t> pairs;
++        VU::BlockSchedule schedule;
++    };
++
+     std::string header()
+     {
+         return "// Generated by ga2_vu1_gen from a VU1 code image. Do not edit.\n"
+@@ -352,12 +386,80 @@ namespace
+         if (!write(outdir + "/" + base + ".cpp", dispatch))
+             return false;
+ 
++        // GA2_VU1GEN_BLOCKS=0: no statically scheduled blocks.
++        static const bool blocksEnabled = [] {
++            const char *v = std::getenv("GA2_VU1GEN_BLOCKS");
++            return !(v && *v == '0');
++        }();
++        size_t blockCount = 0, blockPairs = 0;
+         for (size_t c = 0; c < chunks.size(); ++c)
+         {
+             std::string out = header() + "\nnamespace\n{\n";
++            std::vector<VU::DecodedInstructionPair> decoded;
+             for (uint32_t index : chunks[c])
++            {
++                VU::DecodedInstructionPair d = VU::decodeForCodegen(code.data(), index * 8u);
++                d.flagMode = modes[index];
++                decoded.push_back(d);
+                 out += "constexpr VU::DecodedInstructionPair kP" + std::to_string(index) + " = " +
+                        pair(VU::decodeForCodegen(code.data(), index * 8u), modes[index]) + ";\n";
++            }
++            // Blocks: runs of consecutive pairs that fall through to each
++            // other, with nothing pending from a branch, E bit or halt.
++            std::unordered_map<uint32_t, Block> blockAt;
++            if (blocksEnabled)
++            {
++                const std::vector<uint32_t> &ch = chunks[c];
++                auto inBlock = [&](size_t k) {
++                    const uint32_t index = ch[k];
++                    return index + 1u < pairs && !facts.mayBranch[index] && !facts.mayEnd[index] && !facts.mayHalt[index] &&
++                           VU::blockablePair(decoded[k]);
++                };
++                for (size_t k = 0; k < ch.size();)
++                {
++                    if (!inBlock(k))
++                    {
++                        ++k;
++                        continue;
++                    }
++                    size_t e = k + 1;
++                    while (e < ch.size() && e - k < VU::kMaxBlockPairs && ch[e] == ch[e - 1] + 1u && inBlock(e))
++                        ++e;
++                    if (e - k >= 2u)
++                    {
++                        Block b;
++                        b.first = ch[k];
++                        b.pairs.assign(ch.begin() + static_cast<long>(k), ch.begin() + static_cast<long>(e));
++                        if (VU::scheduleBlockForCodegen(decoded.data() + k, static_cast<uint32_t>(e - k), b.schedule))
++                        {
++                            const VU::BlockSchedule &sc = b.schedule;
++                            std::string n = std::to_string(b.first);
++                            if (sc.guardCount)
++                            {
++                                out += "constexpr VU::BlockGuard kG" + n + "[] = {";
++                                for (uint32_t g = 0; g < sc.guardCount; ++g)
++                                    out += "{VU::BlockGuardKind::" + std::string(guardKind(sc.guards[g].kind)) + "," +
++                                           std::to_string(sc.guards[g].reg) + "," + std::to_string(sc.guards[g].lane) + "," +
++                                           std::to_string(sc.guards[g].offset) + "},";
++                                out += "};\n";
++                            }
++                            if (sc.finalCount)
++                            {
++                                out += "constexpr VU::BlockFinal kF" + n + "[] = {";
++                                for (uint32_t f = 0; f < sc.finalCount; ++f)
++                                    out += "{VU::BlockFinalKind::" + std::string(finalKind(sc.finals[f].kind)) + "," +
++                                           std::to_string(sc.finals[f].reg) + "," + std::to_string(sc.finals[f].lane) + "," +
++                                           std::to_string(sc.finals[f].offset) + "},";
++                                out += "};\n";
++                            }
++                            ++blockCount;
++                            blockPairs += b.pairs.size();
++                            blockAt.emplace(b.first, std::move(b));
++                        }
++                    }
++                    k = e;
++                }
++            }
+             // Threaded: the switch is only taken on entry and after a jump; a
+             // pair whose successor is the next pair of this chunk falls
+             // through behind one well-predicted compare.
+@@ -376,7 +478,34 @@ namespace
+                 const bool prevBranch = facts.mayBranch[index];
+                 const bool prevEnd = facts.mayEnd[index];
+                 const bool prevHalt = facts.mayHalt[index];
+-                out += "    L" + n + ":\n    {\n        const VU::StepResult r = vu.stepPairAfter(kP" + n + ", VU::PairEntry{" +
++                out += "    L" + n + ":\n";
++                if (const auto bit = blockAt.find(index); bit != blockAt.end())
++                {
++                    const Block &b = bit->second;
++                    const VU::BlockSchedule &sc = b.schedule;
++                    const uint32_t last = b.pairs.back();
++                    out += "    if (vu.blockMayRun(" + (sc.guardCount ? "kG" + n : std::string("nullptr")) + ", " +
++                           std::to_string(sc.guardCount) + "u, " + std::to_string(sc.issue[sc.count - 1u]) + "u, a))\n    {\n"
++                           "        const uint64_t e = vu.currentCycle();\n";
++                    const std::string finish = "vu.finishBlock(e, " + (sc.finalCount ? "kF" + n : std::string("nullptr")) +
++                                               ", " + std::to_string(sc.finalCount) + "u, " + std::to_string(sc.regWriteReady) + "u);";
++                    for (uint32_t k = 0; k < sc.count; ++k)
++                    {
++                        const uint32_t stall = k == 0 ? sc.issue[0] : sc.issue[k] - sc.issue[k - 1] - 1u;
++                        out += "        vu.stepPairScheduled(kP" + std::to_string(b.pairs[k]) + ", " + std::to_string(stall) + "u, a);\n";
++                        // Only a PATH1 transfer already running can fail and stop the unit.
++                        out += "        if (vu.stopRequested())\n        {\n            " + finish +
++                               "\n            return VU::StepResult::Stop;\n        }\n";
++                    }
++                    out += "        " + finish + "\n"
++                           "        if (!vu.stepLoopHeadAfterPair(a))\n            return VU::StepResult::Stop;\n";
++                    const bool nextHere = std::binary_search(chunks[c].begin(), chunks[c].end(), last + 1u);
++                    if (nextHere)
++                        out += "        if (vu.state().pc == " + std::to_string((last + 1u) * 8u) + "u)\n            goto L" +
++                               std::to_string(last + 1u) + ";\n";
++                    out += "        continue;\n    }\n";
++                }
++                out += "    {\n        const VU::StepResult r = vu.stepPairAfter(kP" + n + ", VU::PairEntry{" +
+                        (prevBranch ? "true" : "false") + ", " + (prevEnd ? "true" : "false") + ", " +
+                        (prevHalt ? "true" : "false") + "}, a);\n"
+                        "        if (r != VU::StepResult::Continue)\n            return r;\n"
+@@ -390,7 +519,8 @@ namespace
+             if (!write(outdir + "/" + base + "_" + std::to_string(c) + ".cpp", out))
+                 return false;
+         }
+-        std::printf("%s: %zu of %u pairs in %zu chunks\n", base, selected.size(), pairs, chunks.size());
++        std::printf("%s: %zu of %u pairs in %zu chunks, %zu pairs in %zu scheduled blocks\n", base, selected.size(), pairs,
++                    chunks.size(), blockPairs, blockCount);
+         return true;
+     }
+ }
+-- 
+2.55.0
+

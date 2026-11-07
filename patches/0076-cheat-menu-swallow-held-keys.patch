@@ -1,0 +1,114 @@
+From fd2abe6ca90d7b1abc803acdd97e58d94033b514 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 22:01:03 -0500
+Subject: [PATCH] cheat menu: keep held keys from reaching the game after
+ closing
+
+Enter on a menu row also reached the game as Start on the frame the menu
+closed (Zettai paused after Skip). The keys and buttons that close or
+drive the menu now stay with it until released.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_cheat_menu.cpp | 39 +++++++++++++++++++++++---
+ ps2xRuntime/src/lib/ga2_cheat_menu.h   |  1 +
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+index a203d58..f63c28f 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.cpp
+@@ -20,6 +20,10 @@ namespace ga2_cheat_menu
+     namespace
+     {
+         bool g_open = false;
++        // After the menu closes the keys and buttons that closed it stay
++        // with it until released (Enter would otherwise reach the game as
++        // Start on the closing frame).
++        bool g_swallow = false;
+         int g_selected = 0;
+         std::string g_notice;
+         double g_noticeUntil = 0.0;
+@@ -40,6 +44,28 @@ namespace ga2_cheat_menu
+                     {"Stop the time limit", &s.stopTimer}};
+         }
+ 
++        bool menuInputHeld()
++        {
++            for (int key : {KEY_F1, KEY_ESCAPE, KEY_BACKSPACE, KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_UP, KEY_DOWN,
++                            KEY_LEFT, KEY_RIGHT})
++                if (IsKeyDown(key))
++                    return true;
++            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++                return true;
++            if (IsGamepadAvailable(0))
++                for (int button : {GAMEPAD_BUTTON_LEFT_THUMB, GAMEPAD_BUTTON_RIGHT_THUMB, GAMEPAD_BUTTON_RIGHT_FACE_DOWN,
++                                   GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, GAMEPAD_BUTTON_LEFT_FACE_UP, GAMEPAD_BUTTON_LEFT_FACE_DOWN})
++                    if (IsGamepadButtonDown(0, button))
++                        return true;
++            return false;
++        }
++
++        void close()
++        {
++            g_open = false;
++            g_swallow = true;
++        }
++
+         Rectangle panel()
+         {
+             const float w = 560.0f, h = 330.0f;
+@@ -69,21 +95,26 @@ namespace ga2_cheat_menu
+             ga2_cheats::state().skipRequested = true;
+             g_notice = "Battle skipped";
+             g_noticeUntil = GetTime() + 2.0;
+-            g_open = false;
++            close();
+         }
+     }
+ 
+-    bool open() { return g_open; }
++    bool open() { return g_open || g_swallow; }
+ 
+     void update(const uint8_t *rdram)
+     {
++        if (g_swallow && !menuInputHeld())
++            g_swallow = false;
+         if (!ga2_cheats::state().available.load())
+             return;
+         const bool padToggle = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_THUMB) &&
+                                IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_THUMB);
+         if (IsKeyPressed(KEY_F1) || padToggle)
+         {
+-            g_open = !g_open;
++            if (g_open)
++                close();
++            else
++                g_open = true;
+             return;
+         }
+         if (!g_open)
+@@ -91,7 +122,7 @@ namespace ga2_cheat_menu
+         const int count = int(items().size());
+         if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_BACKSPACE) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+         {
+-            g_open = false;
++            close();
+             return;
+         }
+         if (IsKeyPressed(KEY_UP) || IsGamepadButtonPressed(0, GAMEPAD_BUTTON_LEFT_FACE_UP))
+diff --git a/ps2xRuntime/src/lib/ga2_cheat_menu.h b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+index 8260e0e..d75b9ea 100644
+--- a/ps2xRuntime/src/lib/ga2_cheat_menu.h
++++ b/ps2xRuntime/src/lib/ga2_cheat_menu.h
+@@ -7,6 +7,7 @@
+ // input while it is open.
+ namespace ga2_cheat_menu
+ {
++    // The menu has the input: open, or closed with its keys still held.
+     bool open();
+     // After input was polled.
+     void update(const uint8_t *rdram);
+-- 
+2.55.0
+

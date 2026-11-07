@@ -1,0 +1,27 @@
+From 9eca6bf43a509108cfdc4b2191436733fc67c344 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 14:24:24 -0500
+Subject: [PATCH] texpacks: text icons use the shared region hash
+ (gs_texregion.h)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index bab8585..f9883ac 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -190,8 +190,6 @@ namespace ga2_texpacks
+         std::unordered_map<uint64_t, const ga2_text_icons::Glyph *> g_textGlyphs;
+         bool g_textGlyphsBuilt = false;
+ 
+-        uint64_t hashPixels(const std::vector<uint32_t> &px, uint32_t w, uint32_t h);
+-
+         void buildTextGlyphs()
+         {
+             g_textGlyphsBuilt = true;
+-- 
+2.55.0
+

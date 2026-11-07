@@ -1,0 +1,1358 @@
+From fba8f6a564d20c00742f83b620abc785cf96ded3 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:38:12 -0500
+Subject: [PATCH] iop: module unload frees its memory; reset failures are
+ reported; stack arguments are validated; SIF handshake (H-IOP9, H-IOP11,
+ H-IOP12, H-IOP14, review-51 SIF)
+
+H-IOP9: stopModule and a NO_RESIDENT_END start never returned the image block or
+the module metadata, so load/unload cycles exhausted the 2 MiB pool (-400).
+- stopModule now revokes everything that points into the image (threads - also
+  by entry point -, alarms, RPC servers and exports as before, plus interrupt
+  and timer handlers, ioman devices, CDVD callbacks, queued completion events
+  and the SECR/MODLOAD hooks) and then frees the image and metadata
+- a non-resident start frees its backing when no callback still points into
+  it; a module that deliberately leaves a handler/device/callback behind
+  keeps its backing until reset exactly as before
+- a load that is rejected before its start routine runs, including every
+  failure inside the image loader after the block was reserved, returns the
+  block; the dead moduleCursor is removed
+
+H-IOP11: IopSubsystem::reset() ignored tryReset() failure, and the ELF loader
+used it, so old modules, RPC servers and the SPU could survive into the next
+program unnoticed. reset() now throws like PS2Runtime::resetIop(), the ELF
+load fails with a message, and IopRpcBridge::reset() no longer silently skips
+its reset when the retirement observer cannot be reinstalled.
+
+H-IOP12: SifSendCmd and SifRegisterRpc read their o32 stack arguments with
+read32, which yields 0 for memory the IOP does not own, so a bad frame
+registered null callbacks. Both now validate the frame (readStackArguments).
+
+H-IOP14 / review-51 F1-F2: the HLE sceSifInitCmd now raises SMFLAG 0x20000
+between sceSifInit's 0x10000 and the boot-end 0x40000, as the SDK handshake
+does (the EE observed 0x50000 only); a test pins that order and the
+register-number mapping handed to the host. Kprintf formats its arguments
+(shared printf formatter) instead of logging the raw format string. The
+no-op onSifTransfer in the emulator and bridge, Impl::lastError and the
+mutable activity counter are removed, the ioman test friend is test-only.
+
+Tests: module lifecycle (leak check verified by mutation), reset reporting,
+stack-argument validation, SIF handshake/numbering, Kprintf.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/CMakeLists.txt                        |   1 +
+ ps2xIOP/src/emulator/core/iop_kernel.cpp      |   3 +-
+ ps2xIOP/src/emulator/core/iop_memory.h        |   6 +
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp     |  16 +++
+ ps2xIOP/src/emulator/imports/iop_cdvd.h       |   3 +
+ ps2xIOP/src/emulator/imports/iop_intrman.cpp  |  20 ++++
+ ps2xIOP/src/emulator/imports/iop_intrman.h    |   3 +
+ ps2xIOP/src/emulator/imports/iop_ioman.cpp    |  28 +++++
+ ps2xIOP/src/emulator/imports/iop_ioman.h      |   4 +
+ ps2xIOP/src/emulator/imports/iop_printf.cpp   |  70 ++++++++++++
+ ps2xIOP/src/emulator/imports/iop_printf.h     |  17 +++
+ ps2xIOP/src/emulator/imports/iop_stdio.cpp    |  58 +---------
+ ps2xIOP/src/emulator/imports/iop_sysmem.cpp   |   8 +-
+ ps2xIOP/src/emulator/imports/iop_timrman.cpp  |  23 ++++
+ ps2xIOP/src/emulator/imports/iop_timrman.h    |   2 +
+ ps2xIOP/src/emulator/iop_emulator.cpp         |  96 ++++++++++++----
+ ps2xIOP/src/emulator/iop_emulator.h           |   2 +-
+ .../emulator/services/iop_module_loader.cpp   |  21 +++-
+ .../src/emulator/services/iop_module_loader.h |   3 +-
+ ps2xIOP/src/emulator/services/iop_rpc.cpp     |  61 ++++++----
+ ps2xIOP/src/emulator/services/iop_rpc.h       |   3 +-
+ ps2xIOP/src/iop_subsystem.cpp                 |  14 ++-
+ ps2xIOP/tests/iop_boot_notify_tests.cpp       |  79 +++++++++++++
+ ps2xIOP/tests/iop_compat_test_support.h       |   2 +-
+ ps2xIOP/tests/iop_ioman_tests.cpp             |   2 +
+ ps2xIOP/tests/iop_module_boundaries.inc       | 107 ++++++++++++++++++
+ ps2xIOP/tests/iop_reset_boundary_tests.cpp    |  11 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |   6 +-
+ 28 files changed, 552 insertions(+), 117 deletions(-)
+ create mode 100644 ps2xIOP/src/emulator/imports/iop_printf.cpp
+ create mode 100644 ps2xIOP/src/emulator/imports/iop_printf.h
+ create mode 100644 ps2xIOP/tests/iop_module_boundaries.inc
+
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index d7b9a63..17c1353 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_library(ps2_iop STATIC
+     src/emulator/imports/iop_imports.cpp
+     src/emulator/imports/iop_intrman.cpp
+     src/emulator/imports/iop_ioman.cpp
++    src/emulator/imports/iop_printf.cpp
+     src/emulator/imports/iop_loadcore.cpp
+     src/emulator/imports/iop_stdio.cpp
+     src/emulator/imports/iop_sysclib.cpp
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 434f9d0..4ea261b 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -1031,7 +1031,8 @@ namespace ps2x::iop::detail
+         for (auto &[id, thread] : m_threads)
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+-            if (pc >= base && pc < base + size)
++            const uint32_t entry = IopMemory::physicalAddress(thread.entry);
++            if ((pc >= base && pc < base + size) || (entry >= base && entry < base + size))
+             {
+                 invalidateRpcWait(thread);
+                 thread.state = IopThreadState::Dead;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index bd2b02e..ed54040 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -117,6 +117,12 @@ namespace ps2x::iop::detail
+                                      std::function<void(uint8_t, uint8_t)> writer);
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
++        // True when `address` (any KSEG alias) lies in [base, base + size).
++        [[nodiscard]] static bool addressInRange(uint32_t address, uint32_t base, uint32_t size) noexcept
++        {
++            const uint32_t physical = physicalAddress(address);
++            return physical >= base && uint64_t(physical) < uint64_t(base) + size;
++        }
+ 
+     private:
+         template<class Access> decltype(auto) accessSpu(Access &&access) const
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index e8be21c..1fd2eb9 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -492,6 +492,17 @@ namespace ps2x::iop::detail
+                 completionCallback = CompletionCallback{callback.address, callback.gp, reason};
+         }
+ 
++        size_t retireCodeRange(uint32_t base, uint32_t size, bool apply) noexcept
++        {
++            size_t count = 0u;
++            const auto in = [&](uint32_t function) { return function != 0u && IopMemory::addressInRange(function, base, size); };
++            if (in(callback.address)) { ++count; if (apply) callback = {}; }
++            for (Callback &stream : streamCallbacks)
++                if (in(stream.address)) { ++count; if (apply) stream = {}; }
++            if (completionCallback && in(completionCallback->address)) { ++count; if (apply) completionCallback.reset(); }
++            return count;
++        }
++
+         std::optional<CompletionCallback> takeCompletionCallback() noexcept
+         {
+             std::optional<CompletionCallback> result = completionCallback;
+@@ -1057,6 +1068,11 @@ namespace ps2x::iop::detail
+         m_impl->writeSubcommandRegister(offset, value);
+     }
+ 
++    size_t IopCdvd::retireCodeRange(uint32_t base, uint32_t size, bool apply) noexcept
++    {
++        return m_impl->retireCodeRange(base, size, apply);
++    }
++
+     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
+     {
+         return m_impl->takeCompletionCallback();
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 805f207..e710a2c 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
+@@ -38,6 +39,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint8_t readSubcommandRegister(uint8_t offset);
+         void writeSubcommandRegister(uint8_t offset, uint8_t value);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
++        // Counts (and, when `apply`, clears) the registered/queued callbacks whose code lies in [base, base + size).
++        size_t retireCodeRange(uint32_t base, uint32_t size, bool apply) noexcept;
+ 
+     private:
+         class Impl;
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+index f5e485e..4dab0f3 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -95,6 +95,26 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    size_t IopIntrman::retireCodeRange(uint32_t base, uint32_t size, bool apply)
++    {
++        size_t count = 0u;
++        for (auto handler = m_handlers.begin(); handler != m_handlers.end();)
++        {
++            if (IopMemory::addressInRange(handler->second.function, base, size))
++            {
++                ++count;
++                if (apply)
++                {
++                    m_enabled.erase(handler->first);
++                    handler = m_handlers.erase(handler);
++                    continue;
++                }
++            }
++            ++handler;
++        }
++        return count;
++    }
++
+     bool IopIntrman::dispatchInterrupt(int irq, IopGuestExecutor &executor) const
+     {
+         const auto enabled = m_enabled.find(irq);
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.h b/ps2xIOP/src/emulator/imports/iop_intrman.h
+index 48fdb14..2d0d54f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <map>
+ 
+@@ -17,6 +18,8 @@ namespace ps2x::iop::detail
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
++        // Counts (and, when `apply`, drops) the interrupt handlers whose code lies in [base, base + size).
++        size_t retireCodeRange(uint32_t base, uint32_t size, bool apply);
+ 
+     private:
+         struct Handler
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 4a5f3eb..0b63c1f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -82,6 +82,34 @@ namespace ps2x::iop::detail
+         m_devctlScratchInUse.fill(false);
+     }
+ 
++    size_t IopIoman::retireCodeRange(uint32_t base, uint32_t size, bool apply)
++    {
++        const auto retired = [&](const Device &device)
++        {
++            if (IopMemory::addressInRange(device.address, base, size))
++                return true;
++            // The driver's operation table and its devctl routine live in the module too.
++            if (!m_memory.ownsRamRange(device.address + 16u, 4u))
++                return false;
++            const uint32_t operations = m_memory.read32(device.address + 16u);
++            if (IopMemory::addressInRange(operations, base, size))
++                return true;
++            if (!m_memory.ownsRamRange(operations, 24u * 4u))
++                return false;
++            for (uint32_t index = 0u; index < 24u; ++index)
++            {
++                const uint32_t function = m_memory.read32(operations + index * 4u);
++                if (function != 0u && IopMemory::addressInRange(function, base, size))
++                    return true;
++            }
++            return false;
++        };
++        const size_t count = static_cast<size_t>(std::count_if(m_devices.begin(), m_devices.end(), retired));
++        if (apply)
++            m_devices.erase(std::remove_if(m_devices.begin(), m_devices.end(), retired), m_devices.end());
++        return count;
++    }
++
+     int32_t IopIoman::devctl(IopCpuState &cpu, IopGuestExecutor &executor)
+     {
+         const uint32_t nameAddress = cpu.gpr[4];
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.h b/ps2xIOP/src/emulator/imports/iop_ioman.h
+index 6684d13..6b30bd0 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.h
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.h
+@@ -24,10 +24,14 @@ namespace ps2x::iop::detail
+         IopIoman &operator=(const IopIoman &) = delete;
+ 
+         void reset();
++        // Counts (and, when `apply`, removes) the devices whose descriptor or driver code lies in [base, base + size).
++        size_t retireCodeRange(uint32_t base, uint32_t size, bool apply);
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+ 
+     private:
++#if defined(PS2X_IOP_TEST_BOUNDARIES)
+         friend bool testIopDeviceCallbackBoundaries();
++#endif
+         struct Device
+         {
+             uint32_t address = 0u;
+diff --git a/ps2xIOP/src/emulator/imports/iop_printf.cpp b/ps2xIOP/src/emulator/imports/iop_printf.cpp
+new file mode 100644
+index 0000000..505214f
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_printf.cpp
+@@ -0,0 +1,70 @@
++#include "iop_printf.h"
++
++#include "../core/iop_cpu.h"
++#include "../core/iop_memory.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++
++namespace ps2x::iop::detail
++{
++    std::string formatIopPrintf(const IopMemory &memory, const IopCpuState &cpu,
++                                uint32_t formatAddress, unsigned firstArgument)
++    {
++        const std::string format = memory.readString(formatAddress, 2048u);
++        unsigned argument = firstArgument;
++        const auto next = [&]() -> uint32_t
++        {
++            const unsigned index = argument++;
++            if (index < 4u)
++                return cpu.gpr[4 + index];
++            return memory.read32(cpu.gpr[29] + 4u * index);
++        };
++        std::string out;
++        for (size_t i = 0; i < format.size(); ++i)
++        {
++            if (format[i] != '%')
++            {
++                out += format[i];
++                continue;
++            }
++            size_t j = i + 1;
++            while (j < format.size() && std::strchr("-+ #0123456789.", format[j]))
++                ++j;
++            while (j < format.size() && (format[j] == 'l' || format[j] == 'h'))
++                ++j;
++            if (j >= format.size())
++                break;
++            std::string spec = format.substr(i, j - i);
++            spec.erase(std::remove(spec.begin(), spec.end(), 'l'), spec.end());
++            spec.erase(std::remove(spec.begin(), spec.end(), 'h'), spec.end());
++            const char conversion = format[j];
++            char buffer[512];
++            switch (conversion)
++            {
++            case '%':
++                out += '%';
++                break;
++            case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'c':
++                std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), next());
++                out += buffer;
++                break;
++            case 'p':
++                std::snprintf(buffer, sizeof(buffer), "0x%08x", next());
++                out += buffer;
++                break;
++            case 's':
++                std::snprintf(buffer, sizeof(buffer), (spec + 's').c_str(), memory.readString(next(), 256u).c_str());
++                out += buffer;
++                break;
++            default:
++                out += spec;
++                out += conversion;
++                break;
++            }
++            i = j;
++        }
++        return out;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_printf.h b/ps2xIOP/src/emulator/imports/iop_printf.h
+new file mode 100644
+index 0000000..ec5e9da
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_printf.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    struct IopCpuState;
++    class IopMemory;
++
++    // printf-family formatting for the IOP's stdio/sysmem imports: the o32
++    // arguments after the format string come from a1..a3 and then the caller's
++    // stack (sp + 16 onward). `firstArgument` is the register index of the first
++    // argument after the format string (a1 = 1).
++    [[nodiscard]] std::string formatIopPrintf(const IopMemory &memory, const IopCpuState &cpu,
++                                              uint32_t formatAddress, unsigned firstArgument);
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_stdio.cpp b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+index 1af1f10..572bdf8 100644
+--- a/ps2xIOP/src/emulator/imports/iop_stdio.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_stdio.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
++#include "iop_printf.h"
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <algorithm>
+@@ -31,64 +32,9 @@ namespace ps2x::iop::detail
+             setV0(static_cast<uint32_t>(text.size()) + resultBias);
+         };
+ 
+-        // printf-family formatting: o32 arguments after the format string come
+-        // from a1..a3 and then the caller's stack (sp + 16 onward).
+         const auto formatted = [&](uint32_t formatAddress, unsigned firstArgument)
+         {
+-            const std::string format = m_memory.readString(formatAddress, 2048u);
+-            unsigned argument = firstArgument;
+-            const auto next = [&]() -> uint32_t
+-            {
+-                const unsigned index = argument++;
+-                if (index < 4u)
+-                    return cpu.gpr[4 + index];
+-                return m_memory.read32(cpu.gpr[29] + 4u * index);
+-            };
+-            std::string out;
+-            for (size_t i = 0; i < format.size(); ++i)
+-            {
+-                if (format[i] != '%')
+-                {
+-                    out += format[i];
+-                    continue;
+-                }
+-                size_t j = i + 1;
+-                while (j < format.size() && std::strchr("-+ #0123456789.", format[j]))
+-                    ++j;
+-                while (j < format.size() && (format[j] == 'l' || format[j] == 'h'))
+-                    ++j;
+-                if (j >= format.size())
+-                    break;
+-                std::string spec = format.substr(i, j - i);
+-                spec.erase(std::remove(spec.begin(), spec.end(), 'l'), spec.end());
+-                spec.erase(std::remove(spec.begin(), spec.end(), 'h'), spec.end());
+-                const char conversion = format[j];
+-                char buffer[512];
+-                switch (conversion)
+-                {
+-                case '%':
+-                    out += '%';
+-                    break;
+-                case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'c':
+-                    std::snprintf(buffer, sizeof(buffer), (spec + conversion).c_str(), next());
+-                    out += buffer;
+-                    break;
+-                case 'p':
+-                    std::snprintf(buffer, sizeof(buffer), "0x%08x", next());
+-                    out += buffer;
+-                    break;
+-                case 's':
+-                    std::snprintf(buffer, sizeof(buffer), (spec + 's').c_str(), m_memory.readString(next(), 256u).c_str());
+-                    out += buffer;
+-                    break;
+-                default:
+-                    out += spec;
+-                    out += conversion;
+-                    break;
+-                }
+-                i = j;
+-            }
+-            return out;
++            return formatIopPrintf(m_memory, cpu, formatAddress, firstArgument);
+         };
+ 
+         switch (ordinal)
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 4a83fe4..66b9ce0 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
++#include "iop_printf.h"
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <string>
+@@ -61,9 +62,10 @@ namespace ps2x::iop::detail
+             return true;
+         case 14: // Kprintf
+         {
+-            const std::string format = m_memory.readString(a0, 512u);
+-            m_host.log(LogLevel::Info, std::string("[IOP Kprintf] ") + format);
+-            setV0(static_cast<uint32_t>(format.size()));
++            // Kprintf(format, ...): the arguments are formatted like printf's.
++            const std::string text = formatIopPrintf(m_memory, cpu, a0, 1u);
++            m_host.log(LogLevel::Info, std::string("[IOP Kprintf] ") + text);
++            setV0(static_cast<uint32_t>(text.size()));
+             return true;
+         }
+         case 15:
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+index aa8d839..a23cfe8 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -2,6 +2,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include "../core/iop_cpu.h"
++#include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
+ 
+ #include <algorithm>
+@@ -464,6 +465,28 @@ namespace ps2x::iop::detail
+ 
+     }
+ 
++    size_t IopTimrman::retireCodeRange(uint32_t base, uint32_t size, bool apply) noexcept
++    {
++        size_t count = 0u;
++        for (Timer &timer : m_timers)
++        {
++            for (Callback *callback : {&timer.compareCallback, &timer.overflowCallback})
++                if (callback->function != 0u && IopMemory::addressInRange(callback->function, base, size))
++                {
++                    ++count;
++                    if (apply)
++                        *callback = {};
++                }
++            if (apply && timer.compareCallback.function == 0u && timer.overflowCallback.function == 0u)
++            {
++                // Nothing left to deliver to: the timer stops raising events.
++                timer.compareCycle = UINT64_MAX;
++                timer.overflowCycle = UINT64_MAX;
++            }
++        }
++        return count;
++    }
++
+     uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
+     {
+         uint64_t next = fallback;
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.h b/ps2xIOP/src/emulator/imports/iop_timrman.h
+index 11b53b6..3534ca3 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.h
+@@ -17,6 +17,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
+         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
++        // Counts (and, when `apply`, clears) the timer callbacks whose code lies in [base, base + size).
++        size_t retireCodeRange(uint32_t base, uint32_t size, bool apply) noexcept;
+ 
+     private:
+         struct Callback
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ca11cd5..2450bcb 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -180,7 +180,6 @@ namespace ps2x::iop::detail
+             pendingDmaInterrupts.clear();
+             pendingGuestCallbacks.clear();
+             nextModuleId = 1;
+-            moduleCursor = kModuleLoadBase;
+             totalCycles = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+@@ -195,7 +194,6 @@ namespace ps2x::iop::detail
+             cannotWaitLogged = false;
+             alarmRefusalLogged = false;
+             spuBusErrors = 0u;
+-            lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+             callDepth = 0u;
+@@ -1246,6 +1244,51 @@ namespace ps2x::iop::detail
+             (void)runCyclesCore(cycles, false);
+         }
+ 
++        // Counts (and, when `apply`, revokes) the callback registrations that
++        // point into [base, base + size): interrupt and timer handlers, devices,
++        // CDVD callbacks, queued completion events and the SECR/MODLOAD hooks.
++        size_t retireCallbackHolders(uint32_t base, uint32_t size, bool apply)
++        {
++            size_t count = intrman.retireCodeRange(base, size, apply) + timrman.retireCodeRange(base, size, apply) +
++                           ioman.retireCodeRange(base, size, apply) + cdvd.retireCodeRange(base, size, apply);
++            for (auto it = pendingGuestCallbacks.begin(); it != pendingGuestCallbacks.end();)
++                if (!it->second.alarm && IopMemory::addressInRange(it->second.function, base, size))
++                {
++                    ++count;
++                    if (apply) { it = pendingGuestCallbacks.erase(it); continue; }
++                    ++it;
++                }
++                else
++                    ++it;
++            for (GuestCallback *hook : {&secrMcCommandHandler, &secrMcDevIdHandler, &checkKelfPathCallback})
++                if (hook->function != 0u && IopMemory::addressInRange(hook->function, base, size))
++                {
++                    ++count;
++                    if (apply) *hook = {};
++                }
++            return count;
++        }
++
++        // Revokes the execution-owning registrations of an unloaded module:
++        // threads, alarms, RPC servers and exports.
++        void retireModuleExecution(uint32_t base, uint32_t size)
++        {
++            kernel.terminateThreadsInRange(base, size);
++            retireAlarms(base, size);
++            rpc.removeServersInRange(base, size);
++            imports.eraseRange(base, size);
++        }
++
++        // Frees an unloaded module's image and metadata block after its
++        // registrations have been revoked.
++        void releaseModuleBacking(const Module &module)
++        {
++            if (module.base != 0u)
++                (void)freeAllocation(module.base);
++            if (module.metadata != 0u)
++                (void)freeAllocation(module.metadata);
++        }
++
+         bool readOwnedString(uint32_t address, std::string &out)
+         {
+             out.clear();
+@@ -1276,8 +1319,7 @@ namespace ps2x::iop::detail
+                 if (n == argumentSize) return result;
+                 ++n;
+             }
+-            const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
+-            moduleCursor = loaded.nextModuleCursor;
++            const IopImageLoadResult loaded = IopModuleLoader::load(image, memory);
+             if (!loaded)
+             {
+                 if (loaded.error == IopImageLoadError::InvalidElf)
+@@ -1289,9 +1331,13 @@ namespace ps2x::iop::detail
+                 }
+                 return result;
+             }
++            // Until the start routine runs nothing refers to the image, so a
++            // load that fails before that point gives its memory back.
++            const auto discardImage = [&] { (void)freeAllocation(loaded.base); };
+             if (!loaded.relocationsComplete)
+             {
+                 log(LogLevel::Warning, "[IOP] one or more IRX relocations were unsupported");
++                discardImage();
+                 result.moduleId = -200;
+                 return result;
+             }
+@@ -1299,7 +1345,10 @@ namespace ps2x::iop::detail
+             if ((entry & 3u) != 0u || entry < loaded.base ||
+                 uint64_t(entry) + 4u > uint64_t(loaded.base) + loaded.size ||
+                 !memory.ownsRamRange(loaded.entry, 4u))
++            {
++                discardImage();
+                 return result;
++            }
+ 
+             Module module;
+             module.id = nextModuleId++;
+@@ -1317,13 +1366,17 @@ namespace ps2x::iop::detail
+             const uint64_t argvBytes = uint64_t(argc + 1u) * 4u;
+             const uint64_t totalBytes = argvBytes + module.path.size() + 1u + argumentSize;
+             if (totalBytes > IopMemory::RamSize)
++            {
++                discardImage();
+                 return result;
++            }
+             const uint32_t args = allocate(uint32_t(totalBytes), 16u);
+             module.metadata = allocate(uint32_t(0x30u + module.name.size() + 1u), 16u);
+             if (args == 0u || module.metadata == 0u)
+             {
+                 if (args) freeAllocation(args);
+                 if (module.metadata) freeAllocation(module.metadata);
++                discardImage();
+                 return {true, -400, -1};
+             }
+             const uint32_t strings = args + uint32_t(argvBytes);
+@@ -1342,6 +1395,7 @@ namespace ps2x::iop::detail
+             {
+                 freeAllocation(args);
+                 freeAllocation(module.metadata);
++                discardImage();
+                 return result;
+             }
+             memory.write32(module.metadata + 4u, module.metadata + 0x30u);
+@@ -1381,11 +1435,18 @@ namespace ps2x::iop::detail
+             if (residency != 1u) modules[module.id] = std::move(module);
+             else
+             {
+-                kernel.terminateThreadsInRange(module.base, module.size);
+-                retireAlarms(module.base, module.size);
+-                rpc.removeServersInRange(module.base, module.size);
+-                imports.eraseRange(module.base, module.size);
+-                log(LogLevel::Warning, "[IOP] released IRX backing retained until reset; complete resource retirement unverified");
++                // NO_RESIDENT_END: the module asked to be unloaded right after
++                // its start routine. Its threads, alarms, RPC servers and exports
++                // are revoked. When no interrupt/timer/device/CDVD callback still
++                // points into the image its memory goes back to the pool;
++                // otherwise the module evidently left that registration live on
++                // purpose, so the backing stays until reset (as before).
++                retireModuleExecution(module.base, module.size);
++                kernel.cleanupDeadThreads();
++                if (retireCallbackHolders(module.base, module.size, false) == 0u)
++                    releaseModuleBacking(module);
++                else
++                    log(LogLevel::Warning, "[IOP] released IRX still has callbacks registered; backing retained until reset");
+             }
+             return result;
+         }
+@@ -1417,11 +1478,10 @@ namespace ps2x::iop::detail
+             auto it = modules.find(moduleId);
+             if (it == modules.end())
+                 return false;
+-            // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+-            kernel.terminateThreadsInRange(it->second.base, it->second.size);
+-            retireAlarms(it->second.base, it->second.size);
+-            rpc.removeServersInRange(it->second.base, it->second.size);
+-            imports.eraseRange(it->second.base, it->second.size);
++            // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution, revoke everything the image registered and return its memory.
++            retireModuleExecution(it->second.base, it->second.size);
++            (void)retireCallbackHolders(it->second.base, it->second.size, true);
++            releaseModuleBacking(it->second);
+             modules.erase(it);
+             kernel.cleanupDeadThreads();
+             if (result)
+@@ -1454,7 +1514,6 @@ namespace ps2x::iop::detail
+         uint64_t nextCallbackIdentity = 1u;
+         const ScheduledGuestCallback *executingAlarm = nullptr;
+         uint32_t nextModuleId = 1;
+-        uint32_t moduleCursor = kModuleLoadBase;
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
+@@ -1472,7 +1531,6 @@ namespace ps2x::iop::detail
+         bool cannotWaitLogged = false;
+         bool alarmRefusalLogged = false;
+         uint32_t spuBusErrors = 0u;
+-        std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
+@@ -1583,11 +1641,6 @@ namespace ps2x::iop::detail
+         return m_impl->rpc.hasServer(sid);
+     }
+ 
+-    void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+-    {
+-        m_impl->rpc.onSifTransfer(transfer);
+-    }
+-
+     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+     {
+         return m_impl->memory.allocate(size, alignment);
+@@ -1658,6 +1711,7 @@ namespace ps2x::iop::detail
+ #include "../../tests/iop_device_callback_boundaries.inc"
+ #include "../../tests/iop_rpc_wait_boundaries.inc"
+ #include "../../tests/iop_alarm_boundaries.inc"
++#include "../../tests/iop_module_boundaries.inc"
+ #endif
+ 
+ #ifdef GA2_SPU31_TEST
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index a8c224a..6e20ef0 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -37,7 +37,6 @@ namespace ps2x::iop::detail
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+-        void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+         [[nodiscard]] bool freeMemory(uint32_t address);
+@@ -58,6 +57,7 @@ namespace ps2x::iop::detail
+         friend bool testIopDeviceCallbackBoundaries();
+         friend bool testIopRpcWaitBoundaries();
+         friend bool testIopAlarmBoundaries();
++        friend bool testIopModuleBoundaries();
+ #endif
+ #ifdef GA2_SPU31_TEST
+         friend void ga2_spu31_boundary_checks();
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 128bba7..bedcb38 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -373,10 +373,9 @@ namespace ps2x::iop::detail
+         return host.readGuest(guestAddress, bytes.data(), bytes.size());
+     }
+ 
+-    IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)
++    IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory)
+     {
+         IopImageLoadResult result;
+-        result.nextModuleCursor = moduleCursor;
+         if (image.size() < sizeof(Elf32Ehdr))
+             return result;
+ 
+@@ -435,26 +434,37 @@ namespace ps2x::iop::detail
+                               (minVaddr < kModuleLoadBase && minVaddr != 0u);
+         uint32_t base = 0u;
+         int64_t delta = 0;
++        // A load that fails after its block was reserved returns the block.
++        struct AllocationGuard
++        {
++            IopMemory &memory;
++            uint32_t base = 0u;
++            bool keep = false;
++            ~AllocationGuard()
++            {
++                if (base != 0u && !keep)
++                    (void)memory.freeAllocation(base);
++            }
++        } allocation{memory};
+         if (relocate)
+         {
+             // Module images and AllocSysMemory blocks share one pool, as in the
+             // real sysmem; a fixed module/heap split exhausted the heap while
+             // leaving module space unused (CD stream buffers failed to allocate).
+-            (void)moduleCursor;
+             base = memory.allocateLowest(span, 0x100u);
+             if (base == 0u)
+             {
+                 result.error = IopImageLoadError::ArenaExhausted;
+                 return result;
+             }
++            allocation.base = base;
+             delta = static_cast<int64_t>(base) - minVaddr;
+-            result.nextModuleCursor = base + span;
+         }
+         else
+         {
+             base = minVaddr;
+             if (base >= IopMemory::HeapBase && base < IopMemory::HeapLimit)
+-                (void)memory.allocate(span, 0x100u, base); // reserve when it lies in the heap range
++                allocation.base = memory.allocate(span, 0x100u, base); // reserve when it lies in the heap range
+         }
+ 
+         if (hasLoad)
+@@ -607,6 +617,7 @@ namespace ps2x::iop::detail
+         }
+ 
+         result.error = IopImageLoadError::None;
++        allocation.keep = true;
+         return result;
+     }
+ }
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.h b/ps2xIOP/src/emulator/services/iop_module_loader.h
+index 27ba176..1425906 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.h
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.h
+@@ -30,7 +30,6 @@ namespace ps2x::iop::detail
+         uint32_t size = 0;
+         uint32_t entry = 0;
+         uint32_t gp = 0;
+-        uint32_t nextModuleCursor = 0;
+         bool relocationsComplete = true;
+         uint32_t textSize = 0;
+         uint32_t dataSize = 0;
+@@ -49,6 +48,6 @@ namespace ps2x::iop::detail
+     public:
+         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes, int32_t *error = nullptr);
+         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
+-        [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
++        [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory);
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 01a0d3b..5aa1eb5 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -216,7 +216,7 @@ namespace ps2x::iop::detail
+             if (m_retirementSupplement) m_retirementSupplement(m_retirementContext, base, size);
+         };
+         if (!m_memory.setRamRetirementObserver(this, std::move(retirement)))
+-            return;
++            throw std::runtime_error("IOP RAM retirement observer could not be reinstalled; reset aborted");
+         m_servers.clear();
+         while (!m_reverseLease->endpoints.empty())
+             revokeReverseEndpoint(m_reverseLease, m_reverseLease->endpoints.begin()->first);
+@@ -225,6 +225,18 @@ namespace ps2x::iop::detail
+         m_sifInitialized = false;
+     }
+ 
++    bool IopRpcBridge::readStackArguments(const IopCpuState &cpu, uint32_t *destination, uint32_t count) const
++    {
++        // Arguments beyond a0..a3 sit at sp+16 (o32).
++        constexpr uint32_t kFirstStackArgument = 16u;
++        const uint32_t bytes = count * sizeof(uint32_t);
++        const uint32_t stack = cpu.gpr[29];
++        if ((stack & 3u) != 0u || stack > std::numeric_limits<uint32_t>::max() - kFirstStackArgument - bytes)
++            return false;
++        const uint32_t address = stack + kFirstStackArgument;
++        return m_memory.ownsRamRange(address, bytes) && m_memory.readRam(address, destination, bytes);
++    }
++
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const auto setV0 = [&](uint32_t value)
+@@ -302,8 +314,8 @@ namespace ps2x::iop::detail
+ 
+             // IOP-side sceSifSetDma sends IOP RAM to the EE. Validate all EE
+             // destinations before committing any write so a bad chain cannot
+-            // partially update guest memory, but maybe we could skip this check if we trust the EE-side SIF driver to validate the chain ?!
+-            // TODO check later
++            // partially update guest memory (the EE-side SIF driver's own
++            // validation is not assumed).
+             std::vector<uint8_t> scratch(largestTransfer);
+             for (uint32_t i = 0u; i < pendingCount; ++i)
+             {
+@@ -382,6 +394,13 @@ namespace ps2x::iop::detail
+         switch (ordinal)
+         {
+         case 4: // InitCmd
++            // sceSifInitCmd raises SIF_STAT_CMDINIT (SMFLAG 0x20000) between
++            // sceSifInit's 0x10000 and the boot-end 0x40000; the EE observes
++            // the three bits in that order. Hosts without SIF registers simply
++            // have nothing to observe, so a refused write is not an error.
++            (void)m_host.writeSifRegister(SifRegister::SmFlag, 0x20000u);
++            setV0(0);
++            return true;
+         case 5:
+         case 6:
+         case 7:
+@@ -572,9 +591,16 @@ namespace ps2x::iop::detail
+             const uint32_t packetAddress = cpu.gpr[5];
+             const uint32_t packetSize = cpu.gpr[6];
+             const uint32_t extraSource = cpu.gpr[7];
+-            const uint32_t stackPointer = cpu.gpr[29];
+-            const uint32_t extraDestination = m_memory.read32(stackPointer + 16u);
+-            const int32_t signedExtraSize = static_cast<int32_t>(m_memory.read32(stackPointer + 20u));
++            // The o32 stack arguments (extra destination, extra size) must be
++            // owned stack memory: read32 of anything else silently yields 0.
++            std::array<uint32_t, 2> stackWords{};
++            if (!readStackArguments(cpu, stackWords.data(), 2u))
++            {
++                setV0(0u);
++                return true;
++            }
++            const uint32_t extraDestination = stackWords[0];
++            const int32_t signedExtraSize = static_cast<int32_t>(stackWords[1]);
+ 
+             if (packetAddress == 0u || packetSize < kHeaderSize || packetSize > kMaxPacketSize ||
+                 !m_memory.ownsRamRange(packetAddress, packetSize))
+@@ -627,10 +653,16 @@ namespace ps2x::iop::detail
+             server.function = cpu.gpr[6];
+             server.gp = cpu.gpr[28];
+             server.buffer = cpu.gpr[7];
+-            const uint32_t stackPointer = cpu.gpr[29];
+-            server.callback = m_memory.read32(stackPointer + 16u);
+-            server.callbackBuffer = m_memory.read32(stackPointer + 20u);
+-            server.queue = m_memory.read32(stackPointer + 24u);
++            std::array<uint32_t, 3> stackWords{};
++            if (!readStackArguments(cpu, stackWords.data(), 3u))
++            {
++                // A bad frame would otherwise register null callbacks silently.
++                setV0(0u);
++                return true;
++            }
++            server.callback = stackWords[0];
++            server.callbackBuffer = stackWords[1];
++            server.queue = stackWords[2];
+             m_servers[server.sid] = server;
+             if (server.serverData != 0u)
+             {
+@@ -785,15 +817,6 @@ namespace ps2x::iop::detail
+         return result;
+     }
+ 
+-    void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
+-    {
+-        // The EE SIF transport owns the actual directional memory movement.
+-        // Services still receive both phases through IopSubsystem, but mirroring
+-        // IOP bytes through an equal-numbered EE address would alias two distinct
+-        // PS2 address spaces and can overwrite live game data.
+-        (void)transfer;
+-    }
+-
+     void IopRpcBridge::removeServersInRange(uint32_t base, uint32_t size)
+     {
+         if (size != 0u && addWithinUint32(base, size))
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index b032e65..590593f 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -93,7 +93,6 @@ enum class IopGuestCallStatus { Rejected, Completed, ResetRequired, Failed };
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+-        void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
+@@ -103,6 +102,8 @@ enum class IopGuestCallStatus { Rejected, Completed, ResetRequired, Failed };
+         struct ReverseRpcEndpoint;
+         struct ReverseRpcLease;
+ 
++        // Reads `count` o32 stack arguments (from sp+16) when that frame is owned IOP RAM.
++        [[nodiscard]] bool readStackArguments(const IopCpuState &cpu, uint32_t *destination, uint32_t count) const;
+         [[nodiscard]] static uint32_t canonicalAddress(uint32_t address) noexcept;
+         [[nodiscard]] static bool rangesOverlap(uint32_t firstAddress, uint32_t firstSize,
+                                                 uint32_t secondAddress, uint32_t secondSize) noexcept;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b890ddd..5ec1924 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -7,6 +7,7 @@
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <sstream>
++#include <stdexcept>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -19,7 +20,7 @@ namespace ps2x::iop
+         class ActivityGuard
+         {
+         public:
+-            explicit ActivityGuard(const Impl &implRef) noexcept
++            explicit ActivityGuard(Impl &implRef) noexcept
+                 : impl(implRef)
+             {
+                 ++impl.activeOperations;
+@@ -34,7 +35,7 @@ namespace ps2x::iop
+             ActivityGuard &operator=(const ActivityGuard &) = delete;
+ 
+         private:
+-            const Impl &impl;
++            Impl &impl;
+         };
+ 
+         explicit Impl(IopHost &hostRef)
+@@ -114,7 +115,7 @@ namespace ps2x::iop
+         std::string lastError;
+         detail::IopModuleManager moduleManager;
+         detail::IopEmulator emulator;
+-        mutable uint32_t activeOperations = 0u;
++        uint32_t activeOperations = 0u;
+     };
+ 
+     IopSubsystem::IopSubsystem(IopHost &host)
+@@ -163,7 +164,11 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::reset()
+     {
+-        (void)tryReset();
++        // A rejected reset must not look like a successful one: the old
++        // modules, RPC servers and SPU would silently survive into the next
++        // program.
++        if (!tryReset())
++            throw std::runtime_error("IOP reset rejected: an IOP operation or callback is active");
+     }
+ 
+     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+@@ -295,7 +300,6 @@ namespace ps2x::iop
+                 service->onSifTransfer(transfer);
+             }
+         }
+-        m_impl->emulator.onSifTransfer(transfer);
+     }
+ 
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+diff --git a/ps2xIOP/tests/iop_boot_notify_tests.cpp b/ps2xIOP/tests/iop_boot_notify_tests.cpp
+index 2966898..8b5c0da 100644
+--- a/ps2xIOP/tests/iop_boot_notify_tests.cpp
++++ b/ps2xIOP/tests/iop_boot_notify_tests.cpp
+@@ -5,10 +5,12 @@
+ #include "emulator/core/iop_memory.h"
+ #include "emulator/imports/iop_imports.h"
+ #include "emulator/imports/iop_loadcore.h"
++#include "emulator/imports/iop_sysmem.h"
+ #include "emulator/services/iop_rpc.h"
+ 
+ #include <cstdint>
+ #include <functional>
++#include <map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -345,6 +347,81 @@ namespace
+         require(rpc.dispatchSifManImport(29u, cpu), "init check import was unhandled");
+         require(cpu.gpr[2] == 0u, "DMA2 setup fabricated SIF initialization");
+     }
++    // A host with a real SIF register model: IOP MSFLAG writes clear bits, SMFLAG
++    // writes set bits, SUBADDR is assigned (the EE-visible semantics).
++    class SifHost : public Host
++    {
++    public:
++        bool readSifRegister(SifRegister reg, uint32_t &value) const override
++        {
++            const auto entry = registers.find(reg);
++            value = entry == registers.end() ? 0u : entry->second;
++            return true;
++        }
++        bool writeSifRegister(SifRegister reg, uint32_t value) override
++        {
++            writes.emplace_back(reg, value);
++            if (reg == SifRegister::MsFlag) registers[reg] &= ~value;
++            else if (reg == SifRegister::SmFlag) registers[reg] |= value;
++            else registers[reg] = value;
++            return true;
++        }
++        std::map<SifRegister, uint32_t> registers;
++        std::vector<std::pair<SifRegister, uint32_t>> writes;
++    };
++
++    void sifBootHandshakeRaisesInitThenCmdInit()
++    {
++        SifHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge rpc(host, memory, kernel);
++        IopCpuState cpu{};
++        // sceSifInit (SIFMAN 5) then sceSifInitCmd (SIFCMD 4), as the original
++        // boot modules do: the EE sees SIF_STAT_SIFINIT then SIF_STAT_CMDINIT.
++        require(rpc.dispatchSifManImport(5u, cpu) && cpu.gpr[2] == 0u, "sceSifInit");
++        require(host.registers[SifRegister::SmFlag] == 0x10000u, "sceSifInit must raise SIFINIT only");
++        require(rpc.dispatchSifCmdImport(4u, cpu) && cpu.gpr[2] == 0u, "sceSifInitCmd");
++        require(host.registers[SifRegister::SmFlag] == 0x30000u, "sceSifInitCmd must add CMDINIT (0x20000)");
++        require(host.writes.size() == 2u && host.writes[0].second == 0x10000u && host.writes[1].second == 0x20000u,
++                "the handshake bits must be raised in SDK order");
++        // The boot-end bit comes later (EESYNC) and nothing else is disturbed.
++        cpu.gpr[4] = 0x40000u;
++        require(rpc.dispatchSifManImport(24u, cpu) && host.registers[SifRegister::SmFlag] == 0x70000u,
++                "boot end must be added to the earlier bits");
++        // The register numbers handed to the host are pinned: a mixed-up
++        // enumerator would silently read or write the wrong EE-visible register.
++        host.registers[SifRegister::MainAddress] = 0x111u;
++        host.registers[SifRegister::SubAddress] = 0x222u;
++        host.registers[SifRegister::MsFlag] = 0xF0u;
++        const std::pair<uint16_t, uint32_t> reads[] = {{25u, 0x111u}, {26u, 0x222u}, {21u, 0xF0u}, {23u, 0x70000u}};
++        for (const auto &[ordinal, expected] : reads)
++        {
++            require(rpc.dispatchSifManImport(ordinal, cpu) && cpu.gpr[2] == expected, "SIF getter reads the wrong register");
++        }
++        cpu.gpr[4] = 0x30u;
++        require(rpc.dispatchSifManImport(22u, cpu) && host.registers[SifRegister::MsFlag] == 0xC0u,
++                "sceSifSetMSFlag must clear the given bits");
++        cpu.gpr[4] = 0x5678u;
++        require(rpc.dispatchSifManImport(27u, cpu) && host.registers[SifRegister::SubAddress] == 0x5678u,
++                "sceSifSetSubAddr must assign");
++    }
++
++    void kprintfFormatsItsArguments()
++    {
++        Host host;
++        IopMemory memory;
++        IopSysmem sysmem(host, memory);
++        require(memory.writeRam(0x1000u, "%s=%d (%x) %5.2s|", 18u), "format string");
++        require(memory.writeRam(0x1100u, "abcdef", 7u), "string argument");
++        IopCpuState cpu{};
++        cpu.gpr[4] = 0x1000u; cpu.gpr[5] = 0x1100u; cpu.gpr[6] = 42u; cpu.gpr[7] = 0xBEEFu;
++        cpu.gpr[29] = 0x1F00u;
++        memory.write32(0x1F00u + 16u, 0x1100u); // fifth argument: stack slot
++        require(sysmem.dispatchImport(14u, cpu), "Kprintf was not handled");
++        require(!host.logs.empty() && host.logs.back() == "[IOP Kprintf] abcdef=42 (beef)    ab|",
++                "Kprintf must log the formatted text, not the raw format string");
++    }
+ }
+ 
+ int main()
+@@ -358,6 +435,8 @@ int main()
+         {"LOADCORE accepts same-priority registration during finish", samePriorityRegistrationDuringFinishRunsInClassOrder},
+         {"LOADCORE callback exception does not report completion", callbackExceptionRetainsRecordWithoutReportingCompletion},
+         {"SIFMAN absent host registers cannot fabricate initialization", absentHostRegistersCannotReportSifInitialization},
++        {"SIF boot handshake raises INIT then CMDINIT and pins register numbering", sifBootHandshakeRaisesInitThenCmdInit},
++        {"Kprintf formats its arguments", kprintfFormatsItsArguments},
+     };
+     return run(tests);
+ }
+diff --git a/ps2xIOP/tests/iop_compat_test_support.h b/ps2xIOP/tests/iop_compat_test_support.h
+index 17ecd32..1386eb4 100644
+--- a/ps2xIOP/tests/iop_compat_test_support.h
++++ b/ps2xIOP/tests/iop_compat_test_support.h
+@@ -23,7 +23,7 @@ namespace iop_test
+             throw std::runtime_error(message);
+     }
+ 
+-    class Host final : public IopHost
++    class Host : public IopHost
+     {
+     public:
+         explicit Host(size_t bytes = 0x20000u) : guest(bytes, 0xCCu) {}
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index e1bb063..cdcc8ea 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -20,6 +20,7 @@
+ namespace ps2x::iop::detail { bool testIopDeviceCallbackBoundaries(); }
+ namespace ps2x::iop::detail { bool testIopRpcWaitBoundaries(); }
+ namespace ps2x::iop::detail { bool testIopAlarmBoundaries(); }
++namespace ps2x::iop::detail { bool testIopModuleBoundaries(); }
+ 
+ namespace
+ {
+@@ -641,6 +642,7 @@ int main()
+                    testIopDeviceCallbackBoundaries() &&
+                    testIopRpcWaitBoundaries() &&
+                    testIopAlarmBoundaries() &&
++                   testIopModuleBoundaries() &&
+                    testDevctlRejectsInvalidCallsBeforeCallback() &&
+                    testDestructorRevokesHostHandle()
+                ? 0
+diff --git a/ps2xIOP/tests/iop_module_boundaries.inc b/ps2xIOP/tests/iop_module_boundaries.inc
+new file mode 100644
+index 0000000..474c49d
+--- /dev/null
++++ b/ps2xIOP/tests/iop_module_boundaries.inc
+@@ -0,0 +1,107 @@
++// Included by the existing private emulator boundary-test target only.
++//
++// Module lifecycle: stopping (or a NO_RESIDENT_END start) revokes everything
++// the image registered and returns its memory, so repeated load/unload cycles
++// cannot exhaust the pool.
++#include "iop_compat_test_support.h"
++namespace ps2x::iop::detail
++{
++    bool testIopModuleBoundaries()
++    {
++        using State = IopEmulator::Impl;
++        const auto require = [](bool b, const char *s) { if (!b) throw std::runtime_error(s); };
++        const auto jal = [](uint32_t t) { return 0x0C000000u | (t >> 2); };
++        // A module that registers an interrupt handler (IRQ 0x28), enables it,
++        // arms an alarm and registers an RPC server, then returns `residency`.
++        // The image lives inside the heap range so the loader reserves (and
++        // the unload must return) a tracked block.
++        constexpr uint32_t kBase = 0x130000u;
++        const auto module = [&](uint32_t residency, uint32_t imageBytes, bool callbacks = true)
++        {
++            iop_test::Irx image(kBase, imageBytes);
++            image.words(0x100u, {0x41E00000u, 0u, 0x0104u, 0x72746E69u, 0x006E616Du}); // "intrman"
++            for (uint32_t n = 0; n <= 8; ++n) image.words(0x114u + n * 8u, {0x03E00008u, 0x24000000u | n});
++            image.words(0x200u, {0x41E00000u, 0u, 0x0101u, 0x61626874u, 0x00006573u}); // "thbase"
++            for (uint32_t n = 0; n <= 40; ++n) image.words(0x214u + n * 8u, {0x03E00008u, 0x24000000u | n});
++            if (callbacks) image.words(0u, {
++                0x27BDFFE0u, 0xAFBF001Cu,
++                0x34040028u, 0x00002821u, 0x3C060000u | (kBase >> 16u), 0x34C60300u, 0x00003821u, jal(kBase + 0x100u + 20u + 4u * 8u), 0u, // RegisterIntrHandler
++                0x34040028u, jal(kBase + 0x100u + 20u + 6u * 8u), 0u,                                                   // EnableIntr
++                0x3C040000u | (kBase >> 16u), 0x34840400u, 0x3C050000u | (kBase >> 16u), 0x34A50300u, 0x00003021u, jal(kBase + 0x200u + 20u + 35u * 8u), 0u, // SetAlarm
++                0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x34020000u | residency,
++            });
++            else image.words(0u, {0x03E00008u, 0x34020000u | residency}); // initialiser only
++            image.words(0x300u, {0x03E00008u, 0x00001021u}); // handler: return 0
++            image.words(0x400u, {0x00100000u, 0u});          // alarm clock: long delay
++            return image;
++        };
++        try
++        {
++            for (uint32_t residency : {0u, 1u})
++            {
++                iop_test::Host h; State s(h);
++                const uint32_t freeBefore = s.memory.totalFreeMemory();
++                for (unsigned cycle = 0; cycle != 4u; ++cycle)
++                {
++                    // Resident: registrations are revoked and memory returned by stopModule.
++                    // Non-resident initialiser: memory is returned as soon as start returns.
++                    const auto image = module(residency, 0x40000u, residency == 0u);
++                    const auto loaded = s.loadImage("host:cycle.irx", image.bytes, nullptr, 0u);
++                    require(loaded.moduleId > 0 && (uint32_t(loaded.startResult) & 3u) == residency, "module cycle did not load");
++                    if (residency == 0u)
++                    {
++                        require(s.memory.totalFreeMemory() < freeBefore, "the loaded image is a tracked block");
++                        require(s.intrman.dispatchInterrupt(0x28, s) && !s.pendingGuestCallbacks.empty(),
++                                "the module's handler and alarm are registered while resident");
++                        int32_t result = -1;
++                        require(s.stopModule(loaded.moduleId, &result) && result == 0, "stopModule");
++                    }
++                    require(!s.intrman.dispatchInterrupt(0x28, s), "the interrupt handler outlived its module");
++                    require(s.pendingGuestCallbacks.empty(), "the module's alarm outlived the module");
++                    require(!s.resetRequired, "module cycle disabled the IOP");
++                }
++                require(s.memory.totalFreeMemory() == freeBefore, "load/unload cycles leaked IOP RAM");
++                require(s.modules.empty(), "unloaded modules stayed registered");
++            }
++            // A non-resident module that leaves an interrupt handler behind keeps
++            // its backing (the registration would otherwise point at freed code),
++            // but its threads, alarms and servers are revoked.
++            { iop_test::Host h; State s(h);
++              const uint32_t freeBefore = s.memory.totalFreeMemory();
++              const auto image = module(1u, 0x40000u, true);
++              const auto loaded = s.loadImage("host:leaves-handler.irx", image.bytes, nullptr, 0u);
++              require(loaded.moduleId > 0 && s.intrman.dispatchInterrupt(0x28, s), "handler registered by the released module");
++              require(s.pendingGuestCallbacks.empty(), "a released module's alarm must be revoked");
++              require(s.memory.totalFreeMemory() < freeBefore, "backing of a released module with live callbacks must be retained"); }
++            // SIF command/RPC imports validate their o32 stack arguments: a frame
++            // that is not owned IOP RAM is refused instead of reading zeros.
++            { iop_test::Host h; State s(h);
++              IopCpuState cpu{};
++              cpu.gpr[4] = 0x13000u; cpu.gpr[5] = 0x1234u; cpu.gpr[6] = 0x11000u; cpu.gpr[7] = 0x13100u;
++              cpu.gpr[28] = 0x12345u;
++              cpu.gpr[29] = 0x180000u; // inside RAM, never written: not owned
++              require(s.rpc.dispatchSifCmdImport(17u, cpu) && cpu.gpr[2] == 0u && !s.rpc.hasServer(0x1234u),
++                      "RegisterRpc accepted a frame it does not own");
++              cpu.gpr[29] = 0x13FE0u;
++              s.memory.write32(0x13FF0u, 0x11100u); s.memory.write32(0x13FF4u, 0x13200u); s.memory.write32(0x13FF8u, 0x13300u);
++              require(s.rpc.dispatchSifCmdImport(17u, cpu) && cpu.gpr[2] == 0x13000u && s.rpc.hasServer(0x1234u),
++                      "RegisterRpc rejected a valid owned frame");
++              // SendCmd: command id, packet, size, extra source; extra destination/size on the stack.
++              for (uint32_t offset = 0; offset != 64; offset += 4) s.memory.write32(0x13400u + offset, 0u);
++              IopCpuState send{};
++              send.gpr[4] = 0x80000001u; send.gpr[5] = 0x13400u; send.gpr[6] = 32u; send.gpr[7] = 0u;
++              send.gpr[29] = 0x180000u;
++              require(s.rpc.dispatchSifCmdImport(12u, send) && send.gpr[2] == 0u, "SendCmd accepted a frame it does not own");
++              send.gpr[29] = 0x13FE0u;
++              s.memory.write32(0x13FF0u, 0u); s.memory.write32(0x13FF4u, 0u);
++              require(s.rpc.dispatchSifCmdImport(12u, send) && send.gpr[2] != 0u, "SendCmd rejected a valid owned frame"); }
++            std::cout << "PASS module lifecycle (stop and non-resident release revoke registrations and free memory)\n";
++            return true;
++        }
++        catch (const std::exception &error)
++        {
++            std::cerr << "FAIL module lifecycle: " << error.what() << '\n';
++            return false;
++        }
++    }
++}
+diff --git a/ps2xIOP/tests/iop_reset_boundary_tests.cpp b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+index 10a88f0..67dda41 100644
+--- a/ps2xIOP/tests/iop_reset_boundary_tests.cpp
++++ b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+@@ -86,7 +86,14 @@ namespace
+                 if (resetTarget)
+                 {
+                     resetAcceptedDuringGuestExecution = resetTarget->tryReset();
+-                    resetTarget->reset();
++                    try
++                    {
++                        resetTarget->reset();
++                    }
++                    catch (const std::runtime_error &)
++                    {
++                        voidResetRejectedDuringGuestExecution = true; // reported, not silently ignored
++                    }
+                     voidResetInvokedDuringGuestExecution = true;
+                 }
+             }
+@@ -102,6 +109,7 @@ namespace
+         detail::IopEmulator *emulatorProbe = nullptr;
+         bool resetAcceptedDuringGuestExecution = true;
+         bool voidResetInvokedDuringGuestExecution = false;
++        bool voidResetRejectedDuringGuestExecution = false;
+         bool emulatorWasQuiescentDuringGuestExecution = true;
+         uint32_t guestExecutionCallbacks = 0u;
+         uint32_t sifResetCalls = 0u;
+@@ -234,6 +242,7 @@ namespace
+         require(host.guestExecutionCallbacks == 1u, "guest thread did not reach the existing SIF host callback");
+         require(!host.resetAcceptedDuringGuestExecution, "reset succeeded from active guest execution");
+         require(host.voidResetInvokedDuringGuestExecution, "legacy reset did not use the guarded path");
++        require(host.voidResetRejectedDuringGuestExecution, "a rejected reset() must be reported to its caller");
+         require(host.sifResetCalls == 0u, "rejected reset changed host SIF state");
+         require(iop.canBindRpc(kDbcSid), "rejected reset revoked HLE provider");
+         require(iop.debugSnapshot().emulatorLoadedModules == 1u, "rejected reset cleared loaded physical module");
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 156d160..09c53ed 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1271,7 +1271,11 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         return false;
+     }
+ 
+-    m_iopSubsystem->reset();
++    if (!m_iopSubsystem->tryReset())
++    {
++        std::cerr << "[IOP] reset rejected while an IOP operation is active; ELF not loaded" << std::endl;
++        return false;
++    }
+ 
+     ps2_game_overrides::applyMatching(*this,
+                                       elfPath,
+-- 
+2.55.0
+

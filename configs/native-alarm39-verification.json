@@ -1,0 +1,25 @@
+{
+  "static_original_not_found_return_accepted": true,
+  "full_original_runtime_oracle_accepted": false,
+  "bios_source_linkage_independently_reviewed": false,
+  "bounded_late_snapshot_accepted": true,
+  "continuous_iop_spu_health_accepted": false,
+  "native_movie_recovery_accepted": false,
+  "voiced_dialogue_accepted": false,
+  "normal_rate_accepted": false,
+  "natural_game_exit_accepted": false,
+  "shipping_change_applied": false,
+  "full_goal_complete": false,
+  "reviewer": {
+    "model": "gpt-6-astra",
+    "reasoning_effort": "ultra",
+    "effective_verified": true
+  },
+  "static_review_sha256": "4783c403cd9b063138a06323ee0b576a1db56ccc75f10a9e6b9a0db2eac4bc11",
+  "late_review_sha256": "ff0440a2688317fde3873c16b32df055ce82c9c9cd9259664448eeb054a84493",
+  "late_disposition_sha256": "8060b4854b5bba1d150a9b06dd2ce4819bab61899cb00c1b9cafea51f5ba0e8f",
+  "native38_completed_capture_review_sha256": "05399d0fed181edd52989515bc5e119561ed6775f2e05a4580d7278649c93450",
+  "private_artifacts": "research/native-alarm39",
+  "public_source_baseline": 23,
+  "allfive_public_native_baseline": 22
+}

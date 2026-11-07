@@ -1,0 +1,972 @@
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -34,6 +34,7 @@
+ #include "runtime/ps2_rom_device.h"
+ #include "runtime/ps2_vfs.h"
+ #include "ps2x/iop/iop_types.h"
++#include "ps2x/iop/iop_host.h"
+ 
+ namespace ps2x::iop
+ {
+@@ -269,6 +270,14 @@
+     // TODO we dont need this anymore so on next release it will be deleted
+ }
+ 
++class PS2Runtime;
++struct NativeEeRpcHooks
++{
++    using OriginalFunction = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
++    std::function<bool(const ps2x::iop::ReverseRpcRequest &, ps2x::iop::ReverseRpcCompletionEndpoint)> submit;
++    std::function<void(uint32_t, uint8_t *, R5900Context *, PS2Runtime *, OriginalFunction)> guestBoundary;
++};
++
+ class PS2Runtime
+ {
+ public:
+@@ -302,6 +311,11 @@
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
+     // Exact-executable SDK metadata supplied by a verified game override.
+     void configureNativeEeRpcQueueRoot(uint32_t address);
++    // Serialized, quiescent configuration. Replacement requires retirement of
++    // every old execution context, including queued callbacks.
++    void configureNativeEeRpcHooks(NativeEeRpcHooks hooks);
++    void dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram,
++                                    R5900Context *ctx, NativeEeRpcHooks::OriginalFunction original);
+ 
+     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
+     void setDebugUiCallbacks(DebugUiCallback initCallback,
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -354,6 +354,9 @@
+     void observeInvocationReturn(R5900Context *context) noexcept;
+     void failInvocation(R5900Context *context) noexcept;
+     [[nodiscard]] bool hasResetSensitiveInvocations() const;
++    // Read-only quiescent configuration query; includes ordinary lifetimes and
++    // pending/installed calls, even EE-only callbacks.
++    [[nodiscard]] bool hasExecutionContexts() const noexcept;
+     // Quiescent runtime shutdown/reset: release owned packets without completion.
+     void discardInvocations();
+     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1219,6 +1219,14 @@
+     return KE_OK;
+ }
+ 
++bool EeScheduler::hasExecutionContexts() const noexcept
++{
++    if (!m_pendingInvocations.empty()) return true;
++    for (const auto &[id, owner] : m_threads)
++        if (owner.executionLifetime != 0u || !owner.invocations.empty()) return true;
++    return false;
++}
++
+ bool EeScheduler::hasResetSensitiveInvocations() const
+ {
+     for (const auto &[id, owner] : m_threads)
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -264,7 +264,8 @@
+                             PS2Runtime *runtime,
+                             uint32_t commandId,
+                             const void *packet,
+-                            size_t packetSize) noexcept
++                            size_t packetSize,
++                            SifCommandInvocationHooks hooks) noexcept
+     {
+         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
+             return false;
+@@ -301,6 +302,17 @@
+         bool queueOwnsPacket = false;
+         try
+         {
++            struct SettlementState { bool admitted = false; bool settled = false; };
++            const auto settlement = std::make_shared<SettlementState>();
++            // One packet owner. Retained discard retries must neither free a
++            // replacement allocation nor replay external transaction hooks.
++            const auto settlePacket = [runtime, packetAddress, settlement]
++            {
++                if (settlement->settled) return false;
++                settlement->settled = true;
++                runtime->guestFree(packetAddress);
++                return settlement->admitted;
++            };
+             GuestInvocation invocation{};
+             invocation.kind = GuestInvocationKind::SifCommand;
+             invocation.tag = commandId;
+@@ -312,19 +324,31 @@
+             SET_GPR_U32(&invocation.context, 7, 0u);
+             SET_GPR_U32(&invocation.context, 29, 0u);
+             SET_GPR_U32(&invocation.context, 31, 0u);
+-            invocation.isValid = [epoch]
+-            {
+-                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+-                return epoch == g_iopCommandEpoch;
++            invocation.requireGuestReturn = hooks.requireGuestReturn;
++            invocation.isValid = [epoch, valid = std::move(hooks.isValid)]
++            {
++                {
++                    std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++                    if (epoch != g_iopCommandEpoch) return false;
++                }
++                return !valid || valid();
+             };
+-            invocation.onCancel = [runtime, packetAddress] { runtime->guestFree(packetAddress); };
+-            invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
+-            {
+-                runtime->guestFree(packetAddress);
++            invocation.onCancel = [settlePacket, cancel = std::move(hooks.onCancel)]
++            {
++                if (settlePacket() && cancel) cancel();
++            };
++            invocation.onComplete = [settlePacket, complete = std::move(hooks.onComplete)]
++                                   (const R5900Context &returned, R5900Context &parent)
++            {
++                if (settlePacket() && complete) complete(returned, parent);
+             };
+             // Queue submission settles onCancel even when admission throws.
+             queueOwnsPacket = true;
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
++            // queueInvocation runs on this EE executor and cannot dispatch the
++            // queued callback before returning. Rejection cleans the carrier
++            // with notifications still disarmed; false remains caller-owned.
++            settlement->admitted = true;
+             return true;
+         }
+         catch (...)
+@@ -332,6 +356,12 @@
+             if (!queueOwnsPacket) runtime->guestFree(packetAddress);
+             return false;
+         }
++    }
++
++    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId,
++                            const void *packet, size_t packetSize) noexcept
++    {
++        return dispatchSifCommand(rdram, runtime, commandId, packet, packetSize, {});
+     }
+ 
+     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+@@ -4,6 +4,19 @@
+ 
+ namespace ps2_stubs
+ {
++    // Optional transaction lifecycle only; existing SIF owns the packet storage.
++    // Hooks capture native controllers weakly. A false dispatch result remains
++    // caller-owned admission failure with no transaction notification. Accepted
++    // callbacks notify at most once, including retained cancellation retries.
++    struct SifCommandInvocationHooks
++    {
++        bool requireGuestReturn = false;
++        std::function<bool()> isValid;
++        std::function<void()> onCancel;
++        std::function<void(const R5900Context &, R5900Context &)> onComplete;
++    };
++    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize, SifCommandInvocationHooks hooks) noexcept;
++
+     bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
+     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
+ #include "ps2_stubs.h"
+ #include "Kernel/Stubs/SIF.h"
+ #include "runtime/ps2_memory.h"
+@@ -19,6 +20,17 @@
+ #if !defined(_WIN32)
+ #include <sys/types.h>
+ #endif
++
++namespace
++{
++    struct NativeEeRpcHookScope
++    {
++        bool &active;
++        bool previous;
++        explicit NativeEeRpcHookScope(bool &value) : active(value), previous(value) { active = true; }
++        ~NativeEeRpcHookScope() { active = previous; }
++    };
++}
+ 
+ PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
+     : m_lock(owner.m_callMutex),
+@@ -135,6 +147,48 @@
+     if (!nativeRpcRamRange(address, 4u))
+         throw std::invalid_argument("native EE RPC queue-root address is outside aligned EE RAM");
+     m_nativeEeRpcQueueRoot = address;
++}
++
++void PS2IopHostAdapter::configureNativeEeRpcHooks(NativeEeRpcHooks hooks)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    if (m_nativeEeRpcHooksActive || m_activeToken != 0u || m_runtime.eeScheduler().isRunning())
++        throw std::logic_error("native EE RPC hooks require quiescent execution");
++    if (bool(hooks.submit) != bool(hooks.guestBoundary))
++        throw std::invalid_argument("native EE RPC hooks must configure both boundaries");
++    if (m_nativeEeRpcHooks && m_runtime.eeScheduler().hasExecutionContexts())
++        throw std::logic_error("native EE RPC hook replacement requires old execution retirement");
++    NativeEeRpcHookScope hookScope(m_nativeEeRpcHooksActive);
++    std::unique_ptr<NativeEeRpcHooks> replacement;
++    if (hooks.submit) replacement = std::make_unique<NativeEeRpcHooks>(std::move(hooks));
++    // The pair releases its captures here. Native profiles must use sole
++    // long-term hook ownership and weak observers/invocations, or explicitly
++    // detach an externally retained controller before replacement.
++    m_nativeEeRpcHooks.swap(replacement);
++}
++
++bool PS2IopHostAdapter::submitReverseRpc(const ps2x::iop::ReverseRpcRequest &request,
++                                        ps2x::iop::ReverseRpcCompletionEndpoint endpoint)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    if (m_activeToken == 0u || !m_nativeEeRpcHooks || !m_nativeEeRpcHooks->submit) return false;
++    NativeEeRpcHookScope hookScope(m_nativeEeRpcHooksActive);
++    return m_nativeEeRpcHooks->submit(request, std::move(endpoint));
++}
++
++void PS2IopHostAdapter::dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram,
++                                                  R5900Context *ctx,
++                                                  void (*original)(uint8_t *, R5900Context *, PS2Runtime *))
++{
++    if (!rdram || !ctx || !original) throw std::invalid_argument("native EE RPC boundary has no original function");
++    std::lock_guard<std::recursive_mutex> lock(m_callMutex);
++    if (m_nativeEeRpcHooks && m_nativeEeRpcHooks->guestBoundary)
++    {
++        if (m_activeToken != 0u) throw std::logic_error("EE SDK dispatch cannot run inside an IOP call scope");
++        NativeEeRpcHookScope hookScope(m_nativeEeRpcHooksActive);
++        m_nativeEeRpcHooks->guestBoundary(entry, rdram, ctx, &m_runtime, original);
++    }
++    else original(rdram, ctx, &m_runtime);
+ }
+ 
+ ps2x::iop::GuestRpcBinding PS2IopHostAdapter::lookupGuestRpcBinding(uint32_t sid)
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -7,10 +7,12 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <mutex>
++#include <memory>
+ #include <unordered_map>
+ 
+ class PS2Runtime;
+ struct R5900Context;
++struct NativeEeRpcHooks;
+ 
+ class PS2IopHostAdapter final : public ps2x::iop::IopHost
+ {
+@@ -99,6 +101,11 @@
+     void resetIopSifRegisters() override;
+     ps2x::iop::GuestRpcBinding lookupGuestRpcBinding(uint32_t sid) override;
+     void configureNativeEeRpcQueueRoot(uint32_t address);
++    bool submitReverseRpc(const ps2x::iop::ReverseRpcRequest &request,
++                          ps2x::iop::ReverseRpcCompletionEndpoint endpoint) override;
++    void configureNativeEeRpcHooks(NativeEeRpcHooks hooks);
++    void dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram, R5900Context *ctx,
++                                    void (*original)(uint8_t *, R5900Context *, PS2Runtime *));
+ 
+ private:
+     friend class CallScope;
+@@ -122,4 +129,8 @@
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+     uint64_t m_nextHostFileHandle = 1u;
++    // Existing adapter teardown precedes the EE scheduler. Hooks share one
++    // controller; invocation closures retain it weakly.
++    std::unique_ptr<NativeEeRpcHooks> m_nativeEeRpcHooks;
++    bool m_nativeEeRpcHooksActive = false;
+ };
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -535,8 +535,21 @@
+         requestStop();
+         if (m_eeScheduler) m_eeScheduler->discardInvocations();
+         ps2_syscalls::resetDeci2State(this);
+-        m_iopSubsystem.reset();
+-        m_iopHost.reset();
++    }
++    catch (const std::exception &e)
++    {
++        std::cerr << "[~PS2Runtime] execution cleanup exception: " << e.what() << std::endl;
++    }
++    catch (...)
++    {
++        std::cerr << "[~PS2Runtime] execution cleanup exception: unknown" << std::endl;
++    }
++    // Mandatory ownership teardown while the EE observer container is alive,
++    // including the retained-frame path after throwing cancellation.
++    m_iopSubsystem.reset();
++    m_iopHost.reset();
++    try
++    {
+ #if defined(PLATFORM_VITA)
+         m_audioBackend.stopAll();
+         m_audioBackend.setAudioReady(false);
+@@ -579,6 +592,17 @@
+ void PS2Runtime::configureNativeEeRpcQueueRoot(uint32_t address)
+ {
+     m_iopHost->configureNativeEeRpcQueueRoot(address);
++}
++
++void PS2Runtime::configureNativeEeRpcHooks(NativeEeRpcHooks hooks)
++{
++    m_iopHost->configureNativeEeRpcHooks(std::move(hooks));
++}
++
++void PS2Runtime::dispatchNativeEeRpcBoundary(uint32_t entry, uint8_t *rdram,
++                                            R5900Context *ctx, NativeEeRpcHooks::OriginalFunction original)
++{
++    m_iopHost->dispatchNativeEeRpcBoundary(entry, rdram, ctx, original);
+ }
+ 
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+@@ -1083,6 +1107,7 @@
+     ps2x::iop::GameIdentity identity;
+     // A different ELF must not inherit an earlier executable's SDK root.
+     configureNativeEeRpcQueueRoot(0u);
++    configureNativeEeRpcHooks({});
+     identity.elfName = module.name;
+     identity.entryPoint = m_cpuContext.pc;
+     identity.crc32 = elfCrc32;
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -30,6 +30,7 @@
+     src/ps2_deci2_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
+     src/ee_owner_tests21.cpp
++    src/native_ee_rpc_hooks_tests22.cpp
+     src/ps2_execution_counter_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_invocation_stack_tests.cpp
+@@ -41,6 +42,7 @@
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
++    src/sif_command_hooks_tests22.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+ )
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -13,6 +13,7 @@
+ #endif
+ void register_ps2_runtime_kernel_tests();
+ void register_ee_owner_tests21();
++void register_native_ee_rpc_hooks_tests22();
+ void register_ps2_execution_counter_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_invocation_stack_tests();
+@@ -24,6 +25,7 @@
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
++void register_sif_command_hooks_tests22();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void reset_ps2_test_function_table();
+@@ -43,6 +45,7 @@
+ #endif
+     register_ps2_runtime_kernel_tests();
+     register_ee_owner_tests21();
++    register_native_ee_rpc_hooks_tests22();
+     register_ps2_execution_counter_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_invocation_stack_tests();
+@@ -54,6 +57,7 @@
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
++    register_sif_command_hooks_tests22();
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     int res = MiniTest::Run();
+--- /dev/null
++++ b/ps2xTest/src/native_ee_rpc_hooks_tests22.cpp
+@@ -0,0 +1,312 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++    // These are ordinary, aligned test-table slots inside [0, PS2_RAM_SIZE).
++    constexpr uint32_t kHookEntry = 0x001D2000u;
++    static_assert(kHookEntry < PS2_RAM_SIZE && (kHookEntry & 3u) == 0u);
++
++    struct HookTrace
++    {
++        int originalCalls = 0;
++        bool runningConfigurationRejected = false;
++    };
++
++    HookTrace g_trace;
++
++    template <typename Exception, typename Callback>
++    void expectException(TestCase &t, Callback &&callback, const char *message)
++    {
++        bool caught = false;
++        try { callback(); }
++        catch (const Exception &) { caught = true; }
++        t.IsTrue(caught, message);
++    }
++
++    void originalBoundary(uint8_t *, R5900Context *, PS2Runtime *)
++    {
++        ++g_trace.originalCalls;
++    }
++
++    void runningProbe(uint8_t *, R5900Context *, PS2Runtime *runtime)
++    {
++        try { runtime->configureNativeEeRpcHooks({}); }
++        catch (const std::logic_error &) { g_trace.runningConfigurationRejected = true; }
++        runtime->requestStop();
++    }
++
++    NativeEeRpcHooks inertHooks()
++    {
++        NativeEeRpcHooks hooks;
++        hooks.submit = [](const auto &, auto) { return false; };
++        hooks.guestBoundary = [](uint32_t, uint8_t *ram, R5900Context *cpu,
++                                 PS2Runtime *runtime, auto original)
++        {
++            original(ram, cpu, runtime);
++        };
++        return hooks;
++    }
++
++    struct DestructionWitness
++    {
++        PS2Runtime &runtime;
++        bool &destroyed;
++        bool &observerCleared;
++        bool &reentryRejected;
++        bool attemptReentry = false;
++
++        DestructionWitness(PS2Runtime &runtime_, bool &destroyed_, bool &observerCleared_,
++                           bool &reentryRejected_, bool attemptReentry_)
++            : runtime(runtime_), destroyed(destroyed_), observerCleared(observerCleared_),
++              reentryRejected(reentryRejected_), attemptReentry(attemptReentry_)
++        {
++        }
++
++        ~DestructionWitness()
++        {
++            (void)runtime.eeScheduler().hasExecutionContexts();
++            runtime.eeScheduler().clearExecutionRetirementObserver(this);
++            observerCleared = true;
++            if (attemptReentry)
++            {
++                try { runtime.configureNativeEeRpcHooks({}); }
++                catch (const std::logic_error &) { reentryRejected = true; }
++            }
++            destroyed = true;
++        }
++    };
++
++    NativeEeRpcHooks ownedHooks(const std::shared_ptr<DestructionWitness> &owner)
++    {
++        NativeEeRpcHooks hooks;
++        hooks.submit = [owner](const auto &, auto) { return false; };
++        hooks.guestBoundary = [owner](uint32_t, uint8_t *ram, R5900Context *cpu,
++                                      PS2Runtime *runtime, auto original)
++        {
++            original(ram, cpu, runtime);
++        };
++        return hooks;
++    }
++
++    void attachObserver(PS2Runtime &runtime, const std::shared_ptr<DestructionWitness> &owner,
++                        TestCase &t)
++    {
++        std::weak_ptr<DestructionWitness> weak = owner;
++        t.IsTrue(runtime.eeScheduler().setExecutionRetirementObserver(
++                     owner.get(), [weak](const EeExecutionOwner &) { (void)weak.lock(); }),
++                 "hook fixture must attach its observer");
++    }
++
++    struct ScopedTempElf
++    {
++        std::filesystem::path directory;
++        std::filesystem::path path;
++
++        ScopedTempElf()
++        {
++            directory = std::filesystem::temp_directory_path() /
++                        ("ps2-native-hooks22-" +
++                         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++            if (!std::filesystem::create_directory(directory))
++                throw std::runtime_error("temporary ELF directory collision");
++            path = directory / "fixture.elf";
++
++            std::vector<uint8_t> bytes(124u, 0u);
++            const auto u16 = [&](size_t at, uint16_t value) { std::memcpy(bytes.data() + at, &value, 2u); };
++            const auto u32 = [&](size_t at, uint32_t value) { std::memcpy(bytes.data() + at, &value, 4u); };
++            u32(0u, 0x464C457Fu); bytes[4] = bytes[5] = bytes[6] = 1u;
++            u16(16u, 2u); u16(18u, 8u); u32(20u, 1u); u32(24u, 0x001D0000u);
++            u32(28u, 52u); u16(40u, 52u); u16(42u, 32u); u16(44u, 2u);
++            for (uint32_t i = 0u; i != 2u; ++i)
++            {
++                const size_t at = 52u + i * 32u;
++                u32(at, 1u); u32(at + 4u, 116u + i * 4u);
++                u32(at + 8u, 0x001D0000u + i * 0x10u);
++                u32(at + 16u, 4u); u32(at + 20u, 4u);
++                u32(at + 24u, i == 0u ? 5u : 6u); u32(at + 28u, 4u);
++            }
++            u32(116u, 0x11223344u); u32(120u, 0x55667788u);
++            std::ofstream file(path, std::ios::binary);
++            file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++            if (!file) throw std::runtime_error("temporary ELF write failed");
++        }
++
++        ~ScopedTempElf()
++        {
++            std::error_code error;
++            std::filesystem::remove_all(directory, error);
++        }
++    };
++
++    struct IoPathsGuard
++    {
++        PS2Runtime::IoPaths old = PS2Runtime::getIoPaths();
++        ~IoPathsGuard() { PS2Runtime::setIoPaths(old); }
++    };
++}
++
++void register_native_ee_rpc_hooks_tests22()
++{
++    MiniTest::Case("NativeEeRpcHooks22", [](TestCase &tc)
++    {
++        tc.Run("fallback and callback exception retain the original boundary", [](TestCase &t)
++        {
++            g_trace = {};
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "hook fixture must initialize runtime RAM");
++            R5900Context cpu{};
++            uint8_t *ram = runtime.memory().getRDRAM();
++
++            runtime.dispatchNativeEeRpcBoundary(kHookEntry, ram, &cpu, originalBoundary);
++            t.Equals(g_trace.originalCalls, 1, "unconfigured boundary must call its original function");
++
++            NativeEeRpcHooks partial;
++            partial.submit = [](const auto &, auto) { return false; };
++            expectException<std::invalid_argument>(t, [&] { runtime.configureNativeEeRpcHooks(std::move(partial)); },
++                                                   "partial hook configuration must be rejected");
++
++            bool callbackRan = false;
++            auto hooks = inertHooks();
++            hooks.guestBoundary = [&callbackRan](uint32_t, uint8_t *, R5900Context *, PS2Runtime *active, auto)
++            {
++                bool rejected = false;
++                try { active->configureNativeEeRpcHooks({}); }
++                catch (const std::logic_error &) { rejected = true; }
++                if (!rejected) throw std::runtime_error("active boundary allowed reconfiguration");
++                callbackRan = true;
++                throw std::runtime_error("intentional boundary fault");
++            };
++            runtime.configureNativeEeRpcHooks(std::move(hooks));
++            expectException<std::runtime_error>(t,
++                                                [&] { runtime.dispatchNativeEeRpcBoundary(kHookEntry, ram, &cpu, originalBoundary); },
++                                                "boundary exception must remain observable");
++            t.IsTrue(callbackRan, "configured boundary callback must run");
++
++            runtime.configureNativeEeRpcHooks({});
++            runtime.dispatchNativeEeRpcBoundary(kHookEntry, ram, &cpu, originalBoundary);
++            t.Equals(g_trace.originalCalls, 2, "unconfiguration after an exception must restore fallback");
++        });
++
++        tc.Run("execution contexts reject replacement until retirement", [](TestCase &t)
++        {
++            g_trace = {};
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "execution-context fixture must initialize runtime RAM");
++            runtime.configureNativeEeRpcHooks(inertHooks());
++            R5900Context cpu{};
++            cpu.pc = kHookEntry;
++            runtime.eeScheduler().reset(runtime.memory().getRDRAM(), cpu);
++            t.IsTrue(runtime.registerFunction(kHookEntry, runningProbe), "test-table hook entry must register");
++            runtime.eeScheduler().run();
++            t.IsTrue(g_trace.runningConfigurationRejected, "running guest code must reject hook reconfiguration");
++
++            expectException<std::logic_error>(t, [&] { runtime.configureNativeEeRpcHooks({}); },
++                                              "ordinary execution lifetime must block replacement");
++            t.IsTrue(runtime.eeScheduler().retireInvocationStacksForColdLoad(),
++                     "cold retirement must release the ordinary execution lifetime");
++            runtime.configureNativeEeRpcHooks(inertHooks());
++
++            int cancelled = 0;
++            GuestInvocation queued{};
++            queued.context.pc = kHookEntry;
++            queued.iopResetSensitive = false;
++            queued.onCancel = [&] { ++cancelled; };
++            runtime.eeScheduler().queueInvocation(std::move(queued));
++            expectException<std::logic_error>(t, [&] { runtime.configureNativeEeRpcHooks({}); },
++                                              "queued EE-only callback must block replacement");
++            runtime.eeScheduler().discardInvocations();
++            t.Equals(cancelled, 1, "queued callback cancellation must occur exactly once");
++
++            runtime.configureNativeEeRpcHooks(inertHooks());
++            GuestInvocation failing{};
++            failing.context.pc = kHookEntry;
++            failing.iopResetSensitive = false;
++            failing.onCancel = [] { throw std::runtime_error("intentional cancellation fault"); };
++            runtime.eeScheduler().queueInvocation(std::move(failing));
++            expectException<std::runtime_error>(t, [&] { runtime.eeScheduler().discardInvocations(); },
++                                                "throwing cancellation must remain observable");
++            t.IsTrue(runtime.eeScheduler().hasExecutionContexts(),
++                     "failed cancellation must retain its execution access guard");
++            expectException<std::logic_error>(t, [&] { runtime.configureNativeEeRpcHooks({}); },
++                                              "retained failed cancellation must block replacement");
++        });
++
++        tc.Run("captured hook owners clear observers during guarded replacement", [](TestCase &t)
++        {
++            bool destroyed = false, observerCleared = false, reentryRejected = false;
++            PS2Runtime runtime;
++            auto owner = std::make_shared<DestructionWitness>(
++                runtime, destroyed, observerCleared, reentryRejected, true);
++            attachObserver(runtime, owner, t);
++            runtime.configureNativeEeRpcHooks(ownedHooks(owner));
++            owner.reset();
++            runtime.configureNativeEeRpcHooks(inertHooks());
++            t.IsTrue(destroyed && observerCleared && reentryRejected,
++                     "old hook capture must release under the replacement reentry guard");
++
++            bool successorDestroyed = false, successorObserverCleared = false, unusedReentry = false;
++            auto successor = std::make_shared<DestructionWitness>(
++                runtime, successorDestroyed, successorObserverCleared, unusedReentry, false);
++            attachObserver(runtime, successor, t);
++            runtime.configureNativeEeRpcHooks(ownedHooks(successor));
++            successor.reset();
++            runtime.configureNativeEeRpcHooks({});
++            t.IsTrue(successorDestroyed && successorObserverCleared,
++                     "unconfiguration must release the successor capture and observer");
++        });
++
++        tc.Run("runtime teardown survives a throwing queued cancellation", [](TestCase &t)
++        {
++            bool destroyed = false, observerCleared = false, unusedReentry = false;
++            auto runtime = std::make_unique<PS2Runtime>();
++            auto owner = std::make_shared<DestructionWitness>(
++                *runtime, destroyed, observerCleared, unusedReentry, false);
++            attachObserver(*runtime, owner, t);
++            runtime->configureNativeEeRpcHooks(ownedHooks(owner));
++            owner.reset();
++            GuestInvocation failing{};
++            failing.context.pc = kHookEntry;
++            failing.onCancel = [] { throw std::runtime_error("intentional teardown cancellation fault"); };
++            runtime->eeScheduler().queueInvocation(std::move(failing));
++            runtime.reset();
++            t.IsTrue(destroyed && observerCleared,
++                     "runtime teardown must release hook captures after a cancellation fault");
++        });
++
++        tc.Run("minimal temporary ELF reload clears hook state", [](TestCase &t)
++        {
++            IoPathsGuard pathsGuard;
++            bool destroyed = false, observerCleared = false, unusedReentry = false;
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "reload fixture must initialize runtime RAM");
++            auto owner = std::make_shared<DestructionWitness>(
++                runtime, destroyed, observerCleared, unusedReentry, false);
++            attachObserver(runtime, owner, t);
++            runtime.configureNativeEeRpcHooks(ownedHooks(owner));
++            owner.reset();
++            R5900Context cpu{};
++            cpu.pc = kHookEntry;
++            runtime.eeScheduler().reset(runtime.memory().getRDRAM(), cpu);
++            ScopedTempElf elf;
++            t.IsTrue(runtime.loadELF(elf.path.string()), "minimal synthetic ELF must load");
++            t.IsTrue(destroyed && observerCleared && !runtime.eeScheduler().hasExecutionContexts(),
++                     "ELF reload must release hooks, observer, and execution access");
++            const int before = g_trace.originalCalls;
++            runtime.dispatchNativeEeRpcBoundary(kHookEntry, runtime.memory().getRDRAM(), &cpu, originalBoundary);
++            t.Equals(g_trace.originalCalls, before + 1, "ELF reload must restore unconfigured boundary fallback");
++        });
++    });
++}
+--- /dev/null
++++ b/ps2xTest/src/sif_command_hooks_tests22.cpp
+@@ -0,0 +1,266 @@
++#include "MiniTest.h"
++#include "Kernel/Stubs/SIF.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <utility>
++
++namespace
++{
++    constexpr uint32_t kMainEntry = 0x001D3000u;
++    constexpr uint32_t kHandlerEntry = 0x001D3040u;
++    constexpr uint32_t kCommandId = 0x80005555u;
++    static_assert(kHandlerEntry < PS2_RAM_SIZE && (kHandlerEntry & 3u) == 0u);
++
++    struct SifTrace
++    {
++        unsigned handlers = 0u;
++        uint32_t carrier = 0u;
++        bool normalReturn = true;
++        bool guestThrows = false;
++        std::array<uint32_t, 16> packet{};
++        bool packetMatches = false;
++    };
++
++    SifTrace g_trace;
++
++    void stopMain(uint8_t *, R5900Context *, PS2Runtime *runtime)
++    {
++        runtime->requestStop();
++    }
++
++    void commandHandler(uint8_t *ram, R5900Context *cpu, PS2Runtime *runtime)
++    {
++        ++g_trace.handlers;
++        g_trace.carrier = getRegU32(cpu, 4);
++        g_trace.packetMatches = g_trace.carrier != 0u &&
++            std::memcmp(ram + g_trace.carrier, g_trace.packet.data(), sizeof(g_trace.packet)) == 0;
++        if (g_trace.guestThrows) throw std::runtime_error("intentional guest handler fault");
++        cpu->pc = 0u;
++        if (g_trace.normalReturn) runtime->observeGuestReturn(cpu, 0u);
++    }
++
++    struct TestEnv
++    {
++        PS2Runtime runtime;
++        uint8_t *ram = nullptr;
++
++        TestEnv()
++        {
++            if (!runtime.memory().initialize()) throw std::runtime_error("SIF fixture RAM initialization failed");
++            ram = runtime.memory().getRDRAM();
++        }
++    };
++
++    void prepareTrace()
++    {
++        g_trace = {};
++        for (size_t i = 0u; i != g_trace.packet.size(); ++i)
++            g_trace.packet[i] = 0xAB000000u + static_cast<uint32_t>(i);
++        g_trace.packet[0] = sizeof(g_trace.packet);
++        g_trace.packet[2] = kCommandId;
++    }
++
++    void registerHandler(TestEnv &env, TestCase &t)
++    {
++        t.IsTrue(env.runtime.registerFunction(kMainEntry, stopMain) &&
++                     env.runtime.registerFunction(kHandlerEntry, commandHandler),
++                 "SIF fixture entries must register in the test function table");
++        R5900Context main{};
++        main.pc = kMainEntry;
++        env.runtime.eeScheduler().reset(env.ram, main);
++        ps2_stubs::resetSifState();
++        R5900Context registration{};
++        SET_GPR_U32(&registration, 4, kCommandId);
++        SET_GPR_U32(&registration, 5, kHandlerEntry);
++        SET_GPR_U32(&registration, 6, 0u);
++        ps2_stubs::sceSifAddCmdHandler(env.ram, &registration, &env.runtime);
++    }
++
++    void runCase(TestCase &t, bool checked, bool returned, bool valid, bool epochChanged,
++                 bool fault, bool throwComplete, bool throwCancel)
++    {
++        prepareTrace();
++        TestEnv env;
++        registerHandler(env, t);
++        g_trace.normalReturn = returned;
++        g_trace.guestThrows = fault;
++
++        unsigned completed = 0u;
++        unsigned cancelled = 0u;
++        const uint32_t expectedCarrier = env.runtime.guestMalloc(sizeof(g_trace.packet), 16u);
++        t.IsTrue(expectedCarrier != 0u, "packet heap probe must allocate");
++        env.runtime.guestFree(expectedCarrier);
++        uint32_t retainedAllocation = 0u;
++        const auto claimReleasedCarrier = [&]
++        {
++            retainedAllocation = env.runtime.guestMalloc(sizeof(g_trace.packet), 16u);
++            t.Equals(retainedAllocation, expectedCarrier,
++                     "packet must be freed before its settlement callback runs");
++        };
++
++        ps2_stubs::SifCommandInvocationHooks hooks{};
++        hooks.requireGuestReturn = checked;
++        hooks.isValid = [valid] { return valid; };
++        hooks.onComplete = [&](const R5900Context &cpu, R5900Context &)
++        {
++            ++completed;
++            claimReleasedCarrier();
++            t.Equals(cpu.pc, 0u, "completion must follow the guest return boundary");
++            if (throwComplete) throw std::runtime_error("intentional completion fault");
++        };
++        hooks.onCancel = [&]
++        {
++            ++cancelled;
++            claimReleasedCarrier();
++            if (throwCancel) throw std::runtime_error("intentional cancellation fault");
++        };
++        t.IsTrue(ps2_stubs::dispatchSifCommand(env.ram, &env.runtime, kCommandId,
++                                               g_trace.packet.data(), sizeof(g_trace.packet), std::move(hooks)),
++                 "registered command must be admitted");
++        if (epochChanged) ps2_stubs::resetSifState();
++
++        bool threw = false;
++        try { env.runtime.eeScheduler().run(); }
++        catch (const std::runtime_error &) { threw = true; }
++        const bool success = valid && !epochChanged && !fault && (!checked || returned);
++        t.Equals(completed, unsigned(success), "command completion must settle exactly once on success");
++        t.Equals(cancelled, unsigned(!success), "command cancellation must settle exactly once on failure");
++        t.Equals(g_trace.handlers, unsigned(valid && !epochChanged),
++                 "invalid or epoch-revoked command must not call its guest handler");
++        if (valid && !epochChanged) t.IsTrue(g_trace.packetMatches, "guest handler must observe unchanged packet bytes");
++        t.Equals(threw, fault || (success && throwComplete) || (!success && throwCancel),
++                 "guest and settlement faults must preserve their failure result");
++
++        const uint32_t reused = env.runtime.guestMalloc(sizeof(g_trace.packet), 16u);
++        t.IsTrue(retainedAllocation == expectedCarrier && reused != 0u && reused != retainedAllocation,
++                 "settlement must not free the callback's reused packet carrier twice");
++        env.runtime.guestFree(retainedAllocation);
++        env.runtime.guestFree(reused);
++    }
++
++    void legacyFallback(TestCase &t)
++    {
++        prepareTrace();
++        TestEnv env;
++        registerHandler(env, t);
++        g_trace.normalReturn = false;
++        t.IsTrue(ps2_stubs::dispatchSifCommand(env.ram, &env.runtime, kCommandId,
++                                               g_trace.packet.data(), sizeof(g_trace.packet)),
++                 "legacy command dispatch must be admitted");
++        env.runtime.eeScheduler().run();
++        t.Equals(g_trace.handlers, 1u, "legacy unchecked command must run its handler");
++        t.IsTrue(g_trace.packetMatches, "legacy handler must observe its packet bytes");
++        const uint32_t reused = env.runtime.guestMalloc(sizeof(g_trace.packet), 16u);
++        t.IsTrue(reused == g_trace.carrier && g_trace.carrier != 0u,
++                 "legacy packet ownership must return the handler carrier to the heap");
++        env.runtime.guestFree(reused);
++    }
++}
++
++namespace
++{
++    void retainedDiscardRetry(TestCase &t)
++    {
++        std::array<uint32_t, 2> expected{}, retained{};
++        std::array<unsigned, 2> notifications{};
++        prepareTrace(); TestEnv env; registerHandler(env, t);
++        if (!env.runtime.eeScheduler().retireInvocationStacksForColdLoad() ||
++            env.runtime.eeScheduler().hasExecutionContexts())
++            throw std::runtime_error("pending-only cancellation fixture did not retire ordinary contexts");
++        for (size_t i = 0; i < 2; ++i)
++        {
++            expected[i] = env.runtime.guestMalloc(sizeof(g_trace.packet), 16);
++            if (!expected[i]) throw std::runtime_error("retry heap probe failed");
++            env.runtime.guestFree(expected[i]);
++            ps2_stubs::SifCommandInvocationHooks hooks{};
++            hooks.onCancel = [&, i]
++            {
++                ++notifications[i];
++                retained[i] = env.runtime.guestMalloc(sizeof(g_trace.packet), 16);
++                t.Equals(retained[i], expected[i], "cancellation must release its own packet before notification");
++                if (i == 1) throw std::runtime_error("intentional second queued cancellation");
++            };
++            if (!ps2_stubs::dispatchSifCommand(env.ram, &env.runtime, kCommandId,
++                                              g_trace.packet.data(), sizeof(g_trace.packet), std::move(hooks)))
++                throw std::runtime_error("retry command was not admitted");
++        }
++        bool threw = false;
++        try { env.runtime.eeScheduler().discardInvocations(); }
++        catch (const std::runtime_error &) { threw = true; }
++        t.IsTrue(threw && notifications[0] == 1 && notifications[1] == 1 &&
++                 env.runtime.eeScheduler().hasExecutionContexts(),
++                 "throwing cancellation must retain the actual queued command collection");
++        env.runtime.eeScheduler().discardInvocations();
++        t.IsTrue(notifications[0] == 1 && notifications[1] == 1 &&
++                 !env.runtime.eeScheduler().hasExecutionContexts(),
++                 "retry must retire commands without replaying their notifications");
++        const uint32_t next = env.runtime.guestMalloc(sizeof(g_trace.packet), 16);
++        t.IsTrue(next && next != retained[0] && next != retained[1],
++                 "retained cancellation retry must not free a callback-owned replacement allocation");
++        env.runtime.guestFree(next);
++        for (auto allocation : retained) env.runtime.guestFree(allocation);
++    }
++
++    void earlyAdmissionFailure(TestCase &t)
++    {
++        unsigned completed = 0, cancelled = 0;
++        prepareTrace(); TestEnv env; registerHandler(env, t);
++        R5900Context unavailable{};
++        SET_GPR_U32(&unavailable, 4, kCommandId);
++        SET_GPR_U32(&unavailable, 5, PS2_RAM_SIZE);
++        ps2_stubs::sceSifAddCmdHandler(env.ram, &unavailable, &env.runtime);
++        t.IsFalse(env.runtime.hasFunction(PS2_RAM_SIZE), "fixture handler address must be outside the test table");
++        ps2_stubs::SifCommandInvocationHooks hooks{};
++        hooks.onComplete = [&](const auto &, auto &) { ++completed; };
++        hooks.onCancel = [&] { ++cancelled; };
++        t.IsFalse(ps2_stubs::dispatchSifCommand(env.ram, &env.runtime, kCommandId,
++                                               g_trace.packet.data(), sizeof(g_trace.packet), std::move(hooks)),
++                  "unavailable command handler must reject admission");
++        t.IsTrue(completed == 0 && cancelled == 0,
++                 "false admission must leave transaction settlement to the caller");
++    }
++}
++
++void register_sif_command_hooks_tests22()
++{
++    MiniTest::Case("SifCommandHooks22", [](TestCase &tc)
++    {
++        tc.Run("legacy dispatch retains unchecked ABI and packet ownership", legacyFallback);
++        tc.Run("retained direct-discard retries settle carriers once", retainedDiscardRetry);
++        tc.Run("early rejected admission does not notify transaction", earlyAdmissionFailure);
++        tc.Run("checked command return completes after the guest boundary", [](TestCase &t)
++        {
++            runCase(t, true, true, true, false, false, false, false);
++        });
++        tc.Run("missing checked guest return cancels once", [](TestCase &t)
++        {
++            runCase(t, true, false, true, false, false, false, false);
++        });
++        tc.Run("invalid command cancels without guest execution", [](TestCase &t)
++        {
++            runCase(t, true, true, false, false, false, false, false);
++        });
++        tc.Run("epoch revocation cancels without guest execution", [](TestCase &t)
++        {
++            runCase(t, true, true, true, true, false, false, false);
++        });
++        tc.Run("guest handler fault cancels once", [](TestCase &t)
++        {
++            runCase(t, true, true, true, false, true, false, false);
++        });
++        tc.Run("throwing completion keeps settlement ownership", [](TestCase &t)
++        {
++            runCase(t, true, true, true, false, false, true, false);
++        });
++        tc.Run("throwing cancellation keeps settlement ownership", [](TestCase &t)
++        {
++            runCase(t, true, true, false, false, false, false, true);
++        });
++    });
++}

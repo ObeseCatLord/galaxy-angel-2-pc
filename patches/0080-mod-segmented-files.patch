@@ -1,0 +1,222 @@
+From 30a575b4c16825f613b182a4e190c9d83c3579dc Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 11:01:09 -0500
+Subject: [PATCH] mods: NAME.ga2seg files assemble a disc file from stored
+ bytes and image ranges
+
+A mod that rebuilds a large archive (language packs rebuilding battle
+load groups) can describe the result as literal pieces plus byte ranges
+of the verified disc image instead of shipping a copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ps2_disc_mount.cpp | 80 ++++++++++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_disc_mount.h   | 19 ++++++
+ ps2xTest/src/ps2_disc_mount_tests.cpp  | 39 +++++++++++++
+ 3 files changed, 134 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.cpp b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+index 6a4b53f..02f8c68 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.cpp
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.cpp
+@@ -11,6 +11,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <fstream>
+ #include <limits>
+ #include <memory>
+@@ -47,6 +48,7 @@ namespace ps2_disc
+             uint64_t begin = 0u, end = 0u; // byte range in the image's sector space
+             std::filesystem::path host;
+             uint64_t size = 0u;
++            std::vector<Segment> segments; // a .ga2seg file: the pieces to assemble
+         };
+         // Other registered discs; `files`/`verifiedImage` always describe the
+         // current one, and the primary is kept here too once a second disc exists.
+@@ -297,8 +299,19 @@ namespace ps2_disc
+                 for (const auto &entry : std::filesystem::recursive_directory_iterator(dir, error))
+                 {
+                     if (!entry.is_regular_file(error)) continue;
+-                    const std::string key = pathKey(std::filesystem::relative(entry.path(), dir, error).generic_string());
+-                    const uint64_t size = entry.file_size(error);
++                    std::string relative = std::filesystem::relative(entry.path(), dir, error).generic_string();
++                    std::vector<Segment> segments;
++                    uint64_t size = entry.file_size(error);
++                    if (relative.size() > 7u && relative.compare(relative.size() - 7u, 7u, ".ga2seg") == 0)
++                    {
++                        if (!parseSegments(entry.path(), segments, size))
++                        {
++                            std::fprintf(stderr, "[mods] skipped %s (bad .ga2seg)\n", entry.path().string().c_str());
++                            continue;
++                        }
++                        relative.resize(relative.size() - 7u);
++                    }
++                    const std::string key = pathKey(relative);
+                     if (key.empty() || error || size > UINT32_MAX)
+                     {
+                         std::fprintf(stderr, "[mods] skipped %s\n", entry.path().string().c_str());
+@@ -308,7 +321,7 @@ namespace ps2_disc
+                     if (lba > UINT32_MAX) break;
+                     disc.files[key] = File{static_cast<uint32_t>(size), {{static_cast<uint32_t>(lba), static_cast<uint32_t>(size)}}};
+                     const uint64_t span = std::max<uint64_t>(2048u, (size + 2047u) / 2048u * 2048u);
+-                    disc.overlays.push_back(Overlay{next, next + span, entry.path(), size});
++                    disc.overlays.push_back(Overlay{next, next + span, entry.path(), size, std::move(segments)});
+                     next += span;
+                     ++count;
+                 }
+@@ -547,7 +560,13 @@ namespace ps2_disc
+             const size_t chunk = static_cast<size_t>(std::min<uint64_t>(size, overlay->end - position));
+             std::memset(destination, 0, chunk);
+             const uint64_t within = position - overlay->begin;
+-            if (within < overlay->size)
++            if (within < overlay->size && !overlay->segments.empty())
++            {
++                const size_t wanted = static_cast<size_t>(std::min<uint64_t>(chunk, overlay->size - within));
++                if (!readSegments(overlay->host, disc->image, overlay->segments, within, destination, wanted))
++                    return false;
++            }
++            else if (within < overlay->size)
+             {
+                 std::ifstream in(overlay->host, std::ios::binary);
+                 in.seekg(static_cast<std::streamoff>(within));
+@@ -559,4 +578,57 @@ namespace ps2_disc
+         }
+         return true;
+     }
++
++    bool parseSegments(const std::filesystem::path &file, std::vector<Segment> &segments, uint64_t &size)
++    {
++        std::ifstream in(file, std::ios::binary);
++        char magic[8]{};
++        uint32_t head[2]{};
++        if (!in.read(magic, 8) || std::memcmp(magic, "GA2SEG1\0", 8) != 0 ||
++            !in.read(reinterpret_cast<char *>(head), sizeof(head)) || head[0] > 1u << 20)
++            return false;
++        std::error_code error;
++        const uint64_t fileSize = std::filesystem::file_size(file, error);
++        segments.clear();
++        size = 0u;
++        for (uint32_t i = 0; i < head[0]; ++i)
++        {
++            uint32_t kind[2]{};
++            uint64_t range[2]{};
++            if (!in.read(reinterpret_cast<char *>(kind), sizeof(kind)) ||
++                !in.read(reinterpret_cast<char *>(range), sizeof(range)) || kind[0] > 1u)
++                return false;
++            if (kind[0] == 0u && (error || range[0] > fileSize || range[1] > fileSize - range[0]))
++                return false;
++            segments.push_back(Segment{kind[0] == 1u, range[0], range[1]});
++            size += range[1];
++        }
++        return size <= UINT32_MAX;
++    }
++
++    bool readSegments(const std::filesystem::path &file, const std::filesystem::path &image,
++                      const std::vector<Segment> &segments, uint64_t offset, uint8_t *destination, size_t size)
++    {
++        uint64_t start = 0u;
++        for (const Segment &segment : segments)
++        {
++            if (size == 0u)
++                break;
++            const uint64_t end = start + segment.length;
++            if (offset < end)
++            {
++                const uint64_t within = offset - start;
++                const size_t chunk = static_cast<size_t>(std::min<uint64_t>(size, segment.length - within));
++                std::ifstream in(segment.fromImage ? image : file, std::ios::binary);
++                in.seekg(static_cast<std::streamoff>(segment.source + within));
++                if (!in.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(chunk)))
++                    return false;
++                destination += chunk;
++                offset += chunk;
++                size -= chunk;
++            }
++            start = end;
++        }
++        return size == 0u;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_disc_mount.h b/ps2xRuntime/src/lib/ps2_disc_mount.h
+index dd6c4cb..81bfd07 100644
+--- a/ps2xRuntime/src/lib/ps2_disc_mount.h
++++ b/ps2xRuntime/src/lib/ps2_disc_mount.h
+@@ -59,4 +59,23 @@ namespace ps2_disc
+     // when no mod file covers the position.
+     [[nodiscard]] bool readOverlay(const std::filesystem::path &image, uint64_t position,
+                                    uint8_t *destination, size_t size);
++
++    // A mod file NAME.ga2seg stands for the file NAME assembled from pieces:
++    // literal bytes stored in the .ga2seg file and byte ranges of the disc
++    // image (so a mod can rebuild a large archive while shipping only what
++    // changed). Layout, little-endian: "GA2SEG1\0", u32 count, u32 0, then
++    // count x {u32 kind (0 literal, 1 image), u32 0, u64 source, u64 length}
++    // where source is an offset in the .ga2seg file (literal) or in the disc
++    // image (image); the file is the pieces in order.
++    struct Segment
++    {
++        bool fromImage = false;
++        uint64_t source = 0u, length = 0u;
++    };
++    [[nodiscard]] bool parseSegments(const std::filesystem::path &file, std::vector<Segment> &segments,
++                                     uint64_t &size);
++    // Reads [offset, offset + size) of the assembled file.
++    [[nodiscard]] bool readSegments(const std::filesystem::path &file, const std::filesystem::path &image,
++                                    const std::vector<Segment> &segments, uint64_t offset,
++                                    uint8_t *destination, size_t size);
+ }
+diff --git a/ps2xTest/src/ps2_disc_mount_tests.cpp b/ps2xTest/src/ps2_disc_mount_tests.cpp
+index 654c63a..e2380df 100644
+--- a/ps2xTest/src/ps2_disc_mount_tests.cpp
++++ b/ps2xTest/src/ps2_disc_mount_tests.cpp
+@@ -109,6 +109,45 @@ void register_ps2_disc_mount_tests()
+ {
+     MiniTest::Case("Verified mounted-disc extents", [](TestCase &tc)
+     {
++    tc.Run("A .ga2seg mod file assembles literal pieces and disc image ranges", [](TestCase &t)
++    {
++        const auto dir = std::filesystem::temp_directory_path() /
++            ("ga2seg-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++        std::filesystem::create_directories(dir);
++        const auto image = dir / "image.iso", seg = dir / "STRM.DAT.ga2seg";
++        { std::ofstream out(image, std::ios::binary); out << "0123456789ABCDEF"; }
++        {
++            std::ofstream out(seg, std::ios::binary);
++            const uint32_t head[2] = {3u, 0u};
++            out.write("GA2SEG1\0", 8);
++            out.write(reinterpret_cast<const char *>(head), sizeof(head));
++            const uint64_t literalAt = 8 + 8 + 3 * 24;
++            auto piece = [&](uint32_t kind, uint64_t source, uint64_t length) {
++                const uint32_t k[2] = {kind, 0u};
++                const uint64_t r[2] = {source, length};
++                out.write(reinterpret_cast<const char *>(k), sizeof(k));
++                out.write(reinterpret_cast<const char *>(r), sizeof(r));
++            };
++            piece(0u, literalAt, 3u);     // "abc"
++            piece(1u, 10u, 4u);           // image "ABCD"
++            piece(0u, literalAt + 3u, 2u); // "xy"
++            out << "abcxy";
++        }
++        std::vector<ps2_disc::Segment> segments;
++        uint64_t size = 0u;
++        t.IsTrue(ps2_disc::parseSegments(seg, segments, size), "parses");
++        t.Equals(size, uint64_t(9u), "assembled size");
++        std::array<uint8_t, 9> all{};
++        t.IsTrue(ps2_disc::readSegments(seg, image, segments, 0u, all.data(), all.size()), "reads all");
++        t.Equals(std::string(all.begin(), all.end()), std::string("abcABCDxy"), "pieces in order");
++        std::array<uint8_t, 4> mid{};
++        t.IsTrue(ps2_disc::readSegments(seg, image, segments, 2u, mid.data(), mid.size()), "reads across pieces");
++        t.Equals(std::string(mid.begin(), mid.end()), std::string("cABC"), "range across pieces");
++        std::array<uint8_t, 2> past{};
++        t.IsTrue(!ps2_disc::readSegments(seg, image, segments, 8u, past.data(), past.size()), "past the end fails");
++        std::filesystem::remove_all(dir);
++    });
++
+     tc.Run("EE and IOP search/read agree and mounted image overrides pseudo LBA collision", [](TestCase &t)
+     {
+         Env env; const auto image=env.root/"large.iso";
+-- 
+2.55.0
+

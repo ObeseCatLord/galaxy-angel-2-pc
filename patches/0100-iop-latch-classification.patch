@@ -1,0 +1,815 @@
+From 304f09dc8b51f5fc07175b81f13aaa5d59fcc1c7 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:25:15 -0500
+Subject: [PATCH] iop: classify the remaining shutdown latches; guest errors no
+ longer disable the IOP (H-IOP4, H-IOP7, H-IOP14)
+
+Inventory of every markResetRequired/throwing path, each now either kept with
+a stated reason or converted (policy comment next to markResetRequired):
+
+Converted to errors / ignored-and-logged:
+- SPU2 bus errors a guest can cause (byte access to the 16-bit registers,
+  unaligned halfword/word access, DMA sync mode other than block mode, a DMA
+  range that is not owned aligned IOP RAM, a second transfer on a busy core,
+  empty/oversized/unsupported AutoDMA blocks) throw SpuBusError, are caught at
+  the bus, ignored (reads return 0, a refused DMA clears its start bit) and
+  logged with a rate limit. Genuine device faults still latch.
+- an AutoDMA completion and an ordinary transfer's completion on one core are
+  the same IRQ line: they now coalesce into one interrupt that still settles
+  the ordinary transfer. Replacing the older entry used to leave the device
+  with a transfer nobody settled, so the next DMA on that core was refused and
+  the IOP latched (H-IOP14 AutoDMA overwrite).
+- an incomplete synchronous devctl driver callback fails only that devctl
+  with an I/O error; its scratch slot stays quarantined (it may still be
+  referenced) instead of stopping the IOP and the calling thread.
+- a CPU exception stops that CPU only (previous commit); RPC, alarm, timer and
+  interrupt callbacks that overrun are dropped and logged (earlier commits).
+
+Kept, with reason: an exception escaping guest execution (H-IOP4 residual: it
+leaves an instruction half done and device state unknown, so it now always
+stops the emulator with the logged cause instead of being swallowed in the
+unchecked path), a faulted/re-entered SPU device, 64-bit counter exhaustion,
+a reset requested from inside guest execution, and freeing the code of an
+alarm that is executing.
+
+Diagnostics no longer bypass the host logger: the allocator trace and the
+sceCdRE trace log through IopHost, and SPU bus faults report their cause
+through the failure callback (H-IOP14 stderr item).
+
+Tests: spu31 boundary checks now assert the bus-error contract (8 cases) and
+the coalescing; ioman/device-callback tests assert the devctl contract; the
+RPC boundaries assert an escaping exception outside an RPC.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/src/emulator/core/iop_memory.cpp      | 63 +++++++++++----
+ ps2xIOP/src/emulator/core/iop_memory.h        | 35 ++++++--
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp     | 10 ++-
+ ps2xIOP/src/emulator/imports/iop_ioman.cpp    |  7 ++
+ ps2xIOP/src/emulator/iop_emulator.cpp         | 81 +++++++++++++++----
+ .../tests/iop_device_callback_boundaries.inc  | 59 ++++++--------
+ ps2xIOP/tests/iop_ioman_tests.cpp             | 65 +++++++++++----
+ ps2xIOP/tests/iop_rpc_wait_boundaries.inc     | 13 +++
+ ps2xIOP/tests/iop_spu31_boundaries.inc        | 72 ++++++++++++++---
+ 9 files changed, 305 insertions(+), 100 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 89093fc..2119d8c 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -118,7 +118,7 @@ namespace ps2x::iop::detail
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+-            return accessSpu([]() -> uint8_t { throw std::runtime_error("SPU byte read unsupported in private31"); });
++            return accessSpu([]() -> uint8_t { throw SpuBusError("byte read of an SPU2 register (registers are 16-bit)"); });
+         if (phys < RamSize)
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+@@ -135,7 +135,7 @@ namespace ps2x::iop::detail
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+         {
+             return accessSpu([&]() -> uint16_t {
+-            if (phys & 1u) throw std::runtime_error("unaligned SPU halfword read");
++            if (phys & 1u) throw SpuBusError("unaligned halfword read of an SPU2 register");
+             return m_spu->read16(phys);
+             });
+         }
+@@ -157,7 +157,7 @@ namespace ps2x::iop::detail
+         {
+             return accessSpu([&]() -> uint32_t {
+             if ((phys & 3u) || phys > Spu2End - 4u)
+-                throw std::runtime_error("unaligned SPU word read");
++                throw SpuBusError("unaligned or out-of-range word read of an SPU2 register");
+             const uint32_t low = m_spu->read16(phys);
+             return low | (uint32_t(m_spu->read16(phys + 2u)) << 16u);
+             });
+@@ -195,7 +195,7 @@ namespace ps2x::iop::detail
+     {
+         const uint32_t phys = physicalAddress(address);
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+-            return accessSpu([] { throw std::runtime_error("SPU byte write unsupported in private31"); });
++            return accessSpu([] { throw SpuBusError("byte write of an SPU2 register (registers are 16-bit)"); });
+         if (phys >= 0x1F402016u && phys <= 0x1F402018u && m_cdvdSubcommandWriter)
+         {
+             m_cdvdSubcommandWriter(uint8_t(phys - 0x1F402000u), value);
+@@ -225,7 +225,7 @@ namespace ps2x::iop::detail
+         if (phys >= Spu2Base && phys < Spu2End && m_spuSynchronize)
+         {
+             accessSpu([&] {
+-            if (phys & 1u) throw std::runtime_error("unaligned SPU halfword write");
++            if (phys & 1u) throw SpuBusError("unaligned halfword write of an SPU2 register");
+             m_spu->write16(phys, value);
+             if (const auto observer = ps2x::iop::traceObservers().spuWrite)
+                 observer(phys - Spu2Base, value);
+@@ -254,7 +254,7 @@ namespace ps2x::iop::detail
+         {
+             accessSpu([&] {
+             if ((phys & 3u) || phys > Spu2End - 4u)
+-                throw std::runtime_error("unaligned SPU word write");
++                throw SpuBusError("unaligned or out-of-range word write of an SPU2 register");
+             write16(phys, uint16_t(value));
+             write16(phys + 2u, uint16_t(value >> 16u));
+             return;
+@@ -401,14 +401,23 @@ namespace ps2x::iop::detail
+                 return;
+             }
+             // Block mode (sync mode 1). libsd uses it for both ordinary and AutoDMA writes.
++            // A DMA the guest programmed wrongly is refused like a channel that
++            // never starts: clear the start bit (so a poll does not wait for a
++            // transfer that does not exist) and report a bus error.
++            const auto refuse = [&](const std::string &reason)
++            {
++                m_hardware[address] &= ~kDmaStart;
++                throw SpuBusError(reason);
++            };
+             if ((value & 0x00000600u) != 0x200u)
+-                throw std::runtime_error("unsupported SPU DMA mode");
++                refuse("SPU DMA sync mode is not block mode (CHCR=" + std::to_string(value) + ")");
+             const uint32_t bcr = m_hardware[address - 4u];
+             const uint64_t words32 = uint64_t(bcr & 0xffffu) * (bcr >> 16u);
+             const uint32_t madr = physicalAddress(m_hardware[address - 8u]);
+             if (!words32 || words32 > RamSize / 4u || (madr & 3u) ||
+                 !ownsRamRange(madr, size_t(words32 * 4u)))
+-                throw std::runtime_error("SPU DMA range is not owned aligned IOP RAM");
++                refuse("SPU DMA range is not owned aligned IOP RAM (madr=" + std::to_string(madr) +
++                       " words=" + std::to_string(words32) + ")");
+             std::vector<uint16_t> words(size_t(words32 * 2u));
+             const bool toSpu = (value & 1u) != 0u;
+             if (toSpu && !readRam(madr, words.data(), words.size() * 2u))
+@@ -417,9 +426,25 @@ namespace ps2x::iop::detail
+             const auto result = m_spu->transfer({core, toSpu ? ga2::spu::DmaDirection::ToSpuRam :
+                 ga2::spu::DmaDirection::FromSpuRam, madr, words, autoDma});
+             if (result.status != ga2::spu::DmaStatus::Consumed || result.words_transferred != words.size())
+-                throw std::runtime_error("SPU DMA rejected by device: status=" + std::to_string(int(result.status)) +
+-                                         " words=" + std::to_string(words.size()) + " core=" + std::to_string(core) +
+-                                         " auto=" + std::to_string(autoDma) + " chcr=" + std::to_string(value));
++            {
++                const std::string reason = "SPU DMA rejected by device: status=" + std::to_string(int(result.status)) +
++                                           " words=" + std::to_string(words.size()) + " core=" + std::to_string(core) +
++                                           " auto=" + std::to_string(autoDma) + " chcr=" + std::to_string(value);
++                // Busy (a transfer is already running on that core), an empty or
++                // oversized block and unsupported AutoDMA shapes are guest
++                // programming errors; anything else means the chip is unusable.
++                switch (result.status)
++                {
++                case ga2::spu::DmaStatus::Busy:
++                case ga2::spu::DmaStatus::InvalidRange:
++                case ga2::spu::DmaStatus::UnsupportedAutoDma:
++                case ga2::spu::DmaStatus::InvalidCore:
++                    refuse(reason);
++                    break;
++                default:
++                    throw std::runtime_error(reason);
++                }
++            }
+             if (autoDma)
+                 return; // completes when the mixer has consumed it (IopEmulator polls the device)
+             if (!toSpu && !writeRam(madr, words.data(), words.size() * 2u))
+@@ -465,11 +490,13 @@ namespace ps2x::iop::detail
+     }
+ 
+     void IopMemory::setSpuAccess(ga2::spu::Device *device, std::function<void()> synchronize,
+-                                 std::function<void()> failed)
++                                 std::function<void(std::string_view)> failed,
++                                 std::function<void(std::string_view)> busError)
+     {
+         m_spu = device;
+         m_spuSynchronize = std::move(synchronize);
+         m_spuFailed = std::move(failed);
++        m_spuBusError = std::move(busError);
+     }
+ 
+     void IopMemory::finishSpuDma(uint8_t core)
+@@ -534,18 +561,22 @@ namespace ps2x::iop::detail
+                 if (const uint32_t low = allocateLowest(size, alignment))
+                     return low;
+                 static int dumps = 0;
+-                if (std::getenv("GA2_IOP_ALLOC_TRACE") && dumps++ < 3)
++                if (m_diagnostic && std::getenv("GA2_IOP_ALLOC_TRACE") && dumps++ < 3)
+                 {
+                     std::vector<Allocation> sorted = m_allocations;
+                     std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+                     uint64_t used = 0;
+-                    std::fprintf(stderr, "[iop-alloc] FAIL size=%x align=%x blocks=%zu\n", size, alignment, sorted.size());
++                    char line[160];
++                    std::snprintf(line, sizeof(line), "[iop-alloc] FAIL size=%x align=%x blocks=%zu", size, alignment, sorted.size());
++                    m_diagnostic(line);
+                     for (const auto &b : sorted)
+                     {
+                         used += b.size;
+-                        std::fprintf(stderr, "[iop-alloc]   %06x-%06x (%x)\n", b.address, b.address + b.size, b.size);
++                        std::snprintf(line, sizeof(line), "[iop-alloc]   %06x-%06x (%x)", b.address, b.address + b.size, b.size);
++                        m_diagnostic(line);
+                     }
+-                    std::fprintf(stderr, "[iop-alloc] used=%llx of heap %x-%x\n", (unsigned long long)used, HeapBase, HeapLimit);
++                    std::snprintf(line, sizeof(line), "[iop-alloc] used=%llx of heap %x-%x", (unsigned long long)used, HeapBase, HeapLimit);
++                    m_diagnostic(line);
+                 }
+                 return 0u;
+             }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index fff1717..bd2b02e 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,6 +1,8 @@
+ #pragma once
+-#include <cstdio>
+ #include <exception>
++#include <stdexcept>
++#include <string_view>
++#include <type_traits>
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -15,6 +17,14 @@ namespace ga2::spu { class Device; }
+ 
+ namespace ps2x::iop::detail
+ {
++    // A guest-caused SPU2 bus/DMA error (unsupported access width, bad DMA
++    // programming, a transfer the chip refuses). The access is ignored and
++    // reported; it is not an emulator failure and never disables the IOP.
++    struct SpuBusError : std::runtime_error
++    {
++        using std::runtime_error::runtime_error;
++    };
++
+     class IopMemory
+     {
+     public:
+@@ -90,8 +100,13 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         // Serialized IOP owner supplies both lifetime and authoritative time.
++        // `failed` reports an emulator-level fault (the device is unusable);
++        // `busError` reports a guest bus error that was ignored.
+         void setSpuAccess(ga2::spu::Device *device, std::function<void()> synchronize,
+-                          std::function<void()> failed);
++                          std::function<void(std::string_view)> failed,
++                          std::function<void(std::string_view)> busError);
++        // Optional destination for allocator diagnostics (no direct stderr use).
++        void setDiagnosticSink(std::function<void(std::string_view)> sink) { m_diagnostic = std::move(sink); }
+         void setSpuDevice(ga2::spu::Device *device) noexcept { m_spu = device; }
+         void finishSpuDma(uint8_t core);
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+@@ -106,14 +121,20 @@ namespace ps2x::iop::detail
+     private:
+         template<class Access> decltype(auto) accessSpu(Access &&access) const
+         {
++            using Result = std::invoke_result_t<Access>;
+             try { m_spuSynchronize(); return access(); }
++            catch (const SpuBusError &error)
++            {
++                if (m_spuBusError) m_spuBusError(error.what());
++                if constexpr (!std::is_void_v<Result>)
++                    return Result{}; // the access has no effect; reads see zero
++            }
+             catch (const std::exception &error)
+             {
+-                std::fprintf(stderr, "[IOP SPU] bus fault: %s\n", error.what());
+-                if (m_spuFailed) m_spuFailed();
++                if (m_spuFailed) m_spuFailed(error.what());
+                 throw;
+             }
+-            catch (...) { if (m_spuFailed) m_spuFailed(); throw; }
++            catch (...) { if (m_spuFailed) m_spuFailed("unknown exception"); throw; }
+         }
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+@@ -134,7 +155,9 @@ namespace ps2x::iop::detail
+         std::optional<DmaStart> m_dmaStart;
+         ga2::spu::Device *m_spu = nullptr;
+         std::function<void()> m_spuSynchronize;
+-        std::function<void()> m_spuFailed;
++        std::function<void(std::string_view)> m_spuFailed;
++        std::function<void(std::string_view)> m_spuBusError;
++        std::function<void(std::string_view)> m_diagnostic;
+         std::function<uint8_t()> m_cdvdDiscTypeReader;
+         std::function<uint8_t(uint8_t)> m_cdvdSubcommandReader;
+         std::function<void(uint8_t, uint8_t)> m_cdvdSubcommandWriter;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 7f17e7d..e8be21c 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -447,9 +447,13 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 114: // sceCdRE(lsn, sectors, buf, mode): read used by the stream engine
+-                if (std::getenv("GA2_IPU_TRACE"))
+-                    std::fprintf(stderr, "[cdvd] sceCdRE lsn=%x sectors=%u buf=%08x owned=%d\n", a0, a1, a2,
+-                                 memory.ownsRamRange(a2, size_t(a1) * kSectorSize) ? 1 : 0);
++                if (static const bool trace = std::getenv("GA2_IPU_TRACE") != nullptr; trace)
++                {
++                    char line[128];
++                    std::snprintf(line, sizeof(line), "[cdvd] sceCdRE lsn=%x sectors=%u buf=%08x owned=%d", a0, a1, a2,
++                                  memory.ownsRamRange(a2, size_t(a1) * kSectorSize) ? 1 : 0);
++                    host.log(LogLevel::Info, line);
++                }
+                 if (readSectors(a0, a1, a2))
+                 {
+                     currentLsn = a0 + a1;
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 85ffce5..4a5f3eb 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -142,6 +142,13 @@ namespace ps2x::iop::detail
+             cpu.executionFault = true;
+             return kErrorIo;
+         }
++        if (status == IopGuestCallStatus::Failed)
++        {
++            // The driver callback was abandoned part-way: it may still be
++            // referenced by whatever it registered, so this scratch slot stays
++            // quarantined, but only this devctl fails.
++            return kErrorIo;
++        }
+         m_devctlScratchInUse[slot] = false;
+         if (status == IopGuestCallStatus::Rejected)
+             return int32_t(result) < 0 ? int32_t(result) : kErrorIo;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 3dccc1f..ca11cd5 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -92,6 +92,8 @@ namespace ps2x::iop::detail
+             uint32_t gp = 0;
+         };
+ 
++        struct PendingDma { uint64_t deadline; uint64_t identity; uint8_t core; bool autoDma = false; };
++
+         struct ScheduledGuestCallback
+         {
+             // One authoritative queue; an alarm leaves it before its callback runs.
+@@ -124,6 +126,7 @@ namespace ps2x::iop::detail
+                 [this](uint8_t offset) { return cdvd.readSubcommandRegister(offset); },
+                 [this](uint8_t offset, uint8_t value) { cdvd.writeSubcommandRegister(offset, value); });
+             rpc.setRamRetirementSupplement(this, [](void *context, uint32_t base, uint32_t size) noexcept { static_cast<Impl *>(context)->retireAlarms(base, size); });
++            memory.setDiagnosticSink([this](std::string_view message) { log(LogLevel::Info, message); });
+             bindSpuBus();
+             reset();
+         }
+@@ -191,6 +194,7 @@ namespace ps2x::iop::detail
+             abandonedCallbacks.clear();
+             cannotWaitLogged = false;
+             alarmRefusalLogged = false;
++            spuBusErrors = 0u;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+@@ -244,20 +248,52 @@ namespace ps2x::iop::detail
+                     if (dma->delayCycles > UINT64_MAX - totalCycles)
+                         throw std::runtime_error("IOP DMA deadline overflow");
+                     const uint64_t identity = reserveCallbackIdentity();
+-                    pendingDmaInterrupts[dma->irq] = PendingDma{
+-                        totalCycles + dma->delayCycles, identity, dma->core};
++                    queueDmaInterrupt(dma->irq, PendingDma{totalCycles + dma->delayCycles, identity, dma->core});
+                 }
+             }
+             catch (...) { markResetRequired(__LINE__); throw; }
+         }
+ 
++        // Raises a DMA completion interrupt. The AutoDMA completion and an
++        // ordinary transfer's completion on the same core are the same IRQ line:
++        // when one is still unserviced the two coalesce into a single interrupt
++        // (one I_STAT bit on hardware) that must still settle the ordinary
++        // transfer. Replacing the older entry used to leave the device with a
++        // transfer nobody settled, so the next DMA on that core was refused.
++        void queueDmaInterrupt(int irq, PendingDma incoming)
++        {
++            const auto [slot, inserted] = pendingDmaInterrupts.try_emplace(irq, incoming);
++            if (inserted)
++                return;
++            PendingDma &queued = slot->second;
++            queued.deadline = std::min(queued.deadline, incoming.deadline);
++            queued.identity = incoming.identity;
++            queued.autoDma = queued.autoDma && incoming.autoDma;
++        }
++
+         bool pcmRejectionLogged = false;
+         bool pendingSpuIrq = false;
+ 
+         void bindSpuBus()
+         {
+             memory.setSpuAccess(spu.get(), [this] { synchronizeSpu(true); },
+-                [this] { markResetRequired(__LINE__); });
++                [this](std::string_view message)
++                {
++                    // The chip or its owner is unusable: stop, with the cause.
++                    try { log(LogLevel::Error, std::string("[IOP SPU] bus fault: ") + std::string(message)); } catch (...) {}
++                    markResetRequired(__LINE__);
++                },
++                [this](std::string_view message)
++                {
++                    // A guest programming error: the access is ignored.
++                    if (++spuBusErrors > 16u) return;
++                    try
++                    {
++                        log(LogLevel::Warning, std::string("[IOP SPU] bus error ignored: ") + std::string(message) +
++                                                   (spuBusErrors == 16u ? " (further bus errors are not logged)" : ""));
++                    }
++                    catch (...) {}
++                });
+         }
+ 
+         void synchronizeSpu(bool access = false)
+@@ -305,8 +341,8 @@ namespace ps2x::iop::detail
+                         if ((done & (1u << core)) == 0u)
+                             continue;
+                         memory.finishSpuDma(core);
+-                        pendingDmaInterrupts[core ? 0x28 : 0x24] = // IOP DMA IRQ 40/36 (SPU2 core 1/0)
+-                            PendingDma{totalCycles, reserveCallbackIdentity(), core, true};
++                        queueDmaInterrupt(core ? 0x28 : 0x24, // IOP DMA IRQ 40/36 (SPU2 core 1/0)
++                            PendingDma{totalCycles, reserveCallbackIdentity(), core, true});
+                     }
+                 }
+             }
+@@ -869,13 +905,16 @@ namespace ps2x::iop::detail
+             bool returned = false;
+             bool started = false;
+             try { result = callFunction(address, a0, a1, a2, a3, gp, budget, &returned, stackArguments, &started); }
+-            catch (...) { result = uint32_t(-5); }
++            catch (...) { result = uint32_t(-5); if (started) markResetRequired(__LINE__); }
+             if (resetRequired) return IopGuestCallStatus::ResetRequired;
+             if (returned) return IopGuestCallStatus::Completed;
+             if (!started) return IopGuestCallStatus::Rejected;
+-            markResetRequired(__LINE__);
+-            log(LogLevel::Error, "[IOP] synchronous device callback incomplete; reset required before guest execution");
+-            return IopGuestCallStatus::ResetRequired;
++            // The callback was abandoned before it returned (budget, fault, an
++            // unimplemented import, or it tried to block). The caller keeps
++            // whatever the callback may still reference quarantined and reports
++            // an I/O error; nothing else is affected.
++            log(LogLevel::Warning, "[IOP] synchronous device callback did not complete; the call fails and its resources stay quarantined");
++            return IopGuestCallStatus::Failed;
+         }
+ 
+         bool executeGuestFunctionChecked(uint32_t address,
+@@ -1186,15 +1225,18 @@ namespace ps2x::iop::detail
+             }
+             catch (const std::exception &error)
+             {
+-                // Runtime scheduling must never throw through EeScheduler::accountCycles(),
+-                // but the failure must not vanish either.
++                // Runtime scheduling must never throw through EeScheduler::accountCycles().
++                // An exception that escapes guest execution (allocation failure,
++                // a broken device invariant) leaves an instruction half done and
++                // device state unknown: that is an emulator fault, not a guest
++                // error, so stop with the cause instead of continuing.
+                 try { log(LogLevel::Error, std::string("[IOP] exception during scheduling: ") + error.what()); } catch (...) {}
+-                if (checked || (spu && spu->faulted())) markResetRequired(__LINE__);
++                markResetRequired(__LINE__);
+             }
+             catch (...)
+             {
+                 try { log(LogLevel::Error, "[IOP] unknown exception during scheduling"); } catch (...) {}
+-                if (checked || (spu && spu->faulted())) markResetRequired(__LINE__);
++                markResetRequired(__LINE__);
+             }
+             return !resetRequired;
+         }
+@@ -1407,7 +1449,6 @@ namespace ps2x::iop::detail
+         IopImportRegistry imports;
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
+-        struct PendingDma { uint64_t deadline; uint64_t identity; uint8_t core; bool autoDma = false; };
+         std::map<int, PendingDma> pendingDmaInterrupts;
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+         uint64_t nextCallbackIdentity = 1u;
+@@ -1430,11 +1471,23 @@ namespace ps2x::iop::detail
+         std::set<uint32_t> abandonedCallbacks;
+         bool cannotWaitLogged = false;
+         bool alarmRefusalLogged = false;
++        uint32_t spuBusErrors = 0u;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
+         bool resetRequired = false;
++        // Latch policy. resetRequired stops the whole IOP until a quiescent
++        // reset and is reserved for conditions that make continuing unsafe or
++        // meaningless: an exception escaping guest execution (a half-run
++        // instruction and unknown device state), a faulted or re-entered SPU
++        // device, counter exhaustion, a reset requested from inside guest
++        // execution, and the code of an alarm that is executing being freed.
++        // Everything a guest can cause by itself is an SCE error result, an
++        // ignored-and-logged bus access, or the loss of that one call/callback:
++        // alarm and semaphore misuse, SPU2 bus/DMA programming errors, a
++        // thread's CPU exception, an RPC server's fault or hang, an abandoned
++        // interrupt/timer/alarm/devctl callback.
+         // Every path that disables the IOP reports where it happened (once).
+         void markResetRequired(int line) noexcept
+         {
+diff --git a/ps2xIOP/tests/iop_device_callback_boundaries.inc b/ps2xIOP/tests/iop_device_callback_boundaries.inc
+index b154b66..533d95b 100644
+--- a/ps2xIOP/tests/iop_device_callback_boundaries.inc
++++ b/ps2xIOP/tests/iop_device_callback_boundaries.inc
+@@ -50,8 +50,10 @@ namespace ps2x::iop::detail
+             return true;
+         };
+ 
+-        // Establish the crucial otherwise-complete CPU state at the budget
+-        // boundary: service runs after the JR delay slot has reached sentinel.
++        // A due guest callback tail-calls devctl on the inner driver, which
++        // exhausts its instruction budget while the outer driver has already
++        // returned. The inner devctl fails with an I/O error (its scratch slot
++        // stays quarantined); the callback and the IOP carry on.
+         iop_test::Host firstHost;
+         IopEmulator::Impl first(firstHost);
+         if (!check(prepare(first), "could not prepare nested boundary fixture")) return false;
+@@ -61,13 +63,16 @@ namespace ps2x::iop::detail
+         outer.gpr[29] = 0x13FE0u;
+         outer.gpr[31] = kCallReturnSentinel;
+         first.runCpu(outer, 2000000u);
+-        if (!check(first.resetRequired && first.totalInstructions >= 2000000u,
+-                   "nested callback did not latch failure at the outer budget boundary") ||
++        if (!check(!first.resetRequired && first.totalInstructions >= 2000000u,
++                   "an abandoned nested devctl callback latched the IOP") ||
+             !check(outer.pc == kCallReturnSentinel && !outer.yielded && !outer.missingImport && !outer.executionFault,
+-                   "outer CPU failed for a reason other than the nested fault latch")) return false;
++                   "outer CPU did not complete normally") ||
++            !check(first.ioman.m_devctlScratchInUse[0] || first.ioman.m_devctlScratchInUse[1],
++                   "the abandoned callback's scratch slot was released")) return false;
+ 
+-        // The actual outer devctl must propagate that latch, preserving both
+-        // file slots. A local return sentinel cannot release outer scratch.
++        // The actual outer devctl completes normally (its driver returned); the
++        // nested devctl that failed inside the due callback keeps only its own
++        // scratch slot quarantined, and the outer slot is released.
+         iop_test::Host secondHost;
+         IopEmulator::Impl second(secondHost);
+         if (!check(prepare(second), "could not prepare outer devctl fixture")) return false;
+@@ -76,17 +81,18 @@ namespace ps2x::iop::detail
+         caller.gpr[4] = 0x130A0u;
+         caller.gpr[5] = 0x4391u;
+         caller.gpr[29] = 0x13FE0u;
+-        if (!check(second.ioman.dispatchImport(31u, caller, second) && second.resetRequired && caller.executionFault,
+-                   "outer devctl falsely completed after nested callback failure") ||
+-            !check(second.ioman.m_devctlScratchInUse[0] && second.ioman.m_devctlScratchInUse[1],
+-                   "nested failure released quarantined outer or inner scratch")) return false;
++        if (!check(second.ioman.dispatchImport(31u, caller, second) && !second.resetRequired && !caller.executionFault &&
++                       caller.gpr[2] == 0u,
++                   "outer devctl was disturbed by the nested callback failure") ||
++            !check(!second.ioman.m_devctlScratchInUse[0] && second.ioman.m_devctlScratchInUse[1],
++                   "nested failure released its quarantined slot or kept the completed outer slot")) return false;
+         uint32_t result = 0u;
+         if (!check(second.executeGuestFunctionWithStackArgumentsChecked(
+-                       0x11000u, 0u, 0u, 0u, 0u, 0u, {}, 2u, result) == IopGuestCallStatus::ResetRequired,
+-                   "checked executor did not give global fault precedence")) return false;
++                       0x11000u, 0u, 0u, 0u, 0u, 0u, {}, 2u, result) == IopGuestCallStatus::Completed,
++                   "the IOP did not keep executing guest code after the failure")) return false;
+ 
+-        // A due callback fails before normal ready-thread selection. Capture a
+-        // real ready thread and verify neither its state nor CPU is consumed.
++        // A due callback that fails does not stop the scheduler: the unrelated
++        // ready thread still runs.
+         iop_test::Host thirdHost;
+         IopEmulator::Impl third(thirdHost);
+         if (!check(prepare(third), "could not prepare scheduling boundary fixture")) return false;
+@@ -101,25 +107,10 @@ namespace ps2x::iop::detail
+         if (!third.kernel.dispatchThreadImport(4u, create, 0u) || int32_t(create.gpr[2]) <= 0) return false;
+         create.gpr[4] = create.gpr[2];
+         if (!third.kernel.dispatchThreadImport(6u, create, 0u) || create.gpr[2] != 0u) return false;
+-        IopThread *ready = third.kernel.beginNextReady(0u);
+-        if (!check(ready != nullptr, "fixture thread was not ready")) return false;
+-        third.kernel.endTimeslice(*ready, kThreadReturnSentinel);
+-        const IopCpuState before = ready->cpu;
+-        const auto stateBefore = ready->state;
+         third.pendingGuestCallbacks.emplace(0u, IopEmulator::Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
+-        third.runCycles(1000u);
+-        return check(third.resetRequired && stateBefore == IopThreadState::Ready && ready->state == stateBefore,
+-                     "service failure selected or changed an unrelated ready thread") &&
+-               check(ready->cpu.gpr == before.gpr && ready->cpu.pc == before.pc &&
+-                         ready->cpu.hi == before.hi && ready->cpu.lo == before.lo && ready->cpu.cop0 == before.cop0 &&
+-                         ready->cpu.pendingLoadReg == before.pendingLoadReg &&
+-                         ready->cpu.pendingLoadValue == before.pendingLoadValue && ready->cpu.pendingLoad == before.pendingLoad &&
+-                         ready->cpu.branchPending == before.branchPending && ready->cpu.branchTarget == before.branchTarget &&
+-                         ready->cpu.yielded == before.yielded && ready->cpu.stopped == before.stopped &&
+-                         ready->cpu.exception == before.exception &&
+-                         ready->cpu.missingImport == before.missingImport && ready->cpu.executionFault == before.executionFault,
+-                     "service failure changed the unrelated thread CPU") &&
+-               check(third.memory.read32(0x14000u) == 0u,
+-                     "unrelated ready thread executed after service failure");
++        third.runCycles(3000000u);
++        return check(!third.resetRequired, "a failed due callback latched the IOP") &&
++               check(third.memory.read32(0x14000u) == 0x10000u,
++                     "the unrelated ready thread did not run after a failed callback");
+     }
+ }
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index 1f7aae3..e1bb063 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -32,6 +32,8 @@ namespace
+     constexpr int32_t kErrorReadOnly = -30;
+     constexpr int32_t kErrorUnsupported = -48;
+     constexpr int32_t kErrorNoEntry = -2;
++    constexpr int32_t kErrorIo = -5;
++    constexpr int32_t kErrorNoMemory = -12;
+ 
+     class Host final : public IopHost
+     {
+@@ -442,11 +444,13 @@ namespace
+                       "devctl handler did not receive the caller buffer");
+     }
+ 
+-    bool testDevctlIncompleteRequiresReset()
++    bool testDevctlIncompleteFailsOnlyTheCall()
+     {
+         // Tail-calling a yielding import returns PC to the call sentinel while
+-        // the callback is incomplete. Missing imports and budget exhaustion
+-        // likewise must quarantine side effects and prevent subsequent code.
++        // the callback is incomplete. Missing imports and budget exhaustion are
++        // incomplete too. The driver callback is abandoned: that devctl fails
++        // with an I/O error and its scratch slot stays quarantined (the
++        // abandoned callback may still be referenced), but nothing else stops.
+         for (uint32_t failure = 0u; failure < 3u; ++failure)
+         {
+             iop_test::Host host;
+@@ -462,23 +466,56 @@ namespace
+                 0x3C080001u, 0x35080500u, 0x24090001u, 0xAD090000u,
+                 0x08000000u | (target >> 2u), 0u,
+             });
+-            const ModuleLoadResult failed = emulator.loadModuleImage("host0:incomplete-devctl.irx", image.bytes);
++            const ModuleLoadResult loaded = emulator.loadModuleImage("host0:incomplete-devctl.irx", image.bytes);
+             uint32_t marker = 0u;
+-            if (!expect(failed.moduleId < 0, "incomplete callback reported successful startup") ||
++            std::array<uint32_t, 2> failed{};
++            if (failure == 2u)
++            {
++                // A callback that spins uses up the module start routine's own
++                // instruction budget too, so the start is reported incomplete;
++                // the IOP itself is unaffected and keeps running.
++                const iop_test::Irx complete = devctlIrx();
++                if (!expect(loaded.moduleId < 0, "a spinning driver callback did not exhaust the start routine budget") ||
++                    !expect(emulator.readMemory(0x10500u, &marker, 4u) && marker == 1u, "spinning fixture did not run"))
++                    return false;
++                emulator.reset();
++                const ModuleLoadResult recovered = emulator.loadModuleImage("host0:after-reset.irx", complete.bytes);
++                if (!expect(recovered.moduleId > 0 && recovered.startResult == 0, "reset did not restore the IOP")) return false;
++                continue;
++            }
++            if (!expect(loaded.moduleId > 0 && loaded.startResult == 0,
++                        "an incomplete driver callback stopped the module that called devctl") ||
+                 !expect(emulator.readMemory(0x10500u, &marker, 4u) && marker == 1u,
+-                        "failure fixture did not execute its side effect before interruption")) return false;
++                        "failure fixture did not execute its side effect before interruption") ||
++                !expect(emulator.readMemory(0x10340u, failed.data(), sizeof(failed)) &&
++                            static_cast<int32_t>(failed[0]) == kErrorIo && static_cast<int32_t>(failed[1]) == kErrorIo,
++                        "an incomplete devctl callback did not report an I/O error to its caller")) return false;
+             const uint64_t before = emulator.instructions();
+             emulator.runEeCycles(1000000u);
++            // A healthy driver still works while some scratch slots are quarantined.
+             const iop_test::Irx complete = devctlIrx();
+-            const ModuleLoadResult blocked = emulator.loadModuleImage("host0:blocked-after-failure.irx", complete.bytes);
+-            if (!expect(emulator.instructions() == before && blocked.moduleId < 0,
+-                        "reset-required emulator executed more guest instructions") ||
+-                !expect(emulator.readMemory(0x10500u, &marker, 4u) && marker == 1u,
+-                        "reset-required load replaced quarantined callback backing")) return false;
++            const ModuleLoadResult next = emulator.loadModuleImage("host0:after-failure.irx", complete.bytes);
++            std::array<uint32_t, 2> healthy{};
++            if (!expect(emulator.instructions() > before && next.moduleId > 0 &&
++                            emulator.readMemory(0x10340u, healthy.data(), sizeof(healthy)) &&
++                            static_cast<int32_t>(healthy[0]) == -37 && static_cast<int32_t>(healthy[1]) == -37,
++                        "the emulator stopped serving devctl after one failed callback")) return false;
++            // Each abandoned call keeps its slot (four in all): two more failures
++            // exhaust the pool and a healthy driver then sees ENOMEM.
++            const ModuleLoadResult again = emulator.loadModuleImage("host0:failure-again.irx", image.bytes);
++            const ModuleLoadResult exhausted = emulator.loadModuleImage("host0:after-exhaustion.irx", complete.bytes);
++            std::array<uint32_t, 2> quarantined{};
++            if (!expect(again.moduleId > 0 && exhausted.moduleId > 0 &&
++                            emulator.readMemory(0x10340u, quarantined.data(), sizeof(quarantined)) &&
++                            static_cast<int32_t>(quarantined[0]) == kErrorNoMemory,
++                        "the abandoned callbacks' scratch slots were released")) return false;
+             emulator.reset();
+             const ModuleLoadResult recovered = emulator.loadModuleImage("host0:after-reset.irx", complete.bytes);
+-            if (!expect(recovered.moduleId > 0 && recovered.startResult == 0,
+-                        "reset did not retire quarantine and restore guest execution")) return false;
++            std::array<uint32_t, 2> after{};
++            if (!expect(recovered.moduleId > 0 && recovered.startResult == 0 &&
++                            emulator.readMemory(0x10340u, after.data(), sizeof(after)) &&
++                            static_cast<int32_t>(after[0]) == -37 && static_cast<int32_t>(after[1]) == -37,
++                        "reset did not retire the quarantine and restore devctl")) return false;
+         }
+         return true;
+     }
+@@ -600,7 +637,7 @@ int main()
+                    testInvalidInputsAndHandleRevocation() &&
+                    testMissingAndRegisteredDeviceRoute() &&
+                    testDevctlGuestAbiAndScratchReuse() &&
+-                   testDevctlIncompleteRequiresReset() &&
++                   testDevctlIncompleteFailsOnlyTheCall() &&
+                    testIopDeviceCallbackBoundaries() &&
+                    testIopRpcWaitBoundaries() &&
+                    testIopAlarmBoundaries() &&
+diff --git a/ps2xIOP/tests/iop_rpc_wait_boundaries.inc b/ps2xIOP/tests/iop_rpc_wait_boundaries.inc
+index c517d52..224971a 100644
+--- a/ps2xIOP/tests/iop_rpc_wait_boundaries.inc
++++ b/ps2xIOP/tests/iop_rpc_wait_boundaries.inc
+@@ -286,6 +286,19 @@ namespace ps2x::iop::detail
+                     throwing.memory.read32(0x14000u) == 0u,
+                     "scheduler exception was swallowed or leaked execution ownership");
+ 
++            // The same exception outside an RPC also stops the emulator (with a
++            // logged cause) instead of being swallowed with a half-run instruction.
++            iop_test::Host swallowHost; Impl swallow(swallowHost); prepare(swallow);
++            words(swallow, 0x11500u, {0x3C081F40u, 0x8D09200Cu, 0u, 0x03E00008u, 0u});
++            swallow.memory.setCdvdDiscTypeReader([]() -> uint8_t { throw std::runtime_error("injected device read failure"); });
++            thread(swallow, 0x11500u);
++            swallow.runCycles(1000u);
++            bool exceptionLogged = false;
++            for (const auto &line : swallowHost.logs)
++                exceptionLogged = exceptionLogged || line.find("exception during scheduling") != std::string::npos;
++            require(swallow.resetRequired && exceptionLogged && !swallow.kernel.hasCurrentThread() && !swallow.activeCpu,
++                    "an escaping exception outside an RPC was swallowed");
++
+             // Nested guest execution shares the outer instruction deadline.
+             iop_test::Host nestedHost; Impl nested(nestedHost); prepare(nested);
+             words(nested, 0x11500u, {0x08004540u, 0u}); // infinite callback
+diff --git a/ps2xIOP/tests/iop_spu31_boundaries.inc b/ps2xIOP/tests/iop_spu31_boundaries.inc
+index ee442e7..5acda0f 100644
+--- a/ps2xIOP/tests/iop_spu31_boundaries.inc
++++ b/ps2xIOP/tests/iop_spu31_boundaries.inc
+@@ -207,22 +207,68 @@ void ga2_spu31_boundary_checks() {
+     s.runCycles(128u * 768u);
+     require(s.read16(base + 0xau) == 0u, "KOFF stops actual IOP voice");
+   }
+-  for (unsigned failure = 0u; failure != 4u; ++failure) {
++  // Guest bus/DMA programming errors are ignored and reported; they are not
++  // emulator faults and never stop the IOP.
++  for (unsigned failure = 0u; failure != 8u; ++failure) {
+     iop_test::Host h;
+     State s(h);
+-    try {
+-      if (failure == 0u)
+-        s.write8(base + 0x1a0u, 1u);
+-      if (failure == 1u)
+-        (void)s.read8(base + 0x1acu);
+-      if (failure == 2u)
+-        s.write16(base + 1u, 1u);
+-      if (failure == 3u)
+-        dma(s, 0u, 0x11000u, 4u); // unowned
+-      require(false, "unsupported input must fail");
+-    } catch (const std::exception &) {
+-      require(s.resetRequired, "unsupported operation cannot report success");
++    const uint32_t chcr = 0x1f8010c8u;
++    tsa(s, 0u, 0x7000u);
++    s.write16(base + 0x19au, 0u);
++    if (failure == 0u) s.write8(base + 0x1a0u, 1u);                 // byte write
++    if (failure == 1u) require(s.read8(base + 0x1acu) == 0u, "refused byte read returns zero");
++    if (failure == 2u) s.write16(base + 1u, 1u);                    // unaligned halfword
++    if (failure == 3u) dma(s, 0u, 0x11000u, 4u);                    // unowned source
++    if (failure == 4u) { s.write32(0x1f8010c0u, 0x11000u); s.write32(0x1f8010c4u, 0x00010004u); s.write32(chcr, 0x01000601u); } // sync mode 3
++    if (failure == 5u) { dma(s, 0u, 0x11001u, 4u); }                // unaligned MADR
++    if (failure == 6u) {                                            // second transfer on a busy core
++      std::array<uint32_t, 8> words{};
++      require(s.writeRam(0x11000u, words.data(), sizeof(words)), "owned source");
++      dma(s, 0u, 0x11000u, 8u);
++      dma(s, 0u, 0x11000u, 8u);
+     }
++    if (failure == 7u) s.write32(base + 0x1a1u, 0u);                // unaligned word
++    require(!s.resetRequired, "a guest bus error must not disable the IOP");
++    if (failure >= 3u && failure <= 5u)
++      require(!(s.read32(chcr) & 0x01000000u), "a refused DMA must not stay active");
++    bool logged = false;
++    for (const auto &line : h.logs) logged = logged || line.find("bus error ignored") != std::string::npos;
++    require(logged, "the ignored bus error was not reported");
++    // The chip still works: a valid DMA is accepted and settles.
++    std::array<uint32_t, 8> good{};
++    require(s.writeRam(0x12000u, good.data(), sizeof(good)), "owned source");
++    s.advanceIopTime(4096u);
++    s.servicePendingDmaInterrupts();
++    tsa(s, 0u, 0x7100u);
++    dma(s, 0u, 0x12000u, 8u);
++    require(!s.resetRequired, "a valid DMA after a refused one must still work");
++    s.advanceIopTime(4096u);
++    s.servicePendingDmaInterrupts();
++    require(!s.resetRequired && s.pendingDmaInterrupts.empty(), "valid DMA settled after a refused one");
++  }
++  // Completion of an AutoDMA block and of an ordinary transfer on one core are
++  // one IRQ line: they coalesce and the ordinary transfer is still settled.
++  {
++    iop_test::Host h;
++    State s(h);
++    std::array<uint32_t, 8> words{};
++    require(s.writeRam(0x11000u, words.data(), sizeof(words)), "owned source");
++    tsa(s, 0u, 0x7000u);
++    dma(s, 0u, 0x11000u, 8u);
++    require(s.pendingDmaInterrupts.size() == 1u && !s.pendingDmaInterrupts.begin()->second.autoDma, "ordinary transfer queued");
++    s.queueDmaInterrupt(0x24, State::PendingDma{s.totalCycles + 1u, s.reserveCallbackIdentity(), 0u, true});
++    require(s.pendingDmaInterrupts.size() == 1u && !s.pendingDmaInterrupts.begin()->second.autoDma,
++            "an AutoDMA completion replaced an unsettled ordinary transfer");
++    s.advanceIopTime(4096u);
++    s.servicePendingDmaInterrupts();
++    require(s.pendingDmaInterrupts.empty() && !s.resetRequired, "coalesced completion serviced");
++    tsa(s, 0u, 0x7000u);
++    dma(s, 0u, 0x11000u, 8u);
++    require(!s.resetRequired && s.pendingDmaInterrupts.size() == 1u,
++            "the next transfer on the core was refused after the coalesced completion");
++    s.advanceIopTime(4096u);
++    s.servicePendingDmaInterrupts();
++    require(!s.resetRequired && s.pendingDmaInterrupts.empty(), "next transfer settled");
+   }
+   {
+     iop_test::Host h;
+-- 
+2.55.0
+

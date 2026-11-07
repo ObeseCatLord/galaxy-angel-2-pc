@@ -1,0 +1,1718 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 18510c5..a79e05b 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -6,6 +6,7 @@ option(PS2X_IOP_BUILD_TESTS "Build ps2xIOP emulator smoke tests" OFF)
+ 
+ add_library(ps2_iop STATIC
+     src/ps2_path.cpp
++    src/iop_reboot_image.cpp
+     src/iop_module_manager.cpp
+     src/iop_subsystem.cpp
+     src/emulator/iop_emulator.cpp
+@@ -44,6 +45,9 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_reboot_image_tests tests/iop_reboot_image_tests.cpp)
++    target_link_libraries(ps2_iop_reboot_image_tests PRIVATE ps2_iop)
++    add_test(NAME ps2_iop_reboot_image_tests COMMAND ps2_iop_reboot_image_tests)
+     add_executable(ps2_iop_emulator_tests tests/iop_emulator_tests.cpp)
+     target_link_libraries(ps2_iop_emulator_tests PRIVATE ps2_iop)
+     add_test(NAME ps2_iop_emulator_tests COMMAND ps2_iop_emulator_tests)
+diff --git a/ps2xIOP/include/ps2x/iop/iop_reboot_image.h b/ps2xIOP/include/ps2x/iop/iop_reboot_image.h
+new file mode 100644
+index 0000000..d1c0fff
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_reboot_image.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include "ps2x/iop/iop_types.h"
++#include <optional>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace ps2x::iop
++{
++    struct RebootImageEntry { std::string name; uint32_t offset; uint32_t size; };
++    // ROMDIR is an IOP image format, independent of the mounted ISO filesystem.
++    bool parseRebootImage(std::span<const uint8_t> image, std::vector<RebootImageEntry> &entries);
++
++    // One successful copy consumes one matching BeforeCopy descriptor. No packet
++    // pointers survive service callbacks or the destructive reset boundary.
++    class RebootTransferTracker
++    {
++    public:
++        std::optional<std::string> observe(const SifTransfer &transfer,
++                                          std::span<const uint8_t> packet,
++                                          uint32_t subAddress);
++        void clear() { m_before.reset(); }
++    private:
++        std::optional<SifTransfer> m_before;
++    };
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 2516e97..aeff924 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -4,6 +4,7 @@
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <memory>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -29,6 +30,7 @@ namespace ps2x::iop
+         [[nodiscard]] bool finishBootNotifications();
+ 
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
++        [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c38af3c..0432657 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -904,6 +904,11 @@ namespace ps2x::iop::detail
+         return m_impl->loadModule(path, arguments, argumentSize);
+     }
+ 
++    ModuleLoadResult IopEmulator::loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
++    {
++        return m_impl->loadImage(std::string(path), image, arguments, argumentSize);
++    }
++
+     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
+         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 2c30fa1..9b4385e 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -25,6 +26,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool beginBootNotifications(uint32_t capacity);
+         [[nodiscard]] bool finishBootNotifications();
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
++        [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+diff --git a/ps2xIOP/src/iop_reboot_image.cpp b/ps2xIOP/src/iop_reboot_image.cpp
+new file mode 100644
+index 0000000..bf582e6
+--- /dev/null
++++ b/ps2xIOP/src/iop_reboot_image.cpp
+@@ -0,0 +1,99 @@
++#include "ps2x/iop/iop_reboot_image.h"
++#include "ps2x/iop/ps2_path.h"
++#include <algorithm>
++#include <array>
++#include <set>
++
++namespace ps2x::iop
++{
++    namespace
++    {
++        uint32_t word(std::span<const uint8_t> b, size_t p)
++        { return uint32_t(b[p]) | uint32_t(b[p+1]) << 8 | uint32_t(b[p+2]) << 16 | uint32_t(b[p+3]) << 24; }
++    }
++
++    bool parseRebootImage(std::span<const uint8_t> image, std::vector<RebootImageEntry> &entries)
++    {
++        entries.clear();
++        if (image.size() < 32u || image.size() > 16u * 1024u * 1024u) return false;
++        constexpr std::array<uint8_t, 10> reset{'R','E','S','E','T',0,0,0,0,0};
++        for (size_t start = 0; start + 16u <= std::min(image.size(), size_t(512u * 1024u)); start += 16u)
++        {
++            if (!std::equal(reset.begin(), reset.end(), image.begin() + start)) continue;
++            std::vector<RebootImageEntry> candidate;
++            std::set<std::string> names;
++            size_t offset = 0, extTotal = 0;
++            bool terminated = false;
++            for (size_t n = 0; n < 512u; ++n)
++            {
++                const size_t p = start + n * 16u;
++                if (p + 16u > image.size()) return false;
++                const uint32_t size = word(image, p + 12u);
++                const uint32_t ext = image[p+10] | uint32_t(image[p+11]) << 8;
++                std::string name;
++                bool padding = false;
++                for (size_t j = 0; j < 10u; ++j)
++                {
++                    const char c = char(image[p+j]);
++                    if (!c) { padding = true; continue; }
++                    if (padding || !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
++                    name += c;
++                }
++                if (name.empty()) { if (size || ext) return false; terminated = true; break; }
++                if (!names.insert(name).second || offset > image.size() || size > image.size() - offset) return false;
++                candidate.push_back({name, uint32_t(offset), size});
++                offset += (size_t(size) + 15u) & ~size_t(15u);
++                extTotal += ext;
++            }
++            if (!terminated) return false;
++            const auto directory = std::find_if(candidate.begin(), candidate.end(), [](const auto &e) { return e.name == "ROMDIR"; });
++            const auto extension = std::find_if(candidate.begin(), candidate.end(), [](const auto &e) { return e.name == "EXTINFO"; });
++            if (directory == candidate.end() || directory->offset != start ||
++                directory->size < (candidate.size() + 1u) * 16u || extension == candidate.end() || extension->size != extTotal) return false;
++            entries = std::move(candidate);
++            return true;
++        }
++        return false;
++    }
++
++    std::optional<std::string> RebootTransferTracker::observe(const SifTransfer &t,
++                                                            std::span<const uint8_t> packet,
++                                                            uint32_t subAddress)
++    {
++        if (t.phase == SifTransferPhase::BeforeCopy)
++        {
++            m_before = t;
++            return {};
++        }
++        auto before = m_before;
++        m_before.reset();
++        if (!before || t.kind != SifTransferKind::SetDma || before->kind != t.kind ||
++            before->sourceAddress != t.sourceAddress || before->destinationAddress != t.destinationAddress ||
++            before->size != t.size || before->attributes != t.attributes || t.size != 104u || t.attributes != 0x44u ||
++            (t.destinationAddress != 0u && t.destinationAddress != subAddress) || packet.size() != 104u) return {};
++        if (word(packet, 0u) != 104u || word(packet, 4u) != 0u || word(packet, 8u) != 0x80000003u ||
++            word(packet, 12u) != 0u || word(packet, 20u) != 0u) return {};
++        const uint32_t argSize = word(packet, 16u);
++        if (!argSize || argSize > 80u) return {};
++        // The observed original SDK supplies strlen(args), excluding NUL;
++        // tolerate a counted terminator too, but require it inside the packet.
++        const bool countedNull = packet[24u + argSize - 1u] == 0u;
++        if (!countedNull && (argSize == 80u || packet[24u + argSize] != 0u)) return {};
++        const auto args = packet.subspan(24u, argSize - (countedNull ? 1u : 0u));
++        if (std::find(args.begin(), args.end(), 0u) != args.end()) return {};
++        const std::string command(args.begin(), args.end());
++        constexpr std::string_view prefix = "rom0:UDNL ";
++        if (!command.starts_with(prefix)) return {};
++        const std::string path = command.substr(prefix.size());
++        const auto parsed = parsePs2Path(path);
++        if (!parsed || parsed.device != Ps2PathDevice::Cdrom) return {};
++        std::string normalized;
++        for (char c : parsed.path)
++        {
++            if (c == '/' && !normalized.empty() && normalized.back() == '/') continue;
++            normalized += c;
++        }
++        if (normalized != "MODULES/IOPRP300.IMG") return {};
++        return "cdrom0:" + normalized;
++    }
++}
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index ea3cd64..43cc536 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -198,6 +198,18 @@ namespace ps2x::iop
+         return hle;
+     }
+ 
++    ModuleLoadResult IopSubsystem::loadModuleImage(std::string_view path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
++    {
++        const Impl::ActivityGuard activity(*m_impl);
++        auto result = m_impl->emulator.loadModuleImage(path, image, arguments, argumentSize);
++        if (result.moduleId > 0 && ((uint32_t(result.startResult) & 3u) == 0u || (uint32_t(result.startResult) & 3u) == 2u))
++        {
++            m_impl->moduleManager.observePhysicalLoad(result.moduleId, path);
++            m_impl->rebuildRoutes();
++        }
++        return result;
++    }
++
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
+         const Impl::ActivityGuard activity(*m_impl);
+diff --git a/ps2xIOP/tests/iop_reboot_image_tests.cpp b/ps2xIOP/tests/iop_reboot_image_tests.cpp
+new file mode 100644
+index 0000000..32c86a0
+--- /dev/null
++++ b/ps2xIOP/tests/iop_reboot_image_tests.cpp
+@@ -0,0 +1,70 @@
++#include "ps2x/iop/iop_reboot_image.h"
++#include <array>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++using namespace ps2x::iop;
++static void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
++static void word(std::span<uint8_t> data, size_t offset, uint32_t value)
++{ for (size_t n = 0; n < 4; ++n) data[offset+n] = uint8_t(value >> (8*n)); }
++int main(int argc, char **argv)
++{
++    try
++    {
++        std::array<uint8_t,104> packet{};
++        word(packet,0,104); word(packet,8,0x80000003);
++        constexpr char args[] = "rom0:UDNL cdrom0:\\MODULES\\IOPRP300.IMG;1";
++        word(packet,16,sizeof(args)); std::memcpy(packet.data()+24,args,sizeof(args));
++        SifTransfer t{SifTransferKind::SetDma,SifTransferPhase::BeforeCopy,0x834080,0,104,0x44};
++        RebootTransferTracker tracker;
++        require(!tracker.observe(t,{},0),"BeforeCopy acted on command");
++        t.phase = SifTransferPhase::AfterCopy;
++        auto path=tracker.observe(t,packet,0);
++        require(path && *path == "cdrom0:MODULES/IOPRP300.IMG","original command not recognized");
++        require(!tracker.observe(t,packet,0),"duplicate AfterCopy rebooted");
++        // Exact observed packet has doubled separators and excludes the NUL
++        // from arglen; it resolves to the same verified ISO file.
++        auto observed = packet;
++        constexpr char originalArgs[] = "rom0:UDNL cdrom0:\\\\MODULES\\\\IOPRP300.IMG;1";
++        std::fill(observed.begin()+24,observed.end(),0);
++        std::memcpy(observed.data()+24,originalArgs,sizeof(originalArgs));
++        word(observed,16,sizeof(originalArgs)-1u);
++        t.phase=SifTransferPhase::BeforeCopy;tracker.observe(t,{},0);t.phase=SifTransferPhase::AfterCopy;
++        require(tracker.observe(t,observed,0)==path,"observed SDK strlen/doubled separator contract rejected");
++        auto checkRejected=[&](auto mutate)
++        {
++            auto p=packet; auto transfer=t;
++            transfer.phase=SifTransferPhase::BeforeCopy; tracker.observe(transfer,{},0);
++            transfer.phase=SifTransferPhase::AfterCopy; mutate(p,transfer);
++            require(!tracker.observe(transfer,p,0),"malformed command accepted");
++        };
++        checkRejected([](auto &p,auto &){word(p,8,0x80000002);});
++        checkRejected([](auto &p,auto &){word(p,0,103);});
++        checkRejected([](auto &p,auto &){word(p,16,81);});
++        checkRejected([](auto &p,auto &){word(p,20,1);});
++        checkRejected([](auto &p,auto &){p[24]=0;});
++        checkRejected([](auto &,auto &s){s.attributes=4;});
++        checkRejected([](auto &,auto &s){s.sourceAddress+=16;});
++        checkRejected([](auto &,auto &s){s.destinationAddress=16;});
++
++        std::vector<uint8_t> image(80,0); std::vector<RebootImageEntry> entries;
++        std::memcpy(image.data(),"RESET",5);
++        std::memcpy(image.data()+16,"ROMDIR",6);word(image,28,64);
++        std::memcpy(image.data()+32,"EXTINFO",7);
++        require(parseRebootImage(image,entries) && entries.size()==3,"valid bounded ROMDIR rejected");
++        auto bad=image;word(bad,28,0xffffffff);require(!parseRebootImage(bad,entries),"oversized extent accepted");
++        bad=image;word(bad,44,1);require(!parseRebootImage(bad,entries),"extinfo mismatch accepted");
++        bad=image;bad[6]='X';require(!parseRebootImage(bad,entries),"malformed RESET padding accepted");
++        for(int n=1;n<argc;++n)
++        {
++            std::ifstream file(argv[n],std::ios::binary);
++            std::vector<uint8_t> original((std::istreambuf_iterator<char>(file)),{});
++            require(parseRebootImage(original,entries),"supplied original image rejected");
++            std::cout << "original ROMDIR entries=" << entries.size() << '\n';
++        }
++        std::cout << "reboot descriptor/image checks passed\n";
++        return 0;
++    }
++    catch(const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
++}
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..d5b48da 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -100,6 +100,10 @@ struct GuestInvocation
+     uint64_t tag = 0;
+     R5900Context context{};
+     std::function<void(const R5900Context &, R5900Context &)> onComplete;
++    // Checked at dispatcher boundaries before callback dispatch/completion.
++    // Running or blocked revocable callbacks prevent whole-IOP reset.
++    std::function<bool()> isValid;
++    std::function<void()> onCancel;
+ };
+ 
+ struct GuestThread
+@@ -316,6 +320,9 @@ public:
+     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
+     int cancelAlarm(int id);
+     void queueInvocation(GuestInvocation invocation);
++    [[nodiscard]] bool hasResetSensitiveInvocations() const;
++    // Quiescent runtime shutdown/reset: release owned packets without completion.
++    void discardInvocations();
+     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
+     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
+     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..7fc3f87 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -85,6 +85,7 @@ EeScheduler::~EeScheduler()
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ {
+     m_executorThread = std::this_thread::get_id();
++    discardInvocations();
+     m_rdram = rdram;
+     m_readyQueues = {};
+     m_threads.clear();
+@@ -198,6 +199,17 @@ void EeScheduler::run()
+ 
+         GuestThread *running = currentThread();
+         assert(running != nullptr);
++        if (!running->invocations.empty())
++        {
++            auto &invocation = running->invocations.back();
++            if (invocation.isValid && !invocation.isValid())
++            {
++                auto cancelled = std::move(invocation);
++                running->invocations.pop_back();
++                if (cancelled.onCancel) cancelled.onCancel();
++                continue;
++            }
++        }
+         if (running->resumeCompletion)
+         {
+             auto completion = std::move(running->resumeCompletion);
+@@ -1098,6 +1110,27 @@ int EeScheduler::cancelAlarm(int id)
+     return KE_OK;
+ }
+ 
++bool EeScheduler::hasResetSensitiveInvocations() const
++{
++    for (const auto &[id, owner] : m_threads)
++        for (const auto &invocation : owner.invocations)
++            if (invocation.isValid) return true;
++    return false;
++}
++
++void EeScheduler::discardInvocations()
++{
++    for (auto &[id, owner] : m_threads)
++    {
++        for (auto &invocation : owner.invocations)
++            if (invocation.onCancel) invocation.onCancel();
++        owner.invocations.clear();
++    }
++    for (auto &invocation : m_pendingInvocations)
++        if (invocation.onCancel) invocation.onCancel();
++    m_pendingInvocations.clear();
++}
++
+ void EeScheduler::queueInvocation(GuestInvocation invocation)
+ {
+     assertExecutor();
+@@ -1647,6 +1680,8 @@ void EeScheduler::makeDormant(GuestThread &item)
+     item.resumeCompletion = {};
+     item.suspendCount = 0;
+     item.wakeupCount = 0;
++    for (auto &invocation : item.invocations)
++        if (invocation.onCancel) invocation.onCancel();
+     item.invocations.clear();
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 9cb0b84..dcf3b94 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -65,6 +65,7 @@ namespace ps2_stubs
+         std::mutex g_sifDmaTransferMutex;
+         uint32_t g_nextSifDmaTransferId = 1u;
+         std::mutex g_sifCmdStateMutex;
++        uint64_t g_iopCommandEpoch = 0;
+         std::unordered_map<uint32_t, uint32_t> g_sifRegs;
+         std::unordered_map<uint32_t, uint32_t> g_sifSregs;
+         struct SifCmdHandler
+@@ -123,6 +124,7 @@ namespace ps2_stubs
+             SifStateInitializer()
+             {
+                 std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++                ++g_iopCommandEpoch;
+                 seedDefaultSifRegsLocked();
+             }
+         } g_sifStateInitializer;
+@@ -243,6 +245,7 @@ namespace ps2_stubs
+     {
+         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+         // Revoke IOP-owned readiness and addresses; retain unrelated EE state.
++        ++g_iopCommandEpoch;
+         g_sifRegs[4u] &= ~0x70000u;
+         g_sifRegs[1u] = 0u;
+         g_sifRegs[0x80000001u] = 0u;
+@@ -253,6 +256,7 @@ namespace ps2_stubs
+     void resetSifState()
+     {
+         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++        ++g_iopCommandEpoch;
+         seedDefaultSifRegsLocked();
+     }
+ 
+@@ -266,12 +270,14 @@ namespace ps2_stubs
+             return false;
+ 
+         SifCmdHandler registered{};
++        uint64_t epoch = 0;
+         {
+             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+             const auto handler = g_sifCmdHandlers.find(commandId);
+             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+                 return false;
+             registered = handler->second;
++            epoch = g_iopCommandEpoch;
+         }
+ 
+         if (!runtime->hasFunction(registered.function))
+@@ -305,6 +311,12 @@ namespace ps2_stubs
+             SET_GPR_U32(&invocation.context, 7, 0u);
+             SET_GPR_U32(&invocation.context, 29, 0u);
+             SET_GPR_U32(&invocation.context, 31, 0u);
++            invocation.isValid = [epoch]
++            {
++                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++                return epoch == g_iopCommandEpoch;
++            };
++            invocation.onCancel = [runtime, packetAddress] { runtime->guestFree(packetAddress); };
+             invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
+             {
+                 runtime->guestFree(packetAddress);
+@@ -371,6 +383,7 @@ namespace ps2_stubs
+     void sceSifExitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++        ++g_iopCommandEpoch;
+         seedDefaultSifRegsLocked();
+         setReturnS32(ctx, 0);
+     }
+@@ -589,8 +602,7 @@ namespace ps2_stubs
+ 
+     void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        PS2IopTransport::reset(runtime);
+-        setReturnS32(ctx, 1);
++        setReturnS32(ctx, PS2IopTransport::reset(runtime, rdram) ? 1 : 0);
+     }
+ 
+     void sceSifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -618,8 +630,7 @@ namespace ps2_stubs
+ 
+     void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        PS2IopTransport::reset(runtime);
+-        setReturnS32(ctx, 1);
++        setReturnS32(ctx, PS2IopTransport::reset(runtime, rdram) ? 1 : 0);
+     }
+ 
+     void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -726,6 +737,18 @@ namespace ps2_stubs
+                 break;
+             }
+ 
++            // Only the observed single-descriptor reset contract is supported.
++            // Reject a reset-bearing chain before any copy: continuing it after
++            // synchronous bootstrap could overwrite the new IOP's providers.
++            if (count != 1u && xfer.attr == 0x44 && sizeBytes >= 16u)
++            {
++                std::array<uint8_t,16> header{};
++                if (!readEeRange(rdram,xfer.src,header.data(),header.size())) { ok = false; break; }
++                uint32_t command = 0u;
++                std::memcpy(&command,header.data()+8u,sizeof(command));
++                if (command == 0x80000003u) { ok = false; break; }
++            }
++
+             pending[pendingCount++] = xfer;
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index d6b7549..952fab2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -153,10 +153,20 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
+ static constexpr uint32_t kFioSoIWOth = 0x0002;
+ static constexpr uint32_t kFioSoIXOth = 0x0001;
+ 
++enum class RpcBindingOwner : uint8_t
++{
++    None,
++    Ee,
++    Iop,
++    RetiredIop,
++};
++
+ struct RpcServerState
+ {
+     uint32_t sid = 0;
+     uint32_t sd_ptr = 0; // PS2 address
++    RpcBindingOwner owner = RpcBindingOwner::None;
++    uint64_t iopEpoch = 0;
+ };
+ 
+ struct RpcClientState
+@@ -164,6 +174,8 @@ struct RpcClientState
+     bool busy = false;
+     uint32_t last_rpc = 0;
+     uint32_t sid = 0;
++    RpcBindingOwner owner = RpcBindingOwner::None;
++    uint64_t iopEpoch = 0;
+ };
+ 
+ struct SifRpcDebugEvent
+@@ -204,6 +216,7 @@ static constexpr uint32_t kSifRpcDebugFlagServerDispatch = 1u << 4;
+ static constexpr uint32_t kSifRpcDebugFlagUnhandled = 1u << 6;
+ static constexpr uint32_t kSifRpcDebugFlagFallbackCopy = 1u << 7;
+ static constexpr uint32_t kSifRpcDebugFlagFallbackZero = 1u << 8;
++static constexpr uint32_t kSifRpcDebugFlagRetiredIop = 1u << 9;
+ 
+ inline std::unordered_map<uint32_t, RpcServerState> g_rpc_servers;
+ inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
+@@ -216,6 +229,7 @@ inline uint32_t g_rpc_next_id = 1;
+ inline uint32_t g_rpc_packet_index = 0;
+ inline uint32_t g_rpc_server_index = 0;
+ inline uint32_t g_rpc_active_queue = 0;
++inline uint64_t g_iop_rpc_binding_epoch = 1;
+ inline std::mutex g_bootmode_mutex;
+ inline bool g_bootmode_initialized = false;
+ inline uint32_t g_bootmode_pool_offset = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..50600da 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -148,6 +148,12 @@ namespace ps2_syscalls
+             return runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true) >= 0;
+         }
+ 
++        bool isCurrentIopRpcEpoch(uint64_t epoch)
++        {
++            std::lock_guard<std::mutex> lock(g_rpc_mutex);
++            return g_iop_rpc_binding_epoch == epoch;
++        }
++
+     } // namespace
+ 
+     void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -236,6 +242,7 @@ namespace ps2_syscalls
+             g_rpc_packet_index = 0;
+             g_rpc_server_index = 0;
+             g_rpc_active_queue = 0;
++            g_iop_rpc_binding_epoch = 1;
+             g_sif_rpc_debug_next_seq = 0;
+             for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
+             {
+@@ -283,6 +290,8 @@ namespace ps2_syscalls
+         client->hdr.mode = mode;
+ 
+         uint32_t serverPtr = 0;
++        RpcBindingOwner bindingOwner = RpcBindingOwner::None;
++        uint64_t bindingEpoch = 0;
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             client->hdr.rpc_id = g_rpc_next_id++;
+@@ -290,9 +299,23 @@ namespace ps2_syscalls
+             if (it != g_rpc_servers.end())
+             {
+                 serverPtr = it->second.sd_ptr;
++                bindingOwner = it->second.owner;
++                bindingEpoch = it->second.iopEpoch;
++            }
++            else
++            {
++                const auto previous = g_rpc_clients.find(clientPtr);
++                if (previous != g_rpc_clients.end() &&
++                    (previous->second.owner == RpcBindingOwner::Iop ||
++                     previous->second.owner == RpcBindingOwner::RetiredIop))
++                {
++                    // A retry without a provider must not turn a revoked
++                    // binding into an unowned call with a successful fallback.
++                    bindingOwner = RpcBindingOwner::RetiredIop;
++                    bindingEpoch = g_iop_rpc_binding_epoch;
++                }
+             }
+-            g_rpc_clients[clientPtr] = {};
+-            g_rpc_clients[clientPtr].sid = rpcId;
++            g_rpc_clients[clientPtr] = {false, 0u, rpcId, bindingOwner, bindingEpoch};
+         }
+ 
+         if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+@@ -311,7 +334,10 @@ namespace ps2_syscalls
+                     dummy->sid = static_cast<int>(rpcId);
+                 }
+                 std::lock_guard<std::mutex> lock(g_rpc_mutex);
+-                g_rpc_servers[rpcId] = {rpcId, serverPtr};
++                g_rpc_servers[rpcId] = {rpcId, serverPtr, RpcBindingOwner::Iop, g_iop_rpc_binding_epoch};
++                RpcClientState &state = g_rpc_clients[clientPtr];
++                state.owner = RpcBindingOwner::Iop;
++                state.iopEpoch = g_iop_rpc_binding_epoch;
+             }
+         }
+ 
+@@ -403,12 +429,14 @@ namespace ps2_syscalls
+                           endFunctionStack);
+ 
+         uint32_t sidHint = 0u;
++        bool eeOwnedRequest = false;
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             const auto clientIt = g_rpc_clients.find(clientPtr);
+             if (clientIt != g_rpc_clients.end())
+             {
+                 sidHint = clientIt->second.sid;
++                eeOwnedRequest = clientIt->second.owner == RpcBindingOwner::Ee;
+             }
+         }
+ 
+@@ -433,7 +461,10 @@ namespace ps2_syscalls
+                 endParameterStack,
+                 stackPackPlausible,
+             };
+-            selectedAbi = PS2IopTransport::selectRpcAbi(runtime, request);
++            if (!eeOwnedRequest)
++            {
++                selectedAbi = PS2IopTransport::selectRpcAbi(runtime, request);
++            }
+         }
+ 
+         bool useRegisterConvention = selectedAbi != ps2x::iop::RpcAbi::Stack;
+@@ -478,18 +509,47 @@ namespace ps2_syscalls
+             return;
+         }
+ 
+-        client->command = rpcNum;
+-        client->end_function = endFunction;
+-        client->end_param = endParameter;
+-        client->hdr.mode = mode;
+-
+         uint32_t sid = 0u;
++        bool iopBoundRequest = false;
++        uint64_t iopEpoch = 0;
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+-            auto &state = g_rpc_clients[clientPtr];
++            auto clientIt = g_rpc_clients.find(clientPtr);
++            if (clientIt != g_rpc_clients.end() && clientIt->second.owner == RpcBindingOwner::RetiredIop)
++            {
++                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx, runtime);
++                event.clientPtr = clientPtr;
++                event.sid = clientIt->second.sid;
++                event.rpcNum = rpcNum;
++                event.mode = mode;
++                event.sendBuf = sendBuf;
++                event.sendSize = sendSize;
++                event.recvBuf = receiveBuffer;
++                event.recvSize = receiveSize;
++                event.endFunc = endFunction;
++                event.endParam = endParameter;
++                event.flags = kSifRpcDebugFlagRetiredIop |
++                              ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u);
++                event.result = -1;
++                pushSifRpcDebugEventLocked(event);
++                setReturnS32(ctx, -1);
++                return;
++            }
++
++            if (clientIt == g_rpc_clients.end())
++            {
++                clientIt = g_rpc_clients.emplace(clientPtr, RpcClientState{}).first;
++            }
++
++            RpcClientState &state = clientIt->second;
+             state.busy = true;
+             state.last_rpc = rpcNum;
+             sid = state.sid;
++            eeOwnedRequest = state.owner == RpcBindingOwner::Ee;
++            // Even legacy unowned calls submitted to the IOP need retirement
++            // protection if a provider executes them.
++            iopBoundRequest = !eeOwnedRequest;
++            iopEpoch = state.owner == RpcBindingOwner::Iop ? state.iopEpoch : g_iop_rpc_binding_epoch;
+             if (sid != 0u)
+             {
+                 const auto serverIt = g_rpc_servers.find(sid);
+@@ -501,6 +561,11 @@ namespace ps2_syscalls
+             }
+         }
+ 
++        client->command = rpcNum;
++        client->end_function = endFunction;
++        client->end_param = endParameter;
++        client->hdr.mode = mode;
++
+         const uint32_t serverPtr = client->server;
+         auto *server = serverPtr
+                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
+@@ -529,6 +594,7 @@ namespace ps2_syscalls
+             completionSemaphore = endParameter;
+         }
+ 
++        if (!eeOwnedRequest)
+         {
+             ps2x::iop::RpcRequest request{};
+             request.clientAddress = clientPtr;
+@@ -545,12 +611,13 @@ namespace ps2_syscalls
+ 
+             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+ 
+-            if (iopResult.signalNowaitCompletion &&
++            const bool currentIopRequest = !iopBoundRequest || isCurrentIopRpcEpoch(iopEpoch);
++            if (currentIopRequest && iopResult.signalNowaitCompletion &&
+                 (mode & kSifRpcModeNowait) != 0u)
+             {
+                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
+             }
+-            if (iopResult.signalCompletion)
++            if (currentIopRequest && iopResult.signalCompletion)
+             {
+                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
+             }
+@@ -575,6 +642,11 @@ namespace ps2_syscalls
+ 
+         auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
+         {
++            if (iopBoundRequest && !isCurrentIopRpcEpoch(iopEpoch))
++            {
++                return;
++            }
++
+             bool handled = iopResult.handled;
+             uint32_t resultPointer = iopResult.resultAddress;
+             bool copiedFallback = false;
+@@ -609,9 +681,18 @@ namespace ps2_syscalls
+ 
+             auto completeClient = [=](R5900Context &base, bool callbackCompleted)
+             {
++                if (iopBoundRequest && !isCurrentIopRpcEpoch(iopEpoch))
++                {
++                    return;
++                }
+                 {
+                     std::lock_guard<std::mutex> lock(g_rpc_mutex);
+-                    g_rpc_clients[clientPtr].busy = false;
++                    const auto clientIt = g_rpc_clients.find(clientPtr);
++                    if (clientIt == g_rpc_clients.end())
++                    {
++                        return;
++                    }
++                    clientIt->second.busy = false;
+                 }
+                 SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
+                 event.clientPtr = clientPtr;
+@@ -674,6 +755,13 @@ namespace ps2_syscalls
+             SET_GPR_U32(&callback.context, 4, endParameter);
+             SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+             SET_GPR_U32(&callback.context, 31, 0u);
++            if (iopBoundRequest)
++            {
++                callback.isValid = [iopEpoch]
++                {
++                    return isCurrentIopRpcEpoch(iopEpoch);
++                };
++            }
+             callback.onComplete = [completeClient](const R5900Context &, R5900Context &base)
+             {
+                 completeClient(base, true);
+@@ -693,6 +781,13 @@ namespace ps2_syscalls
+             SET_GPR_U32(&invocation.context, 7, guestA3);
+             SET_GPR_U32(&invocation.context, 29, runtime->eeScheduler().invocationStackTop());
+             SET_GPR_U32(&invocation.context, 31, 0u);
++            if (iopBoundRequest)
++            {
++                invocation.isValid = [iopEpoch]
++                {
++                    return isCurrentIopRpcEpoch(iopEpoch);
++                };
++            }
+             invocation.onComplete = [finishCall](const R5900Context &completed, R5900Context &parent)
+             {
+                 finishCall(&completed, parent);
+@@ -785,11 +880,22 @@ namespace ps2_syscalls
+                 }
+             }
+ 
+-            g_rpc_servers[sid] = {sid, sdPtr};
++            const auto existing = g_rpc_servers.find(sid);
++            if (existing != g_rpc_servers.end() && existing->second.owner == RpcBindingOwner::Iop &&
++                existing->second.sd_ptr != sdPtr)
++            {
++                if (t_SifRpcServerData *old = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, existing->second.sd_ptr)))
++                {
++                    std::memset(old, 0, sizeof(*old));
++                }
++            }
++            g_rpc_servers[sid] = {sid, sdPtr, RpcBindingOwner::Ee, 0};
+             for (auto &entry : g_rpc_clients)
+             {
+                 if (entry.second.sid == sid)
+                 {
++                    entry.second.owner = RpcBindingOwner::Ee;
++                    entry.second.iopEpoch = 0;
+                     t_SifRpcClientData *cd = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, entry.first));
+                     if (cd)
+                     {
+@@ -814,6 +920,60 @@ namespace ps2_syscalls
+         setReturnS32(ctx, 0);
+     }
+ 
++    void invalidateIopRpcBindings(uint8_t *rdram)
++    {
++        std::lock_guard<std::recursive_mutex> callLock(g_sif_call_rpc_mutex);
++        std::lock_guard<std::mutex> lock(g_rpc_mutex);
++
++        if (++g_iop_rpc_binding_epoch == 0u)
++        {
++            g_iop_rpc_binding_epoch = 1u;
++        }
++
++        for (auto serverIt = g_rpc_servers.begin(); serverIt != g_rpc_servers.end();)
++        {
++            if (serverIt->second.owner != RpcBindingOwner::Iop)
++            {
++                ++serverIt;
++                continue;
++            }
++
++            if (t_SifRpcServerData *server = rdram
++                    ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverIt->second.sd_ptr))
++                    : nullptr)
++            {
++                std::memset(server, 0, sizeof(*server));
++            }
++            serverIt = g_rpc_servers.erase(serverIt);
++        }
++
++        for (auto &[clientPtr, state] : g_rpc_clients)
++        {
++            if (state.owner != RpcBindingOwner::Iop)
++            {
++                continue;
++            }
++
++            if (t_SifRpcClientData *client = rdram
++                    ? reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr))
++                    : nullptr)
++            {
++                client->hdr.pkt_addr = 0;
++                client->hdr.sema_id = -1;
++                client->command = 0;
++                client->buf = 0;
++                client->cbuf = 0;
++                client->end_function = 0;
++                client->end_param = 0;
++                client->server = 0;
++            }
++            state.busy = false;
++            state.last_rpc = 0;
++            state.owner = RpcBindingOwner::RetiredIop;
++            state.iopEpoch = g_iop_rpc_binding_epoch;
++        }
++    }
++
+     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t clientPtr = getRegU32(ctx, 4);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+index 5e9a446..e3ddc61 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+@@ -14,6 +14,7 @@ namespace ps2_syscalls
+     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifRemoveRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifRemoveRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void invalidateIopRpcBindings(uint8_t *rdram);
+     void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 4cb2bd2..1bb9c6d 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2_disc_mount.h"
++#include "ps2x/iop/iop_reboot_image.h"
+ 
+ #include <cstdint>
+ #include <cstdio>
+@@ -45,6 +46,8 @@ public:
+     [[nodiscard]] CallScope enterCall(R5900Context *context,
+                                       uint8_t *rdram = nullptr);
+ 
++    ps2x::iop::RebootTransferTracker rebootTransfers;
++
+     bool readGuest(uint32_t address, void *destination, size_t size) const override;
+     bool writeGuest(uint32_t address, const void *source, size_t size) override;
+     bool zeroGuest(uint32_t address, size_t size) override;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+index 6bd1835..6be2d82 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -44,11 +44,6 @@ public:
+         }
+     }
+ 
+-    static void reset(PS2Runtime *runtime)
+-    {
+-        if (runtime)
+-        {
+-            runtime->resetIop();
+-        }
+-    }
++    // Existing transport boundary returns whether the quiescent reset happened.
++    static bool reset(PS2Runtime *runtime, uint8_t *rdram = nullptr);
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index cb3540b..e9ef56b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -13,7 +13,9 @@
+ #include "Kernel/Stubs/MPEG.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
++#include "ps2_iop_transport.h"
+ #include "ps2x/iop/iop_subsystem.h"
++#include "Kernel/Syscalls/RPC.h"
+ 
+ #include <iostream>
+ #include <stdexcept>
+@@ -530,6 +532,7 @@ PS2Runtime::~PS2Runtime()
+     try
+     {
+         requestStop();
++        if (m_eeScheduler) m_eeScheduler->discardInvocations();
+         m_iopSubsystem.reset();
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+@@ -602,8 +605,67 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
+ 
+ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+ {
++    using namespace ps2x::iop;
++    std::array<uint8_t, 104> packet{};
++    uint32_t subAddress = 0u;
++    (void)m_iopHost->readSifRegister(SifRegister::SubAddress, subAddress);
++    std::span<const uint8_t> copied;
++    if (transfer.kind == SifTransferKind::SetDma && transfer.phase == SifTransferPhase::AfterCopy &&
++        transfer.size == packet.size() && transfer.attributes == 0x44u &&
++        m_iopSubsystem->readMemory(transfer.destinationAddress, packet.data(), packet.size())) copied = packet;
++    const auto reboot = m_iopHost->rebootTransfers.observe(transfer, copied, subAddress);
++    {
++        auto scope = m_iopHost->enterCall(nullptr, rdram);
++        m_iopSubsystem->onSifTransfer(transfer);
++    }
++    if (!reboot) return;
++
++    // Stage and validate the original image before retiring the old IOP. This
++    // uses the mounted ISO adapter, never a second ISO parser or guest scratch.
+     auto scope = m_iopHost->enterCall(nullptr, rdram);
+-    m_iopSubsystem->onSifTransfer(transfer);
++    const uint64_t handle = m_iopHost->openGuestFile(*reboot);
++    if (!handle) { std::cerr << "[IOP reboot] original image unavailable\n"; return; }
++    struct CloseFile
++    {
++        PS2IopHostAdapter *host; uint64_t handle;
++        ~CloseFile() { host->closeHostFile(handle); }
++    } close{m_iopHost.get(), handle};
++    uint64_t size = 0;
++    if (!m_iopHost->hostFileSize(handle, size) || size < 32u || size > 16u * 1024u * 1024u)
++    { std::cerr << "[IOP reboot] image size rejected\n"; return; }
++    std::vector<uint8_t> image(size);
++    size_t read = 0;
++    std::vector<RebootImageEntry> entries;
++    if (!m_iopHost->readHostFile(handle, 0u, image.data(), image.size(), read) || read != image.size() ||
++        !parseRebootImage(image, entries))
++    { std::cerr << "[IOP reboot] original ROMDIR rejected\n"; return; }
++    constexpr std::array<std::string_view, 6> providers{"SIFCMD", "EESYNC", "CDVDMAN", "CDVDFSV", "FILEIO", "LOADFILE"};
++    std::array<RebootImageEntry, providers.size()> selected;
++    for (size_t n = 0; n < providers.size(); ++n)
++    {
++        const auto entry = std::find_if(entries.begin(), entries.end(), [&](const auto &e) { return e.name == providers[n]; });
++        if (entry == entries.end() || entry->size < 52u ||
++            std::memcmp(image.data() + entry->offset, "\177ELF\1\1\1", 7u) != 0)
++        { std::cerr << "[IOP reboot] required original provider rejected\n"; return; }
++        selected[n] = *entry;
++    }
++    if (!PS2IopTransport::reset(this, rdram))
++    { std::cerr << "[IOP reboot] active IOP reset rejected\n"; return; }
++    if (!m_iopSubsystem->beginBootNotifications(uint32_t(providers.size())))
++    { std::cerr << "[IOP reboot] boot collection rejected\n"; return; }
++    for (const auto &entry : selected)
++    {
++        const auto result = m_iopSubsystem->loadModuleImage("rom0:" + entry.name,
++            std::span<const uint8_t>(image).subspan(entry.offset, entry.size));
++        std::cerr << "[IOP reboot] original " << entry.name << " id=" << result.moduleId << " start=" << result.startResult << '\n';
++        if (result.moduleId <= 0 || result.startResult != 0)
++        { std::cerr << "[IOP reboot] original provider did not start\n"; return; }
++        m_iopSubsystem->runEeCycles(3000000u);
++    }
++    const bool finished = m_iopSubsystem->finishBootNotifications();
++    uint32_t flags = 0;
++    (void)m_iopHost->readSifRegister(SifRegister::SmFlag, flags);
++    std::cerr << "[IOP reboot] original notifications complete=" << finished << " SMFLAG=0x" << std::hex << flags << std::dec << '\n';
+ }
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+@@ -613,7 +675,18 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ 
+ void PS2Runtime::resetIop()
+ {
+-    m_iopSubsystem->reset();
++    if (!PS2IopTransport::reset(this))
++        throw std::runtime_error("IOP reset rejected while callback or IOP operation is active");
++}
++
++bool PS2IopTransport::reset(PS2Runtime *runtime, uint8_t *rdram)
++{
++    if (!runtime || runtime->m_eeScheduler->hasResetSensitiveInvocations() || !runtime->m_iopSubsystem->tryReset()) return false;
++    runtime->m_iopHost->rebootTransfers.clear();
++    if (!rdram) rdram = runtime->m_eeScheduler->rdram();
++    if (!rdram) rdram = runtime->m_boundRdram ? runtime->m_boundRdram : runtime->m_memory.getRDRAM();
++    ps2_syscalls::invalidateIopRpcBindings(rdram);
++    return true;
+ }
+ 
+ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+@@ -2336,6 +2409,8 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+ void PS2Runtime::run()
+ {
+     m_stopRequested.store(false, std::memory_order_relaxed);
++    // Stopped EE callbacks must release ownership before startup retires IOP.
++    m_eeScheduler->discardInvocations();
+     ps2_stubs::resetSifState();
+     resetIop();
+     ps2_stubs::resetAudioStubState();
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index 674a60e..6102b67 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -131,12 +131,195 @@ namespace
+         ctx->pc = 0u;
+         runtime->requestStop();
+     }
++
++    uint32_t g_commandRuns = 0u, g_unrelatedRuns = 0u;
++    bool g_commandQueued = false;
++    constexpr uint32_t kCommandEntry = 0x00101100u, kCommandHandler = 0x00101110u;
++    constexpr uint32_t kUnrelatedHandler = 0x00101120u, kCommandResume = 0x00101130u;
++    void commandHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    { ++g_commandRuns; ctx->pc = 0u; }
++    void unrelatedHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    { ++g_unrelatedRuns; ctx->pc = 0u; }
++    void commandEpochEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        R5900Context registration{};
++        setRegU32(registration,4,0x80000000u);
++        setRegU32(registration,5,kCommandHandler);
++        ps2_stubs::sceSifAddCmdHandler(rdram,&registration,runtime);
++        const std::array<uint8_t,16> packet{};
++        g_commandQueued = ps2_stubs::dispatchSifCommand(rdram,runtime,0x80000000u,packet.data(),packet.size());
++        GuestInvocation unrelated{};
++        unrelated.context.pc = kUnrelatedHandler;
++        runtime->eeScheduler().queueInvocation(std::move(unrelated));
++        PS2IopTransport::reset(runtime);
++        g_commandQueued = ps2_stubs::dispatchSifCommand(rdram,runtime,0x80000000u,packet.data(),packet.size()) && g_commandQueued;
++        ctx->pc = kCommandResume;
++    }
++
++    bool g_blockResetTest = false, g_resetRejected = false;
++    uint32_t g_sensitiveCompletions = 0u;
++    int g_resetSemaphore = 0;
++    int32_t g_resetStubResult = -1;
++    constexpr uint32_t kSensitiveEntry=0x00101200u, kSensitiveHandler=0x00101210u;
++    constexpr uint32_t kSensitiveResume=0x00101220u, kResetDriver=0x00101230u;
++    void resetDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ps2_stubs::sceSifRebootIop(rdram,ctx,runtime);
++        g_resetStubResult=getRegS32(*ctx,2);
++        g_resetRejected = PS2IopTransport::canBindRpc(runtime,0x80001300u);
++        runtime->eeScheduler().signalSemaphore(g_resetSemaphore,true);
++        ctx->pc=0u;
++    }
++    void sensitiveHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (g_blockResetTest)
++        {
++            ctx->pc=kSensitiveResume;
++            runtime->eeScheduler().waitSemaphore(g_resetSemaphore);
++            return;
++        }
++        ps2_stubs::sceSifResetIop(rdram,ctx,runtime);
++        g_resetStubResult=getRegS32(*ctx,2);
++        g_resetRejected=PS2IopTransport::canBindRpc(runtime,0x80001300u);
++        ctx->pc=0u;
++    }
++    void sensitiveResume(uint8_t *, R5900Context *ctx, PS2Runtime *) { ctx->pc=0u; }
++    void sensitiveEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &scheduler=runtime->eeScheduler();
++        if (g_blockResetTest)
++        {
++            g_resetSemaphore=scheduler.createSemaphore(0,1,0,0);
++            EeThreadCreateParams driver{};
++            driver.entry=kResetDriver;driver.stack=0x1c000;driver.stackSize=0x1000;driver.priority=10;
++            scheduler.startThread(scheduler.createThread(driver),0,*ctx,false);
++        }
++        GuestInvocation invocation{};
++        invocation.context.pc=kSensitiveHandler;
++        invocation.isValid=[] {return true;};
++        invocation.onComplete=[](const auto &,auto &) {++g_sensitiveCompletions;};
++        scheduler.queueInvocation(std::move(invocation));
++        ctx->pc=kCommandResume;
++    }
++    constexpr uint32_t kCleanupEntry=0x00101300u,kCleanupHandler=0x00101310u,kCleanupDriver=0x00101320u;
++    uint32_t g_ownedCommandAddress=0u;
++    void cleanupHandler(uint8_t *,R5900Context *ctx,PS2Runtime *runtime)
++    {
++        g_ownedCommandAddress=getRegU32(ctx,4);
++        runtime->eeScheduler().exitCurrent(false);
++    }
++    void cleanupDriver(uint8_t *,R5900Context *ctx,PS2Runtime *runtime)
++    { ctx->pc=0u;runtime->requestStop(); }
++    void cleanupEntry(uint8_t *rdram,R5900Context *ctx,PS2Runtime *runtime)
++    {
++        R5900Context registration{};
++        setRegU32(registration,4,0x80000000u);setRegU32(registration,5,kCleanupHandler);
++        ps2_stubs::sceSifAddCmdHandler(rdram,&registration,runtime);
++        const std::array<uint8_t,16> packet{};
++        ps2_stubs::dispatchSifCommand(rdram,runtime,0x80000000u,packet.data(),packet.size());
++        EeThreadCreateParams driver{};
++        driver.entry=kCleanupDriver;driver.stack=0x1c000;driver.stackSize=0x1000;driver.priority=10;
++        auto &scheduler=runtime->eeScheduler();
++        scheduler.startThread(scheduler.createThread(driver),0,*ctx,false);
++        ctx->pc=kCommandResume;
++    }
+ }
+ 
+ void register_ps2_sif_dma_tests()
+ {
+     MiniTest::Case("PS2SifDma", [](TestCase &tc)
+     {
++        tc.Run("thread exit releases actual SIF packet through cancellation cleanup", [](TestCase &t)
++        {
++            TestEnv env;g_ownedCommandAddress=0;
++            env.runtime.registerFunction(kCleanupEntry,cleanupEntry);
++            env.runtime.registerFunction(kCleanupHandler,cleanupHandler);
++            env.runtime.registerFunction(kCleanupDriver,cleanupDriver);
++            R5900Context main{};main.pc=kCleanupEntry;
++            env.runtime.eeScheduler().reset(env.rdram.data(),main);
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_ownedCommandAddress!=0u,"real receiving handler must execute before exit");
++            const uint32_t reused=env.runtime.guestMalloc(16,16);
++            t.Equals(reused,g_ownedCommandAddress,"packet allocation must become reusable on thread exit");
++            env.runtime.guestFree(reused);
++        });
++        tc.Run("whole IOP reset rejects active and blocked sensitive callback lifetimes", [](TestCase &t)
++        {
++            for (bool blocked : {false,true})
++            {
++                TestEnv env;
++                const auto provider=env.runtime.loadIopModule("rom0:DBCMAN");
++                t.IsTrue(provider.moduleId>0,"real IOP provider fixture should load");
++                env.runtime.registerFunction(kSensitiveEntry,sensitiveEntry);
++                env.runtime.registerFunction(kSensitiveHandler,sensitiveHandler);
++                env.runtime.registerFunction(kSensitiveResume,sensitiveResume);
++                env.runtime.registerFunction(kResetDriver,resetDriver);
++                env.runtime.registerFunction(kCommandResume,schedulerSifDmaResume);
++                g_blockResetTest=blocked;g_resetRejected=false;g_sensitiveCompletions=0;g_resetStubResult=-1;
++                R5900Context main{};main.pc=kSensitiveEntry;
++                env.runtime.eeScheduler().reset(env.rdram.data(),main);
++                env.runtime.eeScheduler().run();
++                t.IsTrue(g_resetRejected,"reset must retain provider while callback owns its lifetime");
++                t.Equals(g_resetStubResult,0,"guest reset/reboot must report quiescent rejection");
++                t.Equals(g_sensitiveCompletions,1u,"rejected reset must retain callback and semaphore continuation");
++                ps2_stubs::sceSifResetIop(env.rdram.data(),&env.ctx,&env.runtime);
++                t.Equals(getRegS32(env.ctx,2),1,"quiescent guest reset must report success");
++                t.IsFalse(PS2IopTransport::canBindRpc(&env.runtime,0x80001300u),"reset should succeed after callback returns");
++            }
++        });
++        tc.Run("quiescent scheduler discard releases queued invocation ownership once", [](TestCase &t)
++        {
++            TestEnv env;R5900Context main{};
++            env.runtime.eeScheduler().reset(env.rdram.data(),main);
++            uint32_t cancelled=0,completed=0;
++            GuestInvocation invocation{};
++            invocation.onCancel=[&] {++cancelled;};
++            invocation.onComplete=[&](const auto &,auto &) {++completed;};
++            env.runtime.eeScheduler().queueInvocation(std::move(invocation));
++            env.runtime.eeScheduler().discardInvocations();
++            env.runtime.eeScheduler().discardInvocations();
++            t.Equals(cancelled,1u,"owned packet cleanup must execute once");
++            t.Equals(completed,0u,"discard is not completion");
++        });
++        tc.Run("reset-bearing DMA chains reject before old or new IOP memory is written", [](TestCase &t)
++        {
++            TestEnv env;
++            const auto provider=env.runtime.loadIopModule("rom0:DBCMAN");
++            t.IsTrue(provider.moduleId>0,"provider should load");
++            std::array<uint8_t,104> packet{};
++            const uint32_t header[6]={104,0,0x80000003,0,40,0};
++            std::memcpy(packet.data(),header,sizeof(header));
++            constexpr char args[]="rom0:UDNL cdrom0:\\\\MODULES\\\\IOPRP300.IMG;1";
++            std::memcpy(packet.data()+24,args,sizeof(args));
++            std::memcpy(env.rdram.data()+0x5000,packet.data(),packet.size());
++            const uint32_t poison=0xaabbccdd,guard=0x11223344;
++            writeGuestU32(env.rdram.data(),0x5100,poison);
++            env.runtime.writeIopMemory(0x10000,&guard,sizeof(guard));
++            const Ps2SifDmaTransfer desc[2]={{0x5000,0,104,0x44},{0x5100,0x10000,4,0}};
++            std::memcpy(env.rdram.data()+0x5200,desc,sizeof(desc));
++            setRegU32(env.ctx,4,0x5200);setRegU32(env.ctx,5,2);
++            ps2_stubs::sceSifSetDma(env.rdram.data(),&env.ctx,&env.runtime);
++            uint32_t observed=0;
++            env.runtime.readIopMemory(0x10000,&observed,sizeof(observed));
++            t.Equals(getRegS32(env.ctx,2),0,"unsupported chain must report failed DMA");
++            t.Equals(observed,guard,"trailing write must not cross reset generations");
++            t.IsTrue(PS2IopTransport::canBindRpc(&env.runtime,0x80001300u),"provider must not reset in rejected chain");
++        });
++        tc.Run("IOP reset retires queued commands while retaining handler and unrelated invocation", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kCommandEntry,commandEpochEntry);
++            env.runtime.registerFunction(kCommandHandler,commandHandler);
++            env.runtime.registerFunction(kUnrelatedHandler,unrelatedHandler);
++            env.runtime.registerFunction(kCommandResume,schedulerSifDmaResume);
++            g_commandRuns = g_unrelatedRuns = 0u; g_commandQueued = false;
++            R5900Context main{}; main.pc = kCommandEntry;
++            env.runtime.eeScheduler().reset(env.rdram.data(),main);
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_commandQueued,"both real command packets should queue");
++            t.Equals(g_commandRuns,1u,"only the new IOP command may execute");
++            t.Equals(g_unrelatedRuns,1u,"unrelated queued work must survive");
++        });
+         tc.Run("sceSifSetDma copies payload and sceSifDmaStat reports complete", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index 7242e65..f5d74f3 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_macros.h"
+ #include "ps2_iop_transport.h"
++#include "Kernel/Syscalls/RPC.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+ #include "runtime/ee_scheduler.h"
+@@ -10,6 +11,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <filesystem>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -106,11 +108,17 @@ namespace
+         std::vector<uint8_t> rdram;
+         R5900Context ctx{};
+         PS2Runtime runtime;
++        uint8_t *rpcRam = nullptr;
+ 
+-        TestEnv() : rdram(PS2_RAM_SIZE, 0)
++        explicit TestEnv(bool useRuntimeRam = false) : rdram(PS2_RAM_SIZE, 0)
+         {
+             ps2_stubs::resetSifState();
+             std::memset(&ctx, 0, sizeof(ctx));
++            if (useRuntimeRam && !runtime.memory().initialize())
++            {
++                throw std::runtime_error("RPC reset test could not initialize runtime memory");
++            }
++            rpcRam = useRuntimeRam ? runtime.memory().getRDRAM() : rdram.data();
+         }
+     };
+ 
+@@ -151,6 +159,55 @@ namespace
+         std::memcpy(rdram + addr, &value, sizeof(value));
+     }
+ 
++    void bindRpc(TestEnv &env, uint32_t clientAddress, uint32_t sid)
++    {
++        setRegU32(env.ctx, 4, clientAddress);
++        setRegU32(env.ctx, 5, sid);
++        setRegU32(env.ctx, 6, 0u);
++        SifBindRpc(env.rpcRam, &env.ctx, &env.runtime);
++    }
++
++    void callRpc(TestEnv &env,
++                 uint32_t clientAddress,
++                 uint32_t function,
++                 uint32_t sendAddress,
++                 uint32_t sendSize,
++                 uint32_t receiveAddress,
++                 uint32_t receiveSize,
++                 uint32_t endFunction = 0u,
++                 uint32_t endParameter = 0u)
++    {
++        setRegU32(env.ctx, 4, clientAddress);
++        setRegU32(env.ctx, 5, function);
++        setRegU32(env.ctx, 6, 0u);
++        setRegU32(env.ctx, 7, sendAddress);
++        setRegU32(env.ctx, 8, sendSize);
++        setRegU32(env.ctx, 9, receiveAddress);
++        setRegU32(env.ctx, 10, receiveSize);
++        setRegU32(env.ctx, 11, endFunction);
++        setRegU32(env.ctx, 29, K_STACK_ADDR);
++        writeGuestU32(env.rpcRam, K_STACK_ADDR, endParameter);
++        SifCallRpc(env.rpcRam, &env.ctx, &env.runtime);
++    }
++
++    void registerRpc(TestEnv &env,
++                     uint32_t serverAddress,
++                     uint32_t sid,
++                     uint32_t serverBuffer,
++                     uint32_t queueAddress = 0u,
++                     uint32_t function = 0u)
++    {
++        setRegU32(env.ctx, 29, K_STACK_ADDR);
++        writeGuestU32(env.rpcRam, K_STACK_ADDR + 0x10u, 0u);
++        writeGuestU32(env.rpcRam, K_STACK_ADDR + 0x14u, 0u);
++        writeGuestU32(env.rpcRam, K_STACK_ADDR + 0x18u, queueAddress);
++        setRegU32(env.ctx, 4, serverAddress);
++        setRegU32(env.ctx, 5, sid);
++        setRegU32(env.ctx, 6, function);
++        setRegU32(env.ctx, 7, serverBuffer);
++        SifRegisterRpc(env.rpcRam, &env.ctx, &env.runtime);
++    }
++
+     struct ScopedTempDir
+     {
+         std::filesystem::path path;
+@@ -183,6 +240,72 @@ namespace
+         std::memcpy(&value, rdram + addr, sizeof(value));
+         return value;
+     }
++
++    constexpr uint32_t kRpcCallEntry = 0x00370000u;
++    constexpr uint32_t kRpcCallResume = 0x00370010u;
++    constexpr uint32_t kEeRpcFunction = 0x00370020u;
++    constexpr uint32_t kRpcCallbackFunction = 0x00370030u;
++    constexpr uint32_t kRpcExecCount = 0x00037D00u;
++    constexpr uint32_t kRpcObservedReply = 0x00037D04u;
++    constexpr uint32_t kRpcCallStatus = 0x00037D08u;
++    constexpr uint32_t kRpcCallbackCount = 0x00037D0Cu;
++    constexpr uint32_t kRpcResetInsideEe = 0x00037D10u;
++    constexpr uint32_t kEeRpcReply = 0xEEC0FFEEu;
++    constexpr uint32_t kSameSidReplyAddress = 0x00038100u;
++
++    void rpcCallEntry(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = kRpcCallResume;
++        SifCallRpc(ram, ctx, runtime);
++    }
++
++    void rpcCallResume(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeGuestU32(ram, kRpcCallStatus, ::getRegU32(ctx, 2));
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void eeRpcFunction(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeGuestU32(ram, kRpcExecCount, readGuestStruct<uint32_t>(ram, kRpcExecCount) + 1u);
++        writeGuestU32(ram, kRpcObservedReply, readGuestStruct<uint32_t>(ram, kSameSidReplyAddress));
++        if (readGuestStruct<uint32_t>(ram, kRpcResetInsideEe) != 0u)
++        {
++            PS2IopTransport::reset(runtime);
++        }
++        const uint32_t buffer = ::getRegU32(ctx, 5);
++        writeGuestU32(ram, buffer, kEeRpcReply);
++        setRegU32(*ctx, 2, buffer);
++        ctx->pc = 0u;
++    }
++
++    void rpcCompletionCallback(uint8_t *ram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        writeGuestU32(ram, kRpcCallbackCount, readGuestStruct<uint32_t>(ram, kRpcCallbackCount) + 1u);
++        runtime->eeScheduler().signalSemaphore(static_cast<int>(::getRegU32(ctx, 4)), true);
++        ctx->pc = 0u;
++    }
++
++    void runEeRpc(TestEnv &env, uint32_t clientAddress, uint32_t function, uint32_t receiveAddress)
++    {
++        env.runtime.registerFunction(kRpcCallEntry, rpcCallEntry);
++        env.runtime.registerFunction(kRpcCallResume, rpcCallResume);
++        env.runtime.registerFunction(kEeRpcFunction, eeRpcFunction);
++        env.ctx.pc = kRpcCallEntry;
++        setRegU32(env.ctx, 4, clientAddress);
++        setRegU32(env.ctx, 5, function);
++        setRegU32(env.ctx, 6, 0u);
++        setRegU32(env.ctx, 7, 0u);
++        setRegU32(env.ctx, 8, 0u);
++        setRegU32(env.ctx, 9, receiveAddress);
++        setRegU32(env.ctx, 10, 4u);
++        setRegU32(env.ctx, 11, 0u);
++        setRegU32(env.ctx, 29, K_STACK_ADDR);
++        writeGuestU32(env.rpcRam, K_STACK_ADDR, 0u);
++        env.runtime.eeScheduler().reset(env.rpcRam, env.ctx);
++        env.runtime.eeScheduler().run();
++    }
+ }
+ 
+ void register_ps2_sif_rpc_tests()
+@@ -257,6 +380,277 @@ void register_ps2_sif_rpc_tests()
+                      "client server pointer must stay null until the emulated IRX registers its SID");
+         });
+ 
++        tc.Run("IOP reset invalidation retires only IOP RPC bindings", [](TestCase &t)
++        {
++            TestEnv env(true);
++            uint8_t *const ram = env.rpcRam;
++            constexpr uint32_t kDbcManSid = 0x80001300u;
++            constexpr uint32_t kCheckVersionRpc = 0x80001363u;
++            constexpr uint32_t kIopClientAddr = 0x00037000u;
++            constexpr uint32_t kIopRecvAddr = 0x00037100u;
++            constexpr uint32_t kEeSid = 0x20000370u;
++            constexpr uint32_t kEeServerAddr = 0x00037200u;
++            constexpr uint32_t kEeServerBufAddr = 0x00037300u;
++            constexpr uint32_t kEeClientAddr = 0x00037400u;
++            constexpr uint32_t kEeSendAddr = 0x00037500u;
++            constexpr uint32_t kEeRecvAddr = 0x00037600u;
++
++            const auto dbcmanModule = env.runtime.loadIopModule("rom0:DBCMAN");
++            t.IsTrue(dbcmanModule.moduleId > 0, "IOP provider should load before bind");
++            SifInitRpc(ram, &env.ctx, &env.runtime);
++
++            bindRpc(env, kIopClientAddr, kDbcManSid);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "IOP bind should complete");
++            const SifRpcClientData iopClientBeforeReset = readGuestStruct<SifRpcClientData>(ram, kIopClientAddr);
++            t.IsTrue(iopClientBeforeReset.server != 0u, "IOP bind should allocate a native descriptor");
++            const uint32_t iopServerAddr = iopClientBeforeReset.server;
++
++            std::memset(ram + kIopRecvAddr, 0xCC, 16u);
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, 0u, 0u, kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "IOP call should complete before reset");
++            t.Equals(readGuestStruct<uint32_t>(ram, kIopRecvAddr), 0x0310u,
++                     "IOP provider should produce its concrete version response");
++
++            registerRpc(env, kEeServerAddr, kEeSid, kEeServerBufAddr);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "EE provider registration should complete");
++            bindRpc(env, kEeClientAddr, kEeSid);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "EE provider bind should complete");
++            const SifRpcClientData eeClientBeforeReset = readGuestStruct<SifRpcClientData>(ram, kEeClientAddr);
++            t.Equals(eeClientBeforeReset.server, kEeServerAddr, "EE client should bind to its real descriptor");
++
++            const std::array<uint8_t, 8> eePayload{0x31u, 0x41u, 0x59u, 0x26u, 0x53u, 0x58u, 0x97u, 0x93u};
++            std::memcpy(ram + kEeSendAddr, eePayload.data(), eePayload.size());
++            std::memset(ram + kEeRecvAddr, 0, eePayload.size());
++            callRpc(env, kEeClientAddr, 0x55u, kEeSendAddr, static_cast<uint32_t>(eePayload.size()),
++                    kEeRecvAddr, static_cast<uint32_t>(eePayload.size()));
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "EE call should complete before reset");
++            t.IsTrue(std::memcmp(ram + kEeRecvAddr, eePayload.data(), eePayload.size()) == 0,
++                     "EE provider route should perform its normal fallback reply");
++
++            std::memset(ram + kIopRecvAddr, 0xA5, 16u);
++            PS2IopTransport::reset(&env.runtime);
++            t.IsFalse(PS2IopTransport::canBindRpc(&env.runtime, kDbcManSid),
++                      "test reset must retire the IOP provider before binding invalidation");
++
++            const SifRpcClientData iopClientAfterReset = readGuestStruct<SifRpcClientData>(ram, kIopClientAddr);
++            t.Equals(iopClientAfterReset.server, 0u, "IOP client server should be cleared");
++            t.Equals(iopClientAfterReset.buf, 0u, "IOP client buffer should be cleared");
++            t.Equals(iopClientAfterReset.cbuf, 0u, "IOP client callback buffer should be cleared");
++            t.Equals(iopClientAfterReset.hdr.pkt_addr, 0u, "IOP client packet should be cleared");
++            t.Equals(readGuestStruct<SifRpcServerData>(ram, iopServerAddr).sid, 0,
++                     "retired IOP server descriptor should be cleared");
++            const SifRpcClientData eeClientAfterReset = readGuestStruct<SifRpcClientData>(ram, kEeClientAddr);
++            t.Equals(eeClientAfterReset.server, kEeServerAddr, "unrelated EE client should remain bound");
++            t.Equals(readGuestStruct<SifRpcServerData>(ram, kEeServerAddr).sid,
++                     static_cast<int32_t>(kEeSid), "unrelated EE server should remain registered");
++
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, 0u, 0u, kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), -1, "stale IOP client call should fail");
++            for (uint32_t index = 0u; index < 16u; ++index)
++            {
++                t.Equals(ram[kIopRecvAddr + index], static_cast<uint8_t>(0xA5),
++                         "stale IOP call must preserve poisoned output");
++            }
++
++            std::memset(ram + kEeRecvAddr, 0, eePayload.size());
++            callRpc(env, kEeClientAddr, 0x56u, kEeSendAddr, static_cast<uint32_t>(eePayload.size()),
++                    kEeRecvAddr, static_cast<uint32_t>(eePayload.size()));
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "unrelated EE client should keep working after invalidation");
++            t.IsTrue(std::memcmp(ram + kEeRecvAddr, eePayload.data(), eePayload.size()) == 0,
++                     "EE reply should remain intact after IOP invalidation");
++
++            // An unsuccessful retry must keep the old binding retired.
++            bindRpc(env, kIopClientAddr, kDbcManSid);
++            t.Equals(readGuestStruct<SifRpcClientData>(ram, kIopClientAddr).server, 0u,
++                     "retry without a new IOP provider must stay unbound");
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, kEeSendAddr,
++                    static_cast<uint32_t>(eePayload.size()), kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), -1, "unsuccessful rebind must not enable echo fallback");
++            for (uint32_t index = 0u; index < 16u; ++index)
++            {
++                t.Equals(ram[kIopRecvAddr + index], static_cast<uint8_t>(0xA5),
++                         "failed rebind call must preserve poisoned output");
++            }
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, 0u, 0u, kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), -1, "unsuccessful rebind must not enable zero fallback");
++            t.Equals(readGuestStruct<uint32_t>(ram, kIopRecvAddr), 0xA5A5A5A5u,
++                     "failed rebind without send data must preserve poisoned output");
++
++            const auto reloaded = env.runtime.loadIopModule("rom0:DBCMAN");
++            t.IsTrue(reloaded.moduleId > 0, "new IOP provider must actually reload");
++            t.IsTrue(PS2IopTransport::canBindRpc(&env.runtime, kDbcManSid),
++                     "reloaded IOP provider should be available");
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, 0u, 0u, kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), -1, "provider reload alone must not resurrect a retired client");
++            bindRpc(env, kIopClientAddr, kDbcManSid);
++            t.IsTrue(readGuestStruct<SifRpcClientData>(ram, kIopClientAddr).server != 0u,
++                     "explicit rebind should acquire the new IOP provider");
++            callRpc(env, kIopClientAddr, kCheckVersionRpc, 0u, 0u, kIopRecvAddr, 16u);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "rebound IOP call should complete");
++            for (uint32_t index = 0u; index < 4u; ++index)
++            {
++                t.Equals(readGuestStruct<uint32_t>(ram, kIopRecvAddr + index * 4u), 0x0310u,
++                         "reloaded IOP provider should produce its version reply");
++            }
++        });
++
++        tc.Run("IOP RPC callback retirement preserves replies semaphore and rebound busy state", [](TestCase &t)
++        {
++            TestEnv env(true);
++            uint8_t *const ram = env.rpcRam;
++            constexpr uint32_t kSid = 0x80001300u;
++            constexpr uint32_t kVersionRpc = 0x80001363u;
++            constexpr uint32_t kClientAddress = 0x00037B00u;
++            constexpr uint32_t kReplyAddress = 0x00037C00u;
++
++            t.IsTrue(env.runtime.loadIopModule("rom0:DBCMAN").moduleId > 0, "callback test needs a real IOP provider");
++            SifInitRpc(ram, &env.ctx, &env.runtime);
++            bindRpc(env, kClientAddress, kSid);
++            env.runtime.registerFunction(kRpcCallbackFunction, rpcCompletionCallback);
++            env.runtime.registerFunction(kRpcCallResume, rpcCallResume);
++            env.ctx.pc = kRpcCallResume;
++            auto &scheduler = env.runtime.eeScheduler();
++            scheduler.bindMainContextForSyscall(env.ctx, ram);
++            const int sema = scheduler.createSemaphore(0, 2, 0u, 0u);
++            t.IsTrue(sema > 0, "completion semaphore must exist");
++
++            const auto captureCallback = [&]() -> GuestInvocation
++            {
++                try
++                {
++                    callRpc(env, kClientAddress, kVersionRpc, 0u, 0u, kReplyAddress, 16u,
++                            kRpcCallbackFunction, static_cast<uint32_t>(sema));
++                }
++                catch (const EeDispatcherTransfer &)
++                {
++                }
++                GuestThread *owner = scheduler.currentThread();
++                t.IsTrue(owner && !owner->invocations.empty(), "actual IOP call must attach its guest callback");
++                if (!owner || owner->invocations.empty())
++                {
++                    return {};
++                }
++                // A reset must reject an attached frame. Moving this actual
++                // frame to the pending queue exercises the permitted queued
++                // retirement path without inventing a mock RPC completion.
++                PS2IopTransport::reset(&env.runtime);
++                t.IsTrue(PS2IopTransport::canBindRpc(&env.runtime, kSid),
++                         "reset with an attached validity-sensitive callback must reject");
++                GuestInvocation callback = std::move(owner->invocations.back());
++                owner->invocations.pop_back();
++                return callback;
++            };
++
++            GuestInvocation oldCallback = captureCallback();
++            t.IsTrue(static_cast<bool>(oldCallback.isValid), "IOP callback must capture epoch validity");
++            auto oldCompletion = oldCallback.onComplete;
++            scheduler.queueInvocation(std::move(oldCallback));
++            PS2IopTransport::reset(&env.runtime);
++            t.IsFalse(PS2IopTransport::canBindRpc(&env.runtime, kSid),
++                      "pending-only callback must permit central reset");
++            t.Equals(readGuestStruct<SifRpcClientData>(ram, kClientAddress).server, 0u,
++                     "central reset must clear its IOP client descriptor");
++
++            t.IsTrue(env.runtime.loadIopModule("rom0:DBCMAN").moduleId > 0, "new IOP provider must reload");
++            bindRpc(env, kClientAddress, kSid);
++            GuestInvocation freshCallback = captureCallback();
++            t.Equals(readGuestStruct<uint32_t>(ram, kReplyAddress), 0x0310u,
++                     "fresh IOP request should produce a genuine reply");
++            std::memset(ram + kReplyAddress, 0x5A, 16u);
++            setRegU32(env.ctx, 4, kClientAddress);
++            SifCheckStatRpc(ram, &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), 1, "fresh request must remain busy until its callback completes");
++            if (oldCompletion)
++            {
++                R5900Context completed{};
++                oldCompletion(completed, env.ctx);
++            }
++            setRegU32(env.ctx, 4, kClientAddress);
++            SifCheckStatRpc(ram, &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), 1, "stale completion must not clear rebound request busy state");
++            t.Equals(scheduler.pollSemaphore(sema), KE_SEMA_ZERO, "stale completion must not signal semaphore");
++            scheduler.queueInvocation(std::move(freshCallback));
++            scheduler.run();
++
++            t.Equals(readGuestStruct<uint32_t>(ram, kRpcCallbackCount), 1u,
++                     "only the fresh RPC callback may execute guest instructions");
++            t.Equals(scheduler.pollSemaphore(sema), sema, "fresh callback should signal completion once");
++            t.Equals(scheduler.pollSemaphore(sema), KE_SEMA_ZERO, "retired callback must not add a semaphore signal");
++            for (uint32_t index = 0u; index < 16u; ++index)
++            {
++                t.Equals(ram[kReplyAddress + index], static_cast<uint8_t>(0x5A),
++                         "delayed stale effects must preserve the new reply buffer");
++            }
++            setRegU32(env.ctx, 4, kClientAddress);
++            SifCheckStatRpc(ram, &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), 0, "fresh callback must release the current request busy state");
++        });
++
++        tc.Run("RPC invalidation without guest RAM still retires IOP host bindings", [](TestCase &t)
++        {
++            TestEnv env;
++            constexpr uint32_t kClientAddress = 0x00037E00u;
++            constexpr uint32_t kReplyAddress = 0x00037F00u;
++            t.IsTrue(env.runtime.loadIopModule("rom0:LIBSD").moduleId > 0, "null-RAM test needs a real IOP provider");
++            SifInitRpc(env.rpcRam, &env.ctx, &env.runtime);
++            bindRpc(env, kClientAddress, IOP_SID_LIBSD);
++            t.IsTrue(readGuestStruct<SifRpcClientData>(env.rpcRam, kClientAddress).server != 0u,
++                     "real Bind must create IOP ownership before null-RAM invalidation");
++            callRpc(env, kClientAddress, 0u, 0u, 0u, kReplyAddress, 4u);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "IOP request should complete before invalidation");
++            std::memset(env.rpcRam + kReplyAddress, 0xA5, 4u);
++            invalidateIopRpcBindings(nullptr);
++            callRpc(env, kClientAddress, 0u, 0u, 0u, kReplyAddress, 4u);
++            t.Equals(getRegS32(env.ctx, 2), -1, "host-only invalidation must retire the real IOP binding");
++            t.Equals(readGuestStruct<uint32_t>(env.rpcRam, kReplyAddress), 0xA5A5A5A5u,
++                     "retired host binding must preserve poisoned output even without descriptor writes");
++        });
++
++        tc.Run("real EE RPC server owns a SID shared with IOP and survives central reset", [](TestCase &t)
++        {
++            TestEnv env(true);
++            uint8_t *const ram = env.rpcRam;
++            constexpr uint32_t kSid = 0x80001300u;
++            constexpr uint32_t kVersionRpc = 0x80001363u;
++            constexpr uint32_t kServerAddress = 0x00038000u;
++            constexpr uint32_t kServerBuffer = 0x00038200u;
++            constexpr uint32_t kClientAddress = 0x00038300u;
++
++            t.IsTrue(env.runtime.loadIopModule("rom0:DBCMAN").moduleId > 0, "IOP route with the same SID must exist");
++            SifInitRpc(ram, &env.ctx, &env.runtime);
++            registerRpc(env, kServerAddress, kSid, kServerBuffer, 0u, kEeRpcFunction);
++            bindRpc(env, kClientAddress, kSid);
++            t.Equals(readGuestStruct<SifRpcClientData>(ram, kClientAddress).server, kServerAddress,
++                     "client must acquire the EE-owned provider");
++            std::memset(ram + kSameSidReplyAddress, 0xA5, 4u);
++            writeGuestU32(ram, kRpcResetInsideEe, 1u);
++            runEeRpc(env, kClientAddress, kVersionRpc, kSameSidReplyAddress);
++
++            t.Equals(readGuestStruct<uint32_t>(ram, kRpcExecCount), 1u, "real EE function must execute");
++            t.Equals(readGuestStruct<uint32_t>(ram, kRpcObservedReply), 0xA5A5A5A5u,
++                     "same-SID IOP route must not write the reply before EE dispatch");
++            t.Equals(readGuestStruct<uint32_t>(ram, kSameSidReplyAddress), kEeRpcReply,
++                     "reply must come from the EE function return buffer");
++            t.Equals(readGuestStruct<int32_t>(ram, kRpcCallStatus), KE_OK, "EE RPC completion should succeed");
++            t.IsFalse(PS2IopTransport::canBindRpc(&env.runtime, kSid),
++                      "an actual EE-owned frame must allow IOP reset during execution");
++            t.Equals(readGuestStruct<SifRpcClientData>(ram, kClientAddress).server, kServerAddress,
++                     "reset inside EE dispatch must preserve the EE binding");
++
++            t.IsTrue(env.runtime.loadIopModule("rom0:DBCMAN").moduleId > 0, "same-SID IOP route should reload");
++            PS2IopTransport::reset(&env.runtime);
++            t.IsFalse(PS2IopTransport::canBindRpc(&env.runtime, kSid), "central reset must retire the reloaded IOP route");
++            writeGuestU32(ram, kRpcResetInsideEe, 0u);
++            std::memset(ram + kSameSidReplyAddress, 0x5A, 4u);
++            runEeRpc(env, kClientAddress, kVersionRpc, kSameSidReplyAddress);
++            t.Equals(readGuestStruct<uint32_t>(ram, kRpcExecCount), 2u,
++                     "existing EE client must execute its real function again after central reset");
++            t.Equals(readGuestStruct<uint32_t>(ram, kSameSidReplyAddress), kEeRpcReply,
++                     "EE reply must survive the IOP reset epoch change");
++            t.Equals(readGuestStruct<SifRpcServerData>(ram, kServerAddress).func, kEeRpcFunction,
++                     "EE registration must retain its function across IOP resets");
++        });
++
+         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
+         {
+             TestEnv env;

@@ -1,0 +1,986 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_types.h b/ps2xIOP/include/ps2x/iop/iop_types.h
+index be0ad65..5261764 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_types.h
++++ b/ps2xIOP/include/ps2x/iop/iop_types.h
+@@ -104,6 +104,8 @@ namespace ps2x::iop
+         uint32_t guestFunction = 0;
+         uint32_t guestArguments[4]{};
+         uint32_t guestDefaultResultAddress = 0;
++        // Negative transport/execution failure; independent of an RPC reply.
++        int32_t failureResult = 0;
+     };
+ 
+     enum class SifTransferKind : uint32_t
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index d184508..f7178d2 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -33,6 +33,7 @@ namespace ps2x::iop::detail
+         m_nextEventFlagId = 1;
+         m_systemStatusEventFlag = 0;
+         m_currentThread = nullptr;
++        m_detachedSemaphoreWait = nullptr;
+     }
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+@@ -353,6 +354,30 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
++    bool IopKernel::attachDetachedSemaphoreWait(DetachedSemaphoreWait &wait) noexcept
++    {
++        if (m_detachedSemaphoreWait || m_currentThread || hasSemaphoreWaiter(wait.id) ||
++            m_semaphores.find(wait.id) == m_semaphores.end())
++            return false;
++        wait.acquired = wait.cancelled = false;
++        m_detachedSemaphoreWait = &wait;
++        wakeOneSemaphore(wait.id);
++        return true;
++    }
++
++    void IopKernel::detachDetachedSemaphoreWait(DetachedSemaphoreWait &wait) noexcept
++    {
++        if (m_detachedSemaphoreWait == &wait) m_detachedSemaphoreWait = nullptr;
++    }
++
++    bool IopKernel::hasSemaphoreWaiter(int id) const noexcept
++    {
++        for (const auto &[threadId, thread] : m_threads)
++            if (thread.state == IopThreadState::Semaphore && thread.waitId == id)
++                return true;
++        return false;
++    }
++
+     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const auto setV0 = [&](int32_t value)
+@@ -376,6 +401,8 @@ namespace ps2x::iop::detail
+             return true;
+         }
+         case 5:
++            if (hasDetachedSemaphoreWait(static_cast<int>(cpu.gpr[4])) && !m_detachedSemaphoreWait->acquired)
++                m_detachedSemaphoreWait->cancelled = true;
+             setV0(m_semaphores.erase(static_cast<int>(cpu.gpr[4])) != 0u ? 0 : -1);
+             return true;
+         case 6:
+@@ -456,6 +483,14 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::wakeOneSemaphore(int id)
+     {
++        const auto semaphore = m_semaphores.find(id);
++        if (hasDetachedSemaphoreWait(id) && !m_detachedSemaphoreWait->acquired &&
++            !m_detachedSemaphoreWait->cancelled && semaphore != m_semaphores.end() && semaphore->second.current > 0)
++        {
++            --semaphore->second.current;
++            m_detachedSemaphoreWait->acquired = true;
++            return;
++        }
+         IopThread *best = nullptr;
+         for (auto &[threadId, thread] : m_threads)
+         {
+@@ -465,7 +500,6 @@ namespace ps2x::iop::detail
+                 best = &thread;
+         }
+ 
+-        const auto semaphore = m_semaphores.find(id);
+         if (best != nullptr && semaphore != m_semaphores.end() && semaphore->second.current > 0)
+         {
+             --semaphore->second.current;
+@@ -712,7 +746,7 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
+-        if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
++        if (thread.state != IopThreadState::Dead && (thread.cpu.pc == returnSentinel || thread.cpu.stopped))
+             thread.state = IopThreadState::Dormant;
+         else if (thread.state == IopThreadState::Running)
+             thread.state = IopThreadState::Ready;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 7816785..360513f 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -46,6 +46,20 @@ namespace ps2x::iop::detail
+     class IopKernel
+     {
+     public:
++        // A scoped synchronous caller participates in the existing semaphore
++        // handoff while its exact CPU/C++ frame remains held by the executor.
++        struct DetachedSemaphoreWait
++        {
++            int id;
++            bool acquired = false;
++            bool cancelled = false;
++        };
++        [[nodiscard]] bool attachDetachedSemaphoreWait(DetachedSemaphoreWait &wait) noexcept;
++        void detachDetachedSemaphoreWait(DetachedSemaphoreWait &wait) noexcept;
++        [[nodiscard]] bool hasDetachedSemaphoreWait(int id) const noexcept
++        { return m_detachedSemaphoreWait && m_detachedSemaphoreWait->id == id; }
++        [[nodiscard]] bool hasPendingDetachedSemaphoreWait(int id) const noexcept
++        { return hasDetachedSemaphoreWait(id) && !m_detachedSemaphoreWait->acquired; }
+         explicit IopKernel(IopMemory &memory) noexcept;
+ 
+         void reset();
+@@ -67,6 +81,10 @@ namespace ps2x::iop::detail
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
++        [[nodiscard]] bool hasCurrentThread() const noexcept { return m_currentThread != nullptr; }
++        [[nodiscard]] bool ownsCurrentCpu(const IopCpuState &cpu) const noexcept
++        { return m_currentThread && &m_currentThread->cpu == &cpu; }
++        [[nodiscard]] bool hasSemaphoreWaiter(int id) const noexcept;
+ 
+     private:
+         struct Semaphore
+@@ -100,5 +118,6 @@ namespace ps2x::iop::detail
+         uint32_t m_nextEventFlagId = 1;
+         int m_systemStatusEventFlag = 0;
+         IopThread *m_currentThread = nullptr;
++        DetachedSemaphoreWait *m_detachedSemaphoreWait = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 251cb13..5e259ab 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -140,6 +140,8 @@ namespace ps2x::iop::detail
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+             activeCpu = nullptr;
++            rpcWaitCpu = nullptr;
++            rpcInstructionDeadline = rpcCycleDeadline = 0u;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+@@ -283,6 +285,78 @@ namespace ps2x::iop::detail
+             }
+             if (iequals(call.library, "thsemap"))
+             {
++                if (call.ordinal == 8u && rpcWaitCpu != nullptr && &cpu == rpcWaitCpu)
++                {
++                    if (kernel.hasCurrentThread() || servicingDmaInterrupts || servicingGuestCallbacks)
++                    {
++                        resetRequired = true;
++                        cpu.executionFault = true;
++                        setV0(uint32_t(-5));
++                        return ImportDisposition::Handled;
++                    }
++                    const int id = static_cast<int>(a0);
++                    if (kernel.hasSemaphoreWaiter(id))
++                    {
++                        resetRequired = true;
++                        cpu.executionFault = true;
++                        setV0(uint32_t(-5));
++                        return ImportDisposition::Handled;
++                    }
++                    (void)kernel.dispatchSemaphoreImport(9u, cpu);
++                    if (int32_t(cpu.gpr[2]) != -419)
++                        return ImportDisposition::Handled;
++                    IopKernel::DetachedSemaphoreWait wait{id};
++                    if (!kernel.attachDetachedSemaphoreWait(wait))
++                        resetRequired = true;
++                    struct WaitGuard
++                    {
++                        IopKernel &kernel;
++                        IopKernel::DetachedSemaphoreWait &wait;
++                        ~WaitGuard() { kernel.detachDetachedSemaphoreWait(wait); }
++                    };
++                    const WaitGuard waitGuard{kernel, wait};
++                    while (!resetRequired && !wait.acquired)
++                    {
++                        if (wait.cancelled || kernel.hasSemaphoreWaiter(id) || rpcBudgetExhausted() ||
++                            !runCyclesCore(kDefaultSlice, true))
++                        {
++                            resetRequired = true;
++                            break;
++                        }
++                    }
++                    if (!resetRequired && wait.acquired)
++                    {
++                        setV0(0u);
++                        return ImportDisposition::Handled;
++                    }
++                    cpu.executionFault = true;
++                    setV0(uint32_t(-5));
++                    return ImportDisposition::Handled;
++                }
++                if (call.ordinal == 8u && rpcWaitCpu && &cpu != rpcWaitCpu &&
++                    (!kernel.ownsCurrentCpu(cpu) || kernel.hasPendingDetachedSemaphoreWait(static_cast<int>(a0))))
++                {
++                    // An IRQ/callback must not borrow a scheduler thread's
++                    // identity, and a real waiter must not race detached polling.
++                    // Immediate/invalid waits retain their kernel result.
++                    if (kernel.hasPendingDetachedSemaphoreWait(static_cast<int>(a0)))
++                    {
++                        resetRequired = true;
++                        cpu.executionFault = true;
++                        setV0(uint32_t(-5));
++                    }
++                    else
++                    {
++                        (void)kernel.dispatchSemaphoreImport(9u, cpu);
++                        if (int32_t(cpu.gpr[2]) == -419)
++                        {
++                            resetRequired = true;
++                            cpu.executionFault = true;
++                            setV0(uint32_t(-5));
++                        }
++                    }
++                    return ImportDisposition::Handled;
++                }
+                 return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+@@ -428,10 +502,13 @@ namespace ps2x::iop::detail
+ 
+             if (const auto import = imports.decode(cpu.pc))
+             {
++                // A checked call charges the import before nested execution;
++                // suspended import frames cannot add counters after deadline.
++                const bool counted = rpcWaitCpu != nullptr;
++                if (counted) { ++totalInstructions; ++totalCycles; }
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 if (disposition == ImportDisposition::Missing) cpu.missingImport = true;
+-                ++totalInstructions;
+-                ++totalCycles;
++                if (!counted) { ++totalInstructions; ++totalCycles; }
+                 if (disposition == ImportDisposition::JumpToGuest)
+                     return true;
+                 cpu.pc = cpu.gpr[31];
+@@ -461,8 +538,21 @@ namespace ps2x::iop::detail
+             const uint64_t start = totalInstructions;
+             while (!resetRequired && !cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+             {
++                // Reaching a return sentinel is completion, not an instruction.
++                if (cpu.pc == kCallReturnSentinel || cpu.pc == kThreadReturnSentinel)
++                {
++                    cpu.stopped = true;
++                    break;
++                }
++                if (rpcWaitCpu && rpcBudgetExhausted())
++                {
++                    resetRequired = true;
++                    break;
++                }
+                 if (!step(cpu))
+                     break;
++                if (rpcWaitCpu && (cpu.missingImport || cpu.executionFault))
++                    resetRequired = true;
+                 if (resetRequired) break;
+                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                     servicePendingDmaInterrupts();
+@@ -482,7 +572,8 @@ namespace ps2x::iop::detail
+                               uint32_t budget = kMaxCallInstructions,
+                               bool *returned = nullptr,
+                               std::span<const uint32_t> stackArguments = {},
+-                              bool *started = nullptr)
++                              bool *started = nullptr,
++                              bool permitRpcWait = false)
+         {
+             if (returned) *returned = false;
+             if (started) *started = false;
+@@ -528,11 +619,50 @@ namespace ps2x::iop::detail
+                 !memory.writeRam(cpu.gpr[29] + 16u, stackArguments.data(), stackArguments.size_bytes()))
+                 return uint32_t(-14);
+             if (started) *started = true;
++            struct RpcWaitGuard
++            {
++                Impl &state;
++                CpuState *previous;
++                ~RpcWaitGuard() { state.rpcWaitCpu = previous; }
++            };
++            const RpcWaitGuard waitGuard{*this, rpcWaitCpu};
++            if (permitRpcWait)
++            {
++                rpcWaitCpu = &cpu;
++                rpcInstructionDeadline = totalInstructions + budget;
++                rpcCycleDeadline = totalCycles + uint64_t(budget);
++            }
+             runCpu(cpu, budget);
+-            if (returned) *returned = !resetRequired && cpu.pc == kCallReturnSentinel && !cpu.yielded && !cpu.missingImport && !cpu.executionFault;
++            const bool completed = !resetRequired && cpu.pc == kCallReturnSentinel && !cpu.yielded && !cpu.missingImport && !cpu.executionFault;
++            if (rpcWaitCpu && !completed) resetRequired = true;
++            if (returned) *returned = completed;
+             return cpu.gpr[2];
+         }
+ 
++        bool rpcBudgetExhausted() const noexcept
++        {
++            return totalInstructions >= rpcInstructionDeadline || totalCycles >= rpcCycleDeadline;
++        }
++
++        IopGuestCallStatus executeRpcFunctionChecked(
++            uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++            uint32_t gp, uint32_t budget, uint32_t &result) override
++        {
++            if (resetRequired) { result = uint32_t(-5); return IopGuestCallStatus::ResetRequired; }
++            // Reentrant RPC dispatch cannot borrow another CPU/thread's owner.
++            if (callDepth != 0u || activeCpu || kernel.hasCurrentThread() || budget == 0u)
++            { result = uint32_t(-5); return IopGuestCallStatus::Rejected; }
++            bool returned = false, started = false;
++            try { result = callFunction(address, a0, a1, a2, a3, gp, budget, &returned, {}, &started, true); }
++            catch (...) { result = uint32_t(-5); if (started) resetRequired = true; }
++            if (resetRequired) { result = uint32_t(-5); return IopGuestCallStatus::ResetRequired; }
++            if (returned) return IopGuestCallStatus::Completed;
++            result = uint32_t(-5);
++            if (!started) return IopGuestCallStatus::Rejected;
++            resetRequired = true;
++            return IopGuestCallStatus::ResetRequired;
++        }
++
+         uint32_t executeGuestFunction(uint32_t address,
+                                       uint32_t a0,
+                                       uint32_t a1,
+@@ -665,14 +795,16 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
+-        void runCycles(uint64_t cycles) noexcept
++        bool runCyclesCore(uint64_t cycles, bool checked) noexcept
+         {
+-            if (resetRequired) return;
++            if (resetRequired) return false;
+             try
+             {
+-                const uint64_t target = totalCycles + cycles;
++                const uint64_t target = checked && rpcWaitCpu
++                    ? std::min(totalCycles + cycles, rpcCycleDeadline) : totalCycles + cycles;
+                 while (totalCycles < target && !resetRequired)
+                 {
++                    if (checked && rpcWaitCpu && rpcBudgetExhausted()) { resetRequired = true; break; }
+                     servicePendingDmaInterrupts();
+                     if (resetRequired) break;
+                     servicePendingGuestCallbacks();
+@@ -692,8 +824,20 @@ namespace ps2x::iop::detail
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
+-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
++                    {
++                        struct TimesliceGuard
++                        {
++                            IopKernel &kernel;
++                            IopThread &thread;
++                            ~TimesliceGuard() { kernel.endTimeslice(thread, kThreadReturnSentinel); }
++                        };
++                        const TimesliceGuard ownerGuard{kernel, *next};
++                        runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                        if (checked && (next->cpu.missingImport || next->cpu.executionFault ||
++                            (next->cpu.stopped && next->cpu.pc != kThreadReturnSentinel &&
++                             !(next->cpu.yielded && (next->state == IopThreadState::Dormant || next->state == IopThreadState::Dead)))))
++                            resetRequired = true;
++                    }
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
+@@ -701,7 +845,14 @@ namespace ps2x::iop::detail
+             catch (...)
+             {
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
++                if (checked) resetRequired = true;
+             }
++            return !resetRequired;
++        }
++
++        void runCycles(uint64_t cycles) noexcept
++        {
++            (void)runCyclesCore(cycles, false);
+         }
+ 
+         bool readOwnedString(uint32_t address, std::string &out)
+@@ -910,6 +1061,9 @@ namespace ps2x::iop::detail
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
+         CpuState *activeCpu = nullptr;
++        CpuState *rpcWaitCpu = nullptr;
++        uint64_t rpcInstructionDeadline = 0;
++        uint64_t rpcCycleDeadline = 0;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+@@ -1059,4 +1213,5 @@ namespace ps2x::iop::detail
+ 
+ #ifdef PS2X_IOP_TEST_BOUNDARIES
+ #include "../../tests/iop_device_callback_boundaries.inc"
++#include "../../tests/iop_rpc_wait_boundaries.inc"
+ #endif
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 430623a..4f645ef 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -50,6 +50,7 @@ namespace ps2x::iop::detail
+     private:
+         // Defined only in the boundary-test translation unit; no runtime API.
+         friend bool testIopDeviceCallbackBoundaries();
++        friend bool testIopRpcWaitBoundaries();
+         class Impl;
+         std::unique_ptr<Impl> m_impl;
+     };
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 7c45f65..fe2984d 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -352,7 +352,7 @@ namespace ps2x::iop::detail
+         if (serverIt == m_servers.end() || serverIt->second.function == 0u)
+             return result;
+ 
+-        RpcServer &server = serverIt->second;
++        const RpcServer server = serverIt->second;
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
+@@ -364,12 +364,21 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
+-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
++        uint32_t returnPointer = 0u;
++        const IopGuestCallStatus status = executor.executeRpcFunctionChecked(server.function,
+                                                                request.function,
+                                                                server.buffer,
+                                                                request.send.size,
+                                                                0u,
+-                                                               server.gp);
++                                                               server.gp, 2000000u, returnPointer);
++        if (status != IopGuestCallStatus::Completed)
++        {
++            result.handled = true;
++            result.failureResult = -5;
++            result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
++            result.callbackPolicy = CallbackPolicy::Suppress;
++            return result;
++        }
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index ed60088..5e1ce37 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -25,6 +25,16 @@ namespace ps2x::iop::detail
+     public:
+         virtual ~IopGuestExecutor() = default;
+ 
++        // Only this checked native RPC entry may retain a detached CPU while
++        // pumping the existing scheduler to satisfy a semaphore wait.
++        [[nodiscard]] virtual IopGuestCallStatus executeRpcFunctionChecked(
++            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
++            uint32_t, uint32_t &result)
++        {
++            result = uint32_t(-48);
++            return IopGuestCallStatus::Rejected;
++        }
++
+         // Checked synchronous o32 call with arguments beyond a0..a3. Executors
+         // without this ABI must fail rather than report callback completion.
+         [[nodiscard]] virtual IopGuestCallStatus executeGuestFunctionWithStackArgumentsChecked(
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index 17c9aba..8eb7f2f 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ namespace ps2x::iop::detail { bool testIopDeviceCallbackBoundaries(); }
++namespace ps2x::iop::detail { bool testIopRpcWaitBoundaries(); }
+ 
+ namespace
+ {
+@@ -604,6 +605,7 @@ int main()
+                    testDevctlGuestAbiAndScratchReuse() &&
+                    testDevctlIncompleteRequiresReset() &&
+                    testIopDeviceCallbackBoundaries() &&
++                   testIopRpcWaitBoundaries() &&
+                    testDevctlRejectsInvalidCallsBeforeCallback() &&
+                    testDestructorRevokesHostHandle()
+                ? 0
+diff --git a/ps2xIOP/tests/iop_rpc_wait_boundaries.inc b/ps2xIOP/tests/iop_rpc_wait_boundaries.inc
+new file mode 100644
+index 0000000..ed53fa7
+--- /dev/null
++++ b/ps2xIOP/tests/iop_rpc_wait_boundaries.inc
+@@ -0,0 +1,308 @@
++// Included by the existing private emulator boundary-test target only.
++namespace ps2x::iop::detail
++{
++    bool testIopRpcWaitBoundaries()
++    {
++        using iop_test::require;
++        using Impl = IopEmulator::Impl;
++        const auto words = [](Impl &state, uint32_t address, std::initializer_list<uint32_t> values)
++        {
++            for (uint32_t value : values) { state.memory.write32(address, value); address += 4u; }
++        };
++        const auto prepare = [&](Impl &state, uint32_t id = 1u)
++        {
++            words(state, 0x12000u, {0x41E00000u, 0u, 0x0101u});
++            require(state.memory.writeRam(0x1200Cu, "thsemap", 8u), "wait fixture import name");
++            words(state, 0x12014u, {0x03E00008u, 0x24000008u, // WaitSema
++                                   0x03E00008u, 0x24000009u, // PollSema
++                                   0x03E00008u, 0x24000007u, 0u, 0u}); // iSignalSema
++            words(state, 0x11000u, {
++                0x27BDFFE0u, 0xAFBF001Cu, 0xAFBC0018u,
++                0x34040000u | id, 0x0C004805u, 0u,
++                0x3C080001u, 0x34090001u, 0xAD094000u,
++                0xAD1C4004u, 0xAD1D4008u, 0x8FA9001Cu, 0u, 0xAD09400Cu,
++                0x34040000u | id, 0x0C004805u, 0u,
++                0x3C080001u, 0x34090002u, 0xAD094000u,
++                0x35024000u, 0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            words(state, 0x11200u, {
++                0x3C080001u, 0x8D094010u, 0u, 0x25290001u, 0xAD094010u,
++                0x34040001u, 0x08004809u, 0u,
++            });
++            words(state, 0x11400u, {
++                0x27BDFFE0u, 0xAFBF001Cu, 0x34040001u, 0x0C004805u, 0u,
++                0x3C020001u, 0x34424000u, 0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            words(state, 0x13000u, {0u, 0u, 0u, 1u});
++            IopCpuState create{};
++            create.gpr[4] = 0x13000u;
++            require(state.kernel.dispatchSemaphoreImport(4u, create) && create.gpr[2] == 1u,
++                    "create empty semaphore");
++        };
++        const auto thread = [&](Impl &state, uint32_t function)
++        {
++            words(state, 0x13300u, {0u, 0u, function, 0x400u, 10u});
++            IopCpuState cpu{};
++            cpu.gpr[4] = 0x13300u;
++            require(state.kernel.dispatchThreadImport(4u, cpu, state.totalCycles), "create owned thread");
++            const uint32_t id = cpu.gpr[2];
++            cpu.gpr[4] = id;
++            require(state.kernel.dispatchThreadImport(6u, cpu, state.totalCycles) && cpu.gpr[2] == 0u,
++                    "start owned thread");
++            return id;
++        };
++        try
++        {
++            // Real MIPS calls, two distinct asynchronous signals, same frame.
++            iop_test::Host host;
++            Impl state(host);
++            prepare(state);
++            for (const auto [irq, cycle] : {std::pair{36u, 100u}, std::pair{40u, 500u}})
++            {
++                IopCpuState registration{};
++                registration.gpr[4] = irq;
++                registration.gpr[6] = 0x11200u;
++                require(state.intrman.dispatchImport(4u, registration, state) &&
++                        state.intrman.dispatchImport(6u, registration, state), "register and enable DMA IRQ");
++                state.pendingDmaInterrupts.emplace(int(irq), cycle);
++            }
++            uint32_t result = 0u;
++            require(state.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0x165432u, 2000u, result)
++                        == IopGuestCallStatus::Completed && result == 0x14000u,
++                    "two waits did not return through held native RPC");
++            require(state.memory.read32(0x14000u) == 2u && state.memory.read32(0x14010u) == 2u &&
++                    state.memory.read32(0x14004u) == 0x165432u &&
++                    state.memory.read32(0x14008u) == kCallStackLimit - 64u &&
++                    state.memory.read32(0x1400Cu) == kCallReturnSentinel,
++                    "callback/chunk count or original GP/SP/RA frame changed");
++            IopCpuState poll{}; poll.gpr[4] = 1u;
++            require(state.kernel.dispatchSemaphoreImport(9u, poll) && int32_t(poll.gpr[2]) == -419,
++                    "signals were not consumed exactly once");
++            require(!state.activeCpu && !state.rpcWaitCpu && !state.kernel.hasCurrentThread() && state.callDepth == 0u,
++                    "successful call leaked execution ownership");
++
++            // Both IRQs fire in one pump. Reservation of the first signal must
++            // leave room for the second even when maximum semaphore count is 1.
++            iop_test::Host doubleHost; Impl doubleSignal(doubleHost); prepare(doubleSignal);
++            for (uint32_t irq : {36u, 40u})
++            {
++                IopCpuState registration{};
++                registration.gpr[4] = irq; registration.gpr[6] = 0x11200u;
++                require(doubleSignal.intrman.dispatchImport(4u, registration, doubleSignal) &&
++                        doubleSignal.intrman.dispatchImport(6u, registration, doubleSignal), "same-pump IRQ setup");
++                doubleSignal.pendingDmaInterrupts.emplace(int(irq), 100u);
++            }
++            require(doubleSignal.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::Completed && doubleSignal.memory.read32(0x14000u) == 2u &&
++                    doubleSignal.memory.read32(0x14010u) == 2u,
++                    "same-pump signals collapsed instead of reserving the first token");
++            poll.gpr[4] = 1u;
++            require(doubleSignal.kernel.dispatchSemaphoreImport(9u, poll) && int32_t(poll.gpr[2]) == -419,
++                    "two waits did not consume exactly two same-pump signals");
++
++            // A real worker signals then polls before the pump returns. The
++            // pending RPC already owns that first token, so its poll must fail.
++            iop_test::Host stealHost; Impl steal(stealHost); prepare(steal);
++            words(steal, 0x11500u, {
++                0x27BDFFE0u, 0xAFBF001Cu, 0x34040001u, 0x0C004809u, 0u,
++                0x34040001u, 0x0C004807u, 0u,
++                0x3C080001u, 0xAD024014u,
++                0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            thread(steal, 0x11500u);
++            require(steal.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::Completed && int32_t(steal.memory.read32(0x14014u)) == -419 &&
++                    !steal.kernel.hasDetachedSemaphoreWait(1), "competing poll stole the reserved RPC token");
++
++            // Normal JAL ExitThread/ExitDeleteThread terminates the producer,
++            iop_test::Host acquiredHost; Impl acquired(acquiredHost); prepare(acquired);
++            words(acquired, 0x11500u, {
++                0x27BDFFE0u, 0xAFBF001Cu,
++                0x34040001u, 0x0C004809u, 0u, 0x34040001u, 0x0C004809u, 0u,
++                0x34040001u, 0x0C004805u, 0u, 0x3C080001u, 0xAD024018u,
++                0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            acquired.memory.write32(0x14018u, 0xBADu);
++            thread(acquired, 0x11500u);
++            require(acquired.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::Completed && acquired.memory.read32(0x14018u) == 0u,
++                    "acquired reservation rejected worker's safe wait on the second signal");
++
++            iop_test::Host tailHost; Impl tail(tailHost); prepare(tail);
++            words(tail, 0x11400u, {0x34040001u, 0x08004805u, 0u});
++            tail.pendingGuestCallbacks.emplace(90u, Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++            require(tail.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 100u, result)
++                        == IopGuestCallStatus::Completed && result == 0u && tail.totalCycles == 100u &&
++                    tail.totalInstructions < 100u && !tail.kernel.hasDetachedSemaphoreWait(1),
++                    "completed tail wait was rejected at the exact cycle deadline");
++
++            // Normal JAL ExitThread/ExitDeleteThread terminates the producer,
++            // with an internal RA rather than the thread-return sentinel.
++            for (uint32_t ordinal : {8u, 9u})
++            {
++                iop_test::Host exitHost; Impl exiting(exitHost); prepare(exiting);
++                words(exiting, 0x12080u, {0x41E00000u, 0u, 0x0101u});
++                require(exiting.memory.writeRam(0x1208Cu, "thbase", 7u), "exit import table");
++                words(exiting, 0x12094u, {0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++                words(exiting, 0x11500u, {0x34040001u, 0x0C004809u, 0u, 0x0C004825u, 0u});
++                thread(exiting, 0x11500u);
++                require(exiting.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                            == IopGuestCallStatus::Completed && !exiting.kernel.hasCurrentThread() &&
++                        !exiting.activeCpu && !exiting.rpcWaitCpu && exiting.kernel.threadCount() == (ordinal == 8u ? 1u : 0u),
++                        "normal worker exit poisoned RPC or leaked ownership");
++            }
++
++            // A worker erases and replaces the server while the RPC waits. Its
++            // zero return must use the submitting server's default reply buffer.
++            iop_test::Host replaceHost; Impl replacing(replaceHost); prepare(replacing);
++            auto replaceImage = iop_test::rpcServer(0x81234567u, 0x12345678u);
++            replaceImage.words(0x300u, {
++                0x27BDFFE0u, 0xAFBF001Cu, 0x34040001u, 0x0C004805u, 0u,
++                0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0x00001021u,
++            });
++            require(replacing.loadImage("host:replace.irx", replaceImage.bytes, nullptr, 0u).moduleId > 0,
++                    "replaceable native server load");
++            words(replacing, 0x1007Cu, {0x03E00008u, 0x24000018u,
++                                       0x03E00008u, 0x24000011u, 0u, 0u});
++            words(replacing, 0x11500u, {
++                0x27BDFFE0u, 0xAFBF001Cu,
++                0x3C040001u, 0x34840200u, 0x0C00401Fu, 0u,
++                0x3C040001u, 0x34843040u, 0x3C058123u, 0x34A54567u,
++                0x3C060001u, 0x34C61580u, 0x3C070001u, 0x34E74100u,
++                0xAFA00010u, 0xAFA00014u, 0xAFA00018u, 0x0C004021u, 0u,
++                0x34040001u, 0x8FBF001Cu, 0u, 0x27BD0020u, 0x08004809u, 0u,
++            });
++            words(replacing, 0x11580u, {0x3C020001u, 0x34424100u, 0x03E00008u, 0u});
++            words(replacing, 0x14100u, {0x8765ABCDu, 0x8765ABCDu, 0x8765ABCDu, 0x8765ABCDu});
++            thread(replacing, 0x11500u);
++            auto replacementReply = replacing.rpc.handleRpc(iop_test::request(0x81234567u, 1u), replacing);
++            require(replacementReply.handled && replacementReply.failureResult == 0 && replaceHost.word(0x800u) == 0x12345678u,
++                    "RPC did not retain original server metadata across replacement");
++            replacementReply = replacing.rpc.handleRpc(iop_test::request(0x81234567u, 1u), replacing);
++            require(replacementReply.handled && replacementReply.failureResult == 0 && replaceHost.word(0x800u) == 0x8765ABCDu,
++                    "next RPC did not use replacement metadata");
++
++            // Invalid IDs are ordinary guest errors, not transport failure.
++            iop_test::Host invalidHost; Impl invalid(invalidHost); prepare(invalid);
++            words(invalid, 0x11400u, {0x34040063u, 0x08004805u, 0u});
++            require(invalid.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 100u, result)
++                        == IopGuestCallStatus::Completed && int32_t(result) == -1 && !invalid.resetRequired,
++                    "invalid semaphore changed the guest error contract");
++
++            // Owned threads retain the kernel's real blocking behavior.
++            thread(invalid, 0x11400u);
++            IopThread *owned = invalid.kernel.beginNextReady(invalid.totalCycles);
++            require(owned != nullptr, "owned wait fixture not ready");
++            owned->cpu.gpr[4] = 1u;
++            require(invalid.kernel.dispatchSemaphoreImport(8u, owned->cpu) && owned->cpu.yielded &&
++                    owned->state == IopThreadState::Semaphore, "ordinary owned wait no longer blocks");
++            invalid.kernel.endTimeslice(*owned, kThreadReturnSentinel);
++            require(invalid.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 100u, result)
++                        == IopGuestCallStatus::ResetRequired,
++                    "detached polling competed with an existing waiter");
++
++            iop_test::Host competitorHost; Impl competitor(competitorHost); prepare(competitor);
++            words(competitor, 0x11400u, {0x34040001u, 0x08004805u, 0u});
++            thread(competitor, 0x11400u);
++            require(competitor.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && !competitor.kernel.hasCurrentThread() &&
++                    competitor.memory.read32(0x14000u) == 0u,
++                    "new scheduled waiter raced held-RPC token acquisition");
++
++            // The second wait does not renew the absolute cycle budget.
++            iop_test::Host timeoutHost; Impl timeout(timeoutHost); prepare(timeout);
++            timeout.pendingGuestCallbacks.emplace(100u, Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++            timeout.pendingGuestCallbacks.emplace(1500u, Impl::ScheduledGuestCallback{0x11200u, 0u, 0u});
++            require(timeout.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && timeout.totalCycles <= 1001u &&
++                    timeout.memory.read32(0x14000u) == 1u && timeout.memory.read32(0x14010u) == 1u &&
++                    !timeout.kernel.hasDetachedSemaphoreWait(1),
++                    "second wait renewed deadline or resumed without its signal");
++
++            // A scheduled CPU's architectural fault restores current ownership.
++            iop_test::Host faultHost; Impl fault(faultHost); prepare(fault);
++            words(fault, 0x11500u, {0x0000000Du}); // BREAK
++            thread(fault, 0x11500u);
++            require(fault.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && !fault.kernel.hasCurrentThread() &&
++                    !fault.activeCpu && !fault.rpcWaitCpu && fault.callDepth == 0u &&
++                    fault.memory.read32(0x14000u) == 0u,
++                    "scheduler fault completed RPC or leaked its owner");
++
++            // Exceptions from a real scheduled device read restore ownership.
++            iop_test::Host throwHost; Impl throwing(throwHost); prepare(throwing);
++            words(throwing, 0x11500u, {0x3C081F40u, 0x8D09200Cu, 0u, 0x03E00008u, 0u});
++            throwing.memory.setCdvdDiscTypeReader([]() -> uint8_t { throw std::runtime_error("injected device read failure"); });
++            thread(throwing, 0x11500u);
++            require(throwing.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && !throwing.kernel.hasCurrentThread() &&
++                    !throwing.activeCpu && !throwing.rpcWaitCpu && throwing.callDepth == 0u &&
++                    throwing.memory.read32(0x14000u) == 0u,
++                    "scheduler exception was swallowed or leaked execution ownership");
++
++            // Nested guest execution shares the outer instruction deadline.
++            iop_test::Host nestedHost; Impl nested(nestedHost); prepare(nested);
++            words(nested, 0x11500u, {0x08004540u, 0u}); // infinite callback
++            nested.pendingGuestCallbacks.emplace(100u, Impl::ScheduledGuestCallback{0x11500u, 0u, 0u});
++            require(nested.executeRpcFunctionChecked(0x11000u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && nested.totalInstructions <= 1001u &&
++                    !nested.servicingGuestCallbacks && !nested.activeCpu && !nested.rpcWaitCpu,
++                    "nested execution escaped the RPC budget or ownership guard");
++
++            // Bridge failure is handled and cannot copy or request completion.
++            iop_test::Host recursiveHost; Impl recursive(recursiveHost); prepare(recursive);
++            words(recursive, 0x12300u, {0x41E00000u, 0u, 0x0101u});
++            require(recursive.memory.writeRam(0x1230Cu, "intrman", 8u), "recursive import table");
++            words(recursive, 0x12314u, {0x03E00008u, 0x2400000Eu, 0u, 0u});
++            words(recursive, 0x11500u, {0x3C040001u, 0x34841500u, 0x080048C5u, 0u});
++            require(recursive.executeRpcFunctionChecked(0x11500u, 0u, 0u, 0u, 0u, 0u, 100u, result)
++                        == IopGuestCallStatus::ResetRequired && recursive.totalInstructions == 100u &&
++                    recursive.totalCycles == 100u && recursive.callDepth == 0u && !recursive.activeCpu && !recursive.rpcWaitCpu,
++                    "suspended recursive imports incremented counters past the absolute budget");
++
++            // Deleting a pending semaphore fails the checked call and detaches
++            // its scoped reservation rather than completing without a token.
++            iop_test::Host deleteHost; Impl deleting(deleteHost); prepare(deleting);
++            words(deleting, 0x1202Cu, {0x03E00008u, 0x24000005u, 0u, 0u});
++            words(deleting, 0x11500u, {0x34040001u, 0x0800480Bu, 0u});
++            deleting.pendingGuestCallbacks.emplace(100u, Impl::ScheduledGuestCallback{0x11500u, 0u, 0u});
++            require(deleting.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::ResetRequired && !deleting.kernel.hasDetachedSemaphoreWait(1) &&
++                    !deleting.activeCpu && !deleting.rpcWaitCpu,
++                    "deleted pending semaphore completed RPC or leaked its reservation");
++
++            // Bridge failure is handled and cannot copy or request completion.
++            iop_test::Host deleteAcquiredHost; Impl deleteAcquired(deleteAcquiredHost); prepare(deleteAcquired);
++            words(deleteAcquired, 0x1202Cu, {0x03E00008u, 0x24000005u, 0u, 0u});
++            words(deleteAcquired, 0x11500u, {
++                0x27BDFFE0u, 0xAFBF001Cu, 0x34040001u, 0x0C004809u, 0u,
++                0x34040001u, 0x0C00480Bu, 0u,
++                0x8FBF001Cu, 0u, 0x27BD0020u, 0x03E00008u, 0u,
++            });
++            thread(deleteAcquired, 0x11500u);
++            require(deleteAcquired.executeRpcFunctionChecked(0x11400u, 0u, 0u, 0u, 0u, 0u, 1000u, result)
++                        == IopGuestCallStatus::Completed && !deleteAcquired.kernel.hasDetachedSemaphoreWait(1),
++                    "deletion revoked an already acquired token or leaked its reservation");
++
++            // Bridge failure is handled and cannot copy or request completion.
++            iop_test::Host bridgeHost; Impl bridge(bridgeHost);
++            auto image = iop_test::rpcServer(0x81234567u, 0x12345678u);
++            image.words(0x300u, {0x080040C0u, 0u}); // infinite native RPC
++            require(bridge.loadImage("host:failure.irx", image.bytes, nullptr, 0u).moduleId > 0,
++                    "native failing RPC server did not register");
++            const size_t writes = bridgeHost.guestWrites;
++            auto reply = bridge.rpc.handleRpc(iop_test::request(0x81234567u, 1u), bridge);
++            require(reply.handled && reply.failureResult < 0 && !reply.signalCompletion && !reply.signalNowaitCompletion &&
++                    reply.callbackPolicy == CallbackPolicy::Suppress && reply.serverDispatchPolicy == ServerDispatchPolicy::Suppress &&
++                    bridgeHost.guestWrites == writes && bridgeHost.word(0x800u) == 0xCCCCCCCCu,
++                    "failed native RPC copied reply or fell through to success");
++            std::cout << "PASS checked RPC wait/continuation/deadline/ownership/failure boundaries\n";
++            return true;
++        }
++        catch (const std::exception &error)
++        {
++            std::cerr << "FAIL checked RPC waits: " << error.what() << '\n';
++            return false;
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index 952fab2..899ffd4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -176,6 +176,7 @@ struct RpcClientState
+     uint32_t sid = 0;
+     RpcBindingOwner owner = RpcBindingOwner::None;
+     uint64_t iopEpoch = 0;
++    uint64_t activeCallSerial = 0;
+ };
+ 
+ struct SifRpcDebugEvent
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 87b316a..f9704bc 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -4,8 +4,20 @@
+ 
+ namespace ps2_syscalls
+ {
++    void detail::clearFailedIopRpcBusy(uint32_t clientAddress, const RpcClientState &submitted, uint64_t epoch)
++    {
++        std::lock_guard<std::mutex> lock(g_rpc_mutex);
++        const auto current = g_rpc_clients.find(clientAddress);
++        if (g_iop_rpc_binding_epoch == epoch && current != g_rpc_clients.end() &&
++            current->second.activeCallSerial == submitted.activeCallSerial && current->second.sid == submitted.sid &&
++            current->second.owner == submitted.owner && current->second.iopEpoch == submitted.iopEpoch)
++            current->second.busy = false;
++    }
++
+     namespace
+     {
++        // Assigned under g_rpc_mutex; rebinding resets a client's serial.
++        uint64_t nextRpcCallSerial = 0;
+         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
+         {
+             SifRpcDebugEvent event{};
+@@ -512,6 +524,7 @@ namespace ps2_syscalls
+         uint32_t sid = 0u;
+         bool iopBoundRequest = false;
+         uint64_t iopEpoch = 0;
++        RpcClientState submittedState{};
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             auto clientIt = g_rpc_clients.find(clientPtr);
+@@ -544,6 +557,8 @@ namespace ps2_syscalls
+             RpcClientState &state = clientIt->second;
+             state.busy = true;
+             state.last_rpc = rpcNum;
++            state.activeCallSerial = ++nextRpcCallSerial;
++            submittedState = state;
+             sid = state.sid;
+             eeOwnedRequest = state.owner == RpcBindingOwner::Ee;
+             // Even legacy unowned calls submitted to the IOP need retirement
+@@ -611,6 +626,13 @@ namespace ps2_syscalls
+ 
+             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+ 
++            if (iopResult.failureResult < 0)
++            {
++                detail::clearFailedIopRpcBusy(clientPtr, submittedState, iopEpoch);
++                setReturnS32(ctx, iopResult.failureResult);
++                return;
++            }
++
+             const bool currentIopRequest = !iopBoundRequest || isCurrentIopRpcEpoch(iopEpoch);
+             if (currentIopRequest && iopResult.signalNowaitCompletion &&
+                 (mode & kSifRpcModeNowait) != 0u)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+index e3ddc61..4e351da 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+@@ -2,8 +2,15 @@
+ 
+ #include "ps2_syscalls.h"
+ 
++struct RpcClientState;
++
+ namespace ps2_syscalls
+ {
++    namespace detail
++    {
++        // Shared failure boundary; caller snapshots identity under g_rpc_mutex.
++        void clearFailedIopRpcBusy(uint32_t clientAddress, const RpcClientState &submitted, uint64_t epoch);
++    }
+     void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index f5d74f3..c2fc5ed 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -3,6 +3,8 @@
+ #include "ps2_runtime_macros.h"
+ #include "ps2_iop_transport.h"
+ #include "Kernel/Syscalls/RPC.h"
++#include "Kernel/Syscalls/Helpers/State.h"
++#include "../../ps2xIOP/tests/iop_compat_test_support.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+ #include "runtime/ee_scheduler.h"
+@@ -24,9 +26,6 @@ namespace ps2_stubs
+ 
+ namespace
+ {
+-    constexpr int KE_OK = 0;
+-    constexpr int KE_SEMA_ZERO = -419;
+-
+     constexpr uint32_t K_SIF_RPC_MODE_NOWAIT = 0x01u;
+     constexpr uint32_t K_STACK_ADDR = 0x00100000u;
+     constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
+@@ -312,6 +311,64 @@ void register_ps2_sif_rpc_tests()
+ {
+     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
+     {
++        tc.Run("failed native RPC preserves reply and suppresses completion", [](TestCase &t)
++        {
++            TestEnv env(true);
++            auto image = iop_test::rpcServer(0x81234567u, 0x12345678u);
++            image.words(0x300u, {0x080040C0u, 0u}); // real native infinite loop
++            std::memcpy(env.rpcRam + 0x40000u, image.bytes.data(), image.bytes.size());
++            t.IsTrue(env.runtime.loadIopModuleBuffer(0x40000u).moduleId > 0, "native RPC server loads");
++            bindRpc(env, 0x38000u, 0x81234567u);
++            env.runtime.registerFunction(kRpcCallResume, rpcCallResume);
++            env.ctx.pc = kRpcCallResume;
++            env.runtime.eeScheduler().reset(env.rpcRam, env.ctx);
++            const int semaphore = env.runtime.eeScheduler().createSemaphore(0, 1, 0u, 0u);
++            auto client = readGuestStruct<SifRpcClientData>(env.rpcRam, 0x38000u);
++            client.hdr.sema_id = semaphore;
++            writeGuestStruct(env.rpcRam, 0x38000u, client);
++            std::memset(env.rpcRam + 0x39000u, 0xA5, 16u);
++            writeGuestU32(env.rpcRam, kRpcCallbackCount, 0u);
++            env.runtime.registerFunction(kRpcCallbackFunction, rpcCompletionCallback);
++            callRpc(env, 0x38000u, 1u, 0u, 0u, 0x39000u, 16u, kRpcCallbackFunction, uint32_t(semaphore));
++            t.Equals(getRegS32(env.ctx, 2), -5, "incomplete native call must return failure");
++            for (uint32_t i = 0u; i < 16u; ++i)
++                t.Equals(env.rpcRam[0x39000u + i], uint8_t(0xA5), "failure must preserve reply bytes");
++            t.Equals(env.runtime.eeScheduler().pollSemaphore(semaphore), -419, "failure must not signal completion");
++            t.IsFalse(g_rpc_clients.at(0x38000u).busy, "matching failed call must release busy");
++            // Drain actual queued work: a mistakenly queued end callback would
++            // run before this stop entry and change its marker/semaphore.
++            env.runtime.eeScheduler().run();
++            t.Equals(readGuestStruct<uint32_t>(env.rpcRam, kRpcCallbackCount), 0u, "failure must not queue end callback");
++            t.Equals(env.runtime.eeScheduler().pollSemaphore(semaphore), -419, "callback must not signal later");
++        });
++
++        tc.Run("failure cleanup preserves a rebound or newer RPC client", [](TestCase &t)
++        {
++            TestEnv env;
++            const uint32_t address = 0x38000u;
++            const RpcClientState submitted{true, 1u, 0x80001300u, RpcBindingOwner::Iop, g_iop_rpc_binding_epoch, 91u};
++            g_rpc_clients[address] = submitted;
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch);
++            t.IsFalse(g_rpc_clients.at(address).busy, "exact identity clears busy");
++            g_rpc_clients[address] = submitted;
++            ++g_rpc_clients[address].activeCallSerial;
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch);
++            t.IsTrue(g_rpc_clients.at(address).busy, "newer identical call retains busy");
++            g_rpc_clients[address] = {true, 1u, submitted.sid, RpcBindingOwner::Iop, submitted.iopEpoch, 0u};
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch);
++            t.IsTrue(g_rpc_clients.at(address).busy, "same-SID same-epoch rebind retains busy");
++            g_rpc_clients[address] = submitted;
++            g_rpc_clients[address].owner = RpcBindingOwner::Ee;
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch);
++            t.IsTrue(g_rpc_clients.at(address).busy, "EE binding retains busy");
++            g_rpc_clients[address] = submitted;
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch - 1u);
++            t.IsTrue(g_rpc_clients.at(address).busy, "retired epoch retains busy");
++            g_rpc_clients.erase(address);
++            detail::clearFailedIopRpcBusy(address, submitted, g_iop_rpc_binding_epoch);
++            t.IsTrue(g_rpc_clients.find(address) == g_rpc_clients.end(), "cleanup does not recreate removed binding");
++        });
++
+         tc.Run("SifInitRpc does not reset the running IOP", [](TestCase &t)
+         {
+             TestEnv env;

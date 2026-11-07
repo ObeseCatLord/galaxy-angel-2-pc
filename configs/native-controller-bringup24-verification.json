@@ -1,0 +1,32 @@
+{
+  "source_stack": 23,
+  "accepted_native_stack": 22,
+  "diagnostic_private_only": true,
+  "production_profile_enabled": false,
+  "generation_stack": 19,
+  "candidate_sha256": "0bd7908e89350824ce82c7e165bdba075af411ea3ba0bf1c2b334807db87b95a",
+  "fixture_sha256": "11194dd068dbd34531fb0dd510c7fc536ef2faa460eeccd5d51c5ec27b81b8bf",
+  "baseline22_sha256": "4e9998136e76a0090124835c51b77446e317bf783c77d4248a8f4f6a92e554be",
+  "fixture_expected_outcome_controls": 10,
+  "native_test_stimulus_macro": false,
+  "native_capture_seconds": 60.376,
+  "actual_EE_owner": 3,
+  "ordered_native_reply_publications": 28,
+  "reply_bytes_each": 64,
+  "opcodes": {"999": 14, "0": 14},
+  "visual_status": "memory-card-check-at15.2-and60.3-seconds",
+  "baseline_comparison": "preserved22-remains-magenta-in-separate60-second-capture",
+  "astra_evidence_review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_turn_settings_verified": true,
+    "disposition": "bounded-EE-side-observation-accepted; integration-held"
+  },
+  "STREAM17_reply_dependent_continuation_proven": false,
+  "audio_gameplay_saves_transitions_proven": false,
+  "first_IOP_failure": "actual-MCMAN-WaitSemaphore3-cycle-deadline",
+  "demonstrated_missing_effect": "original-SetAlarm35-returns0; runtime-schedules-no-alarm",
+  "next_design_review": "Astra-Ultra-bounded-private-one-shot-experiment-conditionally-approved; evidence-gap-closed; lifecycle-corrections-required",
+  "shipping_approved": false,
+  "review_document": "docs/reviews/native-controller-bringup24.md"
+}

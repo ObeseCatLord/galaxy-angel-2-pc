@@ -1,0 +1,1048 @@
+From 8a9fa9cc8c0fbd239530b0fbc571bc8320aab1ff Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:55:04 -0500
+Subject: [PATCH] runtime: GA2_FPS high frame rate clock, presentation per
+ flip, frame-timing oracle trace
+
+A second scheduler clock (FrameTick, fps*1000/1001 Hz, cycle- and host-paced like the
+VBLANK) that the game's RenderFlip waits on instead of WaitVSync (hooks in the game
+overrides); the GS scans out at the ticks while the game waits on it, the window loop
+shows every new frame (readback ring notifies, no 60 Hz cap, vsync swap interval).
+Native mode (GA2_FPS unset or 60) is unchanged.
+
+Oracle support (GA2_FRAMETRACE): trace writer, frame fingerprints and PNG shots, IOP
+key-on / CD read / RPC observers (iop_trace.h, kept out of iop_host.h), scripted pad
+(GA2_PAD_SCRIPT through the game hooks), GA2_FIXED_CLOCK (frozen CDVD RTC so runs are
+deterministic), per-thread CPU in the [ga2 fps] report.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/include/ps2x/iop/iop_trace.h        |  17 +
+ ps2xIOP/src/emulator/core/iop_memory.cpp    |  12 +
+ ps2xIOP/src/emulator/imports/iop_cdvd.cpp   |   9 +-
+ ps2xRuntime/CMakeLists.txt                  |   1 +
+ ps2xRuntime/include/runtime/ee_scheduler.h  |  23 ++
+ ps2xRuntime/include/runtime/ga2_framepace.h | 102 ++++++
+ ps2xRuntime/include/runtime/gs/gs_pgs.h     |   3 +
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp  |  81 ++++-
+ ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp |  17 +
+ ps2xRuntime/src/lib/ga2_framepace.cpp       | 344 ++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp           |  57 ++++
+ ps2xRuntime/src/lib/ps2_pad.cpp             |  13 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp         |  15 +-
+ 13 files changed, 690 insertions(+), 4 deletions(-)
+ create mode 100644 ps2xIOP/include/ps2x/iop/iop_trace.h
+ create mode 100644 ps2xRuntime/include/runtime/ga2_framepace.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_framepace.cpp
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_trace.h b/ps2xIOP/include/ps2x/iop/iop_trace.h
+new file mode 100644
+index 0000000..3b1afda
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_trace.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2x::iop
++{
++    // Diagnostics only (the runtime's GA2_FRAMETRACE oracle): called on the
++    // IOP/EE executor for each halfword the IOP writes to the SPU2 registers
++    // (offset within the SPU2 window) and each CD read it serves. Kept out of
++    // iop_host.h, which the generated game code includes.
++    struct TraceObservers
++    {
++        void (*spuWrite)(uint32_t offset, uint16_t value) = nullptr;
++        void (*cdRead)(uint32_t lsn, uint32_t sectors) = nullptr;
++    };
++    TraceObservers &traceObservers() noexcept;
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 334a6a2..89093fc 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -2,6 +2,7 @@
+ #include <cstdlib>
+ #include <algorithm>
+ #include "iop_memory.h"
++#include "ps2x/iop/iop_trace.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -9,6 +10,15 @@
+ #include <stdexcept>
+ #include <ga2/spu_device.h>
+ 
++namespace ps2x::iop
++{
++    TraceObservers &traceObservers() noexcept
++    {
++        static TraceObservers observers;
++        return observers;
++    }
++}
++
+ namespace ps2x::iop::detail
+ {
+     namespace
+@@ -217,6 +227,8 @@ namespace ps2x::iop::detail
+             accessSpu([&] {
+             if (phys & 1u) throw std::runtime_error("unaligned SPU halfword write");
+             m_spu->write16(phys, value);
++            if (const auto observer = ps2x::iop::traceObservers().spuWrite)
++                observer(phys - Spu2Base, value);
+             // Diagnostic shadow only: never replay a merged command or read DATA.
+             const uint32_t aligned = phys & ~3u, shift = (phys & 2u) * 8u;
+             auto &shadow = m_hardware[aligned];
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 308c253..7f17e7d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -6,6 +6,7 @@
+ #include "../core/iop_kernel.h"
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/iop_trace.h"
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
+@@ -535,7 +536,11 @@ namespace ps2x::iop::detail
+             else if (!subcommandParameterOverflow && value == 0x08u && subcommandParameters.empty())
+             {
+                 using namespace std::chrono;
+-                const auto now = floor<seconds>(system_clock::now()) + hours{9};
++                auto now = floor<seconds>(system_clock::now()) + hours{9};
++                // GA2_FIXED_CLOCK=<seconds since 1970 as the JST wall clock shows them>: a frozen RTC, so the games
++                // seed their RNG the same way in every run (the frame-rate oracle's runs are compared run to run).
++                if (const char *fixed = std::getenv("GA2_FIXED_CLOCK"); fixed && *fixed)
++                    now = time_point<system_clock, seconds>(seconds(std::atoll(fixed)));
+                 const auto day = floor<days>(now);
+                 const year_month_day date{day};
+                 const hh_mm_ss time{now - day};
+@@ -893,6 +898,8 @@ namespace ps2x::iop::detail
+ 
+         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
+         {
++            if (const auto observer = ps2x::iop::traceObservers().cdRead)
++                observer(lsn, sectors);
+             if (sectors == 0u)
+             {
+                 lastError = kCdvdErrorNone;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 28a1f63..d3f360a 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -403,6 +403,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ga2_vr_platform.cpp
+     src/lib/ga2_cheat_menu.cpp
+     src/lib/ga2_stereo.cpp
++    src/lib/ga2_framepace.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 86ef180..f04b799 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -263,6 +263,7 @@ enum class EeEventType : uint8_t
+     ExternalWake,
+     Alarm,
+     GsInterrupt, // INTC cause 0 (GS SIGNAL/FINISH)
++    FrameTick,   // GA2_FPS: the second clock (runtime/ga2_framepace.h); value = tick index
+ };
+ 
+ struct EeEvent
+@@ -402,6 +403,18 @@ public:
+     void completeExternalWait(uint32_t type, uint64_t token, int result);
+     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+ 
++    // GA2_FPS (runtime/ga2_framepace.h): a second clock with `fps*1000/1001`
++    // ticks per second, paced in EE cycles and host time like the VBLANK. The
++    // guest thread sleeps until its `interval`-th tick after the one it last
++    // woke at. Ticks count from the first wait.
++    void configureFrameClock(uint32_t fps) noexcept { m_frameFps = fps; }
++    [[nodiscard]] uint32_t frameClockFps() const noexcept { return m_frameFps; }
++    [[noreturn]] void waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion);
++    [[nodiscard]] uint64_t frameTicks() const noexcept { return m_frameTicks; }
++    // The game waited on the frame clock within the last few ticks: the GS
++    // scans out at ticks and not at the VBLANK.
++    [[nodiscard]] bool frameDriven() const noexcept;
++
+     [[nodiscard]] GuestThread *thread(int id);
+     [[nodiscard]] const GuestThread *thread(int id) const;
+     [[nodiscard]] EeSemaphore *semaphore(int id);
+@@ -531,6 +544,16 @@ private:
+     uint32_t m_gsVSyncCallback = 0;
+     uint32_t m_gsVSyncCallbackGp = 0;
+     uint32_t m_gsVSyncCallbackSp = 0;
++    // Frame clock (GA2_FPS).
++    uint32_t m_frameFps = 0;
++    bool m_frameClockOn = false;
++    uint64_t m_frameTicks = 0;       // ticks fired
++    uint64_t m_frameLastWake = 0;    // tick the game last woke at
++    uint64_t m_frameWaitTarget = 0;  // tick the waiting game thread wants
++    uint64_t m_frameLastWaitTick = 0;
++    bool m_frameWaiting = false;
++    uint64_t m_frameCycle0 = 0;      // EE cycle of tick 0
++    std::chrono::steady_clock::time_point m_frameHost0{};
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+     uint32_t m_invocationStackArenaBegin = 0u;
+     uint32_t m_invocationStackArenaEnd = 0u;
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+new file mode 100644
+index 0000000..0ee65e3
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -0,0 +1,102 @@
++// High frame rate (GA2_FPS=<61..240>) and the frame-timing oracle trace
++// (GA2_FRAMETRACE=<file>); docs/rendering/horplus-and-framerate.md.
++//
++// The games run one Update(dt) + Render per loop iteration and wait for the
++// VBLANK in RenderFlip. At GA2_FPS=N the game-side hooks
++// (native/compat/ga2_framerate.cpp) give the game dt = 1/(N*1000/1001) and
++// replace that wait with waitTick(): the scheduler keeps a second clock that
++// ticks N*1000/1001 times per second (cycle- and host-paced like the VBLANK
++// chain) and the guest thread sleeps until its next tick. The real VBLANK
++// (vsync counter, IOP, sound, movies) stays at 59.94 Hz. While the game
++// waits on that clock the GS scans out at every tick (a frame is shown for
++// each guest flip) instead of at the emulated VBLANK.
++//
++// Unset or 60 means native timing: nothing here changes behaviour then.
++#pragma once
++
++#include <cstdarg>
++#include <cstdint>
++
++class PS2Runtime;
++
++namespace ga2_framepace
++{
++    // GA2_FPS as an integer in 61..240; 0 = native (unset, 60, invalid, VR,
++    // software GS). Read once.
++    int fps();
++    inline bool enabled() { return fps() > 0; }
++    // Seconds per frame at fps(): 1001 / (1000 * fps) (the NTSC-style
++    // N*1000/1001 rate, so 120 is exactly twice the 59.94 Hz VBLANK).
++    float step();
++    // Frames per second at fps(): fps * 1000 / 1001.
++    double hz();
++
++    // Game thread: sleep until the `interval`-th next frame tick (counted from
++    // the tick this game thread last woke at, like the games' own VBLANK
++    // wait), then resume at `resumePc` with v0 = 0. Never returns.
++    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc);
++    // Frame ticks fired so far (0 when the clock never started).
++    uint64_t ticks(const PS2Runtime &runtime);
++
++    // Game thread: this game iteration runs at the native rate (59.94 Hz, the
++    // real VBLANK): the GS scans out at the VBLANK, not at the frame clock.
++    void setNative(bool native);
++    bool nativeNow();
++
++    // Game thread: the game is about to write new display registers (a flip).
++    void noteFlip();
++    uint64_t flips();
++    // Game time (ga2_trace) of the iteration whose frame the last flip showed.
++    double flipGameTime();
++
++    // Scheduler (EE thread): scan out at this tick? True when a flip happened
++    // since the last scan-out (or the screen was not refreshed for a while).
++    bool scanoutDue(uint64_t tick);
++    // Presentation thread: a new frame went to the window.
++    void notePresented();
++    // Scheduler: counters for the GA2_PERF line.
++    void notePresentTick(bool scannedOut);
++    void perfReport(uint64_t tick, uint64_t vsyncTick);
++}
++
++// Scripted pad for the oracle (GA2_PAD_SCRIPT, native/compat/ga2_framerate.cpp):
++// buttons the game sees held (active-high mask in the PS2 pad's bit values),
++// set per game iteration so that runs at different rates press at equal game
++// time. Combined with the real pad in PSPadBackend::readState.
++namespace ga2_framepace
++{
++    enum PadBit : uint16_t
++    {
++        PadSelect = 0x0001, PadL3 = 0x0002, PadR3 = 0x0004, PadStart = 0x0008, PadUp = 0x0010, PadRight = 0x0020,
++        PadDown = 0x0040, PadLeft = 0x0080, PadL2 = 0x0100, PadR2 = 0x0200, PadL1 = 0x0400, PadR1 = 0x0800,
++        PadTriangle = 0x1000, PadCircle = 0x2000, PadCross = 0x4000, PadSquare = 0x8000,
++    };
++    void setScriptedPad(uint16_t held);
++    uint16_t scriptedPad();
++}
++
++// The oracle: one line per game loop iteration plus events, stamped with the
++// game's own time (the sum of the dt it was given) so that runs at different
++// rates can be compared at equal game time (tools/framerate_oracle.py).
++namespace ga2_trace
++{
++    // GA2_FRAMETRACE=<file> is set (the file opens on first use).
++    bool enabled();
++    // Game time (seconds) the world state currently reflects; set by the
++    // Update hook, stamped on every line.
++    void setGameTime(double seconds);
++    double gameTime();
++    // Free-form line: "<kind> gt=<game time> wall=<s> vs=<vsync> tick=<n> <body>".
++    void line(const char *kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++    // The same with an explicit game time.
++    void lineAt(const char *kind, double gameTime, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
++    // F lines (GA2_FRAMETRACE_FRAMES=1): a fingerprint of every frame the GS
++    // scans out, tagged with the game time of the iteration that drew it.
++    bool framesEnabled();
++    void frameSignature(const uint32_t *pixels, uint32_t width, uint32_t height, bool bgra, uint64_t flip, double gameTime);
++    // The guest vsync count and frame tick stamped into lines (scheduler).
++    void setClocks(uint64_t vsync, uint64_t tick);
++    // Starts logging the IOP's sound key-ons and CD reads as events (no-op
++    // unless enabled()).
++    void installObservers();
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index dde837c..3430764 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -45,6 +45,9 @@ namespace ga2_pgs
+     void vsync(const GSRegisters &regs);
+     // Present thread: newest frame as RGBA8. False when nothing new arrived.
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
++    // Present thread: block until a new frame is ready, at most timeoutMs
++    // (GA2_FPS: show each frame as it arrives instead of at a fixed 60 Hz).
++    bool waitFreshFrame(int timeoutMs);
+     // VR single-pass stereo: a right-eye GS instance runs (GA2_VR=1); each
+     // eye's newest frame with the stereo setup it was rendered with.
+     bool stereo();
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 482f27f..d21672d 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2,6 +2,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ga2_framepace.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -56,6 +57,11 @@ namespace
+         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+     }
+ 
++    // GA2_FPS frame clock: period = 1001 / (1000 * fps) seconds.
++    constexpr uint64_t kFrameCycleNumerator = EeScheduler::kEeClockHz * 1001u / 1000u;
++    constexpr uint64_t kFrameNanosecondNumerator = 1'001'000'000ull;
++    constexpr uint32_t kFrameWaitType = 0x46524d45u; // 'FRME': EeExternalWait type of the frame-clock wait
++
+     constexpr uint64_t kVBlankPeriodCycles = EeScheduler::kEeClockHz * 1001u / 60000u;
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+@@ -150,6 +156,12 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_gsVSyncCallback = 0;
+     m_gsVSyncCallbackGp = 0;
+     m_gsVSyncCallbackSp = 0;
++    m_frameClockOn = false;
++    m_frameTicks = 0;
++    m_frameLastWake = 0;
++    m_frameWaitTarget = 0;
++    m_frameLastWaitTick = 0;
++    m_frameWaiting = false;
+     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
+     m_runtime.memory().resetEeTimers();
+ 
+@@ -1901,6 +1913,34 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
+     blockCurrent(std::move(wait));
+ }
+ 
++bool EeScheduler::frameDriven() const noexcept
++{
++    // The game runs a scene at the native rate (ga2_framepace::setNative): the real VBLANK drives the display.
++    return m_frameClockOn && !ga2_framepace::nativeNow() && m_frameTicks - m_frameLastWaitTick <= 6u;
++}
++
++[[noreturn]] void EeScheduler::waitFrameTick(uint32_t interval, std::function<void(R5900Context &)> completion)
++{
++    assertExecutor();
++    const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
++    if (!m_frameClockOn)
++    {
++        // The clock starts at the first wait; ticks fire from then on.
++        m_frameClockOn = true;
++        m_frameTicks = 0;
++        m_frameLastWake = 0;
++        m_frameCycle0 = m_eeCycle;
++        m_frameHost0 = std::chrono::steady_clock::now();
++        scheduleEvent(m_frameCycle0 + kFrameCycleNumerator / fps,
++                      m_frameHost0 + std::chrono::nanoseconds(kFrameNanosecondNumerator / fps),
++                      EeEvent{EeEventType::FrameTick, 0, 1});
++    }
++    m_frameWaitTarget = std::max<uint64_t>(m_frameLastWake + std::max<uint32_t>(interval, 1u), m_frameTicks + 1u);
++    m_frameWaiting = true;
++    m_frameLastWaitTick = m_frameTicks;
++    blockCurrent(EeWaitState{EeWaitReason::External, EeExternalWait{kFrameWaitType, 0}, std::move(completion)});
++}
++
+ GuestThread *EeScheduler::thread(int id)
+ {
+     auto it = m_threads.find(id);
+@@ -2397,6 +2437,19 @@ void EeScheduler::processDueDeadlines()
+                               hostBase + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
++            else if (scheduled.event.type == EeEventType::FrameTick)
++            {
++                // Same rule as the VBLANK chain: after a slow stretch rebase
++                // the host clock instead of firing ticks back to back.
++                const uint64_t fps = std::max<uint32_t>(1u, m_frameFps);
++                const uint64_t next = scheduled.event.value + 1u;
++                const auto late = std::chrono::steady_clock::now() - scheduled.hostDeadline;
++                if (late > std::chrono::milliseconds(50))
++                    m_frameHost0 += late;
++                scheduleEvent(m_frameCycle0 + next * kFrameCycleNumerator / fps,
++                              m_frameHost0 + std::chrono::nanoseconds(next * kFrameNanosecondNumerator / fps),
++                              EeEvent{EeEventType::FrameTick, 0, next});
++            }
+             processEvent(scheduled.event);
+         }
+     }
+@@ -2411,8 +2464,12 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
+-        if (ga2_pgs::rendering())
++        // At GA2_FPS the frame clock's ticks scan out while the game waits on it.
++        if (ga2_pgs::rendering() && !frameDriven())
+             ga2_pgs::vsync(m_runtime.memory().gs());
++        ga2_trace::setClocks(m_vsyncTick, m_frameTicks);
++        if (!m_frameClockOn)
++            ga2_framepace::perfReport(0, m_vsyncTick); // native mode: the same report (flips, presented, CPU)
+         {
+             // Opt-in speed meter: guest vsyncs per host second (60 = full speed).
+             static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
+@@ -2490,6 +2547,28 @@ void EeScheduler::processEvent(const EeEvent &event)
+         }
+         dispatchIrq(false, 2u);
+         break;
++    case EeEventType::FrameTick:
++    {
++        m_frameTicks = event.value;
++        if (m_frameWaiting)
++            m_frameLastWaitTick = m_frameTicks;
++        bool scannedOut = false;
++        if (ga2_pgs::rendering() && frameDriven() && ga2_framepace::scanoutDue(m_frameTicks))
++        {
++            ga2_pgs::vsync(m_runtime.memory().gs());
++            scannedOut = true;
++        }
++        ga2_framepace::notePresentTick(scannedOut);
++        ga2_framepace::perfReport(m_frameTicks, m_vsyncTick);
++        ga2_trace::setClocks(m_vsyncTick, m_frameTicks);
++        if (m_frameWaiting && m_frameTicks >= m_frameWaitTarget)
++        {
++            m_frameWaiting = false;
++            m_frameLastWake = m_frameTicks;
++            completeExternalWait(kFrameWaitType, 0, KE_OK);
++        }
++        break;
++    }
+     case EeEventType::ExternalWake:
+         completeExternalWait(event.id, event.value, KE_OK);
+         break;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 8735cd1..22302cd 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ga2_framepace.h"
+ #include <cstdio>
+ #include <cstdlib>
+ #include "Common.h"
+@@ -467,6 +468,22 @@ namespace ps2_syscalls
+             }
+         }
+ 
++        // The oracle's view of what the game asks its IOP services for
++        // (sound requests, loads): GA2_FRAMETRACE_RPC=1, R lines.
++        if (ga2_trace::enabled())
++        {
++            static const bool rpcTrace = [] { const char *v = std::getenv("GA2_FRAMETRACE_RPC"); return v && *v && *v != '0'; }();
++            if (rpcTrace)
++            {
++                uint32_t words[4] = {0, 0, 0, 0};
++                const uint32_t phys = sendBuf & 0x1FFFFFFFu;
++                if (sendBuf != 0u && phys + sizeof(words) <= PS2_RAM_SIZE)
++                    std::memcpy(words, rdram + phys, sizeof(words));
++                ga2_trace::line("R", "sid=%x fn=%u mode=%u words=%08x,%08x,%08x,%08x", sidHint, rpcNum, mode, words[0], words[1],
++                                words[2], words[3]);
++            }
++        }
++
+         ps2x::iop::RpcAbi selectedAbi = ps2x::iop::RpcAbi::RuntimeDefault;
+         {
+             ps2x::iop::RpcAbiRequest request{};
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+new file mode 100644
+index 0000000..3281a8c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -0,0 +1,344 @@
++#include "runtime/ga2_framepace.h"
++
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++#include "ps2x/iop/iop_trace.h"
++
++#include <atomic>
++#include <chrono>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <dirent.h>
++#include <map>
++#include <mutex>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++namespace ga2_framepace
++{
++    namespace
++    {
++        int parseFps()
++        {
++            const char *v = std::getenv("GA2_FPS");
++            if (!v || !*v)
++                return 0;
++            const double asked = std::atof(v);
++            const int n = int(std::lround(asked));
++            if (n == 60 || n == 0)
++                return 0;
++            if (n < 61 || n > 240)
++            {
++                std::fprintf(stderr, "[ga2 fps] GA2_FPS=%s is outside 60..240; native timing\n", v);
++                return 0;
++            }
++            // VR presents through the headset's own frame loop and tags each
++            // frame at the emulated VBLANK (ga2_stereo): native pacing there.
++            if (const char *vr = std::getenv("GA2_VR"); vr && std::strcmp(vr, "1") == 0)
++            {
++                std::fprintf(stderr, "[ga2 fps] GA2_FPS ignored in VR (the headset paces the game); native timing\n");
++                return 0;
++            }
++            // Only the GPU GS shows a frame per flip.
++            if (const char *gs = std::getenv("GA2_GS"); gs && std::strcmp(gs, "cpu") == 0)
++            {
++                std::fprintf(stderr, "[ga2 fps] GA2_FPS needs the GPU GS (GA2_GS=cpu); native timing\n");
++                return 0;
++            }
++            std::fprintf(stderr, "[ga2 fps] high frame rate: %d fps (game step %.6f s)\n", n, 1001.0 / (1000.0 * n));
++            return n;
++        }
++
++        std::atomic<uint64_t> g_flips{0}, g_presented{0};
++        // Scheduler thread only.
++        uint64_t g_lastScanFlips = ~0ull;
++        uint64_t g_lastScanTick = 0;
++        struct Stats
++        {
++            uint64_t ticks = 0, scans = 0, flips = 0, vsync = 0, presented = 0;
++            std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
++        } g_stats;
++
++        // CPU seconds (user + system) per thread of this process, by thread name.
++        std::map<std::string, double> threadCpu()
++        {
++            std::map<std::string, double> out;
++            if (DIR *dir = opendir("/proc/self/task"))
++            {
++                const double hz = double(sysconf(_SC_CLK_TCK));
++                while (const dirent *e = readdir(dir))
++                {
++                    if (e->d_name[0] == '.')
++                        continue;
++                    char path[96], line[512];
++                    std::snprintf(path, sizeof(path), "/proc/self/task/%s/stat", e->d_name);
++                    if (FILE *f = std::fopen(path, "r"))
++                    {
++                        if (std::fgets(line, sizeof(line), f))
++                        {
++                            const char *open = std::strchr(line, '('), *close = std::strrchr(line, ')');
++                            unsigned long utime = 0, stime = 0;
++                            if (open && close && std::sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime, &stime) == 2)
++                                out[std::string(open + 1, close)] += double(utime + stime) / hz;
++                        }
++                        std::fclose(f);
++                    }
++                }
++                closedir(dir);
++            }
++            return out;
++        }
++        std::map<std::string, double> g_lastCpu;
++    }
++
++    int fps()
++    {
++        static const int value = parseFps();
++        return value;
++    }
++
++    float step() { return fps() > 0 ? float(1001.0 / (1000.0 * fps())) : float(1001.0 / 60000.0); }
++
++    double hz() { return fps() > 0 ? fps() * 1000.0 / 1001.0 : 60000.0 / 1001.0; }
++
++    [[noreturn]] void waitTick(PS2Runtime &runtime, uint32_t interval, uint32_t resumePc)
++    {
++        EeScheduler &scheduler = runtime.eeScheduler();
++        scheduler.configureFrameClock(uint32_t(fps()));
++        scheduler.waitFrameTick(interval, [resumePc](R5900Context &context) { context.pc = resumePc; });
++    }
++
++    uint64_t ticks(const PS2Runtime &runtime) { return runtime.eeScheduler().frameTicks(); }
++
++    void notePresented() { g_presented.fetch_add(1, std::memory_order_relaxed); }
++
++    namespace
++    {
++        std::atomic<uint16_t> g_scriptedPad{0};
++    }
++    void setScriptedPad(uint16_t held) { g_scriptedPad.store(held, std::memory_order_relaxed); }
++    uint16_t scriptedPad() { return g_scriptedPad.load(std::memory_order_relaxed); }
++
++    namespace
++    {
++        std::atomic<double> g_flipTime{0.0};
++        std::atomic<bool> g_native{false};
++    }
++    void setNative(bool native) { g_native.store(native, std::memory_order_relaxed); }
++    bool nativeNow() { return g_native.load(std::memory_order_relaxed); }
++    void noteFlip()
++    {
++        g_flipTime.store(ga2_trace::gameTime(), std::memory_order_relaxed);
++        g_flips.fetch_add(1, std::memory_order_relaxed);
++    }
++    double flipGameTime() { return g_flipTime.load(std::memory_order_relaxed); }
++
++    uint64_t flips() { return g_flips.load(std::memory_order_relaxed); }
++
++    bool scanoutDue(uint64_t tick)
++    {
++        const uint64_t f = flips();
++        if (f != g_lastScanFlips || tick - g_lastScanTick >= 8u)
++        {
++            g_lastScanFlips = f;
++            g_lastScanTick = tick;
++            return true;
++        }
++        return false;
++    }
++
++    void notePresentTick(bool scannedOut)
++    {
++        ++g_stats.ticks;
++        if (scannedOut)
++            ++g_stats.scans;
++    }
++
++    void perfReport(uint64_t tick, uint64_t vsyncTick)
++    {
++        static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++        if (!perf)
++            return;
++        const auto now = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - g_stats.at).count();
++        if (seconds < 5.0)
++            return;
++        const uint64_t f = flips();
++        std::fprintf(stderr,
++                     "[ga2 fps] tick=%llu ticks %.1f/s, guest flips %.1f/s, scan-outs %.1f/s, presented %.1f/s, vsync %.1f/s (%.0f%% of %d fps)\n",
++                     static_cast<unsigned long long>(tick), double(g_stats.ticks) / seconds,
++                     double(f - g_stats.flips) / seconds, double(g_stats.scans) / seconds,
++                     double(g_presented.load(std::memory_order_relaxed) - g_stats.presented) / seconds,
++                     double(vsyncTick - g_stats.vsync) / seconds,
++                     100.0 * double(f - g_stats.flips) / seconds / hz(), fps() > 0 ? fps() : 60);
++        // Where the host's time goes: busiest threads, as a share of one core.
++        {
++            const auto now = threadCpu();
++            std::string line;
++            std::vector<std::pair<double, std::string>> busy;
++            for (const auto &[name, total] : now)
++            {
++                const double before = g_lastCpu.count(name) ? g_lastCpu[name] : 0.0;
++                if ((total - before) / seconds > 0.02)
++                    busy.push_back({(total - before) / seconds, name});
++            }
++            std::sort(busy.rbegin(), busy.rend());
++            for (size_t i = 0; i < busy.size() && i < 5; ++i)
++            {
++                char part[96];
++                std::snprintf(part, sizeof(part), " %s %.0f%%", busy[i].second.c_str(), busy[i].first * 100.0);
++                line += part;
++            }
++            g_lastCpu = now;
++            std::fprintf(stderr, "[ga2 fps] cpu (share of one core):%s\n", line.c_str());
++        }
++        g_stats.ticks = g_stats.scans = 0;
++        g_stats.flips = f;
++        g_stats.presented = g_presented.load(std::memory_order_relaxed);
++        g_stats.vsync = vsyncTick;
++        g_stats.at = now;
++    }
++}
++
++namespace ga2_trace
++{
++    namespace
++    {
++        std::mutex g_mutex;
++        FILE *g_file = nullptr;
++        bool g_tried = false;
++        std::atomic<double> g_gameTime{0.0};
++        std::atomic<uint64_t> g_vsync{0}, g_tick{0};
++        const std::chrono::steady_clock::time_point g_start = std::chrono::steady_clock::now();
++
++        FILE *file()
++        {
++            if (!g_tried)
++            {
++                g_tried = true;
++                if (const char *path = std::getenv("GA2_FRAMETRACE"); path && *path)
++                {
++                    g_file = std::fopen(path, "w");
++                    if (g_file)
++                        std::setvbuf(g_file, nullptr, _IOLBF, 1 << 16);
++                    else
++                        std::fprintf(stderr, "[ga2 trace] cannot open %s\n", path);
++                }
++            }
++            return g_file;
++        }
++    }
++
++    bool enabled()
++    {
++        static const bool on = [] { const char *p = std::getenv("GA2_FRAMETRACE"); return p && *p; }();
++        return on;
++    }
++
++    void setGameTime(double seconds) { g_gameTime.store(seconds, std::memory_order_relaxed); }
++
++    double gameTime() { return g_gameTime.load(std::memory_order_relaxed); }
++
++    void setClocks(uint64_t vsync, uint64_t tick)
++    {
++        g_vsync.store(vsync, std::memory_order_relaxed);
++        g_tick.store(tick, std::memory_order_relaxed);
++    }
++
++    namespace
++    {
++        void emit(const char *kind, double gt, const char *body)
++        {
++            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
++            std::lock_guard<std::mutex> lock(g_mutex);
++            if (FILE *f = file())
++                std::fprintf(f, "%s gt=%.7f wall=%.4f vs=%llu tk=%llu %s\n", kind, gt, wall,
++                             static_cast<unsigned long long>(g_vsync.load(std::memory_order_relaxed)),
++                             static_cast<unsigned long long>(g_tick.load(std::memory_order_relaxed)), body);
++        }
++    }
++
++    void line(const char *kind, const char *fmt, ...)
++    {
++        if (!enabled())
++            return;
++        char body[4096];
++        va_list args;
++        va_start(args, fmt);
++        std::vsnprintf(body, sizeof(body), fmt, args);
++        va_end(args);
++        emit(kind, gameTime(), body);
++    }
++
++    void lineAt(const char *kind, double gt, const char *fmt, ...)
++    {
++        if (!enabled())
++            return;
++        char body[4096];
++        va_list args;
++        va_start(args, fmt);
++        std::vsnprintf(body, sizeof(body), fmt, args);
++        va_end(args);
++        emit(kind, gt, body);
++    }
++
++    bool framesEnabled()
++    {
++        static const bool on = enabled() && [] { const char *v = std::getenv("GA2_FRAMETRACE_FRAMES"); return v && *v && *v != '0'; }();
++        return on;
++    }
++
++    // 16 x 14 grid of mean luma (one hex byte each) and the mean colour.
++    void frameSignature(const uint32_t *pixels, uint32_t width, uint32_t height, bool bgra, uint64_t flip, double gameTime)
++    {
++        constexpr uint32_t kCols = 16, kRows = 14;
++        if (!pixels || width < kCols || height < kRows)
++            return;
++        uint64_t luma[kRows][kCols] = {}, count[kRows][kCols] = {};
++        uint64_t sum[3] = {0, 0, 0};
++        for (uint32_t y = 0; y < height; ++y)
++        {
++            const uint32_t row = y * kRows / height;
++            const uint32_t *p = pixels + size_t(y) * width;
++            for (uint32_t x = 0; x < width; ++x)
++            {
++                const uint32_t v = p[x];
++                const uint32_t r = bgra ? (v >> 16) & 0xff : v & 0xff, g = (v >> 8) & 0xff, b = bgra ? v & 0xff : (v >> 16) & 0xff;
++                const uint32_t col = x * kCols / width;
++                luma[row][col] += (r * 299 + g * 587 + b * 114) / 1000;
++                ++count[row][col];
++                sum[0] += r;
++                sum[1] += g;
++                sum[2] += b;
++            }
++        }
++        char blocks[kRows * kCols * 2 + 1];
++        for (uint32_t r = 0; r < kRows; ++r)
++            for (uint32_t c = 0; c < kCols; ++c)
++                std::snprintf(blocks + (r * kCols + c) * 2, 3, "%02x", unsigned(count[r][c] ? luma[r][c] / count[r][c] : 0));
++        const double pixelsTotal = double(width) * height;
++        lineAt("F", gameTime, "flip=%llu mean=%.3f,%.3f,%.3f blocks=%s", static_cast<unsigned long long>(flip),
++               sum[0] / pixelsTotal, sum[1] / pixelsTotal, sum[2] / pixelsTotal, blocks);
++    }
++}
++
++namespace ga2_trace
++{
++    void installObservers()
++    {
++        if (!enabled())
++            return;
++        ps2x::iop::TraceObservers &o = ps2x::iop::traceObservers();
++        // SPU2 register offsets: core = bit 10; KON lo/hi at 0x1A0/0x1A2.
++        o.spuWrite = [](uint32_t offset, uint16_t value) {
++            const uint32_t reg = offset & 0x3ffu;
++            if ((reg == 0x1a0u || reg == 0x1a2u) && value != 0u)
++                line("E", "kind=kon core=%u half=%u mask=%04x", (offset >> 10) & 1u, (reg - 0x1a0u) / 2u, unsigned(value));
++        };
++        o.cdRead = [](uint32_t lsn, uint32_t sectors) { line("E", "kind=cd lsn=%u n=%u", lsn, sectors); };
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 7c54f9f..00ff2d7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -5,6 +5,7 @@
+ #if defined(PS2X_HAVE_PGS)
+ 
+ #include "runtime/ga2_stereo.h"
++#include "runtime/ga2_framepace.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_texpacks.h"
+ 
+@@ -18,6 +19,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -123,6 +125,8 @@ namespace
+         bool pending = false;
+         ga2_stereo::Setup setup; // the stereo setup of the copied frame
+         bool uiSplit = false;    // the frame was drawn without its UI layer (HUD panel)
++        uint64_t flip = 0;       // the guest flip it shows and that iteration's game time (GA2_FRAMETRACE_FRAMES)
++        double flipTime = 0.0;
+     };
+ 
+     // One GS instance per eye. Eye 0 is the only one outside VR stereo; eye
+@@ -178,6 +182,7 @@ namespace
+         uint64_t totalSwaps = 0;
+ 
+         std::mutex frameMutex;
++        std::condition_variable frameCv; // a new frame is ready for the presentation thread (waitFreshFrame)
+ 
+         // statistics
+         uint64_t swaps = 0, packets = 0, bytes = 0;
+@@ -491,6 +496,47 @@ namespace
+     {
+         const auto *src = static_cast<const uint32_t *>(eye.device.map_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT));
+         const size_t pixels = size_t(slot.width) * slot.height;
++        if (&eye == &s.eyes[0] && ga2_trace::framesEnabled())
++        {
++            const bool bgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
++            ga2_trace::frameSignature(src, slot.width, slot.height, bgra, slot.flip, slot.flipTime);
++            // GA2_FRAMETRACE_SHOTS=<dir>@<game seconds>[,...]: the first frame at or after each game time as a PNG.
++            static std::string shotDir;
++            static std::vector<double> shotTimes;
++            static size_t shotNext = 0;
++            static bool shotInit = false;
++            if (!shotInit)
++            {
++                shotInit = true;
++                if (const char *spec = std::getenv("GA2_FRAMETRACE_SHOTS"); spec && std::strchr(spec, '@'))
++                {
++                    shotDir.assign(spec, std::strchr(spec, '@'));
++                    for (const char *v = std::strchr(spec, '@') + 1; v && *v;)
++                    {
++                        char *end = nullptr;
++                        shotTimes.push_back(std::strtod(v, &end));
++                        v = end && *end == ',' ? end + 1 : nullptr;
++                    }
++                }
++            }
++            while (shotNext < shotTimes.size() && slot.flipTime >= shotTimes[shotNext] - 1e-6)
++            {
++                std::vector<uint8_t> rgba(pixels * 4u);
++                for (size_t i = 0; i < pixels; ++i)
++                {
++                    const uint32_t v = src[i];
++                    const uint32_t r = bgra ? (v >> 16) & 0xff : v & 0xff, b = bgra ? v & 0xff : (v >> 16) & 0xff;
++                    rgba[i * 4u] = uint8_t(r);
++                    rgba[i * 4u + 1u] = uint8_t(v >> 8);
++                    rgba[i * 4u + 2u] = uint8_t(b);
++                    rgba[i * 4u + 3u] = 0xff;
++                }
++                char name[64];
++                std::snprintf(name, sizeof(name), "/shot-%.3f.png", shotTimes[shotNext]);
++                writePng(shotDir + name, rgba.data(), slot.width, slot.height);
++                ++shotNext;
++            }
++        }
+         {
+             std::lock_guard<std::mutex> lock(s.frameMutex);
+             // Raw copy only; the present thread converts (takeFrame).
+@@ -502,6 +548,7 @@ namespace
+             eye.frameSetup = slot.setup;
+             eye.frameUiSplit = slot.uiSplit;
+             eye.frameFresh = true;
++            s.frameCv.notify_all();
+             if (s.hudDebug && (&eye == &s.eyes[0] || &eye == &s.eyes[2]))
+             {
+                 const bool isUi = &eye == &s.eyes[2];
+@@ -569,6 +616,8 @@ namespace
+         slot.image = result.image;
+         slot.setup = setup;
+         slot.uiSplit = uiSplit;
++        slot.flip = ga2_framepace::flips();
++        slot.flipTime = ga2_framepace::flipGameTime();
+         slot.pending = true;
+         eye.slotIndex = (eye.slotIndex + 1u) % 3u;
+     }
+@@ -791,6 +840,13 @@ namespace ga2_pgs
+ 
+     bool stereo() { return state().eyeCount == 2; }
+ 
++    bool waitFreshFrame(int timeoutMs)
++    {
++        State &s = state();
++        std::unique_lock<std::mutex> lock(s.frameMutex);
++        return s.frameCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return s.eyes[0].frameFresh; });
++    }
++
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+     {
+         ga2_stereo::Setup setup;
+@@ -881,6 +937,7 @@ namespace ga2_pgs
+     void vsync(const GSRegisters &) {}
+     bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+     bool stereo() { return false; }
++    bool waitFreshFrame(int) { return false; }
+     bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *) { return false; }
+     bool uiLayer() { return false; }
+     bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index db9a400..2bec55b 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -5,6 +5,7 @@
+ #include "ga2_cheat_menu.h"
+ #include "ps2_mouse.h"
+ #include "runtime/gs/gs_pgs.h"
++#include "runtime/ga2_framepace.h"
+ #include <cctype>
+ #include <cmath>
+ #include <string>
+@@ -236,5 +237,17 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         std::memcpy(data, g_hostPad.data(), 32);
+     else
+         neutralPad(data); // no window has presented yet
++    // Scripted buttons (the timing oracle): held on top of the real pad.
++    if (const uint16_t held = ga2_framepace::scriptedPad())
++    {
++        const uint16_t buttons = static_cast<uint16_t>(data[2] | (data[3] << 8)) & static_cast<uint16_t>(~held);
++        data[2] = static_cast<uint8_t>(buttons & 0xFF);
++        data[3] = static_cast<uint8_t>(buttons >> 8);
++        // As for the keyboard: the D-pad also tilts the left stick fully.
++        if (held & PAD_LEFT) data[6] = 0x00;
++        if (held & PAD_RIGHT) data[6] = 0xFF;
++        if (held & PAD_UP) data[7] = 0x00;
++        if (held & PAD_DOWN) data[7] = 0xFF;
++    }
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 021339d..5169c1a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
++#include "runtime/ga2_framepace.h"
+ #include "ga2_vr.h"
+ #include "ga2_cheat_menu.h"
+ #include "runtime/ga2_activity.h"
+@@ -462,6 +463,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                 SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+             }
+             UpdateTexture(tex, s_pgsFrame.data());
++            ga2_framepace::notePresented();
+             s_pgsWidth = w;
+             s_pgsHeight = h;
+             if (ga2_pgs::stereo())
+@@ -960,7 +962,11 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        // GA2_FPS above 60: the window shows each frame as it arrives, paced
++        // by the display (GA2_VSYNC=0 turns the swap interval off).
++        const char *vsyncEnv = std::getenv("GA2_VSYNC");
++        SetConfigFlags(FLAG_WINDOW_RESIZABLE |
++                       (ga2_framepace::enabled() && !(vsyncEnv && *vsyncEnv == '0') ? FLAG_VSYNC_HINT : 0));
+         // GA2_WINDOW_SCALE: window size as a multiple of the PS2 frame (the
+         // launcher's display setting); GA2_FULLSCREEN=1 starts borderless
+         // fullscreen. F11 or Alt+Enter toggles fullscreen while playing.
+@@ -976,7 +982,7 @@ bool PS2Runtime::initialize(const char *title)
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+-        SetTargetFPS(60);
++        SetTargetFPS(ga2_framepace::enabled() ? 0 : 60);
+         // Escape is a pad button (Circle); only the window's close button quits.
+         SetExitKey(KEY_NULL);
+         if (m_debugUiInitCallback)
+@@ -2884,6 +2890,7 @@ void PS2Runtime::run()
+     initializeEeKernelState(m_memory.getRDRAM());
+     ps2_mouse_menus::attach(m_memory.getRDRAM(), g_programName);
+     ga2_present::init(g_programName);
++    ga2_trace::installObservers();
+     ga2_vr::start();
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+@@ -3018,6 +3025,10 @@ void PS2Runtime::run()
+         });
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
++        // GA2_FPS: sleep until the GS delivers a frame (or the window needs
++        // its events pumped); no fixed 60 Hz cap.
++        if (ga2_framepace::enabled() && ga2_pgs::rendering() && !ga2_vr::headsetRunning())
++            ga2_pgs::waitFreshFrame(16);
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+-- 
+2.55.0
+

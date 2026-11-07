@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "disc_id": "zettai",
+  "elf_sha256": "727b6451e8216e8b091ba6bcdbfe3a2f5b408cbca2f73118715d6f922c106578",
+  "source_base_commit": "edb48c3",
+  "ps2recomp_commit": "2c5fbb9389e11dd95693385969490c9e8e6f57b4",
+  "runtime_patch_prefix": 14,
+  "source": {
+    "descriptor": "0x002d3bf0",
+    "installer_store": "0x0027dac4",
+    "descriptor_offset": "0x34",
+    "observed_dispatch": "0x0015335c",
+    "pair_address": "0x002d3c28",
+    "pair_offset": "0x38",
+    "guest_return": "0x00153364",
+    "missing_pairs": {
+      "0x30": "0x001034e0",
+      "0x38": "0x001037b8",
+      "0x40": "0x001037f8",
+      "0x58": "0x00103870"
+    },
+    "entry_hints": 39,
+    "SDK_generated_stubs": 13,
+    "original_instruction_words": 66,
+    "original_table_pairs": 14,
+    "null_pair": "0x70 (words70/74)",
+    "adjacent_descriptor": "0x002d3c68 excluded",
+    "semantics": "original reverse key search, reverse indexed primary/secondary word, and empty query; no replacement vector logic"
+  },
+  "generation": {
+    "config_sha256": "889e937a6bbc9095dcc036aa5622b3acdcf7a277e3b40f17994391de9a181f11",
+    "new_methods": [
+      {
+        "address": "0x001034e0",
+        "symbol": "entry_1034e0_0x103550",
+        "file": "entry_1034e0_0x103550.cpp",
+        "sha256": "e20cd5e9c499683f8fd00e76a44fc22baf40c154631723e369a6a7c3e6b39783",
+        "emitted_instruction_words": 28,
+        "omitted_zero_words": [],
+        "original_words": 28
+      },
+      {
+        "address": "0x001037b8",
+        "symbol": "entry_1037b8_0x1037f8",
+        "file": "entry_1037b8_0x1037f8.cpp",
+        "sha256": "233bfb920e9b4f4ccae67761090b34f6259a3217b15364206b4bbb60e6407cba",
+        "emitted_instruction_words": 16,
+        "omitted_zero_words": [],
+        "original_words": 16
+      },
+      {
+        "address": "0x001037f8",
+        "symbol": "entry_1037f8_0x103838",
+        "file": "entry_1037f8_0x103838.cpp",
+        "sha256": "1ff1bde88c3082672c7d46910f4713104dd7002e84f34796aca653befb3d4906",
+        "emitted_instruction_words": 16,
+        "omitted_zero_words": [],
+        "original_words": 16
+      },
+      {
+        "address": "0x00103870",
+        "symbol": "entry_103870_0x103888",
+        "file": "entry_103870_0x103888.cpp",
+        "sha256": "25fd5e4d0c575982a6c007d7b23818bba634fc36d6dc68f28c21723f29e6cb81",
+        "emitted_instruction_words": 6,
+        "omitted_zero_words": [],
+        "original_words": 6
+      }
+    ],
+    "added_files": [
+      "entry_1034e0_0x103550.cpp",
+      "entry_1037b8_0x1037f8.cpp",
+      "entry_1037f8_0x103838.cpp",
+      "entry_103870_0x103888.cpp"
+    ],
+    "changed_existing_files": [
+      "ps2_recompiled_functions.h",
+      "register_functions.cpp",
+      "identity.json"
+    ],
+    "removed_files": [],
+    "generated_cpp": 33451,
+    "warnings": 1579,
+    "errors": 0,
+    "unmodified_existing_files": 33447,
+    "registry_additions": 5,
+    "related_resume_entry": "0x00103510",
+    "raw_existing_alias_retargets": 42,
+    "runtime_preservation": "exact-build GameOverride restores both verified case-owner ranges; raw generated table drift is documented"
+  },
+  "alias_preservation": {
+    "ranges": [
+      {
+        "first": "0x00145b9c",
+        "end_exclusive": "0x00145bf8",
+        "owner_entry": "0x00145b98",
+        "owner": "caseD_4_0x145b98",
+        "count": 23
+      },
+      {
+        "first": "0x0017e3b4",
+        "end_exclusive": "0x0017e400",
+        "owner_entry": "0x0017e3b0",
+        "owner": "caseD_2_0x17e3b0",
+        "count": 19
+      }
+    ],
+    "preflight": "both owner heads and all42aliases before any alias mutation; only expectedcase/knownparent accepted",
+    "mechanism": "existing hasFunction/replaceFunction within exactfilename/entry/CRC override; original pointers directly, no PC/RA/guestRAM mutation",
+    "direct_ELF_J_JAL_edges_into_ranges": 0,
+    "effective_registry": {
+      "preserved_aliases": 42,
+      "effective_existing_retargets": 0,
+      "effective_removed": 0,
+      "new_addresses": [
+        "0x1034e0",
+        "0x103510",
+        "0x1037b8",
+        "0x1037f8",
+        "0x103870"
+      ],
+      "SDK_overrides": "same five entries on both versions, unchanged",
+      "scope": "source effective map plus forthcoming live42pointer check"
+    },
+    "native_installation": "two actual heads matchexplicitcompiledsymbols; all42uniquealiaspointers match",
+    "host_fixture_scenarios_passed": 6,
+    "host_fixture_limit": "actual extracted helper against host-table API fixture; no guest execution",
+    "natural_restored_alias_execution": "unobserved",
+    "broad_owner_ranking": "withheld; source-derived candidate estimates suggest widespread remapping but actual broad-policy generator output was not measured"
+  },
+  "baseline": {
+    "capture": "captures/native-zettai/20261009-072824/capture.json",
+    "dispatch_samples": 1,
+    "descriptor": "0x002d3bf0",
+    "pair_address": "0x002d3c28",
+    "live_original_descriptor_words": 28,
+    "object": "0x8f9a50",
+    "index": 1,
+    "begin": "0x8f9aa0",
+    "end": "0x8f9ab0",
+    "entries": [
+      "0x8f9af0",
+      "0x1",
+      "0xf1d490",
+      "0x9"
+    ],
+    "predicted_original_lookup_word": "0x8f9af0",
+    "method_symbols_absent": 4,
+    "probe_errors": 0
+  },
+  "native": {
+    "capture": "captures/native-zettai/20261009-080114/capture.json",
+    "actual_method": "0x001037b8",
+    "actual_returns": 1,
+    "index": 1,
+    "entry_count": 2,
+    "result": "0x8f9af0",
+    "guest_return": "0x153364",
+    "expected_volatile_low64": {
+      "2": "0x8f9af0",
+      "3": "0x2",
+      "4": "0x8f9aa8",
+      "5": "0x1",
+      "6": "0x8",
+      "7": "0x8f9aa0"
+    },
+    "raw128_gprs_compared": 32,
+    "upper64_all_preserved": true,
+    "other_full_gprs_preserved": 26,
+    "live_original_descriptor_words": 28,
+    "object_descriptor_collection_unchanged": true,
+    "actual_stack_store_address": "0x1fffef0",
+    "actual_stack_store_value": "0x8f9aa8",
+    "stack_bytes_checked": 80,
+    "store_changes_prevalue": true,
+    "live_preserved_aliases": 42,
+    "probe_errors": 0,
+    "pending": 0,
+    "unobserved_methods": [
+      "0x001034e0",
+      "0x001037f8",
+      "0x00103870"
+    ],
+    "limits": [
+      "one valid indexed branch only; invalid path and other collection methods unobserved",
+      "restored aliases installation verified but natural alias execution unobserved",
+      "no native scene/title/audio/gameplay/save acceptance"
+    ]
+  },
+  "binary": {
+    "disc_id": "zettai",
+    "binary_sha256": "daaf7676500631c589f4cefa97405dade71c0b27d8fdd8dc29fcc396fbf63992",
+    "binary_size": 364218800,
+    "source_base_commit": "edb48c3",
+    "runtime_patch_prefix": 14,
+    "entry_hints": 39,
+    "generated_SDK_stubs": 13,
+    "preserved_resume_aliases": 42
+  },
+  "ordinary": {
+    "capture": "captures/native-zettai/20261009-080116/capture.json",
+    "input": "Left8.128s and Circle18.194s,1000ms holds",
+    "frame15": "red left selection, text/buttonlabels absent",
+    "frame30": "white centered viewport on black; no recognizable scene/title",
+    "bounded_missing_targets": 0,
+    "long_capture": {
+      "capture": "captures/native-zettai/20261009-080832/capture.json",
+      "seconds": 60.277,
+      "final_frame": "black at60.2s, mainviewed",
+      "bounded_missing_targets": 0,
+      "bounded_unhandled_RPC_reports": 0,
+      "limit": "separatecoldboot from30swhite sample; exacttransition timing/cause unproved"
+    }
+  },
+  "checks": {
+    "runtime_cases": 477,
+    "runtime_rerun": false,
+    "runtime_scope": "unchanged patch14 runtime from previous stage",
+    "tooling_passed": 19,
+    "tooling_failed": 0,
+    "prior_IOP_suites": 9,
+    "IOP_rerun": false,
+    "diagnostic_AST_checks": 3
+  },
+  "review": {
+    "model": "gpt-6-astra",
+    "effort": "ultra",
+    "effective_settings_verified": true,
+    "artifact": "docs/reviews/object-collection-entries.md",
+    "status": "Astra independently accepted original/generated provenance, exact42alias adapter/installation, fixture design, fresh actual valid1037B8return/all32raw128GPR/all80stackbytes/28descriptorwords/object/list parity and separatewhite30s/black60s observation limits"
+  },
+  "source_hashes": {
+    "configs/recomp-entry-points.json": "99424af1fb57d8ee20e1e0fb6483cb1e6f691b1f86089c92be3b88b2ef127e97",
+    "native/compat/zettai_sif.cpp": "790fb19e887e47126ebce2f41afdbf4a8a8ecf5fe1d97dc4012e88a942eee1a0",
+    "tools/gdb_object_collection.py": "0fa60befa0185f96481d95a7d8d55eb3894975914662e8f59a63d100e678eb94",
+    "tools/gdb_sif_boot.py": "f99fb067c075ceb5f2edbfbde69b82c5d9aa5fd0d04bcf156ea18645ae93fd2c",
+    "tests/test_resume_alias_preservation.py": "4f560a6937201e18f4700a8175e54df7a3a104e2b7456f83ad127e23986a5c81",
+    "tests/fixtures/resume_alias_table.cpp": "9fcbd3e3934cb094cb1cefe0295e4be04506c0a511d70d8869ff608d7df20835"
+  },
+  "limits": [
+    "One valid indexed primary-word branch observed; invalid branches and other three newmethods unobserved",
+    "No runtime alias execution proof; preserves previous compiled function pointers only",
+    "White viewport, not rendered-scene/title/gameplay/audio/save acceptance",
+    "Memory-card equivalence and absent dialog text/labels remain unresolved",
+    "Other four native binaries and original/generated game data remain private; no new claims for their gameplay",
+    "Trilogy app, resolution/FPS/ultrawide/scaling/language/modding/VR gates remain open"
+  ]
+}

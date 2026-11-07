@@ -1,0 +1,930 @@
+From 8e567cd9905bb667606bba34df13d31c78355413 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:57:46 -0500
+Subject: [PATCH 31/31] ga2: paraLLEl-GS GPU GS bridge (raw GIF tee, vblank
+ scanout, async readback), raw tap for re-framed VIF IMAGE chunks, VU1 commit
+ fast path
+
+---
+ ps2xRuntime/CMakeLists.txt                    |  12 +
+ ps2xRuntime/include/runtime/gs/gs_pgs.h       |  35 ++
+ .../include/runtime/gs/ps2_gif_arbiter.h      |  11 +-
+ ps2xRuntime/include/runtime/ps2_memory.h      |   3 +-
+ ps2xRuntime/include/runtime/ps2_vu1.h         |   3 +
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   3 +
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp     |   5 +
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        |  16 +
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             | 378 ++++++++++++++++++
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    |  15 +-
+ ps2xRuntime/src/lib/ps2_memory.cpp            |   5 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  28 ++
+ ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp  |   4 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp       |  50 ++-
+ 14 files changed, 547 insertions(+), 21 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/gs/gs_pgs.h
+ create mode 100644 ps2xRuntime/src/lib/gs/gs_pgs.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 7ab6dc1..64cb48f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -387,6 +387,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_disc_mount.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_ipu.cpp
++    src/lib/gs/gs_pgs.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+@@ -521,6 +522,17 @@ if(TARGET OpenSSL::Crypto)
+     target_compile_definitions(ps2_runtime PRIVATE PS2X_DISC_SHA256=1)
+ endif()
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# paraLLEl-GS (Vulkan compute GS, LGPL-3.0+): built standalone from an external
++# checkout when PS2X_PGS_DIR points at it.
++set(PS2X_PGS_DIR "" CACHE PATH "paraLLEl-GS checkout (with Granite) for the GPU GS")
++if(PS2X_PGS_DIR AND EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt")
++    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
++    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_PGS=1)
++    message(STATUS "GA2: paraLLEl-GS GPU backend enabled from ${PS2X_PGS_DIR}")
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+new file mode 100644
+index 0000000..ee8e082
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -0,0 +1,35 @@
++// paraLLEl-GS bridge: the PS2 GS emulated in Vulkan compute (Arntzen Software,
++// LGPL-3.0+). The CPU GS frontend keeps parsing every packet (register state,
++// CSR/SIGNAL/FINISH, transfers) but skips rasterisation; paraLLEl-GS receives
++// the same raw GIF stream, renders it on the GPU and scans out at each vblank.
++//
++// Enabled by default when built with PS2X_HAVE_PGS and a Vulkan device is
++// available; GA2_GS=cpu forces the software renderer. GA2_PGS_SSAA=1|2|4|8|16
++// selects super-sampling, GA2_PGS_HIRES=0|1|2 the scanout scale (1x/2x/4x).
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++struct GSRegisters;
++
++namespace ga2_pgs
++{
++    // True once the backend initialised successfully (first call initialises).
++    bool active();
++    // Lock-free: whether the GPU renders (set once active() succeeded).
++    bool rendering();
++    // Raw GIF data in stream order. path is 1..3.
++    void gifTransfer(uint32_t path, const uint8_t *data, size_t size);
++    // A host->local image upload delivered through a native fast path.
++    void imageUpload(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                     const uint8_t *data, size_t size);
++    // Local->host transfer data (TRXDIR=1) produced by the GPU's VRAM.
++    void readLocalToHost(uint8_t *dst, uint32_t qwords);
++    // Game thread, at vblank: flush, scan out with the live CRTC registers and
++    // queue an asynchronous readback of the frame.
++    void vsync(const GSRegisters &regs);
++    // Present thread: newest frame as RGBA8. False when nothing new arrived.
++    bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
++}
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 2012083..225e67b 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -18,6 +18,10 @@ struct GifArbiterPacket
+     bool path2DirectHl = false;
+     bool path3Image = false;
+     std::vector<uint8_t> data;
++    // Raw hardware bytes for the tap when `data` was re-framed for the
++    // stateless CPU frontend (e.g. synthesised IMAGE continuation tags).
++    bool hasTapData = false;
++    std::vector<uint8_t> tapData;
+ };
+ 
+ class GifArbiter
+@@ -29,14 +33,19 @@ public:
+     explicit GifArbiter(ProcessPacketFn processFn);
+ 
+     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
++    // Observes every packet in final stream order, with its path (GPU GS tee).
++    using TapFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
++    void setTapFn(TapFn fn) { m_tapFn = std::move(fn); }
+ 
+-    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
++    void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false,
++                const uint8_t *tapData = nullptr, uint32_t tapBytes = 0u);
+ 
+     void drain();
+     bool empty() const { return m_queue.empty(); }
+ 
+ private:
+     ProcessPacketFn m_processFn;
++    TapFn m_tapFn;
+     std::vector<GifArbiterPacket> m_queue;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index da478de..b1eb3dd 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -348,7 +348,8 @@ public:
+     bool isPath3Masked() const { return m_path3Masked; }
+     void flushMaskedPath3Packets(bool drainImmediately = true);
+ 
+-    void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
++    void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false,
++                         const uint8_t *tapData = nullptr, uint32_t tapBytes = 0u);
+     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
+     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..8404320 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -225,6 +225,9 @@ private:
+     std::array<uint64_t, 4> m_accLatestWrite{};
+ 
+     uint64_t m_cycle = 0;
++    uint64_t m_nextCommitCycle = ~0ull;
++    void noteReady(uint64_t cycle) { if (cycle < m_nextCommitCycle) m_nextCommitCycle = cycle; }
++    void commitReadyPipelinesSlow();
+     uint64_t m_nextWriteSequence = 0;
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 7b7591b..c71baa0 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/gs/gs_pgs.h"
+ #include <cstdio>
+ #include <cstdlib>
+ #include "runtime/ee_scheduler.h"
+@@ -2344,6 +2345,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        if (ga2_pgs::rendering())
++            ga2_pgs::vsync(m_runtime.memory().gs());
+         {
+             // Opt-in speed meter: guest vsyncs per host second (60 = full speed).
+             static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..4d613a1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/gs/gs_pgs.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -545,6 +546,8 @@ void GSCpuBackend::ResetUnlocked()
+ 
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (ga2_pgs::rendering())
++        return; // paraLLEl-GS rasterises the same stream on the GPU
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+@@ -1708,6 +1711,8 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ 
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
++    if (ga2_pgs::rendering())
++        return true;
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5658928..3520752 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/gs/gs_pgs.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -744,6 +745,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
++    ga2_pgs::gifTransfer(3u, data, sizeBytes);
+ 
+     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
+                                                 {
+@@ -784,6 +786,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    ga2_pgs::imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1062,6 +1065,11 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    {
++        // Direct register writes from HLE stubs: forward as a one-register A+D packet.
++        uint64_t packet[4] = {1ull | (1ull << 15) | (1ull << 60), 0xEull, value, regAddr};
++        ga2_pgs::gifTransfer(3u, reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
++    }
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+@@ -1629,6 +1637,14 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (ga2_pgs::active())
++    {
++        // The GPU owns rendered VRAM; the CPU copy is not drawn into.
++        const uint32_t produced = m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
++        if (produced >= 16u)
++            ga2_pgs::readLocalToHost(dst, produced / 16u);
++        return produced;
++    }
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+new file mode 100644
+index 0000000..0e9bc6e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -0,0 +1,378 @@
++// paraLLEl-GS bridge. See runtime/gs/gs_pgs.h. Structure follows BT3-Recomp's
++// ps2_gs_pgs.cpp (GPL-3.0) without its game-specific seams.
++#include "runtime/gs/gs_pgs.h"
++
++#if defined(PS2X_HAVE_PGS)
++
++#include "runtime/ps2_memory.h"
++
++#include "context.hpp"
++#include "device.hpp"
++#include "gs_interface.hpp"
++#include "thread_id.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++using namespace Vulkan;
++using namespace ParallelGS;
++
++namespace
++{
++    bool envOff(const char *name, const char *offValue)
++    {
++        const char *v = std::getenv(name);
++        return v && std::string(v) == offValue;
++    }
++
++    int envInt(const char *name, int fallback)
++    {
++        const char *v = std::getenv(name);
++        return v && *v ? std::atoi(v) : fallback;
++    }
++
++    struct ReadbackSlot
++    {
++        BufferHandle buffer;
++        Fence fence;
++        ImageHandle image;
++        uint32_t width = 0, height = 0;
++        VkFormat format = VK_FORMAT_UNDEFINED;
++        bool pending = false;
++    };
++
++    struct State
++    {
++        std::mutex mutex;
++        bool tried = false;
++        bool ok = false;
++        Context context;
++        Device device;
++        GSInterface gs;
++        uint32_t ssaa = 1;
++        uint32_t field = 0;
++        ReadbackSlot slots[3];
++        uint32_t slotIndex = 0;
++
++        std::mutex frameMutex;
++        std::vector<uint8_t> frame;
++        uint32_t frameWidth = 0, frameHeight = 0;
++        bool frameFresh = false;
++
++        // statistics
++        uint64_t swaps = 0, packets = 0, bytes = 0;
++        double gifMs = 0.0, vsyncMs = 0.0;
++        std::chrono::steady_clock::time_point statStart = std::chrono::steady_clock::now();
++    };
++
++    std::atomic<bool> g_rendering{false};
++
++    State &state()
++    {
++        // Leaked on purpose: the device must outlive any thread still calling in.
++        static State *s = new State;
++        return *s;
++    }
++
++    void registerThread()
++    {
++        // Granite keys command pools by registered thread index; every caller is
++        // serialised by the state mutex, so they share index 0.
++        static thread_local bool registered = false;
++        if (!registered)
++        {
++            Util::register_thread_index(0);
++            registered = true;
++        }
++    }
++
++    bool initLocked(State &s)
++    {
++        registerThread();
++        if (s.tried)
++            return s.ok;
++        s.tried = true;
++        if (envOff("GA2_GS", "cpu"))
++        {
++            std::fprintf(stderr, "[pgs] disabled by GA2_GS=cpu; using the software GS\n");
++            return false;
++        }
++        if (!Context::init_loader(nullptr))
++        {
++            std::fprintf(stderr, "[pgs] Vulkan loader unavailable; using the software GS\n");
++            return false;
++        }
++        s.context.set_num_thread_indices(1);
++        if (!s.context.init_instance_and_device(nullptr, 0, nullptr, 0,
++                                                CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
++                                                    CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
++                                                    CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++        {
++            std::fprintf(stderr, "[pgs] no usable Vulkan device; using the software GS\n");
++            return false;
++        }
++        s.device.set_context(s.context);
++        s.device.init_frame_contexts(4);
++
++        GSOptions options = {};
++        const int r = envInt("GA2_PGS_SSAA", 1);
++        options.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8
++                                 : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
++        s.ssaa = static_cast<uint32_t>(options.super_sampling);
++        if (!s.gs.init(&s.device, options))
++        {
++            std::fprintf(stderr, "[pgs] GSInterface init failed; using the software GS\n");
++            return false;
++        }
++        s.ok = true;
++        g_rendering.store(true, std::memory_order_release);
++        std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u\n",
++                     s.device.get_gpu_properties().deviceName, s.ssaa);
++        return true;
++    }
++
++    void consumeSlotLocked(State &s, ReadbackSlot &slot)
++    {
++        const auto *src = static_cast<const uint32_t *>(s.device.map_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT));
++        const size_t pixels = size_t(slot.width) * slot.height;
++        {
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            s.frame.resize(pixels * 4u);
++            const bool bgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
++            uint8_t *dst = s.frame.data();
++            for (size_t i = 0; i < pixels; ++i)
++            {
++                const uint32_t p = src[i];
++                if (bgra)
++                {
++                    dst[i * 4 + 0] = uint8_t(p >> 16);
++                    dst[i * 4 + 1] = uint8_t(p >> 8);
++                    dst[i * 4 + 2] = uint8_t(p);
++                }
++                else
++                {
++                    dst[i * 4 + 0] = uint8_t(p);
++                    dst[i * 4 + 1] = uint8_t(p >> 8);
++                    dst[i * 4 + 2] = uint8_t(p >> 16);
++                }
++                dst[i * 4 + 3] = 0xff;
++            }
++            s.frameWidth = slot.width;
++            s.frameHeight = slot.height;
++            s.frameFresh = true;
++        }
++        s.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
++        slot.pending = false;
++        slot.image.reset();
++        slot.fence.reset();
++    }
++
++    // Asynchronous readback ring: never wait for the GPU on the game thread.
++    void readbackLocked(State &s, const ScanoutResult &result)
++    {
++        for (int k = 1; k <= 2; ++k)
++        {
++            ReadbackSlot &old = s.slots[(s.slotIndex + k) % 3];
++            if (old.pending && old.fence && old.fence->wait_timeout(0))
++                consumeSlotLocked(s, old);
++        }
++        ReadbackSlot &slot = s.slots[s.slotIndex];
++        if (slot.pending)
++        {
++            if (slot.fence && slot.fence->wait_timeout(0))
++                consumeSlotLocked(s, slot);
++            else
++                return; // GPU is behind; drop this frame's copy
++        }
++        const uint32_t w = result.image->get_width(), h = result.image->get_height();
++        if (!slot.buffer || slot.width != w || slot.height != h)
++        {
++            BufferCreateInfo info = {};
++            info.size = VkDeviceSize(w) * h * 4u;
++            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            info.domain = BufferDomain::CachedHost;
++            slot.buffer = s.device.create_buffer(info);
++            slot.width = w;
++            slot.height = h;
++        }
++        slot.format = result.image->get_format();
++        auto cmd = s.device.request_command_buffer();
++        cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
++                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++        cmd->copy_image_to_buffer(*slot.buffer, *result.image, 0, {}, {w, h, 1}, 0, 0,
++                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                     VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++        Fence fence;
++        s.device.submit(cmd, &fence);
++        slot.fence = std::move(fence);
++        slot.image = result.image;
++        slot.pending = true;
++        s.slotIndex = (s.slotIndex + 1u) % 3u;
++    }
++
++    template <typename T>
++    void put(T &dst, uint64_t value)
++    {
++        // Upstream SMODE2Bits pads to 65 bits; only the low 64 carry fields.
++        std::memcpy(&dst, &value, std::min(sizeof(T), sizeof(value)));
++    }
++}
++
++namespace ga2_pgs
++{
++    bool rendering() { return g_rendering.load(std::memory_order_acquire); }
++
++    bool active()
++    {
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        return initLocked(s);
++    }
++
++    void gifTransfer(uint32_t path, const uint8_t *data, size_t size)
++    {
++        if (!data || size < 16u)
++            return;
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!initLocked(s))
++            return;
++        const auto t0 = std::chrono::steady_clock::now();
++        s.gs.gif_transfer(path, data, size & ~size_t(15));
++        s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        ++s.packets;
++        s.bytes += size;
++    }
++
++    void imageUpload(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                     const uint8_t *data, size_t size)
++    {
++        if (!data || size == 0)
++            return;
++        // Rebuild the GIF packet the native fast path consumed: A+D setup, then IMAGE.
++        std::vector<uint8_t> packet(16u + 4u * 16u + 16u + ((size + 15u) & ~size_t(15)));
++        auto store64 = [&](size_t offset, uint64_t v) { std::memcpy(packet.data() + offset, &v, 8); };
++        store64(0, 4ull | (1ull << 15) | (0ull << 58) | (1ull << 60)); // NLOOP=4 EOP PACKED NREG=1
++        store64(8, 0xEull);                                            // A+D
++        const uint64_t regs[4][2] = {{bitbltbuf, 0x50}, {trxpos, 0x51}, {trxreg, 0x52}, {trxdir, 0x53}};
++        for (int i = 0; i < 4; ++i)
++        {
++            store64(16u + i * 16u, regs[i][0]);
++            store64(24u + i * 16u, regs[i][1]);
++        }
++        const size_t imageOffset = 16u + 4u * 16u;
++        const uint64_t qwords = (size + 15u) / 16u;
++        store64(imageOffset, (qwords & 0x7fffu) | (1ull << 15) | (2ull << 58)); // IMAGE, EOP
++        store64(imageOffset + 8u, 0);
++        std::memcpy(packet.data() + imageOffset + 16u, data, size);
++        gifTransfer(3, packet.data(), packet.size());
++    }
++
++    void readLocalToHost(uint8_t *dst, uint32_t qwords)
++    {
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!initLocked(s))
++            return;
++        s.gs.read_transfer_fifo(dst, qwords);
++    }
++
++    void vsync(const GSRegisters &r)
++    {
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!initLocked(s))
++            return;
++        const auto t0 = std::chrono::steady_clock::now();
++        s.gs.flush();
++
++        auto &p = s.gs.get_priv_register_state();
++        put(p.pmode, r.pmode);
++        // NTSC default when the CRTC was never programmed.
++        put(p.smode1, r.smode1 ? r.smode1 : 0x0000000740814504ull);
++        put(p.smode2, r.smode2);
++        put(p.syncv, r.syncv);
++        put(p.dispfb1, r.dispfb1);
++        put(p.display1, r.display1);
++        put(p.dispfb2, r.dispfb2);
++        put(p.display2, r.display2);
++        put(p.extbuf, r.extbuf);
++        put(p.extdata, r.extdata);
++        put(p.extwrite, r.extwrite);
++        put(p.bgcolor, r.bgcolor);
++
++        VSyncInfo info = {};
++        info.phase = s.field ^= 1u;
++        info.dst_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
++        info.dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++        info.dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
++        info.force_progressive = true;
++        info.anti_blur = true;
++        info.overscan = false;
++        info.crtc_offsets = false;
++        info.raw_circuit_scanout = true;
++        const uint32_t maxShift = s.ssaa >= 16 ? 2u : s.ssaa >= 4 ? 1u : 0u;
++        const uint32_t shift = std::min<uint32_t>(static_cast<uint32_t>(std::max(0, envInt("GA2_PGS_HIRES", int(maxShift)))), maxShift);
++        info.high_resolution_scanout = shift >= 1;
++        info.high_resolution_scanout_shift = shift >= 2 ? 2u : 1u;
++
++        const ScanoutResult result = s.gs.vsync(info);
++        if (result.image)
++            readbackLocked(s, result);
++        const auto t1 = std::chrono::steady_clock::now();
++        s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
++        ++s.swaps;
++
++        const double elapsed = std::chrono::duration<double>(t1 - s.statStart).count();
++        if (elapsed >= 5.0 && std::getenv("GA2_PERF"))
++        {
++            std::fprintf(stderr, "[pgs] %.1f swaps/s, %.0f packets/s, %.2f MB/s, gif %.2f ms/swap, vsync %.2f ms/swap, frame %ux%u\n",
++                         s.swaps / elapsed, s.packets / elapsed, s.bytes / elapsed / 1048576.0,
++                         s.swaps ? s.gifMs / s.swaps : 0.0, s.swaps ? s.vsyncMs / s.swaps : 0.0,
++                         s.frameWidth, s.frameHeight);
++            std::fprintf(stderr, "[pgs] pmode=%llx smode1=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
++                         (unsigned long long)r.pmode, (unsigned long long)r.smode1, (unsigned long long)r.smode2,
++                         (unsigned long long)r.dispfb1, (unsigned long long)r.display1,
++                         (unsigned long long)r.dispfb2, (unsigned long long)r.display2, (unsigned long long)r.bgcolor);
++            s.swaps = s.packets = s.bytes = 0;
++            s.gifMs = s.vsyncMs = 0.0;
++            s.statStart = t1;
++        }
++    }
++
++    bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
++    {
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.frameMutex);
++        if (!s.frameFresh)
++            return false;
++        rgba.swap(s.frame);
++        width = s.frameWidth;
++        height = s.frameHeight;
++        s.frameFresh = false;
++        return true;
++    }
++}
++
++#else
++
++namespace ga2_pgs
++{
++    bool active() { return false; }
++    bool rendering() { return false; }
++    void gifTransfer(uint32_t, const uint8_t *, size_t) {}
++    void imageUpload(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, size_t) {}
++    void readLocalToHost(uint8_t *, uint32_t) {}
++    void vsync(const GSRegisters &) {}
++    bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..f671e84 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -18,7 +18,8 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
+     return flg == 2u;
+ }
+ 
+-void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
++void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl,
++                        const uint8_t *tapData, uint32_t tapBytes)
+ {
+     if (!data || sizeBytes < 16 || !m_processFn)
+         return;
+@@ -29,6 +30,11 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
+     pkt.data.resize(sizeBytes);
+     std::memcpy(pkt.data.data(), data, sizeBytes);
++    if (tapData)
++    {
++        pkt.hasTapData = true;
++        pkt.tapData.assign(tapData, tapData + tapBytes);
++    }
+     m_queue.push_back(std::move(pkt));
+ }
+ 
+@@ -56,6 +62,13 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            if (m_tapFn)
++            {
++                if (!pkt.hasTapData)
++                    m_tapFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++                else if (!pkt.tapData.empty())
++                    m_tapFn(pkt.pathId, pkt.tapData.data(), static_cast<uint32_t>(pkt.tapData.size()));
++            }
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index ce2f974..3c2b3a9 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2240,7 +2240,8 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+         m_gifArbiter->drain();
+ }
+ 
+-void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
++void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl,
++                                const uint8_t *tapData, uint32_t tapBytes)
+ {
+     if (!data || sizeBytes < 16)
+         return;
+@@ -2256,7 +2257,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+     }
+ 
+     if (m_gifArbiter)
+-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
++        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, tapData, tapBytes);
+     else if (m_gifPacketCallback)
+         m_gifPacketCallback(data, sizeBytes);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7f47559..7f07e44 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/gs/gs_pgs.h"
+ #include "ps2_runtime.h"
+ #include "ps2_disc_mount.h"
+ #include "ps2_log.h"
+@@ -379,6 +380,30 @@ namespace
+ 
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
++    if (ga2_pgs::rendering())
++    {
++        // GPU GS: present the newest scanout; the texture follows its size.
++        static std::vector<uint8_t> s_pgsFrame;
++        static uint32_t s_pgsWidth = 0u, s_pgsHeight = 0u;
++        uint32_t w = 0u, h = 0u;
++        if (ga2_pgs::takeFrame(s_pgsFrame, w, h) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
++        {
++            if (tex.width != int(w) || tex.height != int(h))
++            {
++                UnloadTexture(tex);
++                Image image = GenImageColor(int(w), int(h), BLACK);
++                tex = LoadTextureFromImage(image);
++                UnloadImage(image);
++                SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
++            }
++            UpdateTexture(tex, s_pgsFrame.data());
++            s_pgsWidth = w;
++            s_pgsHeight = h;
++        }
++        outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
++        outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
++        return;
++    }
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+     static bool s_hasLatchedInitialFrame = false;
+     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
+@@ -784,6 +809,9 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
++    if (ga2_pgs::active())
++        m_gifArbiter.setTapFn([](GifPathId path, const uint8_t *data, uint32_t size)
++                              { ga2_pgs::gifTransfer(static_cast<uint32_t>(path), data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 1329481..ac57b54 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -315,7 +315,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 (static_cast<uint64_t>(kGifFmtImage) << 58);
+             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+             std::memcpy(imagePacket.data() + 16u, payload, chunkQw * 16u);
+-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingDirectHl);
++            // The GPU GS keeps real per-path GIF state: give it the raw continuation bytes.
++            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingDirectHl,
++                            payload, chunkQw * 16u);
+             m_vif1PendingPath2ImageQwc -= chunkQw;
+             payload += chunkQw * 16u;
+             bytes -= chunkQw * 16u;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..801cca1 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/gs/gs_pgs.h"
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -66,6 +67,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ void VU1Interpreter::resetScheduler()
+ {
++    m_nextCommitCycle = ~0ull;
+     m_flagPipeline = {};
+     m_fdiv = {};
+     m_efu = {};
+@@ -532,7 +534,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     *entry = {};
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+-    entry->readyCycle = m_cycle + kFmacLatency;
++    entry->readyCycle = m_cycle + kFmacLatency; noteReady(entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -571,7 +573,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry = {};
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+-            entry.readyCycle = m_cycle + kFmacLatency;
++            entry.readyCycle = m_cycle + kFmacLatency; noteReady(entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -590,7 +592,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry = {};
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+-            entry.readyCycle = m_cycle + kFmacLatency;
++            entry.readyCycle = m_cycle + kFmacLatency; noteReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -614,7 +616,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry = {};
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+-            entry.readyCycle = m_cycle + kFmacLatency;
++            entry.readyCycle = m_cycle + kFmacLatency; noteReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -628,7 +630,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     uint32_t ignoredFlags = 0u;
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+-    m_fdiv.readyCycle = m_cycle + latency;
++    m_fdiv.readyCycle = m_cycle + latency; noteReady(m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -642,7 +644,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         if (!entry.valid)
+         {
+             entry.valid = true;
+-            entry.readyCycle = m_cycle + latency;
++            entry.readyCycle = m_cycle + latency; noteReady(entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -659,7 +661,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         if (!store.valid)
+         {
+             store.valid = true;
+-            store.readyCycle = m_cycle + 1u;
++            store.readyCycle = m_cycle + 1u; noteReady(store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -680,7 +682,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+         {
+             write = {};
+             write.valid = true;
+-            write.readyCycle = m_cycle + latency;
++            write.readyCycle = m_cycle + latency; noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -706,7 +708,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+         {
+             write = {};
+             write.valid = true;
+-            write.readyCycle = m_cycle + latency;
++            write.readyCycle = m_cycle + latency; noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -727,7 +729,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+         {
+             write = {};
+             write.valid = true;
+-            write.readyCycle = m_cycle + latency;
++            write.readyCycle = m_cycle + latency; noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -743,6 +745,24 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ }
+ 
+ void VU1Interpreter::commitReadyPipelines()
++{
++    // Nothing becomes architecturally visible before the earliest pending
++    // result; skip the scan until then (exact, purely a fast path).
++    if (m_cycle < m_nextCommitCycle)
++        return;
++    commitReadyPipelinesSlow();
++    uint64_t next = ~0ull;
++    for (const FlagPipelineEntry &e : m_flagPipeline) if (e.valid) next = std::min(next, e.readyCycle);
++    if (m_fdiv.valid) next = std::min(next, m_fdiv.readyCycle);
++    for (const ScalarPipelineEntry &e : m_efu) if (e.valid) next = std::min(next, e.readyCycle);
++    for (const PendingStore &e : m_storePipeline) if (e.valid) next = std::min(next, e.readyCycle);
++    for (const PendingVfWrite &e : m_vfWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
++    for (const PendingViWrite &e : m_viWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
++    for (const PendingAccWrite &e : m_accWritePipeline) if (e.valid) next = std::min(next, e.readyCycle);
++    m_nextCommitCycle = next;
++}
++
++void VU1Interpreter::commitReadyPipelinesSlow()
+ {
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+@@ -922,7 +942,10 @@ void VU1Interpreter::finishXgkick()
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
++    {
++        ga2_pgs::gifTransfer(1u, m_xgkick.packet.data(), m_xgkick.totalBytes);
+         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
++    }
+     m_xgkick.active = false;
+ }
+ 
+@@ -1005,11 +1028,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
++        for (uint32_t bits = usage->viRead & ~1u; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(__builtin_ctz(bits))]);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((usage->accRead & laneForComponent(component)) != 0u)
+-- 
+2.55.0
+

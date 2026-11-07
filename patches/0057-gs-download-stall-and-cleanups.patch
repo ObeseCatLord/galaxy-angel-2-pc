@@ -1,0 +1,468 @@
+From 4c5b906463419b1f80794922172eeefa3011895b Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:03:08 -0500
+Subject: [PATCH] ga2: GS downloads stall instead of fabricating data; header
+ cleanups
+
+- VIF1 -> memory download stops at an empty GS FIFO with MADR/QWC/STR
+  intact (CHCR reads keep STR) and resumes after the next GIF work, instead
+  of writing zeros and completing (review 55 G1; VIF1_STAT.FDR is still
+  not required).
+- Under paraLLEl-GS a partial transfer tail takes one whole qword from its
+  FIFO, so a PSMCT24 download no longer leaves a stale qword for the next
+  one; the SDK image stubs size PSMCT24 at 3 bytes per pixel (G3).
+- Removed the never-called IopHost::invokeGuestFunction and the unused
+  VU1 store ring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xIOP/include/ps2x/iop/iop_host.h           |  7 --
+ ps2xIOP/tests/iop_compat_test_support.h       |  4 -
+ ps2xIOP/tests/iop_emulator_tests.cpp          |  1 -
+ ps2xIOP/tests/iop_import_tests.cpp            |  1 -
+ ps2xIOP/tests/iop_ioman_tests.cpp             |  4 -
+ ps2xIOP/tests/iop_module_start_tests.cpp      |  4 -
+ ps2xIOP/tests/iop_reset_boundary_tests.cpp    |  4 -
+ ps2xIOP/tests/iop_reverse_rpc_tests.cpp       |  1 -
+ ps2xRuntime/include/runtime/ps2_memory.h      |  3 +
+ ps2xRuntime/include/runtime/ps2_vu1.h         | 13 ---
+ .../src/lib/Kernel/Stubs/Helpers/Support.h    |  4 +-
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        | 15 +++-
+ ps2xRuntime/src/lib/ps2_iop_host.cpp          | 21 -----
+ ps2xRuntime/src/lib/ps2_iop_host.h            |  7 --
+ ps2xRuntime/src/lib/ps2_memory.cpp            | 82 +++++++++++++------
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp       |  3 -
+ ps2xTest/src/ps2_memory_tests.cpp             | 30 +++++++
+ 17 files changed, 103 insertions(+), 101 deletions(-)
+
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 04db9a1..cfda7a1 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -178,13 +178,6 @@ namespace ps2x::iop
+         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
+ 
+         virtual bool hasGuestFunction(uint32_t address) const = 0;
+-        virtual bool invokeGuestFunction(uint64_t callToken,
+-                                         uint32_t address,
+-                                         uint32_t a0,
+-                                         uint32_t a1,
+-                                         uint32_t a2,
+-                                         uint32_t a3,
+-                                         uint32_t *resultAddress) = 0;
+ 
+         // Deliver an IOP -> EE SIF command packet. The default keeps hosts
+         // which do not emulate the EE command dispatcher source-compatible.
+diff --git a/ps2xIOP/tests/iop_compat_test_support.h b/ps2xIOP/tests/iop_compat_test_support.h
+index d19de3e..17ecd32 100644
+--- a/ps2xIOP/tests/iop_compat_test_support.h
++++ b/ps2xIOP/tests/iop_compat_test_support.h
+@@ -89,10 +89,6 @@ namespace iop_test
+             return request.operation == MemoryCardOperation::Init ? initResult : 0;
+         }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
+-        {
+-            return false;
+-        }
+         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+ 
+         bool submitSpuPcm(std::span<const int16_t> samples, uint32_t rate) override
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index 44c2494..fd237d5 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -70,7 +70,6 @@ namespace
+         void closeHostFile(uint64_t) override {}
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
+         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+ 
+         std::vector<uint8_t> guest;
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index c03da95..2d99c39 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -49,7 +49,6 @@ namespace
+         void closeHostFile(uint64_t) override {}
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
+         void log(LogLevel, std::string_view) override {}
+     };
+ 
+diff --git a/ps2xIOP/tests/iop_ioman_tests.cpp b/ps2xIOP/tests/iop_ioman_tests.cpp
+index 8eb7f2f..f05257a 100644
+--- a/ps2xIOP/tests/iop_ioman_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_tests.cpp
+@@ -99,10 +99,6 @@ namespace
+         }
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
+-        {
+-            return false;
+-        }
+         void log(LogLevel, std::string_view) override {}
+ 
+         mutable uint32_t translateCalls = 0u;
+diff --git a/ps2xIOP/tests/iop_module_start_tests.cpp b/ps2xIOP/tests/iop_module_start_tests.cpp
+index 6eb2ddd..16d60c9 100644
+--- a/ps2xIOP/tests/iop_module_start_tests.cpp
++++ b/ps2xIOP/tests/iop_module_start_tests.cpp
+@@ -115,10 +115,6 @@ namespace
+         void closeHostFile(uint64_t handle) override { handles.erase(handle); }
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
+-        {
+-            return false;
+-        }
+         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+ 
+         std::vector<uint8_t> guest;
+diff --git a/ps2xIOP/tests/iop_reset_boundary_tests.cpp b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+index 98fc35a..10a88f0 100644
+--- a/ps2xIOP/tests/iop_reset_boundary_tests.cpp
++++ b/ps2xIOP/tests/iop_reset_boundary_tests.cpp
+@@ -74,10 +74,6 @@ namespace
+         void closeHostFile(uint64_t) override {}
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
+-        {
+-            return false;
+-        }
+         void log(LogLevel, std::string_view) override {}
+ 
+         bool writeSifRegister(SifRegister registerId, uint32_t value) override
+diff --git a/ps2xIOP/tests/iop_reverse_rpc_tests.cpp b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+index 95e1944..10b6b10 100644
+--- a/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
++++ b/ps2xIOP/tests/iop_reverse_rpc_tests.cpp
+@@ -80,7 +80,6 @@ namespace
+         void closeHostFile(uint64_t) override {}
+         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
+         bool hasGuestFunction(uint32_t) const override { return false; }
+-        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
+         void log(LogLevel, std::string_view) override {}
+ 
+         GuestRpcBinding lookupGuestRpcBinding(uint32_t) override { return binding; }
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 6664f78..6b8c907 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -484,6 +484,9 @@ public:
+     bool processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, uint32_t mode);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause, uint64_t latencyCycles);
++    // VIF1 -> memory (GS local->host) download; stalls with the channel
++    // registers intact while the GS FIFO is empty. Returns true on completion.
++    bool drainVif1Download();
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 272e898..7dc2313 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -209,15 +209,6 @@ private:
+         bool valid = false;
+     };
+ 
+-    struct PendingStore
+-    {
+-        uint64_t readyCycle = 0;
+-        uint32_t address = 0;
+-        std::array<uint32_t, 4> words{};
+-        uint8_t laneMask = 0;
+-        bool valid = false;
+-    };
+-
+     struct XgkickPipeline
+     {
+         static constexpr uint32_t kBufferSize = 0x10000u;
+@@ -244,7 +235,6 @@ private:
+     static constexpr uint32_t kFmacLatency = 4u;
+     static constexpr uint32_t kAccForwardLatency = 1u;
+     static constexpr uint32_t kMaxFlagEntries = 8u;
+-    static constexpr uint32_t kMaxPendingStores = 8u;
+     static constexpr uint32_t kMaxDecodedPairs = 0x4000u / 8u;
+ 
+     Unit m_unit;
+@@ -269,9 +259,6 @@ private:
+     }
+     ScalarPipelineEntry m_fdiv{};
+     std::array<ScalarPipelineEntry, 2> m_efu{};
+-    std::array<PendingStore, kMaxPendingStores> m_storePipeline{}; // ring
+-    uint32_t m_storeHead = 0;
+-    uint32_t m_storeCount = 0;
+     XgkickPipeline m_xgkick{};
+     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+     std::array<uint64_t, 16> m_viReady{};
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 7d5f0af..306a4d4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1744,8 +1744,10 @@ namespace
+         uint64_t bytes = 0;
+         switch (psm)
+         {
++        case 1:  // PSMCT24: host transfers pack three bytes per pixel
++            bytes = pixels * 3ull;
++            break;
+         case 0:  // PSMCT32
+-        case 1:  // PSMCT24 (treat as 32)
+         case 27: // PSMT8H (packed in 32-bit lanes)
+         case 36: // PSMT4HL (packed in 32-bit lanes)
+         case 44: // PSMT4HH (packed in 32-bit lanes)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 6fc59e6..87af7ba 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1652,11 +1652,18 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (ga2_pgs::active())
+     {
+-        // The GPU owns rendered VRAM; the CPU copy is not drawn into.
++        // The GPU owns rendered VRAM; the CPU copy is not drawn into. The CPU
++        // backend's count (hardware packing, 3 bytes per PSMCT24 pixel) says
++        // how much the transfer holds; paraLLEl-GS hands out whole qwords, the
++        // last one padded, so a partial tail still takes one qword from it
++        // (leaving it would surface at the head of the next download).
+         const uint32_t produced = m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+-        if (produced >= 16u)
+-            ga2_pgs::readLocalToHost(dst, produced / 16u);
+-        return produced;
++        uint32_t qwords = (produced + 15u) / 16u;
++        if (qwords * 16u > maxBytes)
++            qwords = maxBytes / 16u;
++        if (qwords != 0u)
++            ga2_pgs::readLocalToHost(dst, qwords);
++        return qwords * 16u;
+     }
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 3e5e013..b09a99a 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -856,27 +856,6 @@ bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const
+     return m_runtime.hasFunction(address);
+ }
+ 
+-bool PS2IopHostAdapter::invokeGuestFunction(uint64_t callToken,
+-                                            uint32_t address,
+-                                            uint32_t a0,
+-                                            uint32_t a1,
+-                                            uint32_t a2,
+-                                            uint32_t a3,
+-                                            uint32_t *resultAddress)
+-{
+-    (void)callToken;
+-    (void)address;
+-    (void)a0;
+-    (void)a1;
+-    (void)a2;
+-    (void)a3;
+-    if (resultAddress)
+-    {
+-        *resultAddress = 0u;
+-    }
+-    return false;
+-}
+-
+ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 90a1611..4539c80 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -89,13 +89,6 @@ public:
+     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+ 
+     bool hasGuestFunction(uint32_t address) const override;
+-    bool invokeGuestFunction(uint64_t callToken,
+-                             uint32_t address,
+-                             uint32_t a0,
+-                             uint32_t a1,
+-                             uint32_t a2,
+-                             uint32_t a3,
+-                             uint32_t *resultAddress) override;
+     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 879b810..886bca4 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1444,32 +1444,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             // VIF1 to memory (CHCR.DIR = 0): drain the GS local->host transfer.
+             if (channelBase == 0x10009000u && (value & 1u) == 0u && m_localToHostReader)
+             {
+-                const uint32_t count = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+-                uint32_t address = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+-                for (uint32_t i = 0; i < count; ++i)
+-                {
+-                    uint8_t qword[16]{};
+-                    (void)m_localToHostReader(qword, 16u);
+-                    uint32_t offset = 0;
+-                    try
+-                    {
+-                        offset = translateAddress(address);
+-                    }
+-                    catch (const std::exception &)
+-                    {
+-                        break;
+-                    }
+-                    if (offset + 16u > PS2_RAM_SIZE)
+-                        break;
+-                    std::memcpy(m_rdram + offset, qword, 16u);
+-                    markModified(offset, 16u);
+-                    address += 16u;
+-                }
+-                m_ioRegisters[channelBase + 0x10u] = address;
+-                m_ioRegisters[channelBase + 0x20u] = 0u;
+-                // The GS streams a download at roughly a qword per bus cycle;
+-                // the completion interrupt must not beat the guest to SleepThread.
+-                completeDmacChannelDelayed(channelBase, 1u, std::max<uint64_t>(2000u, uint64_t(count) * 4u));
++                (void)drainVif1Download();
+                 return true;
+             }
+ 
+@@ -1971,6 +1946,53 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+     return fail("mode 3 is reserved");
+ }
+ 
++bool PS2Memory::drainVif1Download()
++{
++    static constexpr uint32_t kVif1 = 0x10009000u;
++    if (!m_localToHostReader)
++        return false;
++    uint32_t count = m_ioRegisters[kVif1 + 0x20u] & 0xFFFFu;
++    uint32_t address = m_ioRegisters[kVif1 + 0x10u] & 0x7FFFFFF0u;
++    const uint32_t requested = count;
++    while (count != 0u)
++    {
++        uint8_t qword[16]{};
++        // The GS hands out whole qwords (the last one of a transfer padded).
++        // An empty FIFO stalls the channel as on hardware: no fabricated data.
++        if (m_localToHostReader(qword, 16u) == 0u)
++            break;
++        uint32_t offset = 0;
++        try
++        {
++            offset = translateAddress(address);
++        }
++        catch (const std::exception &)
++        {
++            break;
++        }
++        if (offset + 16u > PS2_RAM_SIZE)
++            break;
++        std::memcpy(m_rdram + offset, qword, 16u);
++        markModified(offset, 16u);
++        address += 16u;
++        --count;
++    }
++    m_ioRegisters[kVif1 + 0x10u] = address;
++    m_ioRegisters[kVif1 + 0x20u] = (m_ioRegisters[kVif1 + 0x20u] & ~0xFFFFu) | count;
++    if (count != 0u)
++    {
++        static bool logged = false;
++        if (!logged)
++            std::fprintf(stderr, "[dma] VIF1 download stalled: GS FIFO empty with %u of %u qwords left\n", count, requested);
++        logged = true;
++        return false;
++    }
++    // The GS streams a download at roughly a qword per bus cycle; the
++    // completion interrupt must not beat the guest to SleepThread.
++    completeDmacChannelDelayed(kVif1, 1u, std::max<uint64_t>(2000u, uint64_t(requested) * 4u));
++    return true;
++}
++
+ void PS2Memory::completeDmacChannelDelayed(uint32_t channelBase, uint32_t cause, uint64_t latencyCycles)
+ {
+     completeDmacChannel(channelBase, cause);
+@@ -2438,6 +2460,10 @@ void PS2Memory::processPendingTransfers()
+         m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
+         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+     }
++
++    const uint32_t vif1Chcr = m_ioRegisters[0x10009000u];
++    if ((vif1Chcr & 0x101u) == 0x100u && (m_ioRegisters[0x10009020u] & 0xFFFFu) != 0u)
++        (void)drainVif1Download(); // resume a download that found the FIFO empty
+ }
+ 
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+@@ -2906,6 +2932,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+             {
+                 if (address == 0x1000B400u || address == 0x1000B000u)
+                     return m_ioRegisters[address];
++                // A VIF1 download stalled on an empty GS FIFO is still busy.
++                if (address == 0x10009000u && (m_ioRegisters[address] & 0x101u) == 0x100u &&
++                    (m_ioRegisters[0x10009020u] & 0xFFFFu) != 0u)
++                    return m_ioRegisters[address];
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+                 return channelStatus;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 6651ecd..863c7f5 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -71,9 +71,6 @@ void VU1Interpreter::resetScheduler()
+     m_flagCount = 0;
+     m_fdiv = {};
+     m_efu = {};
+-    m_storePipeline = {};
+-    m_storeHead = 0;
+-    m_storeCount = 0;
+     m_regWriteReady = 0;
+     m_xgkick.restart();
+     m_vfReady = {};
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index b4b8259..f9676b4 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -2006,6 +2006,36 @@ void register_ps2_memory_tests()
+                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+         });
+ 
++        tc.Run("VIF1 download stalls on an empty GS FIFO and resumes when data arrives", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            constexpr uint32_t kVif1 = 0x10009000u;
++            constexpr uint32_t kDst = 0x00034000u;
++            uint32_t available = 0u; // qwords the GS FIFO holds
++            mem.setLocalToHostReader([&available](uint8_t *dst, uint32_t bytes) -> uint32_t
++            {
++                if (available == 0u || bytes < 16u)
++                    return 0u;
++                --available;
++                std::memset(dst, 0xA5, 16u);
++                return 16u;
++            });
++            std::memset(mem.getRDRAM() + kDst, 0x11, 32u);
++            mem.writeIORegister(kVif1 + 0x10u, kDst);
++            mem.writeIORegister(kVif1 + 0x20u, 2u);
++            mem.writeIORegister(kVif1 + 0x00u, 0x100u); // DIR = 0: from VIF1
++            t.IsTrue((mem.readIORegister(kVif1) & 0x100u) != 0u, "a stalled download stays busy");
++            t.Equals(mem.readIORegister(kVif1 + 0x20u) & 0xFFFFu, 2u, "nothing transferred from an empty FIFO");
++            t.Equals(static_cast<uint32_t>(mem.getRDRAM()[kDst]), 0x11u, "no fabricated data");
++            t.IsTrue(mem.consumeDelayedDmacCauses().empty(), "no completion while stalled");
++            available = 2u; // the GS transfer started
++            mem.processPendingTransfers();
++            t.Equals(mem.readIORegister(kVif1 + 0x20u) & 0xFFFFu, 0u, "download finished once data arrived");
++            t.Equals(static_cast<uint32_t>(mem.getRDRAM()[kDst + 16u]), 0xA5u, "downloaded data reaches memory");
++            t.Equals(mem.consumeDelayedDmacCauses().size(), size_t{1}, "one delayed completion");
++        });
++
+         tc.Run("GS IMR resets with every interrupt source masked", [](TestCase &t)
+         {
+             PS2Memory mem;
+-- 
+2.55.0
+

@@ -1,0 +1,754 @@
+{
+ "comment": "Where the games' textures show PS2 button icons: texture region hash (from a GA2_TEX_DUMP file name) -> icon rectangles in that region. See README.md.",
+ "textures": {
+  "c829db6813456e05": [
+   {
+    "game": "zettai",
+    "what": "dialogue Back button",
+    "button": "square",
+    "x": 11,
+    "y": 45,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "zettai",
+    "what": "dialogue Menu button",
+    "button": "select",
+    "x": 9,
+    "y": 81,
+    "w": 26,
+    "h": 16
+   }
+  ],
+  "8eb2d9ac19891012": [
+   {
+    "game": "zettai",
+    "what": "continue puck, frame 1",
+    "button": "circle",
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 16
+   }
+  ],
+  "c172328aa0101dee": [
+   {
+    "game": "zettai",
+    "what": "continue puck, frame 2",
+    "button": "circle",
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 16
+   }
+  ],
+  "4f96dfbbd9e015cd": [
+   {
+    "game": "zettai",
+    "what": "ship map floor panel R1",
+    "button": "r1",
+    "x": 15,
+    "y": 30,
+    "w": 44,
+    "h": 19
+   },
+   {
+    "game": "zettai",
+    "what": "ship map floor panel R2",
+    "button": "r2",
+    "x": 15,
+    "y": 54,
+    "w": 44,
+    "h": 19
+   }
+  ],
+  "0c4f6465a24935ee": [
+   {
+    "game": "mugen",
+    "what": "tutorial: back to title",
+    "button": "cross",
+    "x": 0,
+    "y": 0,
+    "w": 31,
+    "h": 31
+   }
+  ],
+  "d892ac269929bdf2": [
+   {
+    "game": "mugen",
+    "what": "tutorial controller: triangle",
+    "button": "triangle",
+    "x": 155,
+    "y": 54,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "mugen",
+    "what": "tutorial controller: square",
+    "button": "square",
+    "x": 137,
+    "y": 71,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "mugen",
+    "what": "tutorial controller: circle",
+    "button": "circle",
+    "x": 173,
+    "y": 71,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "mugen",
+    "what": "tutorial controller: cross",
+    "button": "cross",
+    "x": 155,
+    "y": 88,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "mugen",
+    "what": "tutorial controller: select",
+    "button": "select",
+    "x": 79,
+    "y": 76,
+    "w": 13,
+    "h": 7
+   },
+   {
+    "game": "mugen",
+    "what": "tutorial controller: start",
+    "button": "start",
+    "x": 116,
+    "y": 76,
+    "w": 13,
+    "h": 7
+   }
+  ],
+  "7d1aba9a62deb81e": [
+   {
+    "game": "zettai",
+    "what": "load/save screen: OK",
+    "button": "circle",
+    "x": 349,
+    "y": 439,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "zettai",
+    "what": "load/save screen: Cancel",
+    "button": "cross",
+    "x": 483,
+    "y": 439,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "33f063802fad0e4a": [
+   {
+    "game": "all",
+    "what": "dialogue Auto button (if_btn_001): triangle",
+    "button": "triangle",
+    "x": 1,
+    "y": 1,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "3873ea71ed932dc0": [
+   {
+    "game": "eigou/mugen",
+    "what": "message box (if_dbox_m126): circle",
+    "button": "circle",
+    "x": 312,
+    "y": 67,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "message box (if_dbox_m126): cross",
+    "button": "cross",
+    "x": 151,
+    "y": 89,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "f6d1b2e81396c515": [
+   {
+    "game": "mugen",
+    "what": "message box (if_dbox_m127): circle",
+    "button": "circle",
+    "x": 308,
+    "y": 67,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "mugen",
+    "what": "message box (if_dbox_m127): cross",
+    "button": "cross",
+    "x": 422,
+    "y": 90,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "7535a0a8039419a4": [
+   {
+    "game": "eigou/mugen",
+    "what": "message box (if_dbox_m128): cross",
+    "button": "cross",
+    "x": 144,
+    "y": 48,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "07b4bb0d7b2b58b9": [
+   {
+    "game": "eigou",
+    "what": "message box (if_dbox_m128): cross",
+    "button": "cross",
+    "x": 144,
+    "y": 48,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "bff4ce2de8c9cd52": [
+   {
+    "game": "eigou/mugen",
+    "what": "message box (if_dbox_m129): cross",
+    "button": "cross",
+    "x": 151,
+    "y": 48,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "3f7f5d1d6810a83d": [
+   {
+    "game": "eigou/mugen",
+    "what": "load/save screen (if_kan_000): circle",
+    "button": "circle",
+    "x": 349,
+    "y": 439,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "load/save screen (if_kan_000): cross",
+    "button": "cross",
+    "x": 483,
+    "y": 439,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "d887d3335fb5180e": [
+   {
+    "game": "all",
+    "what": "backlog panel (if_log_001): square",
+    "button": "square",
+    "x": 11,
+    "y": 77,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "all",
+    "what": "backlog panel (if_log_001): triangle",
+    "button": "triangle",
+    "x": 11,
+    "y": 42,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "all",
+    "what": "backlog panel (if_log_001): circle",
+    "button": "circle",
+    "x": 11,
+    "y": 13,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "5845532c367780e1": [
+   {
+    "game": "all",
+    "what": "map loading (if_nowload_003): circle",
+    "button": "circle",
+    "x": 21,
+    "y": 1,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "89fa628adaa47a76": [
+   {
+    "game": "all",
+    "what": "continue puck (if_okr_000): circle",
+    "button": "circle",
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   }
+  ],
+  "78aea8f776127bcd": [
+   {
+    "game": "all",
+    "what": "continue puck (if_okr_001): circle",
+    "button": "circle",
+    "x": 0,
+    "y": 0,
+    "w": 48,
+    "h": 48
+   }
+  ],
+  "06c6611f065d60a9": [
+   {
+    "game": "all",
+    "what": "gallery prompt (if_omk015): cross",
+    "button": "cross",
+    "x": 7,
+    "y": 2,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "43918f2cf3556440": [
+   {
+    "game": "all",
+    "what": "gallery prompt (if_omk016): cross",
+    "button": "cross",
+    "x": 9,
+    "y": 2,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "7e878a16c226b01f": [
+   {
+    "game": "all",
+    "what": "gallery page (if_omk022): l1",
+    "button": "l1",
+    "x": 49,
+    "y": 1,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "6dc787d8defb6156": [
+   {
+    "game": "all",
+    "what": "gallery page (if_omk023): r1",
+    "button": "r1",
+    "x": 0,
+    "y": 1,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "8e618dd2a18b2e56": [
+   {
+    "game": "all",
+    "what": "gallery page (if_omk024): l2",
+    "button": "l2",
+    "x": 75,
+    "y": 25,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "98c9e58b05ea34bc": [
+   {
+    "game": "all",
+    "what": "gallery page (if_omk025): r2",
+    "button": "r2",
+    "x": 3,
+    "y": 25,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "d0c645bd434c195f": [
+   {
+    "game": "eigou",
+    "what": "gallery (if_omk504): circle",
+    "button": "circle",
+    "x": 9,
+    "y": 2,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "92376960345235f9": [
+   {
+    "game": "eigou",
+    "what": "gallery (if_omk512): circle",
+    "button": "circle",
+    "x": 9,
+    "y": 2,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "6cfc99889b9cb136": [
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_000): circle",
+    "button": "circle",
+    "x": 332,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_000): cross",
+    "button": "cross",
+    "x": 462,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_000): triangle",
+    "button": "triangle",
+    "x": 46,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "65e6b47815700388": [
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_000): circle",
+    "button": "circle",
+    "x": 332,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_000): cross",
+    "button": "cross",
+    "x": 462,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_000): triangle",
+    "button": "triangle",
+    "x": 46,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "1d67cc278739a654": [
+   {
+    "game": "all",
+    "what": "options page tab (if_opt_016): l1",
+    "button": "l1",
+    "x": 12,
+    "y": 0,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "db3cbac29a6d18d7": [
+   {
+    "game": "eigou",
+    "what": "options page tab (if_opt_016): l1",
+    "button": "l1",
+    "x": 12,
+    "y": 0,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "2b7853a991ebfed9": [
+   {
+    "game": "all",
+    "what": "options page tab (if_opt_017): r1",
+    "button": "r1",
+    "x": 0,
+    "y": 0,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "69fc87f77874bcb4": [
+   {
+    "game": "eigou",
+    "what": "options page tab (if_opt_017): r1",
+    "button": "r1",
+    "x": 0,
+    "y": 0,
+    "w": 46,
+    "h": 22
+   }
+  ],
+  "e6f6d32f1f2fe05d": [
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_300): circle",
+    "button": "circle",
+    "x": 332,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_300): cross",
+    "button": "cross",
+    "x": 462,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "mugen/zettai",
+    "what": "options screen (if_opt_300): triangle",
+    "button": "triangle",
+    "x": 46,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "ed0b3cffc6daf39b": [
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_300): circle",
+    "button": "circle",
+    "x": 332,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_300): cross",
+    "button": "cross",
+    "x": 462,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (if_opt_300): triangle",
+    "button": "triangle",
+    "x": 46,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "eb6d80ca5bb5ffec": [
+   {
+    "game": "all",
+    "what": "pilot select (if_slg_psel_000): circle",
+    "button": "circle",
+    "x": 526,
+    "y": 423,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "3d24426f1e592996": [
+   {
+    "game": "all",
+    "what": "continue puck (if_tbox_005_b): glow layer pulsed over the puck, left empty",
+    "button": "blank",
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 24
+   }
+  ],
+  "91114f2776c4f2fa": [
+   {
+    "game": "all",
+    "what": "continue puck (if_tbox_006_b): glow layer pulsed over the puck, left empty",
+    "button": "blank",
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 24
+   }
+  ],
+  "d1fe43257c260623": [
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (slg_opt_000a): circle",
+    "button": "circle",
+    "x": 332,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (slg_opt_000a): cross",
+    "button": "cross",
+    "x": 462,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "options screen (slg_opt_000a): triangle",
+    "button": "triangle",
+    "x": 46,
+    "y": 400,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "6a841b0e23abd31a": [
+   {
+    "game": "eigou",
+    "what": "options button (slg_optbu0): triangle",
+    "button": "triangle",
+    "x": 1,
+    "y": 1,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "9030b288d40f648f": [
+   {
+    "game": "eigou",
+    "what": "options button (slg_optbu2): circle",
+    "button": "circle",
+    "x": 1,
+    "y": 1,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "297547d1e460cb49": [
+   {
+    "game": "eigou",
+    "what": "options button (slg_optbu4): cross",
+    "button": "cross",
+    "x": 1,
+    "y": 1,
+    "w": 22,
+    "h": 22
+   }
+  ],
+  "afbbfbc6aef763fc": [
+   {
+    "game": "eigou/mugen",
+    "what": "tutorial text (tut_bun04): cross",
+    "button": "cross",
+    "x": 21,
+    "y": 7,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "c5921bb9024d20ac": [
+   {
+    "game": "eigou/mugen",
+    "what": "tutorial text (tut_bun05): circle",
+    "button": "circle",
+    "x": 21,
+    "y": 7,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "b128b6dbee7c2184": [
+   {
+    "game": "eigou/mugen",
+    "what": "tutorial text (tut_bun06): circle",
+    "button": "circle",
+    "x": 47,
+    "y": 71,
+    "w": 28,
+    "h": 28
+   },
+   {
+    "game": "eigou/mugen",
+    "what": "tutorial text (tut_bun06): cross",
+    "button": "cross",
+    "x": 47,
+    "y": 39,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "59550f8413011f8e": [
+   {
+    "game": "eigou/mugen",
+    "what": "tutorial text (tut_bun07): triangle",
+    "button": "triangle",
+    "x": 59,
+    "y": 7,
+    "w": 28,
+    "h": 28
+   }
+  ],
+  "c06dcf0aac3b21cf": [
+   {
+    "game": "zettai mugen-2",
+    "what": "battle tutorial controller picture (if_slg_tut_015): triangle",
+    "button": "triangle",
+    "x": 155,
+    "y": 54,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "zettai mugen-2",
+    "what": "battle tutorial controller picture (if_slg_tut_015): square",
+    "button": "square",
+    "x": 137,
+    "y": 71,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "zettai mugen-2",
+    "what": "battle tutorial controller picture (if_slg_tut_015): circle",
+    "button": "circle",
+    "x": 173,
+    "y": 71,
+    "w": 16,
+    "h": 16
+   },
+   {
+    "game": "zettai mugen-2",
+    "what": "battle tutorial controller picture (if_slg_tut_015): cross",
+    "button": "cross",
+    "x": 155,
+    "y": 88,
+    "w": 16,
+    "h": 16
+   }
+  ]
+ }
+}
