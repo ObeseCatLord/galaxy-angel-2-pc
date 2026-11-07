@@ -14,7 +14,20 @@ set(CMAKE_CXX_COMPILER_TARGET ${GA2_MINGW_TRIPLE})
 set(CMAKE_RC_COMPILER ${GA2_MINGW_TRIPLE}-windres)
 set(CMAKE_AR llvm-ar)
 set(CMAKE_RANLIB llvm-ranlib)
-set(CMAKE_FIND_ROOT_PATH /usr/${GA2_MINGW_TRIPLE})
+# The mingw-w64 headers and libraries: the distribution's (Arch: mingw-w64-*
+# packages), or with GA2_LLVM_MINGW=<dir> an llvm-mingw release (its own
+# clang, libc++ and mingw-w64 headers; used by CI on Ubuntu, whose mingw-w64
+# headers are too old for paraLLEl-GS).
+if(DEFINED ENV{GA2_LLVM_MINGW})
+    set(CMAKE_C_COMPILER "$ENV{GA2_LLVM_MINGW}/bin/clang")
+    set(CMAKE_CXX_COMPILER "$ENV{GA2_LLVM_MINGW}/bin/clang++")
+    set(CMAKE_RC_COMPILER "$ENV{GA2_LLVM_MINGW}/bin/${GA2_MINGW_TRIPLE}-windres")
+    set(CMAKE_AR "$ENV{GA2_LLVM_MINGW}/bin/llvm-ar")
+    set(CMAKE_RANLIB "$ENV{GA2_LLVM_MINGW}/bin/llvm-ranlib")
+    set(CMAKE_FIND_ROOT_PATH "$ENV{GA2_LLVM_MINGW}/${GA2_MINGW_TRIPLE}")
+else()
+    set(CMAKE_FIND_ROOT_PATH /usr/${GA2_MINGW_TRIPLE})
+endif()
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

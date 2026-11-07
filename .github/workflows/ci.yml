@@ -54,9 +54,9 @@ jobs:
       - name: Dependencies
         run: |
           sudo tools/ci/deps-ubuntu.sh ci
-          sudo apt-get install -y -q mingw-w64 llvm
-          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
-          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          # llvm-mingw: clang, libc++ and current mingw-w64 headers (Ubuntu's are too old).
+          curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "GA2_LLVM_MINGW=$RUNNER_TEMP/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64" >> "$GITHUB_ENV"
       - name: Runtime tree and paraLLEl-GS
         run: |
           git config --global user.name ci && git config --global user.email ci@localhost

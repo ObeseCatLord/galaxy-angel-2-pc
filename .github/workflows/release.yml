@@ -49,11 +49,13 @@ jobs:
           KEY: ${{ secrets.GA2_GENERATED_DEPLOY_KEY }}
           REPO: ${{ secrets.GA2_GENERATED_REPO }}
         run: |
-          mkdir -p ~/.ssh private && printf '%s\n' "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          git clone -q --depth 1 "git@github.com:$REPO.git" generated-src
+          # Explicit paths: in the container ssh's home is not $HOME.
+          mkdir -p private && umask 077 && printf '%s\n' "$KEY" > "$RUNNER_TEMP/deploy_key"
+          ssh-keyscan github.com > "$RUNNER_TEMP/known_hosts" 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/deploy_key -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o IdentitiesOnly=yes" \
+            git clone -q --depth 1 "git@github.com:$REPO.git" generated-src
           tar -I zstd -xf generated-src/generated52.tar.zst -C private
-          rm -rf generated-src ~/.ssh/id_ed25519
+          rm -rf generated-src "$RUNNER_TEMP/deploy_key"
       - name: Build
         if: matrix.arch == 'x86_64' || inputs.arm64
         run: |

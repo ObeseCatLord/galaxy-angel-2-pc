@@ -1,0 +1,71 @@
+From 952d859aaf34f0a8dfbcea7b087283d5205f4f4c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:42:28 -0600
+Subject: [PATCH] portable builds: dynamic-list program table export (binutils
+ 2.34), CPUID SHA-NI check
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/cmake/ProgramTable.cmake |  8 +++++++-
+ ps2xRuntime/include/runtime/sha256.h | 15 ++++++++++++++-
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xRuntime/cmake/ProgramTable.cmake b/ps2xRuntime/cmake/ProgramTable.cmake
+index fdf5106..b4375a2 100644
+--- a/ps2xRuntime/cmake/ProgramTable.cmake
++++ b/ps2xRuntime/cmake/ProgramTable.cmake
+@@ -2,8 +2,14 @@
+ # (g_ps2RecompiledFunctionTable*, see ps2_runtime.h) from the executable that
+ # loaded it, so the executable must export those symbols dynamically. Call this
+ # for every executable that defines a program (game targets, probes, tests).
++# A dynamic list rather than --export-dynamic-symbol, which needs binutils
++# 2.35: release builds link on Ubuntu 20.04 (binutils 2.34).
+ function(ps2x_export_program_table target)
+     if(PS2X_RUNTIME_SHARED)
+-        target_link_options(${target} PRIVATE "LINKER:--export-dynamic-symbol=g_ps2RecompiledFunctionTable*")
++        set(list "${CMAKE_BINARY_DIR}/ps2x_program_table.dynlist")
++        if(NOT EXISTS "${list}")
++            file(WRITE "${list}" "{ g_ps2RecompiledFunctionTable*; };\n")
++        endif()
++        target_link_options(${target} PRIVATE "LINKER:--dynamic-list=${list}")
+     endif()
+ endfunction()
+diff --git a/ps2xRuntime/include/runtime/sha256.h b/ps2xRuntime/include/runtime/sha256.h
+index ea27fbf..956a4a6 100644
+--- a/ps2xRuntime/include/runtime/sha256.h
++++ b/ps2xRuntime/include/runtime/sha256.h
+@@ -11,6 +11,9 @@
+ 
+ #if defined(__x86_64__) || defined(_M_X64)
+ #include <immintrin.h>
++#if defined(__GNUC__) || defined(__clang__)
++#include <cpuid.h>
++#endif
+ #define GA2_SHA256_X86 1
+ #endif
+ 
+@@ -164,10 +167,20 @@ namespace ga2_sha256
+         }
+ 
+     private:
++#if defined(GA2_SHA256_X86) && (defined(__GNUC__) || defined(__clang__))
++        // CPUID directly: __builtin_cpu_supports("sha") needs GCC 11 / clang 19.
++        static bool cpuHasShaNi()
++        {
++            unsigned a, b, c, d;
++            if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & bit_SSE4_1))
++                return false;
++            return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & bit_SHA);
++        }
++#endif
+         void compress(const uint8_t *block, size_t blocks)
+         {
+ #if defined(GA2_SHA256_X86) && (defined(__GNUC__) || defined(__clang__))
+-            static const bool shaNi = __builtin_cpu_supports("sha") && __builtin_cpu_supports("sse4.1");
++            static const bool shaNi = cpuHasShaNi();
+             if (shaNi)
+             {
+                 compressShaNi(m_state, block, blocks);
+-- 
+2.56.0
+
