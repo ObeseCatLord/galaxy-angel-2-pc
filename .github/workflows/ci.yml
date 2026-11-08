@@ -6,8 +6,16 @@ name: CI
 
 on:
   push:
+    branches: ['**']
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   workflow_dispatch:
+
+# A newer push to the same branch cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   linux:

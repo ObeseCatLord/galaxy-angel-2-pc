@@ -17,6 +17,11 @@ on:
         type: boolean
         default: false
 
+# One release build at a time (a second one queues instead of running twice).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   linux:
     name: Linux ${{ matrix.arch }}
