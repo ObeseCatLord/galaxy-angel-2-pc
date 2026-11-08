@@ -17,7 +17,9 @@ export GA2_COMPILERS="-DCMAKE_C_COMPILER=${GA2_CC:-clang-18} -DCMAKE_CXX_COMPILE
 export GA2_DISC_IDS="zettai;mugen-1;mugen-2;eigou-1;eigou-2"
 export GA2_RUNTIME_BUILD="${GA2_RUNTIME_BUILD:-$PRIVATE/build/release}"
 export PKG_CONFIG_PATH="$FFMPEG/lib/pkgconfig"
-STATIC="-static-libstdc++ -static-libgcc"
+# --as-needed drops libraries nothing calls (raylib links libGLU, the runtime
+# libatomic), which a minimal system or SteamOS outside the Steam runtime lacks.
+STATIC="-static-libstdc++ -static-libgcc -Wl,--as-needed"
 # -O2 as in the tested builds (and -O3 needs much more memory on the generated code).
 "$SOURCE/tools/configure_runtime.sh" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG" \
     "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF \
@@ -29,5 +31,6 @@ cmake --build "$GA2_RUNTIME_BUILD" --target ga2 ga2_zettai ga2_mugen_1 ga2_mugen
     --parallel "${GA2_JOBS:-$(nproc)}"
 python3 "$SOURCE/tools/package.py" "$GA2_RUNTIME_BUILD" "$OUT"
 strip --strip-debug "$OUT"/ga2 "$OUT"/ga2_* "$OUT"/libps2_runtime.so
-# Report the newest glibc symbol version the binaries need.
+# Report what the binaries need: the newest glibc symbol version and the libraries.
 objdump -T "$OUT"/ga2 "$OUT"/ga2_* "$OUT"/libps2_runtime.so | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1
+readelf -d "$OUT"/ga2 "$OUT"/ga2_* "$OUT"/libps2_runtime.so | grep NEEDED | sort -u
