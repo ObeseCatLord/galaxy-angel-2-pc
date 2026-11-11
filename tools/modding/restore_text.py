@@ -11,14 +11,18 @@ its translation when the game lays out a message.
 
     python3 tools/modding/restore_text.py <private> <pack-dir> [--discs ...]
 
-File format: ``GA2MSG1\\0``, u32 count, then per entry u16 length + original
-bytes, u16 length + translated bytes (little endian).  Needs only the
-standard library (reads the pack like ``audit_pack.py``).
+File format: ``GA2MSG2\\0``, u32 count, then per entry the first 16 bytes
+of the SHA-256 of the original bytes, u16 length + translated bytes (little
+endian).  Keys are digests so a pack carries none of the games' own text
+(the engine still reads the older ``GA2MSG1``, which stored the original
+bytes).  Needs only the standard library (reads the pack like
+``audit_pack.py``).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -76,9 +80,9 @@ def main(argv=None) -> int:
                     clashes += 1   # the same Japanese line translated two ways: the first one wins
                     continue
                 table.setdefault(ob, nb)
-        out = bytearray(b"GA2MSG1\0" + struct.pack("<I", len(table)))
+        out = bytearray(b"GA2MSG2\0" + struct.pack("<I", len(table)))
         for ob, nb in table.items():
-            out += struct.pack("<H", len(ob)) + ob + struct.pack("<H", len(nb)) + nb
+            out += hashlib.sha256(ob).digest()[:16] + struct.pack("<H", len(nb)) + nb
         (a.pack / "text" / f"{prog}.msg").write_bytes(bytes(out))
         print(f"{disc}: {len(table)} message(s), {clashes} translated differently elsewhere (first kept) -> "
               f"{a.pack / 'text' / (prog + '.msg')}", flush=True)

@@ -289,6 +289,35 @@ narration at 4:3, 16:9 and 21:9 (`research/run57/gems/`: `gems-compare.png`,
 top to bottom: 4:3, 16:9 before, 16:9 after, 21:9 after): the gems sit
 symmetrically around the name at the same pixels as at 4:3.
 
+## Battle map markers, radar blips and the message balloon (2026-11-11)
+
+Seen in an Eigou 1 battle at 16:9 and 21:9 (`research/run58/work/ws169`, `ws219`):
+
+- **Unit markers** (ring `cb 0x194298`, frame, face, star: 2D layer items at the unit's icon): the game
+  projects the icons with the widened camera (measured: unit offsets on the map are 1/k of their 4:3
+  values, `icon43` vs `icon169`), so their x is already in the wide frame. The old rules squeezed them
+  again about the centre, and near an edge the 48-wide ring and the 32-wide face could fall on different
+  sides of the edge rule and come apart. Now the battle pointer publishes the icons each map update
+  (`ga2_hud::setUnitIcons`); an item of no layout, at most 72x72, centred within 20 px of an icon is a
+  world marker: its centre stays where the game put it and its shape is squeezed about that centre
+  (`AnchorWorld`). The pointer's hit test (`markerX`) uses the icon x unchanged.
+- **Radar blips** (kind-2 items, orthographic models): the item draw reaches the ortho draw by a tail
+  jump, which the generated code makes as a direct call past the hook (Eigou, Mugen; Zettai calls it).
+  The item draw hook now places a kind-2 item's x and x scale on the item for its draw (the ortho hook
+  then leaves it), and an item of no layout inside a recently drawn edge-anchored layout (the radar box)
+  takes that layout's side.
+- **Transformed sprites** (`0x11bc30` / zettai `0x11ba18` / mugen-2 `0x11ba98`: x f12, y f13, w f14,
+  h f15, pivot f16/f17, scale f18/f19, angle on the stack; builds its own matrix): hooked, x by the
+  anchor, width and pivot by 1/k.
+- **Message balloon**: the communication window's layout spans the screen; its balloon is a band of
+  plain sprites (caps and stretched middle pieces whose rest rectangles do not touch) and was split
+  between the left and right edges. A band of three or more plain sprites (no callback) with the same top
+  and height, plus what lies inside its box (text, page icon), is now one group, anchored to the edge it
+  starts from. Callback digits (the score and time limit of the top bar) are not bands.
+
+Diagnostics: `GA2_HUD_LOG` (rect hooks in battle scenes, with item depth and anchor), `GA2_CAM_LOG`,
+`GA2_TRACE_ITEM_CB=<callback>` and `GA2_TRACE_BATTLE_FRAME=<s>` (every guest call, runtime patch 0134).
+
 ## Not covered
 
 - AxlPrim immediate geometry (`0x230d70`, beams and lines through VU1) uses

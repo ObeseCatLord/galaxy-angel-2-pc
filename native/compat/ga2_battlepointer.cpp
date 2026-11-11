@@ -815,6 +815,24 @@ namespace
                                  ev.dragging, ev.wheel);
                 }
             }
+            // The unit icons' centres, for the 2D layer's hor+ placement (ga2_hud.h).
+            if (const uint32_t mgr = word(ram, kDiscs[I].mgrGlobal))
+            {
+                const Disc &D = kDiscs[I];
+                const uint32_t last = D.countField ? word(ram, mgr + D.countField) : 0x4fu;
+                float icons[2 * 0x50];
+                int n = 0;
+                for (uint32_t i = 0; int32_t(last) >= 0 && i <= last && i < 0x50u; ++i)
+                {
+                    const uint32_t unit = unitAt<I>(ram, mgr, i);
+                    if (!usable<I>(ram, unit))
+                        continue;
+                    icons[2 * n] = flt(ram, unit + D.sx);
+                    icons[2 * n + 1] = flt(ram, unit + D.sx + 4);
+                    ++n;
+                }
+                ga2_hud::setUnitIcons(icons, n);
+            }
             g_map.mapview = mapview;
             g_map.published = nowNanos();
             g_map.dragging = ev.dragging;

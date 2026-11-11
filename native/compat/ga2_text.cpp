@@ -24,6 +24,7 @@
 #include "game_overrides.h"
 #include "runtime/ga2_hitext.h"
 #include "runtime/ga2_text_icons.h"
+#include "runtime/sha256.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
@@ -176,17 +177,25 @@ namespace
     }
 
     // A save keeps the message that was on screen and shows it again when loaded, in the language it was made in.
-    // A language pack's text/<program>.msg (tools/modding/restore_text.py) maps the disc's message bytes to the
-    // pack's: such a text is swapped for its translation when the game lays it out (the scripts themselves already
-    // come from the pack).
+    // A language pack's text/<program>.msg (tools/modding/restore_text.py) maps the disc's messages to the pack's:
+    // such a text is swapped for its translation when the game lays it out (the scripts themselves already come
+    // from the pack). Keyed by the SHA-256 of the disc's message bytes (first 16 bytes), so a pack carries no
+    // original text: GA2MSG2 stores the digests, the older GA2MSG1 the bytes themselves (hashed when loaded).
     std::unordered_map<std::string, std::string> g_restore;
+
+    std::string messageKey(std::string_view text)
+    {
+        ga2_sha256::Hasher hasher;
+        hasher.update(text.data(), text.size());
+        const std::array<uint8_t, 32> digest = hasher.finish();
+        return std::string(reinterpret_cast<const char *>(digest.data()), 16);
+    }
 
     void loadRestore(const char *program)
     {
         const char *list = std::getenv("GA2_MODS");
         if (!list)
             return;
-        size_t files = 0;
         // GA2_MODS is highest priority first: the first entry for a text wins.
         for (std::string_view rest = list; !rest.empty();)
         {
@@ -201,7 +210,8 @@ namespace
             if (!in)
                 continue;
             const std::string data{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-            if (data.size() < 12 || data.compare(0, 8, std::string("GA2MSG1\0", 8)) != 0)
+            const bool v2 = data.size() >= 12 && data.compare(0, 8, std::string("GA2MSG2\0", 8)) == 0;
+            if (!v2 && (data.size() < 12 || data.compare(0, 8, std::string("GA2MSG1\0", 8)) != 0))
             {
                 std::cerr << "[ga2 text] " << file.string() << ": not a message table\n";
                 continue;
@@ -212,19 +222,20 @@ namespace
             size_t at = 12;
             for (uint32_t i = 0; i < count && at + 2 <= data.size(); ++i)
             {
-                const size_t a = u16(at);
-                if (at + 2 + a + 2 > data.size())
+                // v2: 16-byte key; v1: u16 length + original bytes. Then u16 length + translated bytes.
+                const size_t a = v2 ? 16 : u16(at);
+                const size_t keyAt = v2 ? at : at + 2;
+                if (keyAt + a + 2 > data.size())
                     break;
-                const size_t b = u16(at + 2 + a);
-                if (at + 4 + a + b > data.size())
+                const size_t b = u16(keyAt + a);
+                if (keyAt + a + 2 + b > data.size())
                     break;
-                g_restore.emplace(data.substr(at + 2, a), data.substr(at + 4 + a, b));
-                at += 4 + a + b;
+                const std::string key = v2 ? data.substr(keyAt, 16) : messageKey(std::string_view(data).substr(keyAt, a));
+                g_restore.emplace(key, data.substr(keyAt + a + 2, b));
+                at = keyAt + a + 2 + b;
             }
-            ++files;
             std::cerr << "[ga2 text] " << file.string() << ": " << count << " message translation(s) for restored saves\n";
         }
-        (void)files;
     }
 
     // The text the game should use for the NUL-terminated text at `address`: a restored save's message in the
@@ -241,7 +252,7 @@ namespace
             text += char(rdram[a]);
         bool changed = false;
         if (buffer == 0 && !g_restore.empty())
-            if (const auto it = g_restore.find(text); it != g_restore.end())
+            if (const auto it = g_restore.find(messageKey(text)); it != g_restore.end())
             {
                 text = it->second;
                 changed = true;

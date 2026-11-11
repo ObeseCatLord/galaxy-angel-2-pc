@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0
+
+- English translation included (Options > Language > English): story
+  scripts, character names, battle dialogue, menus, the text inside the game
+  programs, the staff roll and the translated pictures. It ships as a
+  language pack in `mods/ga2-en`.
+- Widescreen battle HUD (16:9 to 21:9):
+  - unit markers stay on their units and keep their shape
+  - the minimap's blips stay inside the minimap
+  - the message balloon stays beside its portrait
+- The launcher also reads mods from a `mods` folder next to it, so a release
+  can ship language packs. A pack installed in the data folder still takes
+  precedence.
+- Language packs' save-message tables are keyed by digests, so a pack
+  carries none of the games' original text. Older packs still work.
+- Steam Frame:
+  - the Frame controller profile, including its D-pad
+  - SteamVR's own OpenXR loader
+  - disc import from an `isos` folder
+  - a launcher that works entirely with a gamepad
+  - a guide (docs/STEAM_FRAME.md)
+- VR controller table in the README.
+- Linux builds need only glibc 2.30 and libGL (no libGLU or libatomic).
+
 ## 0.8.0
 
 The first public release. All three games are playable on all five

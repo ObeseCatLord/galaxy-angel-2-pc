@@ -3,9 +3,10 @@
 [![CI](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml/badge.svg)](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml)
 
 <p align="center">
-  <img src="docs/images/battle.png" width="49%" alt="A battle in Eigou Kaiki no Toki">
-  <img src="docs/images/eigou.png" width="49%" alt="A story scene in Eigou Kaiki no Toki">
+  <img src="docs/images/battle.png" width="49%" alt="A battle in Eigou Kaiki no Toki in 16:9 widescreen">
+  <img src="docs/images/eigou.png" width="49%" alt="A story scene in Eigou Kaiki no Toki with sharp text">
 </p>
+<p align="center"><sub>Eigou Kaiki no Toki at 4x internal resolution: a battle in 16:9 widescreen, and a story scene with Sharp text.</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.
@@ -36,8 +37,10 @@ You need a GPU with Vulkan 1.3. Details, all options and the VR guide are in
 - Keyboard, gamepad and full mouse play, including battles. Button prompts
   match the device you're using.
 - Hold Ctrl to skip messages, Esc skips movies.
-- Language switching: translations install as language packs (see
-  [docs/LANGUAGE_PACKS.md](docs/LANGUAGE_PACKS.md)).
+- **English translation included:** choose English in Options > Language.
+  Story, names, menus, battles and the translated pictures all switch.
+  Other translations install as language packs
+  ([docs/LANGUAGE_PACKS.md](docs/LANGUAGE_PACKS.md)).
 - Mods: replacement files and HD textures ([docs/MODDING.md](docs/MODDING.md)).
 - Filters for the 2D art (Smooth, Anime4K, sharp pixels), debanding, and the
   PS2 dither turned off.
@@ -103,7 +106,7 @@ More in [docs/PLAYING.md](docs/PLAYING.md#vr).
 ## Building
 
 These steps are for Linux. Windows builds are cross-compiled from
-Linux (see `tools/mingw-w64-toolchain.cmake`).
+Linux (see `tools/ci/build-windows-release.sh`).
 
 You need: clang, CMake, Ninja, Python 3, git, the FFmpeg and Vulkan
 development packages, and the X11 development libraries raylib uses.
@@ -122,10 +125,10 @@ python3 tools/ga2.py setup
 # Put each disc image in its own folder:
 #   private/discs/zettai/   private/discs/mugen-1/   private/discs/mugen-2/
 #   private/discs/eigou-1/  private/discs/eigou-2/
-python3 tools/ga2.py import    
-python3 tools/ga2.py analyze   
-python3 tools/ga2.py generate  
-python3 tools/ga2.py build     
+python3 tools/ga2.py import
+python3 tools/ga2.py analyze
+python3 tools/ga2.py generate
+python3 tools/ga2.py build
 
 python3 tools/package.py private/build/ga2-runtime dist
 ```

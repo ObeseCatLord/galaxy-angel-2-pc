@@ -1,0 +1,54 @@
+From d76ec6474098efb03954d2a053bb578d0a746142 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:57:34 -0600
+Subject: [PATCH] diagnostics: ga2_activity::traceCalls logs every guest call
+ while set
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_activity.h | 2 ++
+ ps2xRuntime/src/lib/ps2_runtime.cpp        | 2 ++
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    | 1 +
+ 3 files changed, 5 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_activity.h b/ps2xRuntime/include/runtime/ga2_activity.h
+index 172c881..cadcd62 100644
+--- a/ps2xRuntime/include/runtime/ga2_activity.h
++++ b/ps2xRuntime/include/runtime/ga2_activity.h
+@@ -38,6 +38,8 @@ namespace ga2_activity
+     // > 1 when the game's 3D cameras render hor+ by this factor (anamorphic:
+     // the 640-wide frame holds a view k times wider); set by game hooks.
+     extern std::atomic<float> horPlus;
++    // Diagnostics: while non-zero, every guest call is logged ("[call] from -> to").
++    extern std::atomic<int> traceCalls;
+ 
+     // A frame to show at the wide play-area shape: hor+ 3D on screen.
+     inline bool wideFrame() { return horPlus.load(std::memory_order_relaxed) > 1.0f && scene3d(); }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d9e3ecd..4898d90 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1808,6 +1808,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     ctx->pc = targetPc;
+     if (kind == GuestBranchKind::Return) observeGuestReturn(ctx, targetPc);
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
++    if (isCall && ga2_activity::traceCalls.load(std::memory_order_relaxed))
++        std::fprintf(stderr, "[call] %06x -> %06x\n", sourcePc, targetPc);
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 034ecdd..8102dbe 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -987,6 +987,7 @@ std::atomic<uint64_t> ga2_activity::vsyncs{0};
+ std::atomic<int64_t> ga2_activity::last3dNanos{INT64_MIN / 2};
+ std::atomic<int64_t> ga2_activity::last3dVsync{INT64_MIN / 2};
+ std::atomic<float> ga2_activity::horPlus{1.0f};
++std::atomic<int> ga2_activity::traceCalls{0};
+ 
+ VU1Interpreter::PerfSample VU1Interpreter::takePerfSample()
+ {
+-- 
+2.56.0
+

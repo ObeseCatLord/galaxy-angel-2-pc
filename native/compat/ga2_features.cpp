@@ -58,19 +58,22 @@ namespace
         uint32_t update;    // main-loop Update (the factor is taken once per iteration)
         uint32_t applyProj; // CCamera::ApplyProjection (reads ax at camera + 0xc0 every time a camera is applied)
         uint32_t sys;       // the sys singleton pointer (+4 app, app +0 scene manager, manager +8 scene id)
+        // Transformed 2D sprite (x f12, y f13, w f14, h f15, pivot f16/f17, scale f18/f19, angle on the stack):
+        // the item draw's path for rotated and scaled sprites; builds its own matrix (the battle radar's blips).
+        uint32_t xformSprite;
     };
 
     constexpr DiscFeatures kDiscs[] = {
         {"zettai", "SLPM_662.43", 0x00100008u, 0x5E58C415u, 0x118b58u, 0x113490u, 0x7f96c0u,
-         0x2332a0u, 0x233308u, 0x2333e0u, 0x233448u, 0x2329c8u, 0x232c18u, 0x232e38u, 0x11ce18u, 0x11c0e0u, 0x10bb28u, 0x113210u, 0x118e78u, 0x2d3be4u},
+         0x2332a0u, 0x233308u, 0x2333e0u, 0x233448u, 0x2329c8u, 0x232c18u, 0x232e38u, 0x11ce18u, 0x11c0e0u, 0x10bb28u, 0x113210u, 0x118e78u, 0x2d3be4u, 0x11ba18u},
         {"mugen-1", "SLPM_667.79", 0x00100008u, 0x15F1CB0Du, 0x118cb0u, 0x113540u, 0x517200u,
-         0x24cd00u, 0x24cd68u, 0x24ce40u, 0x24cea8u, 0x24c428u, 0x24c678u, 0x24c898u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2f01e4u},
+         0x24cd00u, 0x24cd68u, 0x24ce40u, 0x24cea8u, 0x24c428u, 0x24c678u, 0x24c898u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2f01e4u, 0x11bc30u},
         {"mugen-2", "SLPM_667.80", 0x00100008u, 0x1F83C20Cu, 0x118bd8u, 0x113510u, 0x7fb340u,
-         0x234d50u, 0x234db8u, 0x234e90u, 0x234ef8u, 0x234478u, 0x2346c8u, 0x2348e8u, 0x11ce98u, 0x11c160u, 0x10bba8u, 0x113290u, 0x118ef8u, 0x2d56e4u},
+         0x234d50u, 0x234db8u, 0x234e90u, 0x234ef8u, 0x234478u, 0x2346c8u, 0x2348e8u, 0x11ce98u, 0x11c160u, 0x10bba8u, 0x113290u, 0x118ef8u, 0x2d56e4u, 0x11ba98u},
         {"eigou-1", "SLPM_551.18", 0x00100008u, 0x73DEC964u, 0x118cb0u, 0x113540u, 0x525a80u,
-         0x259a00u, 0x259a68u, 0x259b40u, 0x259ba8u, 0x259128u, 0x259378u, 0x259598u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2fe2e4u},
+         0x259a00u, 0x259a68u, 0x259b40u, 0x259ba8u, 0x259128u, 0x259378u, 0x259598u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2fe2e4u, 0x11bc30u},
         {"eigou-2", "SLPM_551.19", 0x00100008u, 0xAAAC1E15u, 0x118cb0u, 0x113540u, 0x518680u,
-         0x24dd70u, 0x24ddd8u, 0x24deb0u, 0x24df18u, 0x24d498u, 0x24d6e8u, 0x24d908u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2f12a4u},
+         0x24dd70u, 0x24ddd8u, 0x24deb0u, 0x24df18u, 0x24d498u, 0x24d6e8u, 0x24d908u, 0x11d030u, 0x11c2f8u, 0x10bb90u, 0x1132c0u, 0x118fd0u, 0x2f12a4u, 0x11bc30u},
     };
 
     constexpr float kNativePar = 0.94f;
@@ -94,6 +97,7 @@ namespace
     // window's shape). The factor the game renders with is taken once per iteration (refreshK, in Update) so the
     // cameras, the squeezed 2D and the presentation (ga2_activity::horPlus) always agree within a frame.
     int sceneId(const uint8_t *rdram); // below
+    int g_itemDepth = 0;               // 2D layer item draws in progress (game thread only)
     std::atomic<int64_t> g_cameraVsync{-1000}; // guest vblank of the last perspective camera applied
     // The last 16 distinct vblanks a camera was applied on (game thread): a 3D scene applies one every frame, a 2D
     // scene's one-off (the title's) is not a 3D scene.
@@ -177,6 +181,7 @@ namespace
         DirectSprite,
         Update,
         ApplyProjection,
+        XformSprite,
         HookCount
     };
 
@@ -196,6 +201,23 @@ namespace
     void update(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int scene = sceneId(rdram);
+        // GA2_TRACE_BATTLE_FRAME=<seconds> (diagnostics): log every guest call of two main-loop iterations that
+        // many seconds into the first battle.
+        if (const char *tb = std::getenv("GA2_TRACE_BATTLE_FRAME"))
+        {
+            static int64_t battleSince = -1;
+            static int left = 2;
+            if (scene == 3 && battleSince < 0)
+                battleSince = ga2_activity::nowNanos();
+            if (battleSince >= 0 && left > 0 && ga2_activity::nowNanos() - battleSince > int64_t(std::atof(tb) * 1e9))
+            {
+                ga2_activity::traceCalls.store(1);
+                std::fprintf(stderr, "[trace] iteration %d\n", 3 - left);
+                --left;
+            }
+            else if (left == 0)
+                ga2_activity::traceCalls.store(0);
+        }
         static const bool trace = std::getenv("GA2_WIDE_TRACE") != nullptr;
         static int lastScene = -2;
         if (trace && scene != lastScene)
@@ -223,6 +245,23 @@ namespace
     {
         noteCamera(int64_t(ga2_activity::vsyncs.load(std::memory_order_relaxed)));
         const uint32_t camera = GPR_U32(ctx, 4);
+        // GA2_CAM_LOG=1 (diagnostics): each camera applied in a battle scene, once, with its first 0x100 bytes.
+        if (std::getenv("GA2_CAM_LOG") && camera >= 0x100000u && camera + 0x100u < 0x2000000u &&
+            (sceneId(rdram) == 3 || sceneId(rdram) == 13))
+        {
+            static std::unordered_set<uint32_t> seen;
+            if (seen.insert(camera).second)
+            {
+                std::fprintf(stderr, "[cam] %06x ra=%06x", camera, GPR_U32(ctx, 31));
+                for (uint32_t o = 0; o < 0x100u; o += 4)
+                {
+                    float f;
+                    std::memcpy(&f, rdram + camera + o, 4);
+                    std::fprintf(stderr, " %02x:%g", o, f);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         if ((g_everWide || k() > 1.0f) && camera >= 0x100000u && camera + 0xc4u < 0x2000000u)
         {
             const float ax = 1.0f / (kNativePar * k());
@@ -250,9 +289,11 @@ namespace
     {
         AnchorCentre,
         AnchorLeft,
-        AnchorRight
+        AnchorRight,
+        AnchorWorld // already placed in the wide frame by the game (unit icons)
     };
     Anchor g_anchor = AnchorCentre; // the item being drawn (game thread only)
+    float g_worldCx = 320.0f;       // AnchorWorld: the item's centre, kept in place (game thread only)
 
     float placeXAt(Anchor anchor, float x)
     {
@@ -262,6 +303,8 @@ namespace
             return x / k();
         case AnchorRight:
             return 640.0f - (640.0f - x) / k();
+        case AnchorWorld:
+            return g_worldCx + (x - g_worldCx) / k(); // its own shape, about where the game put it
         default:
             return squeezeX(x);
         }
@@ -330,7 +373,9 @@ namespace
         static const char *env = std::getenv("GA2_HUD_LOG");
         static const auto start = std::chrono::steady_clock::now();
         static int lines = 0;
-        if (!env || lines >= 40000 ||
+        // Battle scenes only (3 battle, 13 tutorial battle), where the HUD rules matter most.
+        const int scene = g_rdram ? sceneId(g_rdram) : -1;
+        if (!env || lines >= 40000 || (scene != 3 && scene != 13) ||
             std::chrono::steady_clock::now() - start < std::chrono::seconds(std::atoi(env)))
             return;
         ++lines;
@@ -342,7 +387,7 @@ namespace
         std::fprintf(stderr, "[hud] h%d ra=%06x", hook, chain[0]);
         for (int i = 1; i < depth; ++i)
             std::fprintf(stderr, "<%06x", chain[i]);
-        std::fprintf(stderr, " x=%.0f..%.0f y=%.0f..%.0f\n", x0, x1, y0, y1);
+        std::fprintf(stderr, " x=%.0f..%.0f y=%.0f..%.0f depth=%d anchor=%d\n", x0, x1, y0, y1, g_itemDepth, int(g_anchor));
     }
 
     float readF(const uint8_t *rdram, uint32_t address)
@@ -397,6 +442,18 @@ namespace
         Rect bounds;
     };
     std::unordered_map<uint32_t, LayoutSide> g_layoutSide; // item -> its layout
+    // Edge-anchored layouts seen recently (the radar): primitives drawn outside
+    // any item draw (the radar's own-unit blips) inside one's bounds take its
+    // side, so they stay with what they are drawn over.
+    struct EdgeArea
+    {
+        Rect bounds;
+        Anchor side;
+        int64_t seen;
+    };
+    std::unordered_map<uint32_t, EdgeArea> g_edgeAreas; // layout -> area
+    bool edgeAreaSide(float x0, float y0, float x1, float y1, Anchor &side); // below
+    bool g_kind2Placed = false; // the item draw placed a kind-2 (ortho model) item itself
     std::unordered_set<uint32_t> g_centreItems;             // 2D layer items that always stay centred (ga2_hud::keepCentred)
 
     // Large centred items (the cockpit reticle, pop-up panels), seen
@@ -483,6 +540,8 @@ namespace
         {
             for (const uint32_t child : items)
                 g_layoutSide[child] = {side, u};
+            if (side != AnchorCentre)
+                g_edgeAreas[layout] = {u, Anchor(side), ga2_activity::nowNanos()};
         }
         else
         {
@@ -503,16 +562,57 @@ namespace
                     if (!backdrop(rects[i]) && !backdrop(rects[j]) && rects[i].x0 <= rects[j].x1 &&
                         rects[j].x0 <= rects[i].x1 && rects[i].y0 <= rects[j].y1 && rects[j].y0 <= rects[i].y1)
                         group[root(i)] = root(j);
+            // A band of pieces with the same top and height (three or more) is one stretched panel (a
+            // communication balloon: caps and stretched middle pieces whose rest rectangles do not touch).
+            // The band and everything inside its box (text, page icon) move together, to the edge the
+            // panel starts from.
+            // Plain sprites only (no draw callback): a row of digits drawn by callbacks (the score and the
+            // time limit in the top bar, at both edges) is not a panel.
+            auto plainSprite = [&](size_t i) { return word(rdram, items[i] + 8) == 0u && word(rdram, items[i] + 0x78) == 0u; };
+            std::unordered_map<size_t, Rect> bandBox;
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (backdrop(rects[i]) || !plainSprite(i))
+                    continue;
+                std::vector<size_t> band;
+                for (size_t j = 0; j < n; ++j)
+                    if (!backdrop(rects[j]) && plainSprite(j) && std::fabs(rects[j].y0 - rects[i].y0) < 0.5f &&
+                        std::fabs((rects[j].y1 - rects[j].y0) - (rects[i].y1 - rects[i].y0)) < 0.5f)
+                        band.push_back(j);
+                if (band.size() < 3)
+                    continue;
+                Rect box = rects[band[0]];
+                for (const size_t j : band)
+                {
+                    box = unite(box, rects[j]);
+                    group[root(j)] = root(band[0]);
+                }
+                bandBox[root(band[0])] = box;
+            }
+            for (const auto &[r, box] : bandBox)
+                for (size_t i = 0; i < n; ++i)
+                    if (!backdrop(rects[i]) && rects[i].x0 >= box.x0 - 2.0f && rects[i].x1 <= box.x1 + 2.0f &&
+                        rects[i].y0 >= box.y0 - 2.0f && rects[i].y1 <= box.y1 + 2.0f)
+                        group[root(i)] = root(r);
             std::unordered_map<size_t, Rect> bounds;
             for (size_t i = 0; i < n; ++i)
             {
                 const auto it = bounds.find(root(i));
                 bounds[root(i)] = it == bounds.end() ? rects[i] : unite(it->second, rects[i]);
             }
+            // A panel band spread across the screen goes to the edge it starts from.
+            std::unordered_set<size_t> bandRoots;
+            for (size_t i = 0; i < n; ++i)
+                for (const auto &[r, box] : bandBox)
+                    if (root(i) == root(r))
+                        bandRoots.insert(root(i));
             for (size_t i = 0; i < n; ++i)
             {
                 const Rect &b = bounds[root(i)];
-                g_layoutSide[items[i]] = {backdrop(rects[i]) ? int(kSpread) : sideOfGroup(b), b};
+                int side = backdrop(rects[i]) ? int(kSpread) : sideOfGroup(b);
+                if (side == kSpread && bandRoots.count(root(i)))
+                    side = b.x0 < kSixth ? int(AnchorLeft) : b.x1 > 640.0f - kSixth ? int(AnchorRight) : int(AnchorCentre);
+                g_layoutSide[items[i]] = {side, b};
             }
         }
         if (std::getenv("GA2_HUD_LOG"))
@@ -555,6 +655,22 @@ namespace
         return id == 2 || id == 3 || id == 13;
     }
 
+    // The tactical map's unit icons (ga2_hud::setUnitIcons), recent ones only.
+    std::vector<std::pair<float, float>> g_unitIcons;
+    int64_t g_unitIconsAt = 0;
+
+    bool onUnitIcon(const Rect &r)
+    {
+        if (g_unitIcons.empty() || ga2_activity::nowNanos() - g_unitIconsAt > 250'000'000)
+            return false;
+        const float cx = 0.5f * (r.x0 + r.x1), cy = 0.5f * (r.y0 + r.y1);
+        // Ring and face are centred on the icon, the frame above it, the star at its corner.
+        for (const auto &[x, y] : g_unitIcons)
+            if (std::fabs(cx - x) <= 20.0f && std::fabs(cy - y) <= 20.0f)
+                return true;
+        return false;
+    }
+
     Anchor itemSide(const uint8_t *rdram, uint32_t item)
     {
         if (!edgeScene(rdram))
@@ -563,14 +679,59 @@ namespace
             return AnchorCentre;
         Rect own;
         const bool hasRect = itemRect(rdram, item, own);
+        if (hasRect && own.x1 - own.x0 <= 72.0f && own.y1 - own.y0 <= 72.0f && !g_layoutSide.count(item) &&
+            onUnitIcon(own))
+        {
+            g_worldCx = 0.5f * (own.x0 + own.x1);
+            return AnchorWorld;
+        }
         if (hasRect)
             noteFrame(item, own);
         const auto layout = g_layoutSide.find(item);
         if (layout != g_layoutSide.end() && layout->second.side != kSpread)
             return insideFrame(layout->second.bounds) ? AnchorCentre : Anchor(layout->second.side);
+        // An item of no layout drawn inside an edge-anchored one (the radar's blips) goes with it.
+        if (Anchor side; hasRect && layout == g_layoutSide.end() && edgeAreaSide(own.x0, own.y0, own.x1, own.y1, side))
+            return side;
         if (!hasRect || spansWidth(own.x0, own.x1) || insideFrame(own))
             return AnchorCentre;
         return sideOf(own.x0, own.x1);
+    }
+
+    // The anchor for a primitive at x0..x1, y0..y1: the item being drawn's, or,
+    // outside any item draw, the side of an edge-anchored layout it lies in.
+    Anchor primitiveAnchor(float x0, float y0, float x1, float y1)
+    {
+        Anchor side;
+        if (g_itemDepth == 0 && edgeAreaSide(x0, y0, x1, y1, side))
+            return side;
+        return g_anchor;
+    }
+
+    // An edge-anchored layout seen in the last 250 ms whose bounds hold x0..x1, y0..y1 (the radar).
+    bool edgeAreaSide(float x0, float y0, float x1, float y1, Anchor &side)
+    {
+        if (g_edgeAreas.empty())
+            return false;
+        const int64_t now = ga2_activity::nowNanos();
+        constexpr float kSlack = 4.0f;
+        for (auto it = g_edgeAreas.begin(); it != g_edgeAreas.end();)
+        {
+            if (now - it->second.seen > 250'000'000)
+            {
+                it = g_edgeAreas.erase(it);
+                continue;
+            }
+            const Rect &b = it->second.bounds;
+            if (std::min(x0, x1) >= b.x0 - kSlack && std::max(x0, x1) <= b.x1 + kSlack &&
+                std::min(y0, y1) >= b.y0 - kSlack && std::max(y0, y1) <= b.y1 + kSlack)
+            {
+                side = it->second.side;
+                return true;
+            }
+            ++it;
+        }
+        return false;
     }
 
     template <size_t I>
@@ -591,6 +752,7 @@ namespace
             return;
         }
         const Anchor outer = g_anchor;
+        const float outerCx = g_worldCx;
         g_anchor = itemSide(rdram, item);
         if (std::getenv("GA2_HUD_LOG"))
         {
@@ -607,8 +769,40 @@ namespace
                 std::fprintf(stderr, "[item] %s\n", line);
             }
         }
+        // GA2_TRACE_ITEM_CB=<hex> (diagnostics): log the guest calls of that callback's item draws (60 draws).
+        static const uint32_t traceCb = std::getenv("GA2_TRACE_ITEM_CB") ? uint32_t(std::strtoul(std::getenv("GA2_TRACE_ITEM_CB"), nullptr, 16)) : 0u;
+        static int traced = 0;
+        const bool trace = traceCb && word(rdram, item + 0x78) == traceCb && traced < 60 && (sceneId(rdram) == 3 || sceneId(rdram) == 13);
+        if (trace)
+        {
+            ++traced;
+            std::fprintf(stderr, "[trace] item %06x cb %06x\n", item, traceCb);
+            ga2_activity::traceCalls.store(1);
+        }
+        // Kind-2 items (orthographic models: the radar's blips) are drawn by a tail jump into the ortho draw
+        // that the generated code makes as a direct call, past its hook (Eigou, Mugen): place x and the x scale
+        // on the item itself for its draw.
+        const bool kind2 = kind == 2u;
+        const float itemX = kind2 ? readF(rdram, item + 0x3c) : 0.0f, itemSx = kind2 ? readF(rdram, item + 0x60) : 0.0f;
+        if (kind2)
+        {
+            writeF(rdram, item + 0x3c, placeX(itemX));
+            writeF(rdram, item + 0x60, itemSx / k());
+            g_kind2Placed = true;
+        }
+        ++g_itemDepth;
         g_original<I, ItemDraw>(rdram, ctx, runtime);
+        --g_itemDepth;
+        if (kind2)
+        {
+            writeF(rdram, item + 0x3c, itemX);
+            writeF(rdram, item + 0x60, itemSx);
+            g_kind2Placed = false;
+        }
+        if (trace)
+            ga2_activity::traceCalls.store(0);
         g_anchor = outer;
+        g_worldCx = outerCx;
     }
 
     // Orthographic VU1 models drawn in 2D space (the radar blips, kind-2 layer
@@ -618,13 +812,30 @@ namespace
     template <size_t I>
     void orthoDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (!ga2_activity::wideFrame())
+        if (!ga2_activity::wideFrame() || g_kind2Placed)
         {
             g_original<I, OrthoDraw>(rdram, ctx, runtime);
             return;
         }
         const uint32_t record = GPR_U32(ctx, 4);
         const float x = readF(rdram, record + 0x14), sx = readF(rdram, record + 0x38);
+        if (std::getenv("GA2_HUD_LOG"))
+        {
+            g_rdram = rdram;
+            static std::unordered_map<uint32_t, int> last; // print anchor changes only
+            if (last.emplace(record, -1).first->second != int(g_anchor))
+            {
+                last[record] = int(g_anchor);
+                uint32_t chain[4] = {GPR_U32(ctx, 31)};
+                uint32_t sp = GPR_U32(ctx, 29);
+                int depth = 1;
+                while (depth < 4 && callerOf(rdram, chain[depth - 1], sp, chain[depth], sp))
+                    ++depth;
+                std::fprintf(stderr, "[ortho] rec=%06x x=%.1f y=%.1f sx=%.3f anchor=%d ra=%06x<%06x<%06x\n", record, x,
+                             readF(rdram, record + 0x18), sx, int(g_anchor), chain[0], depth > 1 ? chain[1] : 0,
+                             depth > 2 ? chain[2] : 0);
+            }
+        }
         writeF(rdram, record + 0x14, placeX(x));
         writeF(rdram, record + 0x38, sx / k());
         g_original<I, OrthoDraw>(rdram, ctx, runtime);
@@ -642,8 +853,9 @@ namespace
             hudLog(H, ctx, x0, float(int16_t(GPR_S32(ctx, 5))), x1, float(int16_t(GPR_S32(ctx, 7))));
         if (ga2_activity::wideFrame() && !spansWidth(std::min(x0, x1), std::max(x0, x1)))
         {
-            SET_GPR_S32(ctx, 4, int32_t(std::lround(placeX(x0))));
-            SET_GPR_S32(ctx, 6, int32_t(std::lround(placeX(x1))));
+            const Anchor a = primitiveAnchor(x0, float(int16_t(GPR_S32(ctx, 5))), x1, float(int16_t(GPR_S32(ctx, 7))));
+            SET_GPR_S32(ctx, 4, int32_t(std::lround(placeXAt(a, x0))));
+            SET_GPR_S32(ctx, 6, int32_t(std::lround(placeXAt(a, x1))));
         }
         g_original<I, H>(rdram, ctx, runtime);
     }
@@ -657,8 +869,9 @@ namespace
         if (ga2_activity::wideFrame() &&
             !spansWidth(std::min(ctx->f[12], ctx->f[14]), std::max(ctx->f[12], ctx->f[14])))
         {
-            ctx->f[12] = placeX(ctx->f[12]);
-            ctx->f[14] = placeX(ctx->f[14]);
+            const Anchor a = primitiveAnchor(ctx->f[12], ctx->f[13], ctx->f[14], ctx->f[15]);
+            ctx->f[12] = placeXAt(a, ctx->f[12]);
+            ctx->f[14] = placeXAt(a, ctx->f[14]);
         }
         g_original<I, H>(rdram, ctx, runtime);
     }
@@ -673,10 +886,36 @@ namespace
             const float xs[4] = {ctx->f[12], ctx->f[14], ctx->f[16], ctx->f[18]};
             hudLog(H, ctx, *std::min_element(xs, xs + 4), ctx->f[13], *std::max_element(xs, xs + 4), ctx->f[19]);
             if (!spansWidth(*std::min_element(xs, xs + 4), *std::max_element(xs, xs + 4)))
+            {
+                const float ys[4] = {ctx->f[13], ctx->f[15], ctx->f[17], ctx->f[19]};
+                const Anchor a = primitiveAnchor(*std::min_element(xs, xs + 4), *std::min_element(ys, ys + 4),
+                                                 *std::max_element(xs, xs + 4), *std::max_element(ys, ys + 4));
                 for (int i = 12; i <= 18; i += 2)
-                    ctx->f[i] = placeX(ctx->f[i]);
+                    ctx->f[i] = placeXAt(a, ctx->f[i]);
+            }
         }
         g_original<I, H>(rdram, ctx, runtime);
+    }
+
+    // Transformed sprites: x by the anchor of the item being drawn (or of the edge layout it lies in), width and
+    // pivot by 1/k so the sprite keeps its shape in the stretched frame.
+    template <size_t I>
+    void xformSprite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_rdram = rdram;
+        if (ga2_activity::wideFrame())
+        {
+            const float x0 = ctx->f[12] - ctx->f[16], y0 = ctx->f[13] - ctx->f[17];
+            hudLog(XformSprite, ctx, x0, y0, x0 + ctx->f[14], y0 + ctx->f[15]);
+            if (!spansWidth(x0, x0 + ctx->f[14]))
+            {
+                const Anchor a = primitiveAnchor(x0, y0, x0 + ctx->f[14], y0 + ctx->f[15]);
+                ctx->f[12] = placeXAt(a, ctx->f[12]);
+                ctx->f[14] /= k();
+                ctx->f[16] /= k();
+            }
+        }
+        g_original<I, XformSprite>(rdram, ctx, runtime);
     }
 
     template <size_t I>
@@ -710,7 +949,8 @@ namespace
             !hook(d.orthoDraw, g_original<I, OrthoDraw>, orthoDraw<I>) ||
             !hook(d.directSprite, g_original<I, DirectSprite>, rectFloat<I, DirectSprite>) ||
             !hook(d.update, g_original<I, Update>, update<I>) ||
-            !hook(d.applyProj, g_original<I, ApplyProjection>, applyProjection<I>))
+            !hook(d.applyProj, g_original<I, ApplyProjection>, applyProjection<I>) ||
+            !hook(d.xformSprite, g_original<I, XformSprite>, xformSprite<I>))
             return;
         std::cerr << "[ga2 features] " << d.disc << ": hor+ hooks bound\n";
     }
@@ -720,9 +960,17 @@ namespace
 // anchor the item draw hook would give a lone item of that width.
 float ga2_hud::markerX(float x, float halfWidth)
 {
-    if (!ga2_activity::wideFrame())
-        return x;
-    return placeXAt(sideOf(x - halfWidth, x + halfWidth), x);
+    (void)halfWidth;
+    // Unit icons are drawn where the game put them (AnchorWorld), in any frame.
+    return x;
+}
+
+void ga2_hud::setUnitIcons(const float *xy, int count)
+{
+    g_unitIcons.clear();
+    for (int i = 0; i < count; ++i)
+        g_unitIcons.emplace_back(xy[2 * i], xy[2 * i + 1]);
+    g_unitIconsAt = ga2_activity::nowNanos();
 }
 
 void ga2_hud::keepCentred(uint32_t item)

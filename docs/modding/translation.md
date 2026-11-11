@@ -238,7 +238,8 @@ loaded, in the language it was made in: a save from a Japanese session shows
 its first line in Japanese under a language pack. `import --build` therefore
 also writes `<mod>/text/<program>.msg` (`restore_text.py`, which can be run
 on its own for an existing pack): every message string the pack changed, as
-original bytes -> pack bytes. The engine (`ga2_text.cpp`) swaps such a text
+a digest of the original bytes (SHA-256, first 16 bytes) -> pack bytes. The
+pack carries none of the original text. The engine (`ga2_text.cpp`) swaps such a text
 for the pack's when the game lays it out. A Japanese line translated
 differently in two scenes takes the first scene's English.
 

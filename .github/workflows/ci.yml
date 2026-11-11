@@ -1,7 +1,5 @@
-# Builds and tests everything that does not need the games' discs: the
-# recompiler, the runtime, the launcher and the unit tests. The game
-# executables are made from code generated from your own discs, so they are
-# built by the release workflow (or locally), never here.
+# Builds and tests the recompiler, the runtime and the launcher on every
+# push: Linux x86-64, Linux ARM64 and Windows (cross-compiled).
 name: CI
 
 on:

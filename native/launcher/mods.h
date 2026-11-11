@@ -6,7 +6,9 @@
 // exactly when that language is chosen in Options. Other mods are switched
 // on and ordered on the Mods screen (<data>/mods.ini; first = highest
 // priority). Loose files in <data>/mods/<disc program>/ still work, below
-// every mod.
+// every mod. Mods in a mods folder beside the launcher (shipped with a
+// release, e.g. its language packs) are listed too, below a data-folder mod
+// of the same folder name.
 #pragma once
 
 #include <filesystem>

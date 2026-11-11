@@ -51,7 +51,17 @@ needs a keyboard.
 
 ## Settings for the Frame
 
-- **Internal resolution:** Native or 2x. 4x is too heavy for a mobile GPU.
+- **Internal resolution:** sets how sharp the 3D scenes are, in VR and
+  flat. **4x matches the Frame's recommended VR resolution.**
+  - In VR each eye gets its own picture at this resolution. 4x renders
+    2560x1792 per eye, which covers SteamVR's recommended 1728x1728 eye size
+    on the Frame (1440x1440 by default).
+  - 2x gives 1280x896, about half the detail. Native gives 640x448.
+  - 4x is the highest setting (16 samples per pixel), so the panels' own
+    2160x2160 is not reached.
+  - Whether the Frame's GPU keeps 72 Hz at 4x in VR is not yet measured. If
+    VR stutters, try 2x.
+  - The 2D scenes are the games' own 640x448 art at every setting.
 - **Frame rate:** 60 (PS2) is the safe choice. Higher rates draw more frames
   and cost battery.
 - **2D picture filter:** Smooth or Bilinear. Anime4K HQ is too heavy.

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Release build for Linux (x86-64 or ARM64): clang (GA2_CC/GA2_CXX, default
-# clang-18) with GCC 13's libstdc++ and FFmpeg linked statically, so the result needs only glibc and the X11/OpenGL
-# libraries of the system it was built on (Ubuntu 20.04: glibc 2.31).
-# Needs the generated game code in $GA2_GENERATED_ROOT (made from the discs
-# with tools/ga2.py generate; never part of this repository).
+# clang-18) with GCC 13's libstdc++ and FFmpeg linked statically, so the
+# result needs only glibc and libGL of the system it was built on (Ubuntu
+# 20.04: glibc 2.31).
+# Needs a prepared private root (tools/ga2.py import and generate, as in the
+# README's build steps).
 #   build-linux-release.sh <out-dir>
 set -euo pipefail
 SOURCE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -20,7 +21,7 @@ export PKG_CONFIG_PATH="$FFMPEG/lib/pkgconfig"
 # --as-needed drops libraries nothing calls (raylib links libGLU, the runtime
 # libatomic), which a minimal system or SteamOS outside the Steam runtime lacks.
 STATIC="-static-libstdc++ -static-libgcc -Wl,--as-needed"
-# -O2 as in the tested builds (and -O3 needs much more memory on the generated code).
+# -O2 as in the tested builds (-O3 needs much more memory).
 "$SOURCE/tools/configure_runtime.sh" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG" \
     "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" -DPS2X_BUILD_TEST=OFF -DPS2X_IOP_BUILD_TESTS=OFF \
     -DPKG_CONFIG_ARGN=--static -DPS2X_LINK_DEPENDS_SHARED=ON \

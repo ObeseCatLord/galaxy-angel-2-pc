@@ -1,9 +1,21 @@
-# Adding an English patch (language packs)
+# Language packs and the English translation
 
-The games are Japanese. A translation is installed as a **language pack**: a
-mod folder that the port loads when its language is chosen in the options.
-The disc images are never modified. Uninstalling the pack or switching the
-language back to Japanese gives you the original text.
+The games are Japanese. A translation is a **language pack**: a mod folder
+that the port loads when its language is chosen in the options. The disc
+images are never modified. Switching the language back to Japanese gives you
+the original text.
+
+## The English translation
+
+Releases from 0.9.0 on include the English translation, in the `mods/ga2-en`
+folder next to `ga2`. Nothing needs installing:
+
+1. Start `ga2` and open **Options** (O, or Start on a pad).
+2. Set **Language** to **English**.
+3. Start a game.
+
+The rest of this page is for other language packs, or for installing a
+newer version of the English pack than the one a release shipped with.
 
 ## Installing a language pack
 

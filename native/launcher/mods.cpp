@@ -1,4 +1,5 @@
 #include "mods.h"
+#include "library.h"
 #include "process.h"
 
 #include <nlohmann/json.hpp>
@@ -29,7 +30,15 @@ namespace ga2
     {
         m_mods.clear();
         std::error_code ec;
-        for (const auto &entry : std::filesystem::directory_iterator(m_dataDir / "mods", ec))
+        // <data>/mods, then the mods shipped with the launcher (<launcher folder>/mods, e.g. a release's language
+        // packs). A mod installed in the data folder replaces a shipped one of the same folder name.
+        std::vector<std::filesystem::directory_entry> entries;
+        for (const auto &root : {m_dataDir / "mods", executableDirectory() / "mods"})
+            for (const auto &entry : std::filesystem::directory_iterator(root, ec))
+                if (std::none_of(entries.begin(), entries.end(),
+                                 [&](const auto &e) { return e.path().filename() == entry.path().filename(); }))
+                    entries.push_back(entry);
+        for (const auto &entry : entries)
         {
             const auto manifest = entry.path() / "mod.json";
             if (!entry.is_directory(ec) || !std::filesystem::exists(manifest, ec))

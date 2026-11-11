@@ -6,7 +6,7 @@ usage: package.py <build-dir> <out-dir>
 Linux builds copy libps2_runtime.so (the launcher puts its own folder on
 LD_LIBRARY_PATH); Windows builds copy the .exe files and the DLLs next to them.
 """
-import shutil, sys
+import os, shutil, sys
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -37,6 +37,9 @@ def main():
     shutil.copy2(SOURCE / "tools" / "assets" / "extract_skybox.py", out / "tools" / "extract_skybox.py")
     shutil.copy2(SOURCE / "docs" / "PLAYING.md", out / "README.md")
     shutil.copy2(SOURCE / "docs" / "LANGUAGE_PACKS.md", out / "LANGUAGE_PACKS.md")
+    # Language packs shipped with a release (GA2_PACKAGE_MODS: folders holding mod.json).
+    for mod in filter(None, os.environ.get("GA2_PACKAGE_MODS", "").split(os.pathsep)):
+        shutil.copytree(mod, out / "mods" / Path(mod).name)
     shutil.copy2(SOURCE / "docs" / "STEAM_FRAME.md", out / "STEAM_FRAME.md")
     shutil.copy2(SOURCE / "LICENSE", out / "LICENSE.md")
     print(f"packaged {'Windows' if windows else 'Linux'} build in {out}")
