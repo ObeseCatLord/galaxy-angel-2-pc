@@ -191,7 +191,7 @@ namespace
         void openWindow()
         {
             SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
-            InitWindow(1280, 720, "Galaxy Angel 2 PC " GA2_VERSION);
+            InitWindow(1280, 720, "Galaxy Angel II PC " GA2_VERSION);
             SetTargetFPS(60);
             SetExitKey(KEY_NULL);
         }
@@ -833,7 +833,7 @@ int main(int argc, char **rawArgv)
         else if (arg == "--list") list = true;
         else if (arg == "--version")
         {
-            std::cout << "Galaxy Angel 2 PC " GA2_VERSION "\n";
+            std::cout << "Galaxy Angel II PC " GA2_VERSION "\n";
             return 0;
         }
         else if (arg == "--import")

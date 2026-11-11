@@ -1,4 +1,4 @@
-# Playing Galaxy Angel 2 PC
+# Playing Galaxy Angel II PC
 
 ## What you need
 
