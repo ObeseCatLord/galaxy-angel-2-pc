@@ -1,4 +1,4 @@
-# Galaxy Angel 2 PC
+# Galaxy Angel II PC
 
 [![CI](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml/badge.svg)](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml)
 
