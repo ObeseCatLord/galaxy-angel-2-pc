@@ -10,6 +10,19 @@
   - unit markers stay on their units and keep their shape
   - the minimap's blips stay inside the minimap
   - the message balloon stays beside its portrait
+- Sharp text and HD button prompts now reach the screen in 2D story scenes
+  at 2x and 4x. Those scenes are composed off screen, and the copy to the
+  screen used to drop back to 640x448.
+- The Anime4K filter at 2x and 4x keeps the full-resolution text and icons
+  instead of redrawing them from a 640x448 copy.
+- New high-resolution button prompts (256x256, sharp up to 8x), also for
+  PlayStation controllers, which used to get the games' own low-resolution
+  icons. The dialogue box's Auto, Back and Menu words are redrawn sharp too.
+- Button prompts blend into the art behind them. The PlayStation icon used
+  to be covered with a flat block of colour.
+- Debanding is on by default (Low) in 2D and 3D scenes, and text and other
+  sharp edges are left untouched.
+- The README is also in Japanese (README.ja.md).
 - The launcher also reads mods from a `mods` folder next to it, so a release
   can ship language packs. A pack installed in the data folder still takes
   precedence.

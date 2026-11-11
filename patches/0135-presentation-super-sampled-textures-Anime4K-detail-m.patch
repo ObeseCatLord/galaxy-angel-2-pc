@@ -1,0 +1,301 @@
+From 9a48f7aad08615ad4cd4e19e52a7986c121a3b78 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:28:20 -0600
+Subject: [PATCH] presentation: super-sampled textures, Anime4K detail mix,
+ deband edge guard, blended button prompts
+
+- paraLLEl-GS super_sampled_textures on (GA2_PGS_SS_TEXTURES=0 disables), so
+  2D scenes composed off-screen keep their internal-resolution detail.
+- Anime4K at 2x/4x runs on a box-downscaled picture and mixes the full-resolution
+  frame back in where it has detail the small picture lost (text, icons).
+- Debanding reads its setting by value, defaults to Low, and skips pixels near
+  strong edges so text stays sharp.
+- HD button prompts fill the original icon's spot by interpolating its border
+  instead of a flat average colour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_options.h |   4 +-
+ ps2xRuntime/src/lib/ga2_present.cpp       | 147 +++++++++++++++++++++-
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp         |   5 +
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp    |  42 ++++---
+ 4 files changed, 178 insertions(+), 20 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_options.h b/ps2xRuntime/include/runtime/ga2_options.h
+index 512da37..b795832 100644
+--- a/ps2xRuntime/include/runtime/ga2_options.h
++++ b/ps2xRuntime/include/runtime/ga2_options.h
+@@ -103,8 +103,8 @@ namespace ga2_options
+             {"dither", "PS2 dithering", "The PS2's checkerboard dither when it reduces colours to 16 bits.", "GA2_PGS_DITHER",
+              Apply::Live, {{"0", "Off"}, {"1", "On (original look)"}}},
+             {"deband", "Debanding",
+-             "Smooths the visible colour steps of the PS2's 16-bit gradients (nebula skies, fades, glows) in 2D and 3D scenes; edges and text stay sharp. High smooths more and costs a little more GPU time.",
+-             "GA2_DEBAND", Apply::Live, {{"off", "Off"}, {"low", "Low"}, {"high", "High"}}},
++             "Smooths the visible colour steps of the PS2's 16-bit gradients (backgrounds, CGs, nebula skies, fades) in 2D and 3D scenes; edges and text stay sharp. High smooths more and costs a little more GPU time.",
++             "GA2_DEBAND", Apply::Live, {{"low", "Low"}, {"high", "High"}, {"off", "Off"}}},
+             {"buttons", "Button prompts", "Which button icons the games show: follows the controller or keyboard you use.",
+              "GA2_BUTTONS", Apply::Live, {{"auto", "Automatic"}, {"playstation", "PlayStation"}, {"xbox", "Xbox"}, {"keyboard", "Keyboard"}}},
+             {"sharp_text", "Sharp text",
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 8245cec..ecaa10f 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -67,7 +67,9 @@ namespace ga2_present
+             s.filter = filterFor(ga2_settings::value(ga2_options::Filter));
+             s.english = std::string(ga2_settings::value(ga2_options::Language)) == "en";
+             s.integer2d = std::string(ga2_settings::value(ga2_options::Scale2d)) == "integer";
+-            s.deband = ga2_settings::get(ga2_options::Deband);
++            // By value (the menu lists Low first: it is the default).
++            const std::string deband = ga2_settings::value(ga2_options::Deband);
++            s.deband = deband == "high" ? 2 : deband == "low" ? 1 : 0;
+             return s;
+         }
+ 
+@@ -107,6 +109,71 @@ namespace ga2_present
+         bool g_ditherLoaded = false;
+         Shader g_sharp{};
+         bool g_sharpLoaded = false;
++
++        // Anime4K over a picture rendered above 640x448 (2x / 4x internal resolution) in a 2D scene: the network
++        // runs on the picture box-filtered back to the game's size (the 2D art's own detail), and the result is
++        // combined with the full picture wherever that has detail the small one lacks (the vector font's text,
++        // HD button prompts and replacement textures), so those stay as rendered.
++        const char *kBoxDown = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform vec2 srcSize;
++uniform int factor;
++out vec4 finalColor;
++void main() {
++    vec2 base = floor(fragTexCoord * srcSize / float(factor)) * float(factor);
++    vec4 sum = vec4(0.0);
++    for (int y = 0; y < factor; ++y)
++        for (int x = 0; x < factor; ++x)
++            sum += texelFetch(texture0, ivec2(base) + ivec2(x, y), 0);
++    // Opaque: the frame's alpha is the PS2's (0x80 = 0.5), and blending it into the target would darken the picture.
++    finalColor = vec4(sum.rgb / float(factor * factor), 1.0);
++})";
++        const char *kDetailMix = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;   // Anime4K of the small picture
++uniform sampler2D fullPicture; // the picture as rendered
++uniform sampler2D smallPicture;
++uniform vec2 fullSize;
++out vec4 finalColor;
++void main() {
++    vec2 uv = fragTexCoord;
++    float detail = 0.0;
++    for (int y = -1; y <= 1; ++y)
++        for (int x = -1; x <= 1; ++x) {
++            vec2 o = vec2(x, y) / fullSize;
++            vec3 d = abs(texture(fullPicture, uv + o).rgb - texture(smallPicture, uv + o).rgb);
++            detail = max(detail, max(d.r, max(d.g, d.b)));
++        }
++    float m = smoothstep(0.08, 0.22, detail);
++    finalColor = vec4(mix(texture(texture0, uv).rgb, texture(fullPicture, uv).rgb, m), 1.0);
++})";
++        Shader g_boxDown{}, g_detailMix{};
++        bool g_detailLoaded = false;
++        RenderTexture2D g_small{}, g_mixed{};
++
++        // A render target of this size (made again when the size changes).
++        void ensureTarget(RenderTexture2D &target, int width, int height)
++        {
++            if (target.id && target.texture.width == width && target.texture.height == height)
++                return;
++            if (target.id)
++                UnloadRenderTexture(target);
++            target = LoadRenderTexture(width, height);
++            SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
++        }
++
++        // Draws `texture` (width x height) over the whole of `target`, keeping its orientation.
++        void drawInto(RenderTexture2D &target, uint32_t texture, int width, int height)
++        {
++            BeginTextureMode(target);
++            ClearBackground(BLANK);
++            const Texture2D t{texture, width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            DrawTexturePro(t, Rectangle{0.0f, 0.0f, float(width), -float(height)},
++                           Rectangle{0.0f, 0.0f, float(target.texture.width), float(target.texture.height)}, Vector2{0, 0},
++                           0.0f, WHITE);
++            EndTextureMode();
++        }
+         RenderTexture2D g_blur[3]{};
+         Texture2D g_skybox{};
+ 
+@@ -208,6 +275,17 @@ vec4 hook() {
+     ivec2 size = ivec2(HOOKED_size);
+     ivec2 p = min(ivec2(HOOKED_pos * HOOKED_size), size - 1);
+     vec4 c0 = texelFetch(HOOKED_raw, p, 0);
++    // Text and sharp lines are left alone: a pixel near a strong edge (a step far larger than a 16-bit band, in
++    // the 5x5 around it, scaled with the picture) keeps its colour, so letters and their anti-aliasing stay
++    // crisp while the flat gradients around them are smoothed.
++    int guard = max(1, int(round(2.0 * HOOKED_size.y / 448.0)));
++    for (int gy = -2; gy <= 2; ++gy)
++        for (int gx = -2; gx <= 2; ++gx) {
++            vec3 e = texelFetch(HOOKED_raw, clamp(p + ivec2(gx, gy) * guard / 2, ivec2(0), size - 1), 0).rgb;
++            vec3 de = abs(e - c0.rgb);
++            if (max(de.r, max(de.g, de.b)) > 0.2)
++                return c0;
++        }
+     float radius = DB_RADIUS * HOOKED_size.y * (1.0 / 448.0);
+     uint state = pcg(uint(p.x) + pcg(uint(p.y)));
+     vec3 sum = c0.rgb;
+@@ -590,11 +668,72 @@ namespace ga2_present
+         if (g_ready && g_chain && !scene3d && sizesMatch)
+         {
+             rlDrawRenderBatchActive();
++            // Above the game's size (2x / 4x): the network sees the picture at the game's size, and the detail
++            // only the full picture has is put back afterwards (kDetailMix). GA2_FILTER_FULL=1 runs it on the
++            // full picture instead (diagnostics).
++            static const bool full = std::getenv("GA2_FILTER_FULL") != nullptr;
++            const int factor = std::max(1, frame.width / 640);
++            const bool hires = factor > 1 && !full;
++            if (hires && !g_detailLoaded)
++            {
++                g_boxDown = LoadShaderFromMemory(nullptr, kBoxDown);
++                g_detailMix = LoadShaderFromMemory(nullptr, kDetailMix);
++                g_detailLoaded = IsShaderValid(g_boxDown) && IsShaderValid(g_detailMix);
++            }
++            uint32_t input = frame.id;
++            int inputW = frame.width, inputH = frame.height;
++            if (hires && g_detailLoaded)
++            {
++                ensureTarget(g_small, frame.width / factor, frame.height / factor);
++                const float size[2] = {float(frame.width), float(frame.height)};
++                SetShaderValue(g_boxDown, GetShaderLocation(g_boxDown, "srcSize"), size, SHADER_UNIFORM_VEC2);
++                SetShaderValue(g_boxDown, GetShaderLocation(g_boxDown, "factor"), &factor, SHADER_UNIFORM_INT);
++                BeginShaderMode(g_boxDown);
++                drawInto(g_small, frame.id, frame.width, frame.height);
++                EndShaderMode();
++                input = g_small.texture.id;
++                inputW = g_small.texture.width;
++                inputH = g_small.texture.height;
++            }
+             int w = 0, h = 0;
+-            const uint32_t result =
+-                g_chain->run(frame.id, frame.width, frame.height, int(picture.width), int(picture.height), w, h);
++            const uint32_t result = g_chain->run(input, inputW, inputH, int(picture.width), int(picture.height), w, h);
+             glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+-            if (result)
++            if (result && hires && g_detailLoaded)
++            {
++                // At the size it is shown at, so the full picture's text keeps all its detail (the network's
++                // output, 2x the small picture, is scaled up to it).
++                const int mixW = std::max(w, int(picture.width)), mixH = std::max(h, int(picture.height));
++                ensureTarget(g_mixed, mixW, mixH);
++                // The extra textures are bound after the target is begun (beginning it flushes the batch, which
++                // drops textures bound for the next draw).
++                BeginTextureMode(g_mixed);
++                ClearBackground(BLANK);
++                BeginShaderMode(g_detailMix);
++                const float fullSize[2] = {float(frame.width), float(frame.height)};
++                SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "fullSize"), fullSize, SHADER_UNIFORM_VEC2);
++                SetShaderValueTexture(g_detailMix, GetShaderLocation(g_detailMix, "fullPicture"), frame);
++                SetShaderValueTexture(g_detailMix, GetShaderLocation(g_detailMix, "smallPicture"), g_small.texture);
++                const Texture2D networkOut{result, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                DrawTexturePro(networkOut, Rectangle{0.0f, 0.0f, float(w), -float(h)},
++                               Rectangle{0.0f, 0.0f, float(mixW), float(mixH)}, Vector2{0, 0}, 0.0f, WHITE);
++                EndShaderMode();
++                EndTextureMode();
++                glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++                shown = g_mixed.texture;
++                source = Rectangle{0.0f, 0.0f, float(mixW), float(mixH)};
++                // GA2_FILTER_DUMP=<dir> (diagnostics): the small picture, the network's output and the mix, now and then.
++                static const char *dump = std::getenv("GA2_FILTER_DUMP");
++                static int mixed = 0;
++                if (dump && *dump && ++mixed % 120 == 0)
++                {
++                    const std::string base = std::string(dump) + "/" + std::to_string(mixed);
++                    dumpPicture(g_small.texture.id, g_small.texture.width, g_small.texture.height, base + "-small.ppm");
++                    dumpPicture(result, w, h, base + "-a4k.ppm");
++                    dumpPicture(g_mixed.texture.id, mixW, mixH, base + "-mix.ppm");
++                    dumpPicture(frame.id, frame.width, frame.height, base + "-full.ppm");
++                }
++            }
++            else if (result)
+             {
+                 shown = Texture2D{result, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R16G16B16A16};
+                 source = Rectangle{0.0f, 0.0f, float(w), float(h)};
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index e86848b..64f83ee 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -471,6 +471,11 @@ namespace
+         options.super_sampling = r >= 16 ? SuperSampling::X16 : r >= 8 ? SuperSampling::X8
+                                  : r >= 4 ? SuperSampling::X4 : r >= 2 ? SuperSampling::X2 : SuperSampling::X1;
+         s.ssaa = static_cast<uint32_t>(options.super_sampling);
++        // Super-sampled textures: a sprite that copies a rendered buffer (a 2D scene composed off screen, then
++        // blitted to the display buffer) keeps the buffer's samples, so the vector text, the HD button icons and
++        // replacement textures of 2D scenes reach the screen at the internal resolution, not 640x448.
++        // GA2_PGS_SS_TEXTURES=0 turns it off.
++        options.super_sampled_textures = envInt("GA2_PGS_SS_TEXTURES", 1) != 0;
+         const GSOptions eyeOptions = options;
+         if (!s.eyes[0].gs.init(&s.eyes[0].device, options))
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 50eba33..e693570 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -34,6 +34,7 @@ namespace ga2_text_icons
+ #include "gs_interface.hpp"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -164,23 +165,36 @@ namespace ga2_texpacks
+                 const ::Image *art = icon(spot.button, ga2_buttonmatch::wideSpot(spot.w, spot.h));
+                 if (!art)
+                     continue;
+-                // Cover the PS2 icon with the colour around it, then draw ours.
+-                uint64_t sum[4] = {};
+-                int n = 0;
+-                for (int y = spot.y - 1; y <= spot.y + spot.h; ++y)
+-                    for (int x = spot.x - 1; x <= spot.x + spot.w; ++x)
++                // Cover the PS2 icon with what is around it, then draw ours: each pixel blends the border pixels of
++                // its row (left to right) and of its column (top to bottom), so a gradient or pattern behind the icon
++                // continues through the spot instead of showing a flat block around our icon.
++                auto at = [&](int x, int y) {
++                    x = std::clamp(x, 0, int(w) - 1);
++                    y = std::clamp(y, 0, int(h) - 1);
++                    return base[size_t(y) * w + size_t(x)];
++                };
++                auto channel = [](uint32_t c, int i) { return float((c >> (8 * i)) & 255u); };
++                const int x0 = spot.x * k, y0 = spot.y * k, sw = spot.w * k, sh = spot.h * k;
++                for (int Y = 0; Y < sh; ++Y)
++                    for (int X = 0; X < sw; ++X)
+                     {
+-                        const bool border = y == spot.y - 1 || y == spot.y + spot.h || x == spot.x - 1 || x == spot.x + spot.w;
+-                        if (!border || x < 0 || y < 0 || x >= int(w) || y >= int(h))
+-                            continue;
+-                        const uint32_t c = base[size_t(y) * w + size_t(x)];
++                        const float u = (float(X) + 0.5f) / float(sw), v = (float(Y) + 0.5f) / float(sh);
++                        const int row = spot.y + std::min(spot.h - 1, int(v * float(spot.h)));
++                        const int col = spot.x + std::min(spot.w - 1, int(u * float(spot.w)));
++                        const uint32_t L = at(spot.x - 1, row), R = at(spot.x + spot.w, row);
++                        const uint32_t T = at(col, spot.y - 1), B = at(col, spot.y + spot.h);
++                        // Nearer borders weigh more: the horizontal blend by how close a side is, likewise vertical.
++                        const float dh = std::min(u, 1.0f - u), dv = std::min(v, 1.0f - v);
++                        const float wh = dv / std::max(1e-3f, dh + dv);
++                        uint8_t c[4];
+                         for (int i = 0; i < 4; ++i)
+-                            sum[i] += (c >> (8 * i)) & 255u;
+-                        ++n;
++                        {
++                            const float horizontal = channel(L, i) * (1.0f - u) + channel(R, i) * u;
++                            const float vertical = channel(T, i) * (1.0f - v) + channel(B, i) * v;
++                            c[i] = uint8_t(std::lround(std::clamp(horizontal * wh + vertical * (1.0f - wh), 0.0f, 255.0f)));
++                        }
++                        ImageDrawPixel(&out, x0 + X, y0 + Y, Color{c[0], c[1], c[2], c[3]});
+                     }
+-                const Color fill = n ? Color{uint8_t(sum[0] / n), uint8_t(sum[1] / n), uint8_t(sum[2] / n), uint8_t(sum[3] / n)}
+-                                     : Color{0, 0, 0, 0};
+-                ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, fill);
+                 // The icon's visible part, fitted into the spot keeping its shape.
+                 ga2_buttonmatch::drawIconFitted(out, *art, float(spot.x * k), float(spot.y * k), float(spot.w * k),
+                                                 float(spot.h * k));
+-- 
+2.56.0
+

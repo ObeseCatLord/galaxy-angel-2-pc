@@ -1,0 +1,149 @@
+From 7910a7a28eb3e9cb1c9d0920ac53ec2126bb4647 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:09:38 -0600
+Subject: [PATCH] button prompts: every style incl. PlayStation, port-drawn
+ prompt words, wider Anime4K detail mask
+
+- The button map applies with a PlayStation controller too (playstation/ icons
+  instead of the games' low-resolution ones); 'blank' spots stay PlayStation-only.
+- Map spots 'label:<name>' draw buttons/labels/<name>.png (the dialogue box's
+  Auto, Back, Menu) in every style; past the texture's edge their cover is
+  transparent; pack images get only icons.
+- Anime4K detail mix looks for detail within one small-picture pixel (5x5 taps),
+  so sharp icons and lettering keep no soft fringe.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/ga2_present.cpp    | 11 +++++--
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 44 ++++++++++++++++++++++----
+ 2 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index ecaa10f..c36863b 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -135,13 +135,16 @@ uniform sampler2D texture0;   // Anime4K of the small picture
+ uniform sampler2D fullPicture; // the picture as rendered
+ uniform sampler2D smallPicture;
+ uniform vec2 fullSize;
++uniform float stepPx; // half a small-picture pixel, in full-picture pixels
+ out vec4 finalColor;
+ void main() {
+     vec2 uv = fragTexCoord;
++    // Detail anywhere within one small-picture pixel: Anime4K redraws an edge from the small picture over that
++    // reach, so near sharp lettering and icons it would leave a soft fringe.
+     float detail = 0.0;
+-    for (int y = -1; y <= 1; ++y)
+-        for (int x = -1; x <= 1; ++x) {
+-            vec2 o = vec2(x, y) / fullSize;
++    for (int y = -2; y <= 2; ++y)
++        for (int x = -2; x <= 2; ++x) {
++            vec2 o = vec2(x, y) * stepPx / fullSize;
+             vec3 d = abs(texture(fullPicture, uv + o).rgb - texture(smallPicture, uv + o).rgb);
+             detail = max(detail, max(d.r, max(d.g, d.b)));
+         }
+@@ -711,6 +714,8 @@ namespace ga2_present
+                 BeginShaderMode(g_detailMix);
+                 const float fullSize[2] = {float(frame.width), float(frame.height)};
+                 SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "fullSize"), fullSize, SHADER_UNIFORM_VEC2);
++                const float stepPx = std::max(1.0f, float(factor) * 0.5f);
++                SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "stepPx"), &stepPx, SHADER_UNIFORM_FLOAT);
+                 SetShaderValueTexture(g_detailMix, GetShaderLocation(g_detailMix, "fullPicture"), frame);
+                 SetShaderValueTexture(g_detailMix, GetShaderLocation(g_detailMix, "smallPicture"), g_small.texture);
+                 const Texture2D networkOut{result, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index e693570..08eb163 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -108,8 +108,26 @@ namespace ga2_texpacks
+             }
+         }
+ 
++        // Labels drawn by the port (native/buttons/labels/<name>.png, the same in every style): map spots whose
++        // button is "label:<name>" put them over the game's low-resolution prompt words ("Auto", "Back", "Menu").
++        constexpr const char *kLabelPrefix = "label:";
++        bool isLabel(const std::string &button) { return button.rfind(kLabelPrefix, 0) == 0; }
++
+         const ::Image *icon(const std::string &button, bool wide = false)
+         {
++            if (isLabel(button))
++            {
++                const std::string name = button.substr(std::char_traits<char>::length(kLabelPrefix));
++                auto it = g_icons.find("labels/" + name);
++                if (it == g_icons.end())
++                {
++                    ::Image image = LoadImage((std::filesystem::path(g_buttonDir) / "labels" / (name + ".png")).string().c_str());
++                    if (image.data)
++                        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                    it = g_icons.emplace("labels/" + name, image).first;
++                }
++                return it->second.data ? &it->second : nullptr;
++            }
+             // Wide spots (pills, 'Menu' keys) use <button>_wide.png when the style has one.
+             if (wide)
+             {
+@@ -158,6 +176,8 @@ namespace ga2_texpacks
+                 // there too, a second icon of another size pulsed over the first and the marker flickered.
+                 if (spot.button == "blank")
+                 {
++                    if (g_style == "playstation")
++                        continue;
+                     ImageDrawRectangle(&out, spot.x * k, spot.y * k, spot.w * k, spot.h * k, Color{0, 0, 0, 0});
+                     drew = true;
+                     continue;
+@@ -168,7 +188,11 @@ namespace ga2_texpacks
+                 // Cover the PS2 icon with what is around it, then draw ours: each pixel blends the border pixels of
+                 // its row (left to right) and of its column (top to bottom), so a gradient or pattern behind the icon
+                 // continues through the spot instead of showing a flat block around our icon.
++                // Past the texture's edge: transparent for a label (a word filling its own texture), else the edge.
++                const bool label = isLabel(spot.button);
+                 auto at = [&](int x, int y) {
++                    if (label && (x < 0 || y < 0 || x >= int(w) || y >= int(h)))
++                        return 0u;
+                     x = std::clamp(x, 0, int(w) - 1);
+                     y = std::clamp(y, 0, int(h) - 1);
+                     return base[size_t(y) * w + size_t(x)];
+@@ -195,9 +219,11 @@ namespace ga2_texpacks
+                         }
+                         ImageDrawPixel(&out, x0 + X, y0 + Y, Color{c[0], c[1], c[2], c[3]});
+                     }
+-                // The icon's visible part, fitted into the spot keeping its shape.
+-                ga2_buttonmatch::drawIconFitted(out, *art, float(spot.x * k), float(spot.y * k), float(spot.w * k),
+-                                                float(spot.h * k));
++                // The icon's visible part, fitted into the spot keeping its shape. A label's spot reaches one pixel
++                // past the game's lettering (its anti-aliased edge), the label itself fills the lettering's box.
++                const float inset = label ? float(k) : 0.0f;
++                ga2_buttonmatch::drawIconFitted(out, *art, float(spot.x * k) + inset, float(spot.y * k) + inset,
++                                                float(spot.w * k) - 2.0f * inset, float(spot.h * k) - 2.0f * inset);
+                 drew = true;
+             }
+             return drew;
+@@ -502,7 +528,8 @@ namespace ga2_texpacks
+                     buildIndex();
+                 if (!g_buttonMapLoaded)
+                     loadButtonMap();
+-                const bool buttons = g_style != "playstation" && !g_buttonMap.empty();
++                // Every style, PlayStation too: the port's own icons and labels are drawn at the icon scale.
++                const bool buttons = !g_buttonMap.empty();
+                 // Placeholder glyphs are small (one 24x24 glyph at a time).
+                 const bool textIcons = desc.rect.width <= 32u && desc.rect.height <= 32u && !g_buttonDir.empty() &&
+                                        !g_noTextIcons;
+@@ -725,8 +752,13 @@ namespace ga2_texpacks
+                             ImageFormat(&packImage, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                             ::Image composed{};
+                             const uint64_t c0 = nowNs();
+-                            const bool done = ga2_buttonmatch::composePackButtons(
+-                                packImage, pixels(), int(w), int(h), packSpots->second, ga2_hitext::iconScale(),
++                            // Only icons are looked for in a pack image: its words are the pack's own.
++                            std::vector<IconSpot> iconSpots;
++                            for (const IconSpot &spot : packSpots->second)
++                                if (!isLabel(spot.button) && spot.button != "blank")
++                                    iconSpots.push_back(spot);
++                            const bool done = !iconSpots.empty() && ga2_buttonmatch::composePackButtons(
++                                packImage, pixels(), int(w), int(h), iconSpots, ga2_hitext::iconScale(),
+                                 [](const std::string &button, bool wide) { return icon(button, wide); }, composed);
+                             std::fprintf(stderr, "[texpacks] pack %s (%s): %s (%.1f ms)\n", name, g_style.c_str(),
+                                          done ? "PS2 icons replaced" : "no PS2 icon found, image kept as is",
+-- 
+2.56.0
+

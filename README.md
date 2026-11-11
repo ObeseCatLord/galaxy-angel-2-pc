@@ -1,12 +1,14 @@
 # Galaxy Angel II PC
 
+**English** | [日本語](README.ja.md)
+
 [![CI](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml/badge.svg)](https://github.com/ObeseCatLord/galaxy-angel-2-pc/actions/workflows/ci.yml)
 
 <p align="center">
-  <img src="docs/images/battle.png" width="49%" alt="A battle in Eigou Kaiki no Toki in 16:9 widescreen">
-  <img src="docs/images/eigou.png" width="49%" alt="A story scene in Eigou Kaiki no Toki with sharp text">
+  <img src="docs/images/battle-en.png" width="56%" alt="A battle in Eigou Kaiki no Toki in 16:9 widescreen, in English">
+  <img src="docs/images/story-en.png" width="42%" alt="A story scene in Eigou Kaiki no Toki, in English">
 </p>
-<p align="center"><sub>Eigou Kaiki no Toki at 4x internal resolution: a battle in 16:9 widescreen, and a story scene with Sharp text.</sub></p>
+<p align="center"><sub>Eigou Kaiki no Toki in English at 4x internal resolution with Anime4K and debanding: a battle in 16:9 widescreen, and a story scene.</sub></p>
 
 A native PC port of the Galaxy Angel II trilogy for the PlayStation 2:
 *Zettai Ryouiki no Tobira*, *Mugen Kairou no Kagi* and *Eigou Kaiki no Toki*.

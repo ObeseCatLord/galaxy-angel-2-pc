@@ -302,7 +302,7 @@ Seen in an Eigou 1 battle at 16:9 and 21:9 (`research/run58/work/ws169`, `ws219`
   world marker: its centre stays where the game put it and its shape is squeezed about that centre
   (`AnchorWorld`). The pointer's hit test (`markerX`) uses the icon x unchanged.
 - **Radar blips** (kind-2 items, orthographic models): the item draw reaches the ortho draw by a tail
-  jump, which the generated code makes as a direct call past the hook (Eigou, Mugen; Zettai calls it).
+  jump, which the build compiles as a direct call past the hook (Eigou, Mugen; Zettai calls it).
   The item draw hook now places a kind-2 item's x and x scale on the item for its draw (the ortho hook
   then leaves it), and an item of no layout inside a recently drawn edge-anchored layout (the radar box)
   takes that layout's side.

@@ -1,12 +1,10 @@
 # Battle engine and cheat hooks
 
 Reverse-engineering notes for a cheat menu, mainly "skip this fight with the
-best result". All addresses are guest (EE) addresses in the stock ELFs; the
-recompiled function for guest function `X` is `FUN_00X_0xX` in
-`generated52/<disc>`. Found 2026-10-14 with Ghidra decompilation of the five
-ELFs (headless, read-only copies of the private projects) plus live RAM
-inspection of the Mugen tutorial battle. A machine-readable copy of every
-table below is `<private>/research/cheats/battle-addresses.json`.
+best result". All addresses are guest (EE) addresses in the stock ELFs (the
+build names the function at guest address `X` `FUN_00X_0xX`). Found
+2026-10-14 with Ghidra decompilation of the five ELFs plus live RAM
+inspection of the Mugen tutorial battle.
 
 Status legend: **verified** = observed in a running game; **static** = read
 from decompiled code, consistent across discs, not exercised at runtime;

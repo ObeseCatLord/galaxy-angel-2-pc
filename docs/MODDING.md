@@ -142,10 +142,11 @@ dumps (`say`, `msg`, `bg`, `char_left`, `bgm`, `se`, `color_out`, `wait`,
 
 ## Button prompts
 
-The port replaces the games' PlayStation button icons with Xbox-style,
-keyboard or VR icons when you play with those (Options > Button prompts).
-The icons are in `buttons/<style>/<button>.png` next to the engines
-(the port's own art, made by `tools/assets/make_button_icons.py`), and
+The port replaces the games' low-resolution button icons with its own
+high-resolution ones for the device you play with (Options > Button
+prompts): PlayStation, Xbox-style, keyboard or VR. The icons are in
+`buttons/<style>/<button>.png` next to the engines (256x256, the port's own
+art, made by `tools/assets/make_button_icons.py`), and
 `buttons/map.json` lists where the games' textures show which button:
 
 ```json
@@ -158,7 +159,9 @@ around it and draws the style's icon there, fitted to the rectangle. Buttons
 are `cross`, `circle`, `square`, `triangle`, `l1`, `l2`, `r1`, `r2`,
 `select`, `start`, `up`, `down`, `left`, `right`. For a rectangle at least
 1.5 times wider than tall the engine uses `<button>_wide.png` when the style
-has one (keyboard keys for the pill-shaped prompts).
+has one (keyboard keys for the pill-shaped prompts). The button
+`label:<name>` draws the word `buttons/labels/<name>.png` instead, in every
+style (the dialogue box's Auto, Back and Menu).
 
 To find a prompt that still shows the PlayStation icon: run with
 `GA2_TEX_DUMP=<dir> GA2_BUTTONS=keyboard` (`xbox` and `vr` work too, and

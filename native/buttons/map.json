@@ -19,6 +19,24 @@
     "y": 81,
     "w": 26,
     "h": 16
+   },
+   {
+    "game": "all",
+    "what": "dialogue Back button: the word, port-drawn",
+    "button": "label:back",
+    "x": 38,
+    "y": 53,
+    "w": 40,
+    "h": 13
+   },
+   {
+    "game": "all",
+    "what": "dialogue Menu button: the word, port-drawn",
+    "button": "label:menu",
+    "x": 37,
+    "y": 85,
+    "w": 42,
+    "h": 13
    }
   ],
   "8eb2d9ac19891012": [
@@ -748,6 +766,17 @@
     "y": 88,
     "w": 16,
     "h": 16
+   }
+  ],
+  "35abcc89c95d8b29": [
+   {
+    "game": "all",
+    "what": "dialogue Auto button: the word (whole texture), port-drawn",
+    "button": "label:auto",
+    "x": -1,
+    "y": 1,
+    "w": 41,
+    "h": 13
    }
   ]
  }

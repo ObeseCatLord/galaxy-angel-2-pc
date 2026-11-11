@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Draws the port's own button-prompt icons (no game art), in the look of
 the games' prompts: glossy dark buttons with a bevelled rim, a coloured
-symbol with a soft glow and a highlight across the top. One 128x128 PNG per
+symbol with a tight glow and a highlight across the top. One 256x256 PNG per
 PS2 button for each prompt style (native/buttons/<style>/<button>.png, see
-native/buttons/README.md).
+native/buttons/README.md): enough for a 32-pixel prompt at 8x.
+
+Also draws the prompt words the dialogue box shows beside its icons
+(native/buttons/labels/<name>.png: Auto, Back, Menu), white like the games'
+lettering, so they are as sharp as the icons.
 
 Keyboard also gets <button>_wide.png for pill-shaped spots (L1/R1/L2/R2/Start/Select).
 
@@ -12,7 +16,7 @@ Styles follow the port's input mappings (ps2_pad.cpp, ga2_vr.h):
   keyboard  Circle=Enter Cross=X Square=Z Triangle=V, Q/E, L-Shift/R-Shift, P/Tab, arrows
   vr        Circle=A Cross=B Square=X Triangle=Y, grips, menu, stick click, stick
 
-usage: make_button_icons.py <out-dir> [--font <ttf>]
+usage: make_button_icons.py <out-dir> [--font <ttf>] [--label-font <ttf>]
 """
 import argparse
 import math
@@ -22,7 +26,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 BUTTONS = ["circle", "cross", "square", "triangle", "l1", "r1", "l2", "r2", "start", "select",
            "up", "down", "left", "right"]
-SIZE = 128
+SIZE = 256
 SS = 4              # supersampling
 S = SIZE * SS
 
@@ -100,11 +104,10 @@ def sheen(img, kind, inner):
 
 
 def glowing(img, draw_symbol, color):
-    """Draws a symbol with a soft glow in its colour."""
+    """Draws a symbol with a tight glow in its colour (a wide one reads as blur at prompt size)."""
     sym = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     draw_symbol(ImageDraw.Draw(sym), color)
-    glow = sym.filter(ImageFilter.GaussianBlur(S * 0.025))
-    img.alpha_composite(glow)
+    glow = sym.filter(ImageFilter.GaussianBlur(S * 0.010))
     img.alpha_composite(glow)
     img.alpha_composite(sym)
 
@@ -178,15 +181,37 @@ def draw_style(style, out, ttf):
                 make("keywide", wide, white, wfont, out / f"{name}_wide.png", accent=(140, 180, 255))
 
 
+# Word and the width/height of the games' lettering (dialogue box, 11 pixels tall), which the label matches.
+LABELS = {"auto": ("Auto", 39 / 11), "back": ("Back", 38 / 11), "menu": ("Menu", 40 / 11)}
+LABEL_HEIGHT = 96   # pixels of lettering height in the PNG (the games' is 11)
+
+
+def draw_labels(out, ttf):
+    """White lettering trimmed to its ink, LABEL_HEIGHT pixels tall and as wide as the games' word is for its
+    height (map.json fits it into the game's box)."""
+    out.mkdir(parents=True, exist_ok=True)
+    fnt = font(ttf, LABEL_HEIGHT * SS * 3 // 2)
+    for name, (text, aspect) in LABELS.items():
+        probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+        l, t, r, b = probe.textbbox((0, 0), text, font=fnt)
+        pad = SS * 4
+        img = Image.new("RGBA", (r - l + 2 * pad, b - t + 2 * pad), (255, 255, 255, 0))
+        ImageDraw.Draw(img).text((pad - l, pad - t), text, font=fnt, fill=(255, 255, 255, 255))
+        img = img.crop(img.getchannel("A").getbbox())
+        img.resize((round(LABEL_HEIGHT * aspect), LABEL_HEIGHT), Image.LANCZOS).save(out / f"{name}.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("out")
     parser.add_argument("--font", default="/usr/share/fonts/TTF/Hack-Bold.ttf")
+    parser.add_argument("--label-font", default="/usr/share/fonts/noto/NotoSans-Bold.ttf")
     args = parser.parse_args()
     for style in ("xbox", "keyboard", "vr"):
         out = Path(args.out) / style
         out.mkdir(parents=True, exist_ok=True)
         draw_style(style, out, args.font)
+    draw_labels(Path(args.out) / "labels", args.label_font)
     print(f"icons written to {args.out}")
 
 
