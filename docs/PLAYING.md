@@ -214,7 +214,8 @@ Windows Mixed Reality and Vive wands have no face buttons: the right
 trackpad's click is Circle / Cross / Square / Triangle by direction. The
 cheat menu appears in front of you (on the screen, or on a panel in 3D
 scenes): move with the left stick, choose with A or the trigger, close with
-B. Hold **both grips** for a second to bring the screen back in front of you.
+B. Hold **both grips** (on the Steam Frame, both bumpers) for a second to
+bring the screen back in front of you.
 
 The 3D scenes (space flights, the ship map, battles) surround you instead:
 the game draws them from your head's position and direction in true stereo,

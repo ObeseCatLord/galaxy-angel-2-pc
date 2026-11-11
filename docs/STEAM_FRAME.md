@@ -77,7 +77,7 @@ Details for the Frame:
   | D-pad (left) | D-pad |
   | Left stick | left stick and D-pad |
   | Right stick | right stick |
-  | Bumpers | L1 / R1 |
+  | Bumpers | L1 / R1 (both held for a second: recentre the screen) |
   | Grips | L2 / R2 |
   | Stick clicks | L3 / R3 (both together: cheat menu with Settings) |
   | Menu (right) | Start when tapped, Select when held |

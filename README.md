@@ -74,6 +74,32 @@ Gamepads use their usual layout. Other keys:
 Menus follow the mouse pointer. The mouse controls in battles are listed in
 [docs/PLAYING.md](docs/PLAYING.md#playing-with-the-mouse).
 
+### VR controllers
+
+| PS2 | Quest, Rift, Pico, Reverb G2 | Index | Steam Frame |
+| --- | --- | --- | --- |
+| Circle / Cross | A / B | right A / B | B / A |
+| Square / Triangle | X / Y | left A / B | X / Y |
+| D-pad, left stick | left stick | left stick | left stick, D-pad |
+| Right stick | right stick | right stick | right stick |
+| L1 / R1 | grips | grips | bumpers |
+| L2 / R2 | right stick left / right | right stick left / right | grips |
+| L3 / R3 | stick clicks | stick clicks | stick clicks |
+| Start | tap Menu | tap left trackpad (press hard) | tap Menu |
+| Select | hold Menu | right trackpad (press hard), or hold the left one | View, or hold Menu |
+| Point and click | trigger | trigger | trigger |
+
+- **Recentre the screen:** hold L1 and R1 together for a second (both grips;
+  both bumpers on the Steam Frame).
+- **Cheat menu:** click both sticks. Its **Settings** row has the options.
+- **Rebinding:** every PS2 button is its own action, so SteamVR's binding
+  screen can change any of them.
+- **Windows Mixed Reality and Vive wands:** clicking the right trackpad
+  presses Circle, Cross, Square or Triangle by direction. Vive wands have no
+  L2, R2 or right stick.
+
+More in [docs/PLAYING.md](docs/PLAYING.md#vr).
+
 ## Building
 
 The build turns the games' own program code into C++, so it needs your disc
