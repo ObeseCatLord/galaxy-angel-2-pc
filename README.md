@@ -102,8 +102,7 @@ More in [docs/PLAYING.md](docs/PLAYING.md#vr).
 
 ## Building
 
-The build turns the games' own program code into C++, so it needs your disc
-images. These steps are for Linux. Windows builds are cross-compiled from
+These steps are for Linux. Windows builds are cross-compiled from
 Linux (see `tools/mingw-w64-toolchain.cmake`).
 
 You need: clang, CMake, Ninja, Python 3, git, the FFmpeg and Vulkan
@@ -123,10 +122,10 @@ python3 tools/ga2.py setup
 # Put each disc image in its own folder:
 #   private/discs/zettai/   private/discs/mugen-1/   private/discs/mugen-2/
 #   private/discs/eigou-1/  private/discs/eigou-2/
-python3 tools/ga2.py import     # check and extract the discs
-python3 tools/ga2.py analyze    # uses the function maps in configs/maps
-python3 tools/ga2.py generate   # recompile the game programs to C++
-python3 tools/ga2.py build      # compile the launcher and the five games
+python3 tools/ga2.py import    
+python3 tools/ga2.py analyze   
+python3 tools/ga2.py generate  
+python3 tools/ga2.py build     
 
 python3 tools/package.py private/build/ga2-runtime dist
 ```
@@ -136,9 +135,7 @@ an hour on 16 cores.
 
 The [CI workflow](.github/workflows/ci.yml) builds and tests the recompiler,
 runtime and launcher on Linux x86-64, Linux ARM64 and Windows on every push.
-The game programs need code generated from the discs, so the
-[release workflow](.github/workflows/release.yml) reads that code from a
-private repository. For portable Linux builds (glibc 2.31 and up), use
+For portable Linux builds (glibc 2.31 and up), use
 `tools/ci/build-linux-release.sh` on Ubuntu 20.04.
 
 ## License
