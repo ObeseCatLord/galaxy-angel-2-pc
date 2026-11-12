@@ -1,0 +1,100 @@
+From 53fb183004c7be6108e6f45bf569449a5305ff7f Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:39:16 -0600
+Subject: [PATCH] Frame pace: count the EE thread's idle time for the rate
+ governor
+
+The scheduler adds the time it spends in its two idle waits (the pacing
+deadline and waitForEvent with nothing to run) to ga2_framepace::idleNanos.
+The governor (native/compat/ga2_framerate.cpp) uses wall time minus this as
+the game thread's busy share, so time blocked on the GS worker or inside a
+scan-out that waits for a saturated GPU counts as load: at 4x with a 175 cap
+the GPU saturated, the thread's CPU time stayed at 57 %, the governor never
+stepped down and the game ran at 46 % speed. No behaviour change here.
+
+RTX 4090, ship map (research/run59/gpu-175): 4x cap 175 now 59.9 fps at
+100 % speed (was 80.8 at 46 %); 1x and 2x still settle at 120.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_framepace.h |  5 +++++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp  | 10 ++++++++++
+ ps2xRuntime/src/lib/ga2_framepace.cpp       |  7 +++++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_framepace.h b/ps2xRuntime/include/runtime/ga2_framepace.h
+index 206a636..ffc92b2 100644
+--- a/ps2xRuntime/include/runtime/ga2_framepace.h
++++ b/ps2xRuntime/include/runtime/ga2_framepace.h
+@@ -73,6 +73,11 @@ namespace ga2_framepace
+     // Scheduler: counters for the GA2_PERF line.
+     void notePresentTick(bool scannedOut);
+     void perfReport(uint64_t tick, uint64_t vsyncTick);
++    // Scheduler (EE thread): time spent idle, waiting for the next event or deadline with nothing to run (the game
++    // is ahead of real time). Everything else the thread does counts as busy, waits for the GS and the GPU
++    // included; the frame-rate governor's load is wall time minus this.
++    void addIdleNanos(uint64_t nanos);
++    uint64_t idleNanos();
+ }
+ 
+ // Scripted pad for the oracle (GA2_PAD_SCRIPT, native/compat/ga2_framerate.cpp):
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index a471720..0959d13 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2494,6 +2494,8 @@ void EeScheduler::processDueDeadlines()
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+                                               m_stopRequested.load(std::memory_order_acquire); });
++                ga2_framepace::addIdleNanos(static_cast<uint64_t>(
++                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - now).count()));
+                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                 {
+                     updateNextDeadline();
+@@ -2815,10 +2817,17 @@ void EeScheduler::waitForEvent()
+     }
+     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
+     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
++    const auto idleStart = std::chrono::steady_clock::now();
++    const auto noteIdle = [&idleStart]()
++    {
++        ga2_framepace::addIdleNanos(static_cast<uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idleStart).count()));
++    };
+     if (m_deadlines.empty() && !hasTimerDeadline)
+     {
+         m_eventCv.wait(lock, [this]()
+                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
++        noteIdle();
+         return;
+     }
+ 
+@@ -2851,6 +2860,7 @@ void EeScheduler::waitForEvent()
+     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                                { return !m_events.empty() ||
+                                                         m_stopRequested.load(std::memory_order_acquire); });
++    noteIdle();
+     if (!signaled)
+     {
+         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+diff --git a/ps2xRuntime/src/lib/ga2_framepace.cpp b/ps2xRuntime/src/lib/ga2_framepace.cpp
+index b68c1d8..ee33c52 100644
+--- a/ps2xRuntime/src/lib/ga2_framepace.cpp
++++ b/ps2xRuntime/src/lib/ga2_framepace.cpp
+@@ -180,6 +180,13 @@ namespace ga2_framepace
+ 
+     void notePresented() { g_presented.fetch_add(1, std::memory_order_relaxed); }
+ 
++    namespace
++    {
++        std::atomic<uint64_t> g_idleNanos{0};
++    }
++    void addIdleNanos(uint64_t nanos) { g_idleNanos.fetch_add(nanos, std::memory_order_relaxed); }
++    uint64_t idleNanos() { return g_idleNanos.load(std::memory_order_relaxed); }
++
+     namespace
+     {
+         std::atomic<uint16_t> g_scriptedPad{0};
+-- 
+2.56.0
+

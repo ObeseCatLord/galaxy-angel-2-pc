@@ -28,7 +28,9 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +39,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -79,6 +82,8 @@ namespace
     bool g_noIcons = false;
     // The sprite colour's four global bytes (r, g, b, a), found in the setter's code.
     uint32_t g_colourAddress = 0;
+    // The same, found whether or not the icons are on (native text reads the sprite colour of its pieces).
+    uint32_t g_colourBytes = 0;
 
     std::optional<std::array<uint8_t, kTableBytes>> g_table;
     bool g_applied = false;
@@ -354,6 +359,386 @@ namespace
             ga2_hitext::noteAsciiMetrics(target);
     }
 
+    // ---- native text (sharp text) ----------------------------------------------------------------------------
+    // With sharp text on, the port draws the games' text itself (ga2_hitext.h, "native text runs"): each drawer
+    // call is laid out again, Latin characters with the font's own advances and kerning instead of the bitmap
+    // font's widths and 10-pixel spaces, full-width ones at the game's advance, keeping the drawer's anchor (left,
+    // right edge or centre) and its line breaks. Each piece of a line in one colour becomes a "ticket" character the
+    // original drawer then draws in place of the text: one full-width sprite per piece, which the screen-rect setter
+    // hook moves onto the piece's rectangle, and whose 24x24 bitmap the texture replacement answers with the piece
+    // rendered whole from the vector font. Button icons and characters the font lacks stay the game's own glyphs,
+    // placed in the new layout. The number drawer (fixed digit slots) is left alone.
+    constexpr float kInv18 = 0.055555552f; // the drawers' size / 18
+    // Tickets: kernel RAM between the native SDK pools (end 0x51000) and the invocation-stack arena (0x60000). The
+    // games upload a glyph by reference (a DMA REF tag to the bitmap), so a ticket must stay unchanged until the
+    // frame's packets are gone: a ring much longer than the pieces of a frame.
+    constexpr uint32_t kTicketRam = 0x00052000u;
+    constexpr uint32_t kTicketSlots = 184u;
+    static_assert(kTicketRam + kTicketSlots * 288u <= 0x00060000u);
+    constexpr uint32_t kTicketLead = 0xF8u; // Shift-JIS user-defined lead; trail 0x40 + slot
+    // The records (message drawer) or the string (string drawers) the original draws instead: read during the call.
+    constexpr uint32_t kSynthRam = 0x00070000u;
+    constexpr uint32_t kSynthBytes = 0x2000u;
+    static_assert(kSynthRam + kSynthBytes <= kIconRam);
+    uint32_t g_ticketNext = 0;
+
+    // A sprite of the synthetic draw: where the original will put it (p), where it goes (t).
+    struct Piece
+    {
+        float px0, py0, px1, py1, tx0, ty0, tx1, ty1;
+        uint64_t hash = 0;                               // a ticket: its piece (for the presentation)
+        std::shared_ptr<const ga2_hitext::RunSpec> spec;
+    };
+    struct Plan
+    {
+        uint32_t lo = 0, hi = 0; // the drawer's code: the setter's return address lies inside
+        std::vector<Piece> pieces;
+        size_t next = 0;
+    };
+    Plan g_plan;
+    uint32_t g_drawerRange[3][2] = {}; // message drawer, string drawers 1 and 2: [start, end)
+
+    template <size_t I>
+    PS2Runtime::RecompiledFunction g_setterOriginal = nullptr;
+
+    bool fullWidthLead(uint32_t b) { return b - 0x81u < 0x1Fu || b - 0xE0u < 0x1Du; }
+
+    void beginPlan(int which)
+    {
+        g_plan.lo = g_drawerRange[which][0];
+        g_plan.hi = g_drawerRange[which][1];
+        g_plan.pieces.clear();
+        g_plan.next = 0;
+    }
+
+    // One character of a line.
+    struct Ch
+    {
+        uint32_t code = 0;    // a byte, or lead | trail << 8 as the records keep it
+        bool full = false;    // double-byte
+        bool drawn = false;   // the drawer draws something for it
+        float size = 18.0f;
+        uint32_t colour = 0;
+        float pen = 0.0f, cellTop = 0.0f;
+    };
+
+    uint32_t unicodeOf(const Ch &c)
+    {
+        if (!c.full)
+            return c.code == 0x5Cu ? 0xA5u : c.code; // the games' backslash cell is a yen sign
+        return ga2_hitext::sjisToUnicode((c.code & 0xFFu) << 8 | c.code >> 8);
+    }
+
+    // Pens from 0 for one line: half-width advances (the font's, with kerning) times `halfScale`, full-width ones
+    // `fullAdvance` (size when < 0). Returns the line's width.
+    float layoutLine(std::vector<Ch> &line, const ga2_hitext::LatinLayout &L, float halfScale, float fullAdvance)
+    {
+        float pen = 0.0f;
+        int prev = -1;
+        for (Ch &c : line)
+        {
+            const float sc = c.size * kInv18 * halfScale;
+            if (c.full)
+            {
+                c.pen = pen;
+                pen += fullAdvance < 0.0f ? c.size : fullAdvance;
+                prev = -1;
+            }
+            else if (c.code - 0x21u < 0x5Eu)
+            {
+                const int k = int(c.code) - 0x20;
+                pen += prev >= 0 ? L.kern[prev][k] * sc : 0.0f;
+                c.pen = pen;
+                pen += L.advance[k] * sc;
+                prev = k;
+            }
+            else
+            {
+                c.pen = pen;
+                pen += (c.code == 0x20u ? L.advance[0] : 10.0f) * sc;
+                prev = -1;
+            }
+        }
+        return pen;
+    }
+
+    // A piece for the synthetic draw: the character to draw and its rectangle.
+    struct Out
+    {
+        uint32_t code, colour;
+        float x0, y0, x1, y1;
+        uint64_t hash = 0;
+        std::shared_ptr<const ga2_hitext::RunSpec> spec;
+    };
+
+    Piece pieceFor(float px0, float py0, float px1, float py1, const Out &o)
+    {
+        return {px0, py0, px1, py1, o.x0, o.y0, o.x1, o.y1, o.hash, o.spec};
+    }
+
+    // The drawn characters of a laid-out line as pieces: runs of one colour become tickets; button icons and
+    // characters the font lacks stay the game's (their own code, at their new place).
+    void piecesOf(uint8_t *rdram, const std::vector<Ch> &line, std::vector<Out> &out)
+    {
+        auto own = [](const Ch &c) { return c.full && !ga2_hitext::fontHasGlyph(unicodeOf(c)); };
+        size_t i = 0;
+        while (i < line.size())
+        {
+            const Ch &c = line[i];
+            if (!c.drawn)
+            {
+                ++i;
+                continue;
+            }
+            if (own(c))
+            {
+                out.push_back({c.code, c.colour, c.pen, c.cellTop, c.pen + c.size, c.cellTop + c.size});
+                ++i;
+                continue;
+            }
+            float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+            size_t j = i;
+            for (; j < line.size(); ++j)
+            {
+                const Ch &d = line[j];
+                if (!d.drawn)
+                    continue;
+                if (d.colour != c.colour || own(d))
+                    break;
+                // Generous: ink may reach past the advance (overhangs, descenders); the rest is transparent.
+                minX = std::min(minX, d.pen - 0.2f * d.size);
+                maxX = std::max(maxX, d.pen + 1.1f * d.size);
+                minY = std::min(minY, d.cellTop - 0.1f * d.size);
+                maxY = std::max(maxY, d.cellTop + 1.25f * d.size);
+            }
+            // The games sample their glyph texture with u, v from half a texel in (below) and clamped at texel 23
+            // of 24: an image shows cleanly from 1/48 to 23/24 of it. The content (shifted in by 1/48) stays
+            // inside that, so the piece is 48/45 of it.
+            const float x0 = std::floor(minX), y0 = std::floor(minY);
+            const float x1 = x0 + std::min(std::ceil((std::ceil(maxX) - x0) * 48.0f / 45.0f) + 1.0f, 1024.0f);
+            const float y1 = y0 + std::min(std::ceil((std::ceil(maxY) - y0) * 48.0f / 45.0f) + 1.0f, 256.0f);
+            auto spec = std::make_shared<ga2_hitext::RunSpec>();
+            spec->width = int(x1 - x0);
+            spec->height = int(y1 - y0);
+            // The games' texel setter puts u, v half a texel in (u * 16 + 8): stretched over the piece, the ticket
+            // shows its image from 1/48 of it in (and 1/48 past its far edge, the empty margin). The ticket's image
+            // has its glyphs that much further in, so they land where they belong.
+            spec->insetX = float(spec->width) / 48.0f;
+            spec->insetY = float(spec->height) / 48.0f;
+            for (size_t k = i; k < j; ++k)
+                if (line[k].drawn)
+                    spec->glyphs.push_back({unicodeOf(line[k]), line[k].pen - x0, line[k].cellTop - y0, line[k].size,
+                                            line[k].full});
+            const uint32_t slot = g_ticketNext++ % kTicketSlots;
+            const uint64_t hash = ga2_hitext::noteRun(*spec, rdram + kTicketRam + slot * 288u);
+            out.push_back({kTicketLead | (0x40u + slot) << 8, c.colour, x0, y0, x1, y1, hash, std::move(spec)});
+            i = j;
+        }
+    }
+
+    // A string as the string drawers read it.
+    void parseString(const uint8_t *rdram, uint32_t p, float size, uint32_t colour, std::vector<Ch> &line)
+    {
+        for (int n = 0; n < 1024; ++n)
+        {
+            const uint32_t b = rdram[p & 0x01FFFFFFu];
+            if (b == 0)
+                break;
+            Ch c;
+            c.size = size;
+            c.colour = colour;
+            if (fullWidthLead(b))
+            {
+                const uint32_t trail = rdram[(p + 1u) & 0x01FFFFFFu];
+                c.code = b | trail << 8;
+                c.full = true;
+                c.drawn = !(b == 0x81u && trail == 0x40u);
+                p += 2;
+                line.push_back(c);
+                if (trail == 0)
+                    break;
+                continue;
+            }
+            c.code = b;
+            c.drawn = b - 0x21u < 0x5Eu;
+            line.push_back(c);
+            ++p;
+        }
+    }
+
+    // Message glyph drawer: f12 x, f13 y, f14 line spacing, a1 records {u8 0, u8 size, u16 code, u32 colour},
+    // a2 count, a3 characters revealed, t0 alignment (0 left, 1 right edge at x, 2 centred on x). The original then
+    // draws the pieces as records of one full-width character each (size 24, left-aligned, one line).
+    void planMessage(uint8_t *rdram, R5900Context *ctx, const ga2_hitext::LatinLayout &L)
+    {
+        beginPlan(0);
+        const uint32_t records = getRegU32(ctx, 5);
+        const int count = std::min(int32_t(getRegU32(ctx, 6)), 0x200), revealed = std::min(int32_t(getRegU32(ctx, 7)), count);
+        const uint32_t align = getRegU32(ctx, 8) & 3u;
+        const float x = ctx->f[12], spacing = ctx->f[14];
+        float y = ctx->f[13] - spacing;
+        std::vector<Out> out;
+        std::vector<Ch> line;
+        for (int i = 0; i < revealed;)
+        {
+            line.clear();
+            uint8_t tallest = 0;
+            int end = i;
+            for (; end < count; ++end)
+            {
+                const uint8_t *r = rdram + ((records + uint32_t(end) * 8u) & 0x01FFFFFFu);
+                const uint32_t code = uint32_t(r[2] | r[3] << 8);
+                tallest = std::max(tallest, r[1]);
+                if (code == 10u)
+                    break;
+                Ch c;
+                c.code = code;
+                c.size = float(r[1]);
+                std::memcpy(&c.colour, r + 4, 4);
+                c.full = (code & 0xFF00u) != 0;
+                const bool alpha = r[7] != 0;
+                c.drawn = alpha && (c.full ? fullWidthLead(code & 0xFFu) && code != 0x4081u : code - 0x21u < 0x5Eu);
+                line.push_back(c);
+            }
+            y += spacing + float(tallest);
+            const float width = layoutLine(line, L, 1.0f, -1.0f);
+            const float start = align == 1 ? x - width : align == 2 ? x - width * 0.5f : x;
+            for (Ch &c : line)
+            {
+                c.pen += start;
+                c.cellTop = y - c.size; // both cells end on the line: 18 * size / 18 high, or size
+            }
+            line.resize(size_t(std::max(0, std::min(end, revealed) - i)));
+            piecesOf(rdram, line, out);
+            i = end + 1;
+        }
+        const size_t n = std::min<size_t>(out.size(), kSynthBytes / 8u);
+        const float y0 = ctx->f[13];
+        for (size_t j = 0; j < n; ++j)
+        {
+            uint8_t *r = rdram + kSynthRam + j * 8u;
+            r[0] = 0;
+            r[1] = 24;
+            r[2] = uint8_t(out[j].code & 0xFFu);
+            r[3] = uint8_t(out[j].code >> 8);
+            std::memcpy(r + 4, &out[j].colour, 4);
+            const float px = x + 24.0f * float(j);
+            g_plan.pieces.push_back(pieceFor(px, y0, px + 24.0f, y0 + 24.0f, out[j]));
+        }
+        SET_GPR_U32(ctx, 5, kSynthRam);
+        SET_GPR_U32(ctx, 6, uint32_t(n));
+        SET_GPR_U32(ctx, 7, uint32_t(n));
+        SET_GPR_U32(ctx, 8, 0u);
+    }
+
+    // String drawers: f12 x, f13 y, a1 size, t0 text; drawer 1: a2 colour, a3 pad half-width characters to size / 2
+    // (left to the game); drawer 2: a2 advance of a full-width character (half-width ones scale with it), a3
+    // colour. The original then draws the pieces as a string of full-width characters. Returns the line's width.
+    template <int D>
+    bool planString(uint8_t *rdram, R5900Context *ctx, const ga2_hitext::LatinLayout &L, float &width)
+    {
+        beginPlan(D);
+        if (D == 1 && getRegU32(ctx, 7) != 0)
+            return false;
+        const int size = int32_t(getRegU32(ctx, 5));
+        if (size <= 0 || size > 255)
+            return false;
+        const float advance = D == 2 ? float(int32_t(getRegU32(ctx, 6))) : float(size);
+        const uint32_t colour = getRegU32(ctx, D == 2 ? 7 : 6);
+        const float x = ctx->f[12], y = ctx->f[13];
+        std::vector<Ch> line;
+        parseString(rdram, getRegU32(ctx, 8), float(size), colour, line);
+        width = layoutLine(line, L, D == 2 ? advance / float(size) : 1.0f, D == 2 ? advance : -1.0f);
+        for (Ch &c : line)
+        {
+            c.pen += x;
+            c.cellTop = y; // both cells start at y here
+        }
+        std::vector<Out> out;
+        piecesOf(rdram, line, out);
+        const size_t n = std::min<size_t>(out.size(), kSynthBytes / 2u - 1u);
+        uint8_t *s = rdram + kSynthRam;
+        for (size_t j = 0; j < n; ++j)
+        {
+            s[2 * j] = uint8_t(out[j].code & 0xFFu);
+            s[2 * j + 1] = uint8_t(out[j].code >> 8);
+            const float px = x + advance * float(j);
+            g_plan.pieces.push_back(pieceFor(px, y, px + float(size), y + float(size), out[j]));
+        }
+        s[2 * n] = 0;
+        SET_GPR_U32(ctx, 8, kSynthRam);
+        return true;
+    }
+
+    // The screen-rect setter (f12 x0, f13 y0, f14 x1, f15 y1): a sprite of the planned drawer call goes onto its
+    // piece. By difference, so a widescreen HUD placement applied before this hook (ga2_features) is kept.
+    template <size_t I>
+    void screenRect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = getRegU32(ctx, 31);
+        if (ra >= g_plan.lo && ra < g_plan.hi && g_plan.next < g_plan.pieces.size())
+        {
+            const Piece &p = g_plan.pieces[g_plan.next++];
+            if (std::fabs(ctx->f[13] - p.py0) < 0.5f)
+            {
+                ctx->f[12] += p.tx0 - p.px0;
+                ctx->f[13] += p.ty0 - p.py0;
+                ctx->f[14] += p.tx1 - p.px1;
+                ctx->f[15] += p.ty1 - p.py1;
+                // The presentation draws the port's text again at the window's resolution.
+                if (p.spec && g_colourBytes)
+                {
+                    ga2_hitext::TextPiece piece;
+                    piece.hash = p.hash;
+                    piece.spec = p.spec;
+                    piece.x0 = ctx->f[12], piece.y0 = ctx->f[13], piece.x1 = ctx->f[14], piece.y1 = ctx->f[15];
+                    piece.r = rdram[g_colourBytes], piece.g = rdram[g_colourBytes + 1u];
+                    piece.b = rdram[g_colourBytes + 2u], piece.a = rdram[g_colourBytes + 3u];
+                    ga2_hitext::notePiece(piece);
+                }
+            }
+            else
+                g_plan.next = g_plan.pieces.size(); // out of step: leave the rest of this call alone
+        }
+        g_setterOriginal<I>(rdram, ctx, runtime);
+    }
+
+    // The aligned string drawer (drawer 1 + 0x358: names on their plates, centred or right-aligned labels):
+    // f12 x, f13 y, a1 size, t0 flags (& 3: 0 left, 1 right edge at x, 2 centred on x; & 4 pad; & 8 outline),
+    // t1 text. It measures the string with the bitmap font's widths, moves x by that, then calls drawer 1, which
+    // lays it out natively: x moves by the difference, so the string is aligned by its native width.
+    template <size_t I>
+    PS2Runtime::RecompiledFunction g_alignedOriginal = nullptr;
+
+    template <size_t I>
+    void aligned(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t flags = getRegU32(ctx, 8), align = flags & 3u;
+        const int size = int32_t(getRegU32(ctx, 5));
+        const ga2_hitext::LatinLayout *L = ga2_hitext::nativeLayout() ? ga2_hitext::latinLayout() : nullptr;
+        if (L && (align == 1u || align == 2u) && (flags & 4u) == 0 && size > 0 && size < 256)
+        {
+            std::vector<Ch> line;
+            parseString(rdram, getRegU32(ctx, 9), float(size), 0u, line);
+            float game = 0.0f;
+            for (const Ch &c : line)
+            {
+                if (c.full)
+                    game += float(size);
+                else
+                {
+                    int32_t w = 9;
+                    if (c.code - 0x21u < 0x5Eu)
+                        std::memcpy(&w, rdram + kDiscs[I].metrics + (c.code - 0x20u) * 12u + 8u, 4);
+                    game += float(c.code - 0x21u < 0x5Eu ? w + 1 : 10) * float(size) * kInv18;
+                }
+            }
+            const float native = layoutLine(line, *L, 1.0f, -1.0f);
+            ctx->f[12] += (game - native) * (align == 1u ? 1.0f : 0.5f);
+        }
+        g_alignedOriginal<I>(rdram, ctx, runtime);
+    }
+
     // Before the original only (it may return to the dispatcher early). The
     // executable's data is loaded once, so one write per boot is enough.
     template <size_t I, int D>
@@ -364,6 +749,31 @@ namespace
         // The two string drawers take the text in t0 (menus, names, the movie player's key legend).
         if (D == 1 || D == 2)
             SET_GPR_U32(ctx, 8, promptText(rdram, getRegU32(ctx, 8), 1));
+        if constexpr (D <= 2)
+            if (g_setterOriginal<I>)
+            {
+                const ga2_hitext::LatinLayout *layout = ga2_hitext::nativeLayout() ? ga2_hitext::latinLayout() : nullptr;
+                if (!layout)
+                    beginPlan(D);
+                else if constexpr (D == 0)
+                    planMessage(rdram, ctx, *layout);
+                else
+                {
+                    const float x = ctx->f[12];
+                    float width = 0.0f;
+                    if (planString<D>(rdram, ctx, *layout, width))
+                    {
+                        // They return where the string ends (drawer 1: x; drawer 2: the width), and callers put
+                        // what follows there (the dots after a speaker's name): the native end. Only when the
+                        // drawer ran to its end here (not when it went back to the dispatcher early).
+                        const uint32_t ra = getRegU32(ctx, 31);
+                        g_original<I, D>(rdram, ctx, runtime);
+                        if (ctx->pc == ra)
+                            ctx->f[0] = D == 1 ? x + width : width;
+                        return;
+                    }
+                }
+            }
         g_original<I, D>(rdram, ctx, runtime);
     }
 
@@ -425,6 +835,12 @@ namespace
         const uint32_t code = getRegU32(ctx, 4) & 0x01FFFFFFu;
         g_lookupOriginal<I>(rdram, ctx, runtime);
         const uint8_t lead = rdram[code], trail = rdram[code + 1u];
+        // A native text piece (planMessage / planString): its ticket.
+        if (lead == kTicketLead && trail >= 0x40u && trail - 0x40u < kTicketSlots)
+        {
+            SET_GPR_U32(ctx, 2, kTicketRam + (trail - 0x40u) * 288u);
+            return;
+        }
         const bool reserved = lead == (ga2_text_icons::kFirstCode >> 8) && trail >= (ga2_text_icons::kFirstCode & 0xFFu) &&
                               trail - (ga2_text_icons::kFirstCode & 0xFFu) < ga2_text_icons::kGlyphCount;
         if (!reserved)
@@ -483,6 +899,26 @@ namespace
             original = runtime.lookupFunction(address);
             runtime.replaceFunction(address, replacement);
         };
+        // Native text: the screen-rect setter sits 0x88 past the colour setter on every disc (same code), the
+        // string drawers follow one another and the message drawer is 0x528 long (up to the font textures init).
+        const uint32_t setter = d.setColour + 0x88u;
+        if (runtime.hasFunction(d.setColour))
+        {
+            const uint32_t colour = colourAddress(runtime.memory().getRDRAM(), d.setColour);
+            g_colourBytes = colour && colour < 0x02000000u ? colour : 0u;
+        }
+        if (runtime.hasFunction(setter))
+        {
+            g_drawerRange[0][0] = d.drawers[0], g_drawerRange[0][1] = d.drawers[0] + 0x528u;
+            g_drawerRange[1][0] = d.drawers[1], g_drawerRange[1][1] = d.drawers[2];
+            g_drawerRange[2][0] = d.drawers[2], g_drawerRange[2][1] = d.drawers[3];
+            hook(setter, g_setterOriginal<I>, screenRect<I>);
+            if (runtime.hasFunction(d.drawers[1] + 0x358u))
+                hook(d.drawers[1] + 0x358u, g_alignedOriginal<I>, aligned<I>);
+        }
+        else
+            std::cerr << "[ga2 text] " << d.disc << ": screen-rect setter 0x" << std::hex << setter << std::dec
+                      << " not in the generated table; the games' own glyphs stay\n";
         hook(d.drawers[0], g_original<I, 0>, drawer<I, 0>);
         hook(d.drawers[1], g_original<I, 1>, drawer<I, 1>);
         hook(d.drawers[2], g_original<I, 2>, drawer<I, 2>);

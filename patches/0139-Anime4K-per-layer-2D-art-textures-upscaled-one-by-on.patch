@@ -1,0 +1,496 @@
+From 77977cb34d0087b6619558c5364d229cfb0d5047 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:13:43 -0600
+Subject: [PATCH] Anime4K per layer: 2D art textures upscaled one by one,
+ cached on disk
+
+With Anime4K above 640x448, every 8/16/32-bit texture of 32x32 or more first seen in a 2D scene is queued (ga2_layers, gs_texpacks.cpp); the presentation runs the filter's network on a few per frame (two 2x chains for 4x, colour bled into transparent pixels, alpha scaled on its own) and hands the result back; the GS's cached textures are dropped now and then so the upscaled ones replace them. Results are kept in <cache>/anime4k. The composed picture is then only scaled (GA2_LAYER_UPSCALE=0: the old pass over the composed picture).
+---
+ ps2xRuntime/src/lib/ga2_present.cpp    | 138 +++++++++++++++-
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 219 ++++++++++++++++++++++++-
+ ps2xRuntime/src/lib/gs/gs_texpacks.h   |  22 +++
+ 3 files changed, 375 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index b515455..111f2a4 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -4,6 +4,7 @@
+ #include "ga2_mpv_shader.h"
+ #include "runtime/ga2_activity.h"
+ #include "runtime/ga2_hitext.h"
++#include "gs/gs_texpacks.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -11,6 +12,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -846,6 +848,129 @@ vec4 hook() {
+             return true;
+         }
+ 
++        // ---- per-layer upscaling (ga2_layers, gs_texpacks.h) ----------------------------------------------------------
++        // Two chains: the second 2x step reads the first's output (each chain owns its result texture).
++        std::unique_ptr<ga2_mpv::Chain> g_layerChain[2];
++        int g_layerChainKind = -1; // 0 Anime4K, 1 Anime4K HQ
++
++        std::unique_ptr<ga2_mpv::Chain> layerChain(bool hq)
++        {
++            const std::vector<std::string> files =
++                hq ? std::vector<std::string>{"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_VL.glsl",
++                                              "anime4k/Anime4K_Upscale_CNN_x2_VL.glsl"}
++                   : std::vector<std::string>{"anime4k/Anime4K_Clamp_Highlights.glsl", "anime4k/Anime4K_Restore_CNN_M.glsl",
++                                              "anime4k/Anime4K_Upscale_CNN_x2_M.glsl"};
++            auto chain = std::make_unique<ga2_mpv::Chain>();
++            for (const std::string &file : files)
++            {
++                std::string error;
++                const std::string text = readFile(shaderDir() / file);
++                if (text.empty() || !chain->add(text, file, error))
++                {
++                    std::fprintf(stderr, "[layers] cannot use %s%s%s\n", file.c_str(), error.empty() ? "" : ": ", error.c_str());
++                    return nullptr;
++                }
++            }
++            return chain;
++        }
++
++        // Colour into the transparent pixels from their opaque neighbours (a few rings), so the network does not
++        // see the black behind a sprite's edge.
++        void bleed(std::vector<uint32_t> &rgba, uint32_t w, uint32_t h)
++        {
++            std::vector<uint8_t> known(rgba.size()), nextKnown;
++            for (size_t i = 0; i < rgba.size(); ++i)
++                known[i] = (rgba[i] >> 24) >= 8u ? 1 : 0;
++            std::vector<uint32_t> next = rgba;
++            for (int pass = 0; pass < 6; ++pass)
++            {
++                nextKnown = known;
++                bool any = false;
++                for (uint32_t y = 0; y < h; ++y)
++                    for (uint32_t x = 0; x < w; ++x)
++                    {
++                        const size_t at = size_t(y) * w + x;
++                        if (known[at])
++                            continue;
++                        uint32_t r = 0, g = 0, b = 0, n = 0;
++                        for (int dy = -1; dy <= 1; ++dy)
++                            for (int dx = -1; dx <= 1; ++dx)
++                            {
++                                const int nx = int(x) + dx, ny = int(y) + dy;
++                                if (nx < 0 || ny < 0 || nx >= int(w) || ny >= int(h) || !known[size_t(ny) * w + size_t(nx)])
++                                    continue;
++                                const uint32_t o = rgba[size_t(ny) * w + size_t(nx)];
++                                r += o & 255u, g += (o >> 8) & 255u, b += (o >> 16) & 255u, ++n;
++                            }
++                        if (n)
++                        {
++                            next[at] = (rgba[at] & 0xFF000000u) | (r / n) | (g / n) << 8 | (b / n) << 16;
++                            nextKnown[at] = 1;
++                            any = true;
++                        }
++                    }
++                rgba = next;
++                known.swap(nextKnown);
++                if (!any)
++                    break;
++            }
++        }
++
++        // A few queued textures per frame (about 6 ms), the GL context current.
++        void processLayerJobs(bool hq)
++        {
++            const int kind = hq ? 1 : 0;
++            if (g_layerChainKind != kind)
++            {
++                g_layerChain[0] = layerChain(hq);
++                g_layerChain[1] = layerChain(hq);
++                g_layerChainKind = kind;
++            }
++            if (!g_layerChain[0] || !g_layerChain[1])
++                return;
++            rlDrawRenderBatchActive();
++            const auto start = std::chrono::steady_clock::now();
++            ga2_layers::Job job;
++            while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(6) && ga2_layers::takeJob(job))
++            {
++                const int scale = ga2_layers::scale();
++                std::vector<uint32_t> rgb = job.rgba;
++                bleed(rgb, job.w, job.h);
++                ::Image source{rgb.data(), int(job.w), int(job.h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                Texture2D input = LoadTextureFromImage(source);
++                int w = int(job.w), h = int(job.h);
++                uint32_t result = input.id;
++                for (int step = 0; step < (scale >= 4 ? 2 : 1) && result; ++step)
++                {
++                    int rw = 0, rh = 0;
++                    result = g_layerChain[step]->run(result, w, h, w * 2, h * 2, rw, rh);
++                    w = rw, h = rh;
++                }
++                std::vector<uint32_t> out;
++                if (result && w == int(job.w) * scale && h == int(job.h) * scale)
++                {
++                    std::vector<float> texels(size_t(w) * size_t(h) * 4u);
++                    glBindTexture(GL_TEXTURE_2D, result);
++                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, texels.data());
++                    glBindTexture(GL_TEXTURE_2D, 0);
++                    // The alpha channel scaled on its own (the network works on colour).
++                    ::Image alpha = ImageCopy(::Image{job.rgba.data(), int(job.w), int(job.h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8});
++                    ImageResize(&alpha, w, h);
++                    const auto *a = static_cast<const uint32_t *>(alpha.data);
++                    out.resize(size_t(w) * size_t(h));
++                    for (size_t i = 0; i < out.size(); ++i)
++                    {
++                        auto c = [&](int k) { return uint32_t(std::lround(std::clamp(texels[i * 4 + size_t(k)], 0.0f, 1.0f) * 255.0f)); };
++                        out[i] = c(0) | c(1) << 8 | c(2) << 16 | (a[i] & 0xFF000000u);
++                    }
++                    UnloadImage(alpha);
++                }
++                UnloadTexture(input);
++                ga2_layers::finish(job.hash, uint32_t(w), uint32_t(h), std::move(out));
++            }
++            glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++        }
++
+         Rect fitAspect(Rect area, float aspect)
+         {
+             if (aspect <= 0.0f || area.width <= 0.0f || area.height <= 0.0f)
+@@ -1158,6 +1283,17 @@ namespace ga2_present
+         }
+ 
+         const bool sizesMatch = frame.width == int(srcWidth) && frame.height == int(srcHeight);
++        // Anime4K above 640x448 works per layer: every 2D art texture upscaled on its own (ga2_layers), composed by
++        // the GS; the composed picture is then only scaled. GA2_LAYER_UPSCALE=0 runs it on the composed picture.
++        static const bool layersAllowed = [] {
++            const char *v = std::getenv("GA2_LAYER_UPSCALE");
++            return !(v && std::string(v) == "0");
++        }();
++        const bool anime4k = s.filter == Filter::Anime4K || s.filter == Filter::Anime4KHQ;
++        if (g_ready && sizesMatch && frame.width % 640 == 0)
++            ga2_layers::setEnabled(layersAllowed && anime4k && frame.width >= 1280, frame.width / 640);
++        if (g_ready && ga2_layers::enabled())
++            processLayerJobs(s.filter == Filter::Anime4KHQ);
+         // Native text: the GS's rendering of the port's text taken out of a 2D picture rendered above 640x448; it is
+         // drawn again at the window's resolution at the end.
+         static const bool textOverlayAllowed = [] {
+@@ -1178,7 +1314,7 @@ namespace ga2_present
+ 
+         Texture2D shown = frame;
+         Rectangle source{0.0f, 0.0f, srcWidth, srcHeight};
+-        if (g_ready && g_chain && !scene3d && sizesMatch)
++        if (g_ready && g_chain && !scene3d && sizesMatch && !ga2_layers::enabled())
+         {
+             rlDrawRenderBatchActive();
+             // Above the game's size (2x / 4x): the network sees the picture at the game's size, and the detail
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 0b7871d..d0b6675 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -8,6 +8,7 @@
+ #include "gs_texpacks.h"
+ #include "runtime/ga2_hitext.h"
+ #include "runtime/ga2_text_icons.h"
++#include "runtime/ga2_activity.h"
+ 
+ #include <atomic>
+ 
+@@ -43,6 +44,9 @@ namespace ga2_text_icons
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
++#include <deque>
++#include <thread>
++#include <memory>
+ #include <list>
+ #include <map>
+ #include <mutex>
+@@ -54,6 +58,184 @@ using namespace Vulkan;
+ using namespace ParallelGS;
+ using namespace ga2_texregion;
+ 
++// ---- per-layer upscaling (gs_texpacks.h) ------------------------------------------------------------------------
++namespace ga2_layers
++{
++    namespace
++    {
++        std::atomic<bool> g_on{false};
++        std::atomic<int> g_scale{4};
++        std::atomic<bool> g_changedLayers{false};
++        std::mutex g_layerMutex;
++        std::deque<Job> g_jobs;
++        std::unordered_set<uint64_t> g_queued;    // queued or being made
++        std::unordered_set<uint64_t> g_failed;    // could not be made: shown as they are
++        struct Result
++        {
++            uint32_t w = 0, h = 0;
++            std::vector<uint32_t> rgba;
++        };
++        std::unordered_map<uint64_t, std::shared_ptr<const Result>> g_results; // the CPU copies (also on disk)
++        std::deque<uint64_t> g_resultOrder;
++        std::chrono::steady_clock::time_point g_lastDrop{};
++        bool g_dropPending = false;
++
++        std::filesystem::path cacheDir()
++        {
++            std::filesystem::path base;
++            if (const char *dir = std::getenv("GA2_CACHE_DIR"); dir && *dir)
++                base = dir;
++            else if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
++                base = std::filesystem::path(xdg) / "ga2";
++            else if (const char *local = std::getenv("LOCALAPPDATA"); local && *local)
++                base = std::filesystem::path(local) / "ga2" / "cache";
++            else if (const char *home = std::getenv("HOME"); home && *home)
++                base = std::filesystem::path(home) / ".cache" / "ga2";
++            else
++                return {};
++            return base / "anime4k";
++        }
++
++        std::filesystem::path cacheFile(uint64_t hash, int scale)
++        {
++            const std::filesystem::path dir = cacheDir();
++            if (dir.empty())
++                return {};
++            char name[48];
++            std::snprintf(name, sizeof(name), "%016llx_x%d.png", (unsigned long long)hash, scale);
++            return dir / name;
++        }
++
++        // g_layerMutex held: drop the GS's cached textures now and then while results come in (each drop makes it
++        // ask for every texture again), and once more when the queue is empty.
++        void dropSoon()
++        {
++            const auto now = std::chrono::steady_clock::now();
++            if (g_jobs.empty() || now - g_lastDrop > std::chrono::milliseconds(750))
++            {
++                g_changedLayers = true;
++                g_lastDrop = now;
++                g_dropPending = false;
++            }
++            else
++                g_dropPending = true;
++        }
++    }
++
++    void setEnabled(bool on, int scale)
++    {
++        scale = scale >= 4 ? 4 : 2;
++        if (g_on.exchange(on) != on || g_scale.exchange(scale) != scale)
++            g_changedLayers = true;
++    }
++    bool enabled() { return g_on.load(); }
++    int scale() { return g_scale.load(); }
++
++    bool takeJob(Job &job)
++    {
++        std::lock_guard<std::mutex> lock(g_layerMutex);
++        if (g_jobs.empty())
++        {
++            if (g_dropPending)
++                dropSoon();
++            return false;
++        }
++        job = std::move(g_jobs.front());
++        g_jobs.pop_front();
++        return true;
++    }
++
++    void finish(uint64_t hash, uint32_t w, uint32_t h, std::vector<uint32_t> rgba)
++    {
++        const int scale = g_scale.load();
++        std::lock_guard<std::mutex> lock(g_layerMutex);
++        g_queued.erase(hash);
++        if (rgba.empty() || rgba.size() != size_t(w) * h)
++        {
++            g_failed.insert(hash);
++            return;
++        }
++        auto result = std::make_shared<Result>();
++        result->w = w, result->h = h;
++        result->rgba = std::move(rgba);
++        g_results[hash] = result;
++        g_resultOrder.push_back(hash);
++        while (g_resultOrder.size() > 32)
++        {
++            g_results.erase(g_resultOrder.front());
++            g_resultOrder.pop_front();
++        }
++        // Kept on disk for the next session (written by a worker: PNG encoding takes a while).
++        const std::filesystem::path file = cacheFile(hash, scale);
++        if (!file.empty())
++            std::thread([result, file] {
++                std::error_code ec;
++                std::filesystem::create_directories(file.parent_path(), ec);
++                const std::filesystem::path partial = file.string() + ".part";
++                ::Image image{const_cast<uint32_t *>(result->rgba.data()), int(result->w), int(result->h), 1,
++                              PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                if (ExportImage(image, (partial.string() + ".png").c_str()))
++                    std::filesystem::rename(partial.string() + ".png", file, ec);
++            }).detach();
++        dropSoon();
++    }
++
++    bool takeChangedInternal() { return g_changedLayers.exchange(false); }
++
++    // GS thread (texture replacement): the upscaled image of a texture, or queue it (in a 2D scene). `pixels` makes
++    // the texture's RGBA (GS alpha, 0x80 = opaque) when needed.
++    template <class Pixels>
++    std::shared_ptr<const Result> lookup(uint64_t hash, uint32_t w, uint32_t h, const Pixels &pixels)
++    {
++        const int scale = g_scale.load();
++        {
++            std::lock_guard<std::mutex> lock(g_layerMutex);
++            if (const auto it = g_results.find(hash); it != g_results.end())
++                return it->second;
++            if (g_queued.count(hash) || g_failed.count(hash))
++                return nullptr;
++        }
++        // From an earlier session.
++        const std::filesystem::path file = cacheFile(hash, scale);
++        std::error_code ec;
++        if (!file.empty() && std::filesystem::exists(file, ec))
++        {
++            ::Image image = LoadImage(file.string().c_str());
++            if (image.data && image.width == int(w) * scale && image.height == int(h) * scale)
++            {
++                ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                auto result = std::make_shared<Result>();
++                result->w = uint32_t(image.width), result->h = uint32_t(image.height);
++                const auto *texels = static_cast<const uint32_t *>(image.data);
++                result->rgba.assign(texels, texels + size_t(image.width) * size_t(image.height));
++                UnloadImage(image);
++                std::lock_guard<std::mutex> lock(g_layerMutex);
++                g_results[hash] = result;
++                g_resultOrder.push_back(hash);
++                while (g_resultOrder.size() > 32)
++                {
++                    g_results.erase(g_resultOrder.front());
++                    g_resultOrder.pop_front();
++                }
++                return result;
++            }
++            if (image.data)
++                UnloadImage(image);
++        }
++        if (ga2_activity::scene3d())
++            return nullptr; // 3D scenes' textures are not 2D art
++        Job job;
++        job.hash = hash, job.w = w, job.h = h;
++        job.rgba = pixels();
++        for (uint32_t &c : job.rgba)
++            c = (c & 0x00FFFFFFu) | (std::min<uint32_t>(255u, (c >> 24) * 2u) << 24);
++        std::lock_guard<std::mutex> lock(g_layerMutex);
++        if (g_queued.insert(hash).second && g_jobs.size() < 4096)
++            g_jobs.push_back(std::move(job));
++        return nullptr;
++    }
++}
++
+ namespace ga2_texpacks
+ {
+     namespace
+@@ -72,6 +254,9 @@ namespace ga2_texpacks
+         // Native text pieces (ga2_hitext::runImage), least recently used first.
+         std::list<std::string> g_runOrder;
+         std::unordered_map<std::string, std::pair<ImageHandle, std::list<std::string>::iterator>> g_runImages;
++        // Per-layer upscaled art (ga2_layers), least recently used first.
++        std::list<std::string> g_layerOrder;
++        std::unordered_map<std::string, std::pair<ImageHandle, std::list<std::string>::iterator>> g_layerImages;
+         // Pack images (per device, file and style) in which no PS2 icon was found: used as they are.
+         std::unordered_set<std::string> g_packIconless;
+ 
+@@ -619,7 +804,10 @@ namespace ga2_texpacks
+                                          (psmRaw == 0x14u || psmRaw == 0x24u || psmRaw == 0x2Cu)))
+                                            ? ga2_hitext::enabled()
+                                            : false;
+-                if (g_index.empty() && g_dumpDir.empty() && !buttons && !textIcons && !sharpText)
++                // Per-layer upscaling: 8, 16 and 32-bit textures of some size (the 4-bit ones are fonts and UI glyphs).
++                const bool layers = ga2_layers::enabled() && desc.rect.width >= 32u && desc.rect.height >= 32u &&
++                                    !(psmRaw == 0x14u || psmRaw == 0x24u || psmRaw == 0x2Cu);
++                if (g_index.empty() && g_dumpDir.empty() && !buttons && !textIcons && !sharpText && !layers)
+                     return {};
+                 uint32_t w = desc.rect.width, h = desc.rect.height;
+                 const uint32_t rx = desc.rect.x, ry = desc.rect.y;
+@@ -832,7 +1020,32 @@ namespace ga2_texpacks
+                 {
+                     const auto spots = buttons ? g_buttonMap.find(hash) : g_buttonMap.end();
+                     if (spots == g_buttonMap.end())
+-                        return {};
++                    {
++                        if (!layers)
++                            return {};
++                        const std::string key = deviceKey(device) + "layer" + std::to_string(ga2_layers::scale()) + name;
++                        if (const auto cached = g_layerImages.find(key); cached != g_layerImages.end())
++                        {
++                            g_layerOrder.splice(g_layerOrder.end(), g_layerOrder, cached->second.second);
++                            return cached->second.first;
++                        }
++                        const auto result = ga2_layers::lookup(hash, w, h, pixels);
++                        if (!result)
++                            return {};
++                        ::Image image = GenImageColor(int(result->w), int(result->h), BLANK);
++                        std::memcpy(image.data, result->rgba.data(), result->rgba.size() * 4u);
++                        ImageHandle handle = upload(device, image);
++                        UnloadImage(image);
++                        // Upscaled art is large (a 640x480 picture at 4x: 18 MB): the least recently used go.
++                        g_layerOrder.push_back(key);
++                        g_layerImages.emplace(key, std::make_pair(handle, std::prev(g_layerOrder.end())));
++                        while (g_layerOrder.size() > 48)
++                        {
++                            g_layerImages.erase(g_layerOrder.front());
++                            g_layerOrder.pop_front();
++                        }
++                        return handle;
++                    }
+                     // Images belong to one device (VR stereo runs one per eye).
+                     const std::string key = deviceKey(device) + name + "/" + g_style;
+                     if (const auto cached = g_images.find(key); cached != g_images.end())
+@@ -949,7 +1162,7 @@ namespace ga2_texpacks
+         g_changed.store(true);
+     }
+ 
+-    bool takeChanged() { return g_changed.exchange(false); }
++    bool takeChanged() { return g_changed.exchange(false) | ga2_layers::takeChangedInternal(); }
+ 
+     namespace
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.h b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+index a230349..6769a92 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.h
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.h
+@@ -44,4 +44,26 @@ namespace ga2_texpacks
+     // Where textures are dumped; empty turns the dump off.
+     void setDumpDirectory(const std::string &dir);
+ }
++
++// Per-layer upscaling (the 2D filter Anime4K at 2x and 4x): every 2D art texture (CGs, backgrounds, character
++// sprites, UI art) the GS samples is upscaled on its own by the filter's network, so each layer keeps its own edges,
++// and the GS composes the upscaled layers. A texture is queued the first time it is seen in a 2D scene; the
++// presentation runs the network (GL, the main thread) a few textures a frame and hands the results back, cached on
++// disk (<cache>/anime4k/); until then the texture shows as it is.
++namespace ga2_layers
++{
++    // On, and the scale (2 or 4: the internal resolution). A change drops the GS's cached textures.
++    void setEnabled(bool on, int scale);
++    bool enabled();
++    int scale();
++    struct Job
++    {
++        uint64_t hash = 0;
++        uint32_t w = 0, h = 0;
++        std::vector<uint32_t> rgba; // RGBA, alpha 255 = opaque
++    };
++    bool takeJob(Job &job);
++    // The upscaled image of a job (RGBA, alpha 255 = opaque), or an empty one when it could not be made.
++    void finish(uint64_t hash, uint32_t w, uint32_t h, std::vector<uint32_t> rgba);
++}
+ #endif
+-- 
+2.56.0
+

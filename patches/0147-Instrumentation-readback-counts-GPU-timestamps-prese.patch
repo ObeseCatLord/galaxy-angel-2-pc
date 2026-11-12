@@ -1,0 +1,264 @@
+From e3b846beb6631d7ccaa897d91dfbed12e1ca1710 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:43:48 -0600
+Subject: [PATCH] Instrumentation: readback counts, GPU timestamps, present
+ stages, thread names
+
+No behaviour change unless a switch below is set.
+- [pgs] readbacks/s submitted, dropped (all slots still in flight) and
+  skipped; per swap eye 0's render passes, primitives, copies and palette
+  updates (paraLLEl-GS flush stats).
+- GA2_PGS_TIMESTAMPS=1: paraLLEl-GS's own GPU timestamps per stage.
+- GA2_PGS_NO_READBACK=1: scan-out without the copy to host memory (nothing
+  is shown), to separate the scan-out pass from the picture's transport.
+- [present] (GA2_PERF): the main thread's wait, take+convert, upload, draw
+  and end+swap per loop.
+- Thread names GSWorker and PgsInstance (the main thread keeps its name:
+  renaming it on Linux renames the process).
+
+RTX 4090, ship map, 4x, cap 175 (research/run59/gpu-175): with the
+readback skipped the title holds 174.8 frames/s and the GPU drops from 99 %
+to 51 %; paraLLEl-GS's GPU time is 5.1 ms per swap (shading 2.6); the main
+thread's swap blocks 10 ms per frame behind the 18 MB upload.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          | 63 ++++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp |  2 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp        | 50 ++++++++++++++++-
+ 3 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 0c4ed2d..df266c9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -15,6 +15,7 @@
+ #include "device.hpp"
+ #include "gs_interface.hpp"
+ #include "thread_id.hpp"
++#include "ThreadNaming.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -180,6 +181,7 @@ namespace
+         void start()
+         {
+             thread = std::thread([this] {
++                ThreadNaming::SetCurrentThreadName("PgsInstance");
+                 for (;;)
+                 {
+                     std::function<void()> task;
+@@ -267,6 +269,16 @@ namespace
+         // statistics
+         uint64_t swaps = 0, packets = 0, bytes = 0;
+         double gifMs = 0.0, vsyncMs = 0.0;
++        // Readbacks submitted, dropped because all three slots were still in flight (the GPU or the presentation
++        // thread is behind), and skipped by GA2_PGS_NO_READBACK=1 (scan-out without the copy to host memory: nothing
++        // is shown; for measuring the scan-out pass apart from the picture's transport). All instances.
++        std::atomic<uint64_t> readbacks{0}, droppedReadbacks{0}, skippedReadbacks{0};
++        bool noReadback = false;
++        // paraLLEl-GS's own counters for eye 0: flush statistics, and with GA2_PGS_TIMESTAMPS=1 its GPU timestamps
++        // (seconds, accumulated; the report shows the difference since the last one).
++        FlushStats flushAcc = {};
++        bool timestamps = false;
++        double tsLast[int(TimestampType::Count)] = {};
+         std::chrono::steady_clock::time_point statStart = std::chrono::steady_clock::now();
+     };
+ 
+@@ -554,6 +566,16 @@ namespace
+             std::fprintf(stderr, "[pgs] GSInterface init failed; using the software GS\n");
+             return false;
+         }
++        s.noReadback = envInt("GA2_PGS_NO_READBACK", 0) != 0;
++        if (s.noReadback)
++            std::fprintf(stderr, "[pgs] GA2_PGS_NO_READBACK=1: scan-out without readback, nothing is shown\n");
++        s.timestamps = envInt("GA2_PGS_TIMESTAMPS", 0) != 0;
++        if (s.timestamps)
++        {
++            DebugMode debug = {};
++            debug.timestamps = true;
++            s.eyes[0].gs.set_debug_mode(debug);
++        }
+         // VR headset: a second instance for the right eye (single-pass stereo).
+         const char *vr = std::getenv("GA2_VR");
+         if (vr && std::string(vr) == "1" && !envOff("GA2_VR_STEREO", "0"))
+@@ -739,9 +761,18 @@ namespace
+     {
+         // slotIndex is the oldest submission.
+         pollReadbackLocked(s, eye);
++        if (s.noReadback)
++        {
++            s.skippedReadbacks.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
+         ReadbackSlot &slot = eye.slots[eye.slotIndex];
+         if (slot.pending)
++        {
++            s.droppedReadbacks.fetch_add(1, std::memory_order_relaxed);
+             return; // GPU is behind; drop this frame's copy
++        }
++        s.readbacks.fetch_add(1, std::memory_order_relaxed);
+         const uint32_t w = result.image->get_width(), h = result.image->get_height();
+         if (!slot.buffer || slot.width != w || slot.height != h)
+         {
+@@ -1030,6 +1061,13 @@ namespace ga2_pgs
+                 eye.gs.set_hacks(eye.hacks);
+             }
+         }
++        {
++            const FlushStats f = s.eyes[0].gs.consume_flush_stats();
++            s.flushAcc.num_primitives += f.num_primitives;
++            s.flushAcc.num_render_passes += f.num_render_passes;
++            s.flushAcc.num_palette_updates += f.num_palette_updates;
++            s.flushAcc.num_copies += f.num_copies;
++        }
+         if (s.uiLayer)
+         {
+             // The UI layer instance scans its target out whenever the game copies a frame to the scanout buffer
+@@ -1087,6 +1125,31 @@ namespace ga2_pgs
+                          (unsigned long long)r.pmode, (unsigned long long)r.smode1, (unsigned long long)r.smode2,
+                          (unsigned long long)r.dispfb1, (unsigned long long)r.display1,
+                          (unsigned long long)r.dispfb2, (unsigned long long)r.display2, (unsigned long long)r.bgcolor);
++            const double perSwap = s.swaps ? 1.0 / double(s.swaps) : 0.0;
++            std::fprintf(stderr, "[pgs] readbacks %.1f/s, dropped %.1f/s, skipped %.1f/s | eye 0 per swap: %.1f render passes, %.0f primitives, %.1f copies, %.1f palette updates\n",
++                         double(s.readbacks.exchange(0)) / elapsed, double(s.droppedReadbacks.exchange(0)) / elapsed,
++                         double(s.skippedReadbacks.exchange(0)) / elapsed, s.flushAcc.num_render_passes * perSwap,
++                         s.flushAcc.num_primitives * perSwap, s.flushAcc.num_copies * perSwap,
++                         s.flushAcc.num_palette_updates * perSwap);
++            s.flushAcc = {};
++            if (s.timestamps)
++            {
++                static const char *const names[int(TimestampType::Count)] = {
++                    "sync", "copy", "palette", "upload", "setup", "binning", "shading", "readback", "vsync"};
++                char line[512];
++                int n = std::snprintf(line, sizeof(line), "[pgs] eye 0 GPU ms/swap:");
++                double total = 0.0;
++                for (int t = 0; t < int(TimestampType::Count); ++t)
++                {
++                    const double now = s.eyes[0].gs.get_accumulated_timestamps(TimestampType(t));
++                    const double ms = (now - s.tsLast[t]) * 1000.0 * perSwap;
++                    s.tsLast[t] = now;
++                    total += ms;
++                    if (n > 0 && n < int(sizeof(line)))
++                        n += std::snprintf(line + n, sizeof(line) - size_t(n), " %s %.2f", names[t], ms);
++                }
++                std::fprintf(stderr, "%s, total %.2f\n", line, total);
++            }
+             s.swaps = s.packets = s.bytes = 0;
+             s.gifMs = s.vsyncMs = 0.0;
+             s.statStart = t1;
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 51a73ab..24d28fc 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
++#include "ThreadNaming.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdio>
+@@ -239,6 +240,7 @@ void GifArbiter::enqueue(GifArbiterPacket &pkt)
+ void GifArbiter::workerLoop()
+ {
+     t_onGsWorker = true;
++    ThreadNaming::SetCurrentThreadName("GSWorker");
+     std::unique_lock<std::mutex> lock(m_workerMutex);
+     for (;;)
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fc8770e..69f87c0 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -475,6 +475,27 @@ static bool UploadJitteredFrame(Texture2D &tex, uint32_t &width, uint32_t &heigh
+     return true;
+ }
+ 
++// GA2_PERF: the presentation thread's time per stage, reported every 5 s ("[present]"). CPU wall time of each
++// call; OpenGL work the driver queues shows up where it blocks (usually the swap).
++namespace
++{
++    struct PresentStats
++    {
++        double waitMs = 0, takeMs = 0, uploadMs = 0, drawMs = 0, swapMs = 0;
++        uint64_t loops = 0, uploads = 0;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    } g_presentStats;
++    bool presentPerf()
++    {
++        static const bool on = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++        return on;
++    }
++    double msSince(std::chrono::steady_clock::time_point t)
++    {
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
++    }
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     if (ga2_pgs::rendering())
+@@ -544,8 +565,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             }
+         }
+         bool eye0Split = false;
+-        if (ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split) && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
++        const auto takeStart = std::chrono::steady_clock::now();
++        const bool took = ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split);
++        g_presentStats.takeMs += msSince(takeStart);
++        if (took && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
+         {
++            const auto uploadStart = std::chrono::steady_clock::now();
+             if (tex.width != int(w) || tex.height != int(h))
+             {
+                 UnloadTexture(tex);
+@@ -555,6 +580,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                 SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+             }
+             UpdateTexture(tex, s_pgsFrame.data());
++            g_presentStats.uploadMs += msSince(uploadStart);
++            ++g_presentStats.uploads;
+             ga2_framepace::notePresented();
+             s_pgsWidth = w;
+             s_pgsHeight = h;
+@@ -3149,9 +3176,12 @@ void PS2Runtime::run()
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         // GA2_FPS: sleep until the GS delivers a frame (or the window needs
+         // its events pumped); no fixed 60 Hz cap.
++        const auto waitStart = std::chrono::steady_clock::now();
+         if (ga2_framepace::enabled() && ga2_pgs::rendering() && !ga2_vr::headsetRunning())
+             ga2_pgs::waitFreshFrame(16);
++        g_presentStats.waitMs += msSince(waitStart);
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
++        const auto drawStart = std::chrono::steady_clock::now();
+ 
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+@@ -3177,7 +3207,25 @@ void PS2Runtime::run()
+         }
+         ps2_mouse::draw();
+         ga2_cheat_menu::draw(m_memory.getRDRAM());
++        const auto swapStart = std::chrono::steady_clock::now();
++        g_presentStats.drawMs += std::chrono::duration<double, std::milli>(swapStart - drawStart).count();
+         EndDrawing();
++        g_presentStats.swapMs += msSince(swapStart);
++        ++g_presentStats.loops;
++        if (presentPerf())
++        {
++            PresentStats &p = g_presentStats;
++            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.start).count();
++            if (elapsed >= 5.0)
++            {
++                const double n = p.loops ? double(p.loops) : 1.0;
++                std::fprintf(stderr, "[present] %.1f loops/s, %.1f uploads/s | ms per loop: wait %.2f, take+convert %.2f, "
++                                     "upload %.2f (%.2f per upload), draw %.2f, end+swap %.2f\n",
++                             p.loops / elapsed, p.uploads / elapsed, p.waitMs / n, p.takeMs / n, p.uploadMs / n,
++                             p.uploads ? p.uploadMs / double(p.uploads) : 0.0, p.drawMs / n, p.swapMs / n);
++                p = PresentStats{};
++            }
++        }
+         // Input was polled in EndDrawing: mouse first (menus, on-screen pad), then the pad.
+         ps2_mouse::beginFrame(ps2_mouse::Rect{dstRect.x, dstRect.y, dstRect.width, dstRect.height},
+                               static_cast<float>(FB_WIDTH), static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+-- 
+2.56.0
+

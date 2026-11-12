@@ -1,0 +1,562 @@
+From 28dfd8b5240190887c19565fb9285d69ec4cb132 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:31:15 -0600
+Subject: [PATCH] Scan-out as a marker on the GS worker; packets handed over in
+ batches
+
+- ga2_pgs::vsync takes what belongs to the tick on the game thread (GS
+  registers, stereo setup, flip and game time, the frame's text pieces)
+  and posts the rest (flush, scan-out, readback) to the GS worker behind
+  the frame's packets (GifArbiter::postTask); the game carries on. At most
+  one marker waits or runs: the next one first waits for it, so the EE
+  stays at most a frame ahead of the GS. The frame text is sealed in two
+  halves: pieces at the tick, prompts (reported by the GS while drawing)
+  in the marker (ga2_hitext::takePieces / sealFrame(newFrame, pieces)).
+  GA2_GS_SCANOUT_MARKER=0: scan-out on the game thread as before.
+- The GIF arbiter gathers packets on the producer side and hands them to
+  the worker 64 at a time (or at a sync or marker): one lock of the
+  worker's queue per batch. GA2_GS_BATCH=0: per packet as before.
+- GA2_PERF: markers per second and time spent waiting for the previous one.
+
+Proof (RTX 4090, gamescope, 4x, GA2_FREERUN, research/run59/gpu-175/proof):
+both switches off vs on: the GIF capture (GA2_GS_CAPTURE_AT=0, records and
+vsync records) is byte-identical over the 113.75 MB both recorded (530348
+records, 966 vsyncs); the frame signatures (GA2_FRAMETRACE_FRAMES) agree
+at all 13113 common game times; GA2_PRESENT_SHOTS at 20/45/70/80 s are
+identical. English dialogue (Xvfb harness): text, names, prompts and the
+typewriter reveal per picture as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_hitext.h      |   5 +
+ ps2xRuntime/include/runtime/gs/gs_pgs.h       |   7 +-
+ .../include/runtime/gs/ps2_gif_arbiter.h      |  19 ++-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   6 +-
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp          |  22 ++++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             | 100 +++++++++++++---
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    | 111 ++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |   5 +
+ 8 files changed, 240 insertions(+), 35 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_hitext.h b/ps2xRuntime/include/runtime/ga2_hitext.h
+index c99f35a..b0910e7 100644
+--- a/ps2xRuntime/include/runtime/ga2_hitext.h
++++ b/ps2xRuntime/include/runtime/ga2_hitext.h
+@@ -118,6 +118,11 @@ namespace ga2_hitext
+         std::vector<PromptDraw> prompts;
+     };
+     std::shared_ptr<const FrameText> sealFrame(bool newFrame);
++    // The same in two halves, for a scan-out run later on the GS worker: the pieces at the tick (the game thread notes
++    // them while it builds the next frame), then the prompts with the frame's packets (the GS reports them while it
++    // draws). sealFrame(newFrame, takePieces(newFrame)) equals sealFrame(newFrame) once the frame's packets are in.
++    std::vector<TextPiece> takePieces(bool newFrame);
++    std::shared_ptr<const FrameText> sealFrame(bool newFrame, std::vector<TextPiece> pieces);
+     void setPresented(std::shared_ptr<const FrameText> text);
+     // A piece drawn at any scale (game pixels -> pixels: sx, sy) with its rectangle's top left at (ox, oy) pixels,
+     // into w x h: plain coverage 0..255 (not the GS levels), no inset.
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 723e222..ca2da4b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -38,6 +38,9 @@ namespace ga2_pgs
+     void setVramMirror(const uint8_t *vram);
+     // Waits for the GS worker (GifArbiter::sync); vsync and readLocalToHost call it before they touch the GS.
+     void setPacketSync(std::function<void()> sync);
++    // Runs a task on the GS worker after everything handed to it so far (GifArbiter::postTask). Set: vsync hands its
++    // scan-out to the worker instead of waiting for it (GA2_GS_SCANOUT_MARKER=0 keeps it on the game thread).
++    void setTaskPoster(std::function<void(std::function<void()>)> poster);
+     void setTexturePacks(const std::vector<std::string> &dirs);
+     // Button prompt style for the detected input device (gs_texpacks.h).
+     void setButtonStyle(const std::string &style);
+@@ -46,8 +49,8 @@ namespace ga2_pgs
+     void applySettings();
+     // Developer aid (GA2_GS_CAPTURE, gs_pgs.cpp): record the GIF stream from now.
+     void captureNow();
+-    // Game thread, at vblank: flush, scan out with the live CRTC registers and
+-    // queue an asynchronous readback of the frame.
++    // Game thread, at vblank: flush, scan out with the CRTC registers of this moment and queue an asynchronous
++    // readback of the frame; with a task poster, all but taking the registers runs later on the GS worker.
+     void vsync(const GSRegisters &regs);
+     // Present thread: newest frame as RGBA8. False when nothing new arrived.
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 1a0426c..f481141 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -26,6 +26,8 @@ struct GifArbiterPacket
+     // stateless CPU frontend (e.g. synthesised IMAGE continuation tags).
+     bool hasTapData = false;
+     std::vector<uint8_t> tapData;
++    // GS worker queue only: a task in place of a packet (postTask).
++    std::function<void()> task;
+ };
+ 
+ class GifArbiter
+@@ -60,13 +62,17 @@ public:
+     void startWorker();
+     void stopWorker();
+     void sync();
++    // Runs `task` on the worker after everything handed over so far, in order with the packets (inline when the
++    // worker is off). At most one task waits or runs: a second one first waits for the first to finish, so the
++    // EE stays at most one frame's scan-out ahead of the GS.
++    void postTask(std::function<void()> task);
+     bool workerRunning() const { return m_workerRunning; }
+     static bool onWorkerThread();
+     // Packets run inline vs. handed to the worker, and syncs that waited (since the last call).
+     struct WorkerStats
+     {
+-        uint64_t inlinePackets = 0, queuedPackets = 0, waits = 0;
+-        double waitMs = 0.0;
++        uint64_t inlinePackets = 0, queuedPackets = 0, waits = 0, tasks = 0, taskWaits = 0;
++        double waitMs = 0.0, taskWaitMs = 0.0;
+     };
+     WorkerStats takeWorkerStats();
+ 
+@@ -87,6 +93,7 @@ private:
+     static uint8_t pathPriority(GifPathId id);
+     void runPacket(GifPathId pathId, const std::vector<uint8_t> &data, bool hasTapData, const std::vector<uint8_t> &tapData);
+     void enqueue(GifArbiterPacket &pkt);
++    void flushLocal();
+     void workerLoop();
+ 
+     std::thread m_worker;
+@@ -98,6 +105,14 @@ private:
+     size_t m_incomingBytes = 0;
+     bool m_workerSleeping = false, m_stopWorker = false;
+     std::atomic<uint64_t> m_submitted{0}, m_completed{0};
++    // Packets gathered on the producer side and handed over 64 at a time (or at a sync or task), so the worker's
++    // mutex is taken per batch, not per packet. Guarded by m_localMutex (producers are the EE threads; a GS entry
++    // may sync from elsewhere).
++    std::mutex m_localMutex;
++    std::vector<GifArbiterPacket> m_local;
++    size_t m_localCount = 0, m_localBytes = 0;
++    uint64_t m_tasksPosted = 0;
++    std::atomic<uint64_t> m_tasksDone{0};
+     WorkerStats m_stats;
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 0959d13..5813acf 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2604,9 +2604,11 @@ void EeScheduler::processEvent(const EeEvent &event)
+                     if (m_runtime.gifArbiter().workerRunning())
+                     {
+                         const auto w = m_runtime.gifArbiter().takeWorkerStats();
+-                        std::fprintf(stderr, "[ga2 perf] gs worker: %.0f packets/s queued, %.0f/s inline, %.0f waits/s, %.2f ms/s waiting\n",
++                        std::fprintf(stderr, "[ga2 perf] gs worker: %.0f packets/s queued, %.0f/s inline, %.0f waits/s, %.2f ms/s waiting; "
++                                             "%.0f scan-out markers/s, %.0f waited for the previous one, %.2f ms/s\n",
+                                      double(w.queuedPackets) / seconds, double(w.inlinePackets) / seconds, double(w.waits) / seconds,
+-                                     w.waitMs / seconds);
++                                     w.waitMs / seconds, double(w.tasks) / seconds, double(w.taskWaits) / seconds,
++                                     w.taskWaitMs / seconds);
+                     }
+                     // Where each live guest thread is (status, resume pc, ra).
+                     std::fprintf(stderr, "[ga2 perf] threads:");
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index c389ec9..b6b587d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -798,6 +798,28 @@ namespace ga2_hitext
+         return g_sealed; // no new frame: the picture on screen is still the last one
+     }
+ 
++    std::vector<TextPiece> takePieces(bool newFrame)
++    {
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        std::vector<TextPiece> out;
++        if (newFrame)
++            out.swap(g_now.pieces);
++        return out;
++    }
++
++    std::shared_ptr<const FrameText> sealFrame(bool newFrame, std::vector<TextPiece> pieces)
++    {
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        if (newFrame)
++        {
++            auto sealed = std::make_shared<FrameText>();
++            sealed->pieces = std::move(pieces);
++            sealed->prompts.swap(g_now.prompts);
++            g_sealed = std::move(sealed);
++        }
++        return g_sealed;
++    }
++
+     void setPresented(std::shared_ptr<const FrameText> text)
+     {
+         if (!text)
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 5be8d25..c6ea3f7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -286,6 +286,8 @@ namespace
+         int hiresShift = -1; // GA2_PGS_HIRES, read once
+         uint64_t totalSwaps = 0;
+         uint64_t lastFlip = ~0ull; // the guest flip of the last sealed frame text
++        uint64_t tickFlip = 0;     // the tick being scanned out: its flip and game time (Tick)
++        double tickFlipTime = 0.0;
+ 
+         std::mutex frameMutex;
+         std::condition_variable frameCv; // a new frame is ready for the presentation thread (waitFreshFrame)
+@@ -968,8 +970,8 @@ namespace
+             slot.setup = setup;
+             slot.uiSplit = uiSplit;
+             slot.text = std::move(text);
+-            slot.flip = ga2_framepace::flips();
+-            slot.flipTime = ga2_framepace::flipGameTime();
++            slot.flip = s.tickFlip;
++            slot.flipTime = s.tickFlipTime;
+             slot.pending = true;
+             eye.slotIndex = (eye.slotIndex + 1u) % ga2_pgs::kReadbackSlots;
+             return;
+@@ -1002,8 +1004,8 @@ namespace
+         slot.setup = setup;
+         slot.uiSplit = uiSplit;
+         slot.text = std::move(text);
+-        slot.flip = ga2_framepace::flips();
+-        slot.flipTime = ga2_framepace::flipGameTime();
++        slot.flip = s.tickFlip;
++        slot.flipTime = s.tickFlipTime;
+         slot.pending = true;
+         eye.slotIndex = (eye.slotIndex + 1u) % ga2_pgs::kReadbackSlots;
+     }
+@@ -1157,23 +1159,43 @@ namespace ga2_pgs
+         }
+     }
+ 
+-    void vsync(const GSRegisters &r)
++    namespace
++    {
++        // What a frame tick hands to the scan-out, taken on the game thread at the tick (the scan-out may run later
++        // on the GS worker, while the game builds the next frame): the GS registers as they were (raw, for the GIF
++        // capture, and the CRTC values), the stereo setup, the flip shown and the port's text pieces of that frame.
++        struct Tick
++        {
++            alignas(8) unsigned char raw[sizeof(GSRegisters)];
++            uint64_t pmode, smode1, smode2, syncv, dispfb1, display1, dispfb2, display2, extbuf, extdata, extwrite, bgcolor;
++            ga2_stereo::Setup shown, next;
++            uint64_t flip = 0;
++            double flipTime = 0.0;
++            bool newFrame = false;
++            std::vector<ga2_hitext::TextPiece> pieces;
++        };
++        std::function<void(std::function<void()>)> g_taskPoster;
++    }
++
++    void setTaskPoster(std::function<void(std::function<void()>)> poster) { g_taskPoster = std::move(poster); }
++
++    void vsyncTick(Tick &t)
+     {
+-        syncPackets();
+         State &s = state();
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+             return;
+-        gifCapture().write(0xFFFFFFFFu, &r, sizeof(r));
++        gifCapture().write(0xFFFFFFFFu, t.raw, sizeof(t.raw));
++        s.tickFlip = t.flip;
++        s.tickFlipTime = t.flipTime;
+         const auto t0 = std::chrono::steady_clock::now();
+         // The CRTC registers by value (the workers run later).
+         struct Crtc
+         {
+             uint64_t pmode, smode1, smode2, syncv, dispfb1, display1, dispfb2, display2, extbuf, extdata, extwrite, bgcolor;
+         };
+-        const Crtc c{uint64_t(r.pmode), uint64_t(r.smode1), uint64_t(r.smode2), uint64_t(r.syncv), uint64_t(r.dispfb1),
+-                     uint64_t(r.display1), uint64_t(r.dispfb2), uint64_t(r.display2), uint64_t(r.extbuf), uint64_t(r.extdata),
+-                     uint64_t(r.extwrite), uint64_t(r.bgcolor)};
++        const Crtc c{t.pmode, t.smode1, t.smode2, t.syncv, t.dispfb1, t.display1, t.dispfb2, t.display2, t.extbuf, t.extdata,
++                     t.extwrite, t.bgcolor};
+         auto setRegisters = [c](Eye &inst) {
+             inst.gs.flush();
+             auto &p = inst.gs.get_priv_register_state();
+@@ -1231,16 +1253,15 @@ namespace ga2_pgs
+ 
+         // The frame on screen carries its stereo setup; the eyes' parallax for
+         // the frames that follow comes from the newest one being built.
+-        const ga2_stereo::Setup shown = s.eyeCount == 2 ? ga2_stereo::displayed() : ga2_stereo::Setup{};
+-        const ga2_stereo::Setup next = s.eyeCount == 2 ? ga2_stereo::building() : ga2_stereo::Setup{};
++        const ga2_stereo::Setup shown = t.shown;
++        const ga2_stereo::Setup next = t.next;
+         // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
+         // renders them in stereo.
+         const bool split = s.uiLayer && (next.active || s.hudDebug);
+         // The port's text and prompts of the frame being scanned out (the game flipped to a new one since the last
+         // vsync, or it is still the last one), kept with its picture.
+-        const uint64_t flip = ga2_framepace::flips();
+-        const auto frameText = ga2_hitext::sealFrame(flip != s.lastFlip);
+-        s.lastFlip = flip;
++        const auto frameText = ga2_hitext::sealFrame(t.newFrame, std::move(t.pieces));
++        s.lastFlip = t.flip;
+         // The jitter instances scan out and read back side by side with eye 0 (their workers).
+         for (uint32_t j = 0; j < s.jitterCount; ++j)
+         {
+@@ -1327,9 +1348,9 @@ namespace ga2_pgs
+                          s.swaps ? s.gifMs / s.swaps : 0.0, s.swaps ? s.vsyncMs / s.swaps : 0.0,
+                          s.eyes[0].frameWidth, s.eyes[0].frameHeight);
+             std::fprintf(stderr, "[pgs] pmode=%llx smode1=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
+-                         (unsigned long long)r.pmode, (unsigned long long)r.smode1, (unsigned long long)r.smode2,
+-                         (unsigned long long)r.dispfb1, (unsigned long long)r.display1,
+-                         (unsigned long long)r.dispfb2, (unsigned long long)r.display2, (unsigned long long)r.bgcolor);
++                         (unsigned long long)t.pmode, (unsigned long long)t.smode1, (unsigned long long)t.smode2,
++                         (unsigned long long)t.dispfb1, (unsigned long long)t.display1,
++                         (unsigned long long)t.dispfb2, (unsigned long long)t.display2, (unsigned long long)t.bgcolor);
+             const double perSwap = s.swaps ? 1.0 / double(s.swaps) : 0.0;
+             std::fprintf(stderr, "[pgs] readbacks %.1f/s, dropped %.1f/s, skipped %.1f/s | eye 0 per swap: %.1f render passes, %.0f primitives, %.1f copies, %.1f palette updates\n",
+                          double(s.readbacks.exchange(0)) / elapsed, double(s.droppedReadbacks.exchange(0)) / elapsed,
+@@ -1361,6 +1382,48 @@ namespace ga2_pgs
+         }
+     }
+ 
++    void vsync(const GSRegisters &r)
++    {
++        auto t = std::make_shared<Tick>();
++        std::memcpy(t->raw, static_cast<const void *>(&r), sizeof(r));
++        t->pmode = uint64_t(r.pmode);
++        t->smode1 = uint64_t(r.smode1);
++        t->smode2 = uint64_t(r.smode2);
++        t->syncv = uint64_t(r.syncv);
++        t->dispfb1 = uint64_t(r.dispfb1);
++        t->display1 = uint64_t(r.display1);
++        t->dispfb2 = uint64_t(r.dispfb2);
++        t->display2 = uint64_t(r.display2);
++        t->extbuf = uint64_t(r.extbuf);
++        t->extdata = uint64_t(r.extdata);
++        t->extwrite = uint64_t(r.extwrite);
++        t->bgcolor = uint64_t(r.bgcolor);
++        // The frame on screen carries its stereo setup; the eyes' parallax for the frames that follow comes from the
++        // newest one being built.
++        if (state().eyeCount == 2)
++        {
++            t->shown = ga2_stereo::displayed();
++            t->next = ga2_stereo::building();
++        }
++        // The port's text of the frame being scanned out (the game flipped to a new one since the last tick, or it is
++        // still the last one): its pieces now, its prompts once the GS has drawn its packets (vsyncTick).
++        static uint64_t lastFlip = ~0ull; // the game thread's (ticks come from it alone)
++        t->flip = ga2_framepace::flips();
++        t->flipTime = ga2_framepace::flipGameTime();
++        t->newFrame = t->flip != lastFlip;
++        lastFlip = t->flip;
++        t->pieces = ga2_hitext::takePieces(t->newFrame);
++        // GS worker on: the scan-out goes into its queue behind this frame's packets and the game carries on (at most
++        // one frame ahead: the poster waits for the previous one). Else here, once the worker is drained.
++        if (g_taskPoster)
++        {
++            g_taskPoster([t] { vsyncTick(*t); });
++            return;
++        }
++        syncPackets();
++        vsyncTick(*t);
++    }
++
+     bool stereo() { return state().eyeCount == 2; }
+ 
+     bool waitFreshFrame(int timeoutMs)
+@@ -1673,6 +1736,7 @@ namespace ga2_pgs
+     void captureNow() {}
+     void setVramMirror(const uint8_t *) {}
+     void setPacketSync(std::function<void()>) {}
++    void setTaskPoster(std::function<void(std::function<void()>)>) {}
+     bool enableZeroCopy(const uint8_t *) { return false; }
+     bool zeroCopy() { return false; }
+     bool takeSharedFrame(int, SharedFrame &, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *)
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 24d28fc..9a8623b 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -3,6 +3,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <exception>
+ 
+@@ -214,29 +215,98 @@ bool GifArbiter::needsInline(const uint8_t *data, uint32_t sizeBytes)
+ 
+ void GifArbiter::enqueue(GifArbiterPacket &pkt)
+ {
+-    bool backlog = false;
++    bool full = false;
+     {
+-        std::lock_guard<std::mutex> lock(m_workerMutex);
+-        if (m_incomingCount == m_incoming.size())
+-            m_incoming.emplace_back();
+-        GifArbiterPacket &job = m_incoming[m_incomingCount++];
++        std::lock_guard<std::mutex> lock(m_localMutex);
++        if (m_localCount == m_local.size())
++            m_local.emplace_back();
++        GifArbiterPacket &job = m_local[m_localCount++];
+         job.pathId = pkt.pathId;
+         job.hasTapData = pkt.hasTapData;
+         job.data.swap(pkt.data); // the packet slot takes the job's old buffer
+         job.tapData.swap(pkt.tapData);
+-        m_incomingBytes += job.data.size() + job.tapData.size();
+-        m_submitted.fetch_add(1, std::memory_order_relaxed);
+-        // Woken per batch, not per packet (a frame is thousands of small XGKICK packets); sync() wakes it for the rest.
+-        if (m_workerSleeping && m_incomingCount >= 64u)
++        m_localBytes += job.data.size() + job.tapData.size();
++        // GA2_GS_BATCH=0 hands every packet over at once (the hand-off before batching).
++        static const size_t batch = [] {
++            const char *v = std::getenv("GA2_GS_BATCH");
++            return v && std::strcmp(v, "0") == 0 ? size_t(1) : size_t(64);
++        }();
++        full = m_localCount >= batch;
++    }
++    ++m_stats.queuedPackets;
++    if (full)
++        flushLocal();
++}
++
++// Hands the gathered packets to the worker (one lock of its queue for the batch).
++void GifArbiter::flushLocal()
++{
++    bool backlog = false;
++    {
++        std::lock_guard<std::mutex> localLock(m_localMutex);
++        if (m_localCount == 0u)
++            return;
++        std::lock_guard<std::mutex> lock(m_workerMutex);
++        for (size_t i = 0; i < m_localCount; ++i)
++        {
++            if (m_incomingCount == m_incoming.size())
++                m_incoming.emplace_back();
++            GifArbiterPacket &job = m_incoming[m_incomingCount++];
++            GifArbiterPacket &mine = m_local[i];
++            job.pathId = mine.pathId;
++            job.hasTapData = mine.hasTapData;
++            job.data.swap(mine.data);
++            job.tapData.swap(mine.tapData);
++            job.task = nullptr;
++        }
++        m_incomingBytes += m_localBytes;
++        m_submitted.fetch_add(m_localCount, std::memory_order_relaxed);
++        m_localCount = 0;
++        m_localBytes = 0;
++        if (m_workerSleeping)
+             m_workCv.notify_one();
+         // Bound what waits: a frame's packets are a few MB at most.
+         backlog = m_incomingCount >= 16384u || m_incomingBytes >= (64u << 20);
+     }
+-    ++m_stats.queuedPackets;
+     if (backlog)
+         sync();
+ }
+ 
++void GifArbiter::postTask(std::function<void()> task)
++{
++    if (!m_workerRunning || t_onGsWorker)
++    {
++        sync();
++        task();
++        return;
++    }
++    flushLocal();
++    ++m_stats.tasks;
++    // At most one task in the queue: wait for the previous one (the last frame's scan-out) to finish.
++    if (m_tasksDone.load(std::memory_order_acquire) < m_tasksPosted)
++    {
++        const auto t0 = std::chrono::steady_clock::now();
++        std::unique_lock<std::mutex> lock(m_workerMutex);
++        if (m_workerSleeping && m_incomingCount != 0u)
++            m_workCv.notify_one();
++        m_idleCv.wait(lock, [&] { return m_tasksDone.load(std::memory_order_acquire) >= m_tasksPosted; });
++        ++m_stats.taskWaits;
++        m_stats.taskWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++    }
++    std::lock_guard<std::mutex> lock(m_workerMutex);
++    if (m_incomingCount == m_incoming.size())
++        m_incoming.emplace_back();
++    GifArbiterPacket &job = m_incoming[m_incomingCount++];
++    job.data.clear();
++    job.tapData.clear();
++    job.hasTapData = false;
++    job.task = std::move(task);
++    ++m_tasksPosted;
++    m_submitted.fetch_add(1, std::memory_order_relaxed);
++    if (m_workerSleeping)
++        m_workCv.notify_one();
++}
++
+ void GifArbiter::workerLoop()
+ {
+     t_onGsWorker = true;
+@@ -257,9 +327,17 @@ void GifArbiter::workerLoop()
+         for (size_t i = 0; i < count; ++i)
+         {
+             GifArbiterPacket &job = m_working[i];
++            const bool isTask = static_cast<bool>(job.task);
+             try
+             {
+-                runPacket(job.pathId, job.data, job.hasTapData, job.tapData);
++                if (isTask)
++                {
++                    std::function<void()> task = std::move(job.task);
++                    job.task = nullptr;
++                    task();
++                }
++                else
++                    runPacket(job.pathId, job.data, job.hasTapData, job.tapData);
+             }
+             catch (const std::exception &e)
+             {
+@@ -269,6 +347,15 @@ void GifArbiter::workerLoop()
+             {
+                 std::fprintf(stderr, "[gs worker] packet failed\n");
+             }
++            if (isTask)
++            {
++                // Counted whatever happened, so the next postTask never waits for it forever.
++                {
++                    std::lock_guard<std::mutex> doneLock(m_workerMutex);
++                    m_tasksDone.fetch_add(1, std::memory_order_release);
++                }
++                m_idleCv.notify_all();
++            }
+             constexpr size_t kRetainBytes = 256u * 1024u;
+             if (job.data.capacity() > kRetainBytes)
+                 std::vector<uint8_t>().swap(job.data);
+@@ -294,6 +381,7 @@ void GifArbiter::stopWorker()
+ {
+     if (!m_workerRunning)
+         return;
++    flushLocal();
+     {
+         std::lock_guard<std::mutex> lock(m_workerMutex);
+         m_stopWorker = true;
+@@ -318,6 +406,7 @@ void GifArbiter::sync()
+ {
+     if (!m_workerRunning || t_onGsWorker)
+         return;
++    flushLocal();
+     const uint64_t target = m_submitted.load(std::memory_order_relaxed);
+     if (m_completed.load(std::memory_order_acquire) >= target)
+         return;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 345c089..51df950 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -858,6 +858,7 @@ PS2Runtime::~PS2Runtime()
+     {
+         requestStop();
+         // The GS worker calls into m_gs, which is destroyed before the arbiter.
++        ga2_pgs::setTaskPoster({});
+         m_gifArbiter.stopWorker();
+         ga2_pgs::setPacketSync({});
+         m_gs.setPacketSync({});
+@@ -1134,6 +1135,10 @@ bool PS2Runtime::syncCoreSubsystems()
+             m_gs.setPacketSync([this] { m_gifArbiter.sync(); });
+             ga2_pgs::setPacketSync([this] { m_gifArbiter.sync(); });
+             m_gifArbiter.startWorker();
++            // The frame tick's scan-out goes into the worker's queue too (GA2_GS_SCANOUT_MARKER=0: on the game thread).
++            const char *marker = std::getenv("GA2_GS_SCANOUT_MARKER");
++            if (!marker || std::strcmp(marker, "0") != 0)
++                ga2_pgs::setTaskPoster([this](std::function<void()> task) { m_gifArbiter.postTask(std::move(task)); });
+         }
+     }
+     m_memory.setGifArbiter(&m_gifArbiter);
+-- 
+2.56.0
+

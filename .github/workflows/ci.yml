@@ -16,6 +16,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The tool tests use synthetic fixtures only (no discs, private root,
+  # submodule or PS2Recomp build), so they run without the heavy setup.
+  python-tests:
+    name: Python tool tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: pytest
+        run: |
+          python -m pip install -q pytest
+          python -m pytest -q tests
+
   linux:
     name: Linux ${{ matrix.arch }}
     strategy:

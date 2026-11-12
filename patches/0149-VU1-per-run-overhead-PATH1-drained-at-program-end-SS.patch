@@ -1,0 +1,194 @@
+From 5d2965ce9d6e9dacb39cc8ca4696eaace5c37835 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:03:48 -0600
+Subject: [PATCH] VU1 per-run overhead: PATH1 drained at program end, SSE
+ rounding scope
+
+- flushPipelines: once a program has ended and only PATH1 is still going
+  (no FDIV/EFU result, flag result or register write due), the rest of
+  the XGKICK packet is copied in one loop: nothing can write VU memory any
+  more, the cycle advances as advanceOneCycle would (the commits it skips
+  have nothing to commit).
+- Rounding: the VU1 run (toward zero) and the GIF hand-off inside XGKICK
+  (nearest) change only the SSE rounding field (MXCSR bits 13-14) on
+  x86-64 instead of fegetround/fesetround, which also rewrites the x87
+  control word nothing here uses. Other targets keep fesetround.
+- last3dVsync was stored on every run (missing braces); now every 32nd
+  with last3dNanos, as meant.
+- ga2_pgs::gifTransfer reads the clock only for GA2_PERF (two reads per
+  packet before).
+
+Proof: ga2_vu1_check on all eleven captures prints the same as before
+(--reference: 0 mismatches; GA2_VU1JIT=0 digest mode: the same counts,
+GIF bytes and cycles as the old build); ga2_vu1_fuzz --lines over 300
+random images x 40 states is byte-identical to the old interpreter's
+output. Replay: ship map 5.1 -> 4.6 ns per VU cycle, Eigou 2 narration
+4.9 -> 4.4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       |  7 ++-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp | 78 +++++++++++++++++++++----
+ 2 files changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 613b662..5be8d25 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -1049,7 +1049,9 @@ namespace ga2_pgs
+             return;
+         gifCapture().write(path, data, size & ~size_t(15));
+         const bool changed = ga2_texpacks::takeChanged();
+-        const auto t0 = std::chrono::steady_clock::now();
++        // The packet time is only measured for the GA2_PERF report (two clock reads per packet otherwise).
++        static const bool perf = [] { const char *v = std::getenv("GA2_PERF"); return v && *v && *v != '0'; }();
++        const auto t0 = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         // Every instance takes the packet here, in turn: a texture an instance first samples is decoded (texture
+         // replacement) from the CPU's copy of GS memory, which is only what this packet saw now.
+         for (uint32_t e = 0; e < s.instanceCount(); ++e)
+@@ -1059,7 +1061,8 @@ namespace ga2_pgs
+                 eye.gs.invalidate_all_cached_textures();
+             eye.gs.gif_transfer(path, data, size & ~size_t(15));
+         }
+-        s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        if (perf)
++            s.gifMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         ++s.packets;
+         s.bytes += size;
+     }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 8102dbe..02cb567 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -10,6 +10,9 @@
+ 
+ #include <algorithm>
+ #include <cfenv>
++#if defined(__x86_64__) || defined(_M_X64)
++#include <xmmintrin.h>
++#endif
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -347,6 +350,47 @@ void VU1Interpreter::progressXgkick()
+     }
+ }
+ 
++namespace
++{
++    // The rounding mode for a stretch of code. On x86-64 only the SSE rounding field (MXCSR bits 13-14) changes: all
++    // VU and GS float arithmetic there is SSE, and fesetround also rewrites the x87 control word, which nothing here
++    // uses, at several times the cost (it ran twice per VU1 run and twice per XGKICK). Elsewhere fesetround as before.
++#if defined(__x86_64__) || defined(_M_X64)
++    constexpr uint32_t kRoundTowardZero = 0x6000u, kRoundNearest = 0x0000u;
++    struct RoundingScope
++    {
++        uint32_t saved;
++        explicit RoundingScope(uint32_t mode) : saved(_mm_getcsr() & 0x6000u)
++        {
++            if (saved != mode)
++                _mm_setcsr((_mm_getcsr() & ~0x6000u) | mode);
++        }
++        ~RoundingScope()
++        {
++            const uint32_t csr = _mm_getcsr();
++            if ((csr & 0x6000u) != saved)
++                _mm_setcsr((csr & ~0x6000u) | saved);
++        }
++    };
++#else
++    constexpr int kRoundTowardZero = FE_TOWARDZERO, kRoundNearest = FE_TONEAREST;
++    struct RoundingScope
++    {
++        int saved;
++        bool changed = false;
++        explicit RoundingScope(int mode) : saved(std::fegetround())
++        {
++            changed = saved != -1 && saved != mode && std::fesetround(mode) == 0;
++        }
++        ~RoundingScope()
++        {
++            if (changed)
++                std::fesetround(saved);
++        }
++    };
++#endif
++}
++
+ void VU1Interpreter::finishXgkick()
+ {
+     if (!m_xgkick.active)
+@@ -355,12 +399,7 @@ void VU1Interpreter::finishXgkick()
+     // The VU1 run executes under round-toward-zero (execute()); the GS/GIF code
+     // XGKICK calls into is not VU arithmetic and must see the default mode, as
+     // it does when the same packet arrives by DMA.
+-    struct DefaultRounding
+-    {
+-        const int previous = std::fegetround();
+-        DefaultRounding() { if (previous != FE_TONEAREST) std::fesetround(FE_TONEAREST); }
+-        ~DefaultRounding() { if (previous != FE_TONEAREST) std::fesetround(previous); }
+-    } defaultRounding;
++    const RoundingScope defaultRounding(kRoundNearest);
+ 
+     if (m_capture)
+         captureGif(m_xgkick.packet.data(), m_xgkick.totalBytes);
+@@ -415,7 +454,27 @@ bool VU1Interpreter::pipelinesPending() const
+ void VU1Interpreter::flushPipelines()
+ {
+     while (pipelinesPending())
++    {
++        // The program has ended and only PATH1 is still going: no instruction can write VU memory any more and no
++        // other result is due, so the rest of the packet goes at once, with the cycles counted exactly as the
++        // per-cycle loop would count them (progressXgkick earns one cycle of credit per call).
++        bool othersPending = m_fdiv.valid || m_regWriteReady > m_cycle;
++        for (const ScalarPipelineEntry &entry : m_efu)
++            othersPending = othersPending || entry.valid;
++        if (m_flagCount != 0u && m_flagPipeline[(m_flagHead + m_flagCount - 1u) & (kMaxFlagEntries - 1u)].readyCycle > m_cycle)
++            othersPending = true;
++        if (m_xgkick.active && !othersPending && m_activeVuData && m_activeVuDataSize != 0u)
++        {
++            while (m_xgkick.active)
++            {
++                ++m_cycle; // as advanceOneCycle, minus the commits (none are pending)
++                progressXgkick();
++            }
++            m_state.cycles = m_cycle;
++            continue;
++        }
+         advanceOneCycle();
++    }
+     syncFlags();
+ }
+ 
+@@ -1016,16 +1075,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+     } perfScope{perfStart, perfCycle, m_cycle};
+     if ((ga2_activity::vu1Runs.fetch_add(1, std::memory_order_relaxed) & 31u) == 0u)
++    {
+         ga2_activity::last3dNanos.store(ga2_activity::nowNanos(), std::memory_order_relaxed);
+         ga2_activity::last3dVsync.store(int64_t(ga2_activity::vsyncs.load(std::memory_order_relaxed)), std::memory_order_relaxed);
++    }
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+     updateBlockOff();
+ 
+-    const int previousRoundingMode = std::fegetround();
+-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++    const RoundingScope vuRounding(kRoundTowardZero);
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     const StepArgs args{vuCode, vuData, dataSize, &gs, memory, codeSize, budgetEnd};
+     StepResult result = StepResult::Stop;
+@@ -1067,8 +1127,6 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     syncFlags();
+     m_state.cycles = m_cycle;
+     m_lastRunEnded = programEnded;
+-    if (useVuRounding && previousRoundingMode != -1)
+-        std::fesetround(previousRoundingMode);
+ }
+ 
+ // ---------------------------------------------------------------------------
+-- 
+2.56.0
+

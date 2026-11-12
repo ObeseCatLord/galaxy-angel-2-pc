@@ -1,0 +1,29 @@
+From 8ddd127b8fecc4fcc92400279b35329852b114bc Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 12:04:38 -0600
+Subject: [PATCH] Hacks: replacement images are sampled bilinearly
+
+A host replacement image has several texels per PS2 texel; nearest sampling (the game's choice for its own texels) turns the per-sample UV jitter into combs along the edges of HD text and art.
+---
+ gs/gs_interface.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 634b160..1ed5ef4 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1887,6 +1887,11 @@ void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const
+ 			// extra detail reaches the output (2D sprites are otherwise evaluated once per PS2 pixel).
+ 			if ((info.flags & TEX_INFO_REPLACED) != 0 && hacks.replaced_per_sample)
+ 				p.tex |= TEX_REPLACED_BIT;
++			// [texreplace] a host replacement image is sampled bilinearly whatever the game set: it has several texels
++			// per PS2 texel, and nearest sampling (the game's choice for its own texels) turns the per-sample UV
++			// jitter into combs along the edges of HD text and art.
++			if ((info.flags & TEX_INFO_REPLACED) != 0)
++				p.tex |= TEX_SAMPLER_MAG_LINEAR_BIT;
+ 		}
+ 
+ 		if (ctx.tex1.desc.mmin_has_mipmap() && !hacks.disable_mipmaps)
+-- 
+2.56.0
+

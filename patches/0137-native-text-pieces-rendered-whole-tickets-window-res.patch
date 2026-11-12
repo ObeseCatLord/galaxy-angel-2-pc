@@ -1,0 +1,1023 @@
+From ba74420f074926601701dc2bf7a19bc402e0b34b Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 13:41:27 -0600
+Subject: [PATCH] native text: pieces rendered whole (tickets),
+ window-resolution text overlay, area downscale, exact text mask
+
+Sharp text draws the games' text itself: the drawers' calls are laid out with the font's advances and kerning and drawn as whole pieces (ga2_hitext::noteRun / runImage) the GS composes as tickets; the presentation takes the GS's rendering out of 2D pictures above 640x448 (text layer, per-PS2-pixel occlusion with an area vote, footprint filled from the surroundings) and draws each piece again at the window's resolution. A picture larger than the window is shrunk with an area filter; Anime4K's detail mix keeps the port's text areas as rendered.
+---
+ ps2xRuntime/include/runtime/ga2_hitext.h |  73 +++-
+ ps2xRuntime/src/lib/ga2_present.cpp      | 480 ++++++++++++++++++++++-
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp     | 219 ++++++++++-
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp   |  38 ++
+ 4 files changed, 790 insertions(+), 20 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_hitext.h b/ps2xRuntime/include/runtime/ga2_hitext.h
+index d463d82..605c54b 100644
+--- a/ps2xRuntime/include/runtime/ga2_hitext.h
++++ b/ps2xRuntime/include/runtime/ga2_hitext.h
+@@ -2,18 +2,21 @@
+ // 4-bit full-width Shift-JIS glyphs, one proportional 128x144 half-width atlas).
+ // At 2x/4x internal resolution that is visibly blocky, so the paraLLEl-GS texture
+ // replacement (gs_texpacks.cpp) swaps each glyph texture for the same character
+-// drawn from the bundled vector font (Noto Sans JP) at the internal resolution,
+-// fitted to the game's own ink box so layout, advances and line breaks do not
+-// change. The game side (native/compat/ga2_text.cpp) only reports what the game
+-// looks up; nothing in the game's memory or timing changes.
++// drawn from the bundled vector font (Noto Sans JP) at the internal resolution.
++// Full-width characters keep the game's layout. Latin characters are drawn at
++// their natural shape and the game side (native/compat/ga2_text.cpp) moves each
++// one to the font's own advance and kerning (native layout); line breaks stay
++// the game's. Nothing in the game's memory or timing changes.
+ //
+ //   GA2_SHARP_TEXT=0|1|auto   off / on / on above native resolution (default)
+ //   GA2_UI_FONT=<file>        the vector font (default <app>/fonts/NotoSansJP-Medium.otf)
+ //   GA2_HITEXT_DUMP=<dir>     writes every replacement glyph next to the game's own (evidence)
+ //   GA2_HITEXT_BOLD=<px>      grow strokes by this many game pixels (default 0; GA2_HITEXT_BOLD_LATIN for the atlas)
++//   GA2_NATIVE_TEXT_LAYOUT=0  Latin text in the game's own bitmap-font layout (glyphs fitted to its cells)
+ #pragma once
+ 
+ #include <cstdint>
++#include <memory>
+ #include <vector>
+ 
+ namespace ga2_hitext
+@@ -38,6 +41,66 @@ namespace ga2_hitext
+     void noteGlyph(uint32_t sjis, const uint8_t *bitmap288);
+     // The half-width metrics table in use: 95 entries (characters 0x20..0x7E) of int32 {u, v, width}.
+     void noteAsciiMetrics(const uint8_t *table);
++    // Native layout of the half-width (Latin) characters: the vector font's own advances and kerning instead of
++    // the game's bitmap widths, at the games' 18-pixel size (em 17.1 px). Sharp text draws each character
++    // unstretched with its ink centred in the game's atlas cell, so the game side (ga2_text.cpp) places a cell
++    // `inkCentre - cellWidth / 2` from the pen. Index 0..94 = characters 0x20..0x7E (0 = space); game pixels.
++    struct LatinLayout
++    {
++        float advance[95];
++        float inkCentre[95];
++        float kern[95][95]; // [previous][next], added before `next`
++    };
++    // nullptr without the font.
++    const LatinLayout *latinLayout();
++
++    // ---- native text runs (game side: ga2_text.cpp) ----------------------------------------------------------
++    // With native layout the port renders the games' text itself: each piece of a line in one colour is drawn
++    // whole from the vector font at the internal resolution, with the font's own spacing, kerning and full
++    // descenders, Japanese at its real size. The game draws a "ticket" in its place: a 24x24 glyph bitmap made for
++    // the piece, as one sprite over the piece's rectangle; the texture replacement answers the ticket with the
++    // piece's image, so the GS still composes the text (colour, fades, layers, VR) as it did the game's glyphs.
++    struct RunGlyph
++    {
++        uint32_t codepoint = 0; // Unicode
++        float x = 0.0f;         // pen position, game pixels from the image's left edge
++        float cellTop = 0.0f;   // top of the game's cell for the character, game pixels from the image's top
++        float size = 18.0f;     // the game's character size
++        bool fullWidth = false; // full-width cell (em 23.8 / 24 of the size) or half-width (em 17.1 / 18)
++    };
++    struct RunSpec
++    {
++        int width = 0, height = 0; // game pixels
++        // The GS shows a ticket's image from this far in (the games' texel coordinates start half a texel in): the
++        // ticket's image has its glyphs that much further in.
++        float insetX = 0.0f, insetY = 0.0f;
++        std::vector<RunGlyph> glyphs;
++    };
++    // The font has this character.
++    bool fontHasGlyph(uint32_t codepoint);
++    // Registers the piece and writes its ticket (288 bytes: 24x24, 4 bits per pixel, the games' glyph layout).
++    // Returns the ticket's hash (the piece's identity).
++    uint64_t noteRun(const RunSpec &spec, uint8_t *ticket288);
++    // The port's text drawn in a frame, for the presentation (ga2_present.cpp): it takes the GS's rendering of it
++    // out of the 2D picture and draws the text again at the window's own resolution, so the 2D filters and the
++    // scaling never touch it. notePiece is called per piece drawn (game thread, game 2D coordinates as given to the
++    // screen-rect setter, the sprite colour 0x80 = 1.0); textPieces gives the last complete frame's (empty when no
++    // text was drawn lately).
++    struct Alpha;
++    struct TextPiece
++    {
++        uint64_t hash = 0;
++        std::shared_ptr<const RunSpec> spec;
++        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++        uint8_t r = 0x80, g = 0x80, b = 0x80, a = 0x80;
++    };
++    void notePiece(const TextPiece &piece);
++    std::vector<TextPiece> textPieces();
++    // A piece drawn at any scale (game pixels -> pixels: sx, sy) with its rectangle's top left at (ox, oy) pixels,
++    // into w x h: plain coverage 0..255 (not the GS levels), no inset.
++    bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out);
++    // Text is laid out natively: sharp text is on and GA2_NATIVE_TEXT_LAYOUT is not 0.
++    bool nativeLayout();
+     // Characters reported, glyph images made, distinct glyph textures the GS then asked for (served), atlas cell images made.
+     struct Stats
+     {
+@@ -80,6 +143,8 @@ namespace ga2_hitext
+     // alpha level*8), as reported by noteGlyph. The image is rendered once and cached (a worker thread prepares
+     // glyphs as they are first seen).
+     bool glyphImage(uint64_t hash, Alpha &out);
++    // The image of the text piece whose ticket decodes to `hash` (noteRun): width*renderScale x height*renderScale.
++    bool runImage(uint64_t hash, Alpha &out);
+     // The metrics noteAsciiMetrics supplied (95 entries); false before the game reported them.
+     bool asciiCells(AsciiCell (&cells)[95]);
+     // The hash a game bitmap has once the GS decoded it (white, alpha level * 8 in the GS's 0..0x80 range).
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index c36863b..2e873e7 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/ga2_display.h"
+ #include "ga2_mpv_shader.h"
+ #include "runtime/ga2_activity.h"
++#include "runtime/ga2_hitext.h"
+ 
+ #include "raylib.h"
+ #include "rlgl.h"
+@@ -18,6 +19,9 @@
+ #include <fstream>
+ #include <memory>
+ #include <sstream>
++#include <list>
++#include <unordered_map>
++#include <string>
+ #include <vector>
+ 
+ namespace ga2_present
+@@ -135,8 +139,23 @@ uniform sampler2D texture0;   // Anime4K of the small picture
+ uniform sampler2D fullPicture; // the picture as rendered
+ uniform sampler2D smallPicture;
+ uniform vec2 fullSize;
++uniform vec2 outSize;  // the mix's size (the picture as shown)
+ uniform float stepPx; // half a small-picture pixel, in full-picture pixels
++uniform vec2 gameSize; // the picture in the game's 2D coordinates (640x480)
++uniform int rectCount; // the port's text (ga2_hitext::textPieces), game coordinates x0, y0, x1, y1
++uniform vec4 rects[64];
++uniform int showMask;  // GA2_TEXT_MASK_SHOW=1: tint what the filter leaves alone
+ out vec4 finalColor;
++// The full picture over one output pixel's footprint (4x4 bilinear taps): the picture is usually shown smaller than
++// rendered (4x in a window), and a single bilinear tap skips texels, which makes the strokes of text uneven.
++vec3 fullArea(vec2 uv) {
++    vec2 foot = max(fullSize / outSize, vec2(1.0));
++    vec3 sum = vec3(0.0);
++    for (int y = 0; y < 4; ++y)
++        for (int x = 0; x < 4; ++x)
++            sum += texture(fullPicture, uv + ((vec2(x, y) + 0.5) / 4.0 - 0.5) * foot / fullSize).rgb;
++    return sum / 16.0;
++}
+ void main() {
+     vec2 uv = fragTexCoord;
+     // Detail anywhere within one small-picture pixel: Anime4K redraws an edge from the small picture over that
+@@ -149,12 +168,44 @@ void main() {
+             detail = max(detail, max(d.r, max(d.g, d.b)));
+         }
+     float m = smoothstep(0.08, 0.22, detail);
+-    finalColor = vec4(mix(texture(texture0, uv).rgb, texture(fullPicture, uv).rgb, m), 1.0);
++    // The port's own text is never filtered: it is rendered at the internal resolution already.
++    vec2 g = uv * gameSize;
++    for (int i = 0; i < rectCount; ++i) {
++        vec4 r = rects[i];
++        if (g.x >= r.x - 1.0 && g.x <= r.z + 1.0 && g.y >= r.y - 1.0 && g.y <= r.w + 1.0)
++            m = 1.0;
++    }
++    vec3 c = mix(texture(texture0, uv).rgb, fullArea(uv), m);
++    if (showMask != 0)
++        c = mix(c, vec3(1.0, 0.0, 0.0), 0.35 * m);
++    finalColor = vec4(c, 1.0);
+ })";
+         Shader g_boxDown{}, g_detailMix{};
+         bool g_detailLoaded = false;
+         RenderTexture2D g_small{}, g_mixed{};
+ 
++        // A picture rendered larger than it is shown (2x / 4x internal resolution in a smaller window), made the
++        // shown size by averaging each output pixel's footprint (4x4 bilinear taps, up to 8 texels across): a plain
++        // bilinear draw skips texels when it shrinks by more than 2x and thins or drops the strokes of text.
++        const char *kAreaDown = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform vec2 srcSize;
++uniform vec2 dstSize;
++out vec4 finalColor;
++void main() {
++    vec2 foot = max(srcSize / dstSize, vec2(1.0));
++    vec3 sum = vec3(0.0);
++    for (int y = 0; y < 4; ++y)
++        for (int x = 0; x < 4; ++x)
++            sum += texture(texture0, fragTexCoord + ((vec2(x, y) + 0.5) / 4.0 - 0.5) * foot / srcSize).rgb;
++    finalColor = vec4(sum / 16.0, 1.0);
++})";
++        Shader g_areaDown{};
++        int g_areaLoaded = -1; // -1 not tried
++        RenderTexture2D g_area{};
++
++
+         // A render target of this size (made again when the size changes).
+         void ensureTarget(RenderTexture2D &target, int width, int height)
+         {
+@@ -177,6 +228,343 @@ void main() {
+                            0.0f, WHITE);
+             EndTextureMode();
+         }
++        void dumpPicture(unsigned texture, int width, int height, const std::string &path, bool alpha = false);
++
++        // ---- native text (ga2_hitext::textPieces) -----------------------------------------------------------------
++        // The port's own text reaches the GS as whole pieces (ga2_text.cpp), so the presentation knows exactly what
++        // the GS drew, where, in which colour. It takes that rendering out of the 2D picture (the filters and the
++        // scaling then work on the art alone) and draws the text again at the window's resolution from the vector
++        // font, like any other text on the desktop. Where the picture does not show the text as drawn (a menu or a
++        // fade over it), the GS's text stays and nothing is drawn over it.
++        //   GA2_TEXT_OVERLAY=0   keep the GS's text
++        //   GA2_TEXT_OVERLAY_DEBUG=1   the overlay in magenta, over the picture with the text taken out
++        // The text as the GS drew it, premultiplied (colour * coverage, coverage).
++        const char *kTextLayer = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform vec4 tint;
++out vec4 finalColor;
++void main() {
++    float k = texture(texture0, fragTexCoord).a * tint.a;
++    finalColor = vec4(tint.rgb * k, k);
++})";
++        // mode 1: where the picture does not show the text layer (occlusion), per PS2 pixel; mode 0: the
++        // picture with the text taken out where it is not occluded: the text's footprint, half a PS2 pixel wider,
++        // filled from the surroundings (taps on four rings, weighted to where there is no text).
++        const char *kTextErase = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;  // the picture
++uniform sampler2D textLayer; // drawn upright into a render target: stored the other way up
++uniform sampler2D occlusion; // mode 0: the widened occlusion
++uniform vec2 size;
++uniform float ring;
++uniform int factor;
++uniform int mode;
++out vec4 finalColor;
++vec4 L(vec2 uv) { return texture(textLayer, vec2(uv.x, 1.0 - uv.y)); }
++// The text's coverage near uv: within a PS2 pixel (the GS's rendering of it is offset and jittered by up to that).
++float nearText(vec2 uv, float reach) {
++    float m = 0.0;
++    for (int y = -1; y <= 1; ++y)
++        for (int x = -1; x <= 1; ++x)
++            m = max(m, L(uv + vec2(x, y) * reach / size).a);
++    return m;
++}
++void main() {
++    vec2 uv = fragTexCoord;
++    vec3 f = texture(texture0, uv).rgb;
++    float halfPixel = float(factor) * 0.5;
++    // The footprint, a PS2 pixel wider.
++    float near = max(nearText(uv, halfPixel), nearText(uv, float(factor)));
++    if (near < 0.004) {
++        finalColor = mode == 0 ? vec4(f, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
++        return;
++    }
++    vec3 sum = vec3(0.0);
++    float wsum = 0.0;
++    for (int r = 1; r <= 4; ++r)
++        for (int i = 0; i < 8; ++i) {
++            float ang = 0.785398 * float(i) + 0.39 * float(r);
++            vec2 o = vec2(cos(ang), sin(ang)) * ring * float(r) / size;
++            float w = clamp(1.0 - nearText(uv + o, float(factor)) * 20.0, 0.0, 1.0);
++            if (w > 0.0) {
++                sum += w * texture(texture0, uv + o).rgb;
++                wsum += w;
++            }
++        }
++    vec3 fill = wsum > 0.0 ? sum / wsum : f;
++    if (mode == 1) {
++        // Inside the strokes (coverage k >= 0.8) a visible text pixel is T k + B (1 - k) for whatever background B,
++        // so it lies within 1 - k of T k; a menu or a fade over the text breaks that. Over the samples of one PS2
++        // pixel (the GS's own rendering has sub-pixel combs).
++        float excess = 0.0, n = 0.0;
++        float c = float(factor - 1) * 0.5;
++        for (int y = 0; y < factor; ++y)
++            for (int x = 0; x < factor; ++x) {
++                vec2 t = uv + (vec2(x, y) - c) / size;
++                vec4 lt = L(t);
++                if (lt.a >= 0.8) {
++                    // The best match within half a PS2 pixel: the GS's rendering is jittered by about that much.
++                    float best = 1.0;
++                    for (int j = -1; j <= 1; ++j)
++                        for (int i = -1; i <= 1; ++i) {
++                            vec3 d = abs(texture(texture0, t + vec2(i, j) * halfPixel / size).rgb - lt.rgb);
++                            best = min(best, max(d.r, max(d.g, d.b)));
++                        }
++                    excess += max(0.0, best - (1.0 - lt.a));
++                    n += 1.0;
++                }
++            }
++        // r: this PS2 pixel's strokes do not match; g: it has strokes to judge by.
++        finalColor = vec4(n > 0.0 && excess / n > 0.12 ? 1.0 : 0.0, n > 0.0 ? 1.0 : 0.0, 0.0, 1.0);
++        return;
++    }
++    finalColor = vec4(mix(mix(f, fill, smoothstep(0.0, 0.08, near)), f, texture(occlusion, uv).r), 1.0);
++})";
++        // The occlusion as an area vote (PS2 pixels within 3): occluded where most of the stroke pixels around do not
++        // match (a menu or a fade covers whole glyphs; a stray mismatch of the GS's own rendering does not count).
++        const char *kTextDilate = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform vec2 size;
++uniform float ring;
++out vec4 finalColor;
++void main() {
++    float bad = 0.0, judged = 0.0;
++    for (int y = -3; y <= 3; ++y)
++        for (int x = -3; x <= 3; ++x) {
++            vec2 v = texture(texture0, fragTexCoord + vec2(x, y) * ring / size).rg;
++            bad += v.r;
++            judged += v.g;
++        }
++    float occ = judged > 0.0 ? smoothstep(0.35, 0.6, bad / judged) : 0.0;
++    finalColor = vec4(vec3(occ), 1.0);
++})";
++        // A piece at the window's resolution: coverage, the piece's colour, not where occluded.
++        const char *kTextOverlay = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform sampler2D occlusion; // picture orientation
++uniform vec4 occRect;        // the quad in picture coordinates (0..1): x0, y0, x1, y1
++uniform vec4 tint;
++out vec4 finalColor;
++void main() {
++    float occ = texture(occlusion, mix(occRect.xy, occRect.zw, fragTexCoord)).r;
++    finalColor = vec4(tint.rgb, texture(texture0, fragTexCoord).a * tint.a * (1.0 - occ));
++})";
++        Shader g_textLayerShader{}, g_textEraseShader{}, g_textDilateShader{}, g_textOverlayShader{};
++        int g_textLoaded = -1;
++        RenderTexture2D g_textLayer{}, g_textOcc{}, g_textOccWide{}, g_textBg{};
++        bool g_textErased = false; // this frame's text was taken out: draw the overlay
++
++        // Textures of pieces, least recently used first.
++        struct TextureCache
++        {
++            std::list<uint64_t> order;
++            std::unordered_map<uint64_t, std::pair<Texture2D, std::list<uint64_t>::iterator>> map;
++            Texture2D *find(uint64_t key)
++            {
++                const auto it = map.find(key);
++                if (it == map.end())
++                    return nullptr;
++                order.splice(order.end(), order, it->second.second);
++                return &it->second.first;
++            }
++            Texture2D *add(uint64_t key, Texture2D texture)
++            {
++                order.push_back(key);
++                auto &slot = map[key];
++                slot = {texture, std::prev(order.end())};
++                while (order.size() > 192)
++                {
++                    const auto old = map.find(order.front());
++                    UnloadTexture(old->second.first);
++                    map.erase(old);
++                    order.pop_front();
++                }
++                return &map[key].first;
++            }
++        };
++        TextureCache g_gsPieces, g_windowPieces;
++
++        // Coverage (0..255 in alpha) as a white texture.
++        Texture2D coverageTexture(const ga2_hitext::Alpha &alpha, int scaleTo255Of)
++        {
++            ::Image image = GenImageColor(alpha.w, alpha.h, Color{255, 255, 255, 0});
++            auto *texels = static_cast<uint8_t *>(image.data);
++            for (size_t i = 0; i < alpha.a.size(); ++i)
++                texels[4 * i + 3] = uint8_t(std::min(255, int(alpha.a[i]) * 255 / scaleTo255Of));
++            Texture2D texture = LoadTextureFromImage(image);
++            UnloadImage(image);
++            SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
++            return texture;
++        }
++
++        bool textShaders()
++        {
++            if (g_textLoaded < 0)
++            {
++                g_textLayerShader = LoadShaderFromMemory(nullptr, kTextLayer);
++                g_textEraseShader = LoadShaderFromMemory(nullptr, kTextErase);
++                g_textDilateShader = LoadShaderFromMemory(nullptr, kTextDilate);
++                g_textOverlayShader = LoadShaderFromMemory(nullptr, kTextOverlay);
++                g_textLoaded = IsShaderValid(g_textLayerShader) && IsShaderValid(g_textEraseShader) &&
++                                       IsShaderValid(g_textDilateShader) && IsShaderValid(g_textOverlayShader)
++                                   ? 1
++                                   : 0;
++                if (!g_textLoaded)
++                    std::fprintf(stderr, "[present] native text overlay shaders failed; the GS's text stays\n");
++            }
++            return g_textLoaded == 1;
++        }
++
++        // The sprite colour (0x80 = 1.0) as the GS applies it to a white coverage texture.
++        Vector4 pieceTint(const ga2_hitext::TextPiece &p)
++        {
++            auto c = [](uint8_t v) { return std::min(1.0f, float(v) / 128.0f); };
++            return Vector4{c(p.r), c(p.g), c(p.b), std::min(2.0f, float(p.a) / 128.0f)};
++        }
++
++        // The picture `frame` (2D, `factor` x 640 wide) with the text the GS drew taken out; false when not done.
++        bool eraseText(const Texture2D &frame, int factor, const std::vector<ga2_hitext::TextPiece> &pieces)
++        {
++            if (!textShaders())
++                return false;
++            const int fw = frame.width, fh = frame.height;
++            // Game 2D coordinates (640x480) to the picture's pixels: the 480 lines are shown on 448.
++            const float fx = float(factor), fy = float(fh) / 480.0f;
++            rlDrawRenderBatchActive();
++            ensureTarget(g_textLayer, fw, fh);
++            // The occlusion is decided per PS2 pixel.
++            ensureTarget(g_textOcc, fw / factor, fh / factor);
++            ensureTarget(g_textOccWide, fw / factor, fh / factor);
++            ensureTarget(g_textBg, fw, fh);
++            // 1. The text layer: each piece's GS image where the GS put it (its glyphs `inset` in, shown from there).
++            BeginTextureMode(g_textLayer);
++            ClearBackground(BLANK);
++            BeginBlendMode(BLEND_ALPHA_PREMULTIPLY);
++            BeginShaderMode(g_textLayerShader);
++            const int tintLoc = GetShaderLocation(g_textLayerShader, "tint");
++            for (const ga2_hitext::TextPiece &p : pieces)
++            {
++                if (!p.spec)
++                    continue;
++                Texture2D *texture = g_gsPieces.find(p.hash);
++                if (!texture)
++                {
++                    ga2_hitext::Alpha alpha;
++                    if (!ga2_hitext::runImage(p.hash, alpha))
++                        continue;
++                    texture = g_gsPieces.add(p.hash, coverageTexture(alpha, 256));
++                }
++                const Vector4 tint = pieceTint(p);
++                SetShaderValue(g_textLayerShader, tintLoc, &tint, SHADER_UNIFORM_VEC4);
++                const float w = float(p.spec->width), h = float(p.spec->height);
++                // The GS samples a pixel at its integer coordinates (not its centre): what it draws lands half a
++                // (game) pixel right and down of the same quad drawn here.
++                DrawTexturePro(*texture, Rectangle{0.0f, 0.0f, float(texture->width), float(texture->height)},
++                               Rectangle{(p.x0 - p.spec->insetX + 0.5f) * fx, (p.y0 - p.spec->insetY + 0.5f) * fy, w * fx, h * fy},
++                               Vector2{0, 0}, 0.0f, WHITE);
++                rlDrawRenderBatchActive(); // the tint is per piece
++            }
++            EndShaderMode();
++            EndBlendMode();
++            EndTextureMode();
++            const float size[2] = {float(fw), float(fh)};
++            const float ring = float(factor) * 1.25f; // 1.25 PS2 pixels between rings
++            const int occMode = 1, bgMode = 0;
++            auto erasePass = [&](RenderTexture2D &target, int mode) {
++                BeginTextureMode(target);
++                ClearBackground(BLANK);
++                BeginShaderMode(g_textEraseShader);
++                SetShaderValue(g_textEraseShader, GetShaderLocation(g_textEraseShader, "size"), size, SHADER_UNIFORM_VEC2);
++                SetShaderValue(g_textEraseShader, GetShaderLocation(g_textEraseShader, "ring"), &ring, SHADER_UNIFORM_FLOAT);
++                SetShaderValue(g_textEraseShader, GetShaderLocation(g_textEraseShader, "mode"), &mode, SHADER_UNIFORM_INT);
++                SetShaderValue(g_textEraseShader, GetShaderLocation(g_textEraseShader, "factor"), &factor, SHADER_UNIFORM_INT);
++                SetShaderValueTexture(g_textEraseShader, GetShaderLocation(g_textEraseShader, "textLayer"), g_textLayer.texture);
++                SetShaderValueTexture(g_textEraseShader, GetShaderLocation(g_textEraseShader, "occlusion"), g_textOccWide.texture);
++                DrawTexturePro(frame, Rectangle{0.0f, 0.0f, float(fw), -float(fh)},
++                               Rectangle{0.0f, 0.0f, float(target.texture.width), float(target.texture.height)}, Vector2{0, 0},
++                               0.0f, WHITE);
++                EndShaderMode();
++                EndTextureMode();
++            };
++            // 2. Occlusion, 3. widened, 4. the picture without the text.
++            erasePass(g_textOcc, occMode);
++            BeginTextureMode(g_textOccWide);
++            ClearBackground(BLANK);
++            BeginShaderMode(g_textDilateShader);
++            const int ow = fw / factor, oh = fh / factor;
++            const float smallSize[2] = {float(ow), float(oh)};
++            const float smallRing = 1.0f; // PS2 pixels
++            SetShaderValue(g_textDilateShader, GetShaderLocation(g_textDilateShader, "size"), smallSize, SHADER_UNIFORM_VEC2);
++            SetShaderValue(g_textDilateShader, GetShaderLocation(g_textDilateShader, "ring"), &smallRing, SHADER_UNIFORM_FLOAT);
++            DrawTexturePro(g_textOcc.texture, Rectangle{0.0f, 0.0f, float(ow), -float(oh)},
++                           Rectangle{0.0f, 0.0f, float(ow), float(oh)}, Vector2{0, 0}, 0.0f, WHITE);
++            EndShaderMode();
++            EndTextureMode();
++            erasePass(g_textBg, bgMode);
++            glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++            // GA2_TEXT_OVERLAY_DUMP=<dir> (diagnostics): the picture, the text layer, the occlusion and the result.
++            static const char *dump = std::getenv("GA2_TEXT_OVERLAY_DUMP");
++            static int erased = 0;
++            if (dump && *dump && ++erased % 150 == 0)
++            {
++                const std::string base = std::string(dump) + "/" + std::to_string(erased);
++                dumpPicture(frame.id, fw, fh, base + "-frame.ppm");
++                dumpPicture(g_textLayer.texture.id, fw, fh, base + "-layer.ppm", true);
++                dumpPicture(g_textOccWide.texture.id, fw / factor, fh / factor, base + "-occ.ppm");
++                dumpPicture(g_textBg.texture.id, fw, fh, base + "-bg.ppm");
++            }
++            return true;
++        }
++
++        // The pieces at the window's resolution over the picture shown at `picture`.
++        void drawTextOverlay(const std::vector<ga2_hitext::TextPiece> &pieces, Rect picture)
++        {
++            static const bool debug = std::getenv("GA2_TEXT_OVERLAY_DEBUG") != nullptr;
++            const float sx = picture.width / 640.0f, sy = picture.height / 480.0f;
++            rlDrawRenderBatchActive();
++            BeginShaderMode(g_textOverlayShader);
++            const int tintLoc = GetShaderLocation(g_textOverlayShader, "tint");
++            const int rectLoc = GetShaderLocation(g_textOverlayShader, "occRect");
++            const int occLoc = GetShaderLocation(g_textOverlayShader, "occlusion");
++            for (const ga2_hitext::TextPiece &p : pieces)
++            {
++                if (!p.spec)
++                    continue;
++                // Where the GS puts it: half a game pixel right and down (see eraseText).
++                const float X = picture.x + (p.x0 + 0.5f) * sx, Y = picture.y + (p.y0 + 0.5f) * sy;
++                const float ox = std::floor(X), oy = std::floor(Y);
++                const int w = int(std::ceil(float(p.spec->width) * sx)) + 2, h = int(std::ceil(float(p.spec->height) * sy)) + 2;
++                // Identity: the piece, the scale and where in a pixel it starts (1/8 pixel).
++                const uint64_t key = p.hash ^ (uint64_t(std::lround(sx * 64.0f)) << 40) ^ (uint64_t(std::lround(sy * 64.0f)) << 52) ^
++                                     (uint64_t(std::lround((X - ox) * 8.0f)) << 32) ^ (uint64_t(std::lround((Y - oy) * 8.0f)) << 36);
++                Texture2D *texture = g_windowPieces.find(key);
++                if (!texture)
++                {
++                    ga2_hitext::Alpha alpha;
++                    if (!ga2_hitext::renderRunScaled(*p.spec, sx, sy, X - ox, Y - oy, w, h, alpha))
++                        continue;
++                    texture = g_windowPieces.add(key, coverageTexture(alpha, 255));
++                }
++                Vector4 tint = pieceTint(p);
++                tint.w = std::min(1.0f, tint.w * 0.9375f); // the games' full intensity (GS alpha 0x78)
++                if (debug)
++                    tint = Vector4{1.0f, 0.0f, 1.0f, 1.0f};
++                const float occRect[4] = {(ox - picture.x) / picture.width, (oy - picture.y) / picture.height,
++                                          (ox + float(w) - picture.x) / picture.width, (oy + float(h) - picture.y) / picture.height};
++                SetShaderValue(g_textOverlayShader, tintLoc, &tint, SHADER_UNIFORM_VEC4);
++                SetShaderValue(g_textOverlayShader, rectLoc, occRect, SHADER_UNIFORM_VEC4);
++                SetTextureFilter(*texture, TEXTURE_FILTER_POINT); // pixel for pixel
++                SetShaderValueTexture(g_textOverlayShader, occLoc, g_textOccWide.texture); // dropped at every flush
++                DrawTexturePro(*texture, Rectangle{0.0f, 0.0f, float(w), float(h)}, Rectangle{ox, oy, float(w), float(h)},
++                               Vector2{0, 0}, 0.0f, WHITE);
++                rlDrawRenderBatchActive();
++            }
++            EndShaderMode();
++        }
++
+         RenderTexture2D g_blur[3]{};
+         Texture2D g_skybox{};
+ 
+@@ -537,7 +925,7 @@ namespace ga2_present
+ 
+         // GA2_DEBAND_DUMP=<dir> (a developer aid): every 300th presented frame, the picture before and after the
+         // debanding pass is written as <dir>/plain-<n>.ppm and deband-<n>.ppm (8-bit, at the picture's resolution).
+-        void dumpPicture(unsigned texture, int width, int height, const std::string &path)
++        void dumpPicture(unsigned texture, int width, int height, const std::string &path, bool alpha)
+         {
+             std::vector<float> pixels(size_t(width) * size_t(height) * 4u);
+             glBindTexture(GL_TEXTURE_2D, texture);
+@@ -545,7 +933,7 @@ namespace ga2_present
+             std::vector<unsigned char> rgb(size_t(width) * size_t(height) * 3u);
+             for (size_t i = 0; i < size_t(width) * size_t(height); ++i)
+                 for (size_t c = 0; c < 3; ++c)
+-                    rgb[i * 3 + c] = (unsigned char)std::lround(std::clamp(pixels[i * 4 + c], 0.0f, 1.0f) * 255.0f);
++                    rgb[i * 3 + c] = (unsigned char)std::lround(std::clamp(pixels[i * 4 + (alpha ? 3 : c)], 0.0f, 1.0f) * 255.0f);
+             if (std::FILE *f = std::fopen(path.c_str(), "wb"))
+             {
+                 std::fprintf(f, "P6\n%d %d\n255\n", width, height);
+@@ -624,8 +1012,9 @@ namespace ga2_present
+         g_ready = true;
+     }
+ 
+-    Rect draw(const Texture &frame, float srcWidth, float srcHeight)
++    Rect draw(const Texture &gsFrame, float srcWidth, float srcHeight)
+     {
++        Texture2D frame = gsFrame;
+         Settings &s = settings();
+         refresh(s);
+         if (g_ready && s.filter != g_loadedFilter)
+@@ -665,9 +1054,27 @@ namespace ga2_present
+                            640.0f * k, 448.0f * k};
+         }
+ 
++        const bool sizesMatch = frame.width == int(srcWidth) && frame.height == int(srcHeight);
++        // Native text: the GS's rendering of the port's text taken out of a 2D picture rendered above 640x448; it is
++        // drawn again at the window's resolution at the end.
++        static const bool textOverlayAllowed = [] {
++            const char *v = std::getenv("GA2_TEXT_OVERLAY");
++            return !(v && std::string(v) == "0");
++        }();
++        std::vector<ga2_hitext::TextPiece> textPieces;
++        g_textErased = false;
++        if (g_ready && textOverlayAllowed && !scene3d && !g_wide && sizesMatch && frame.width >= 1280 && frame.width % 640 == 0)
++        {
++            textPieces = ga2_hitext::textPieces();
++            if (!textPieces.empty() && eraseText(frame, frame.width / 640, textPieces))
++            {
++                frame = g_textBg.texture;
++                g_textErased = true;
++            }
++        }
++
+         Texture2D shown = frame;
+         Rectangle source{0.0f, 0.0f, srcWidth, srcHeight};
+-        const bool sizesMatch = frame.width == int(srcWidth) && frame.height == int(srcHeight);
+         if (g_ready && g_chain && !scene3d && sizesMatch)
+         {
+             rlDrawRenderBatchActive();
+@@ -714,6 +1121,28 @@ namespace ga2_present
+                 BeginShaderMode(g_detailMix);
+                 const float fullSize[2] = {float(frame.width), float(frame.height)};
+                 SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "fullSize"), fullSize, SHADER_UNIFORM_VEC2);
++                const float outSize[2] = {float(mixW), float(mixH)};
++                SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "outSize"), outSize, SHADER_UNIFORM_VEC2);
++                // The 2D API's virtual screen is 640x480, shown on the frame's 448 lines (display info {640, 480, ..., 640, 448}).
++                const float gameSize[2] = {float(frame.width) / float(factor), float(frame.height) / float(factor) * 480.0f / 448.0f};
++                SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "gameSize"), gameSize, SHADER_UNIFORM_VEC2);
++                {
++                    // Where the text is (the GS's text, when it was not taken out; the overlay's otherwise).
++                    float packed[64 * 4];
++                    const int count = int(std::min<size_t>(textPieces.size(), 64));
++                    for (int i = 0; i < count; ++i)
++                    {
++                        packed[4 * i] = textPieces[size_t(i)].x0;
++                        packed[4 * i + 1] = textPieces[size_t(i)].y0;
++                        packed[4 * i + 2] = textPieces[size_t(i)].x1;
++                        packed[4 * i + 3] = textPieces[size_t(i)].y1;
++                    }
++                    SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "rectCount"), &count, SHADER_UNIFORM_INT);
++                    if (count > 0)
++                        SetShaderValueV(g_detailMix, GetShaderLocation(g_detailMix, "rects"), packed, SHADER_UNIFORM_VEC4, count);
++                    static const int show = std::getenv("GA2_TEXT_MASK_SHOW") ? 1 : 0;
++                    SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "showMask"), &show, SHADER_UNIFORM_INT);
++                }
+                 const float stepPx = std::max(1.0f, float(factor) * 0.5f);
+                 SetShaderValue(g_detailMix, GetShaderLocation(g_detailMix, "stepPx"), &stepPx, SHADER_UNIFORM_FLOAT);
+                 SetShaderValueTexture(g_detailMix, GetShaderLocation(g_detailMix, "fullPicture"), frame);
+@@ -747,6 +1176,45 @@ namespace ga2_present
+         else
+             SetTextureFilter(frame, s.filter == Filter::Nearest && !scene3d ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+ 
++        // Larger than shown (2x / 4x internal resolution in a smaller window): the area-weighted downscale first, so
++        // debanding and the final draw work at the shown size. GA2_AREA_DOWNSCALE=0 keeps the bilinear draw.
++        static const bool areaAllowed = [] {
++            const char *v = std::getenv("GA2_AREA_DOWNSCALE");
++            return !(v && std::string(v) == "0");
++        }();
++        const int pictureW = int(std::lround(picture.width)), pictureH = int(std::lround(picture.height));
++        const bool wholeSource = source.x == 0.0f && source.y == 0.0f && int(source.width) == shown.width &&
++                                 int(source.height) == shown.height;
++        if (g_ready && areaAllowed && wholeSource && pictureW > 0 && pictureH > 0 &&
++            (shown.width > pictureW + 1 || shown.height > pictureH + 1))
++        {
++            if (g_areaLoaded < 0)
++            {
++                g_areaDown = LoadShaderFromMemory(nullptr, kAreaDown);
++                g_areaLoaded = IsShaderValid(g_areaDown) ? 1 : 0;
++            }
++            if (g_areaLoaded == 1)
++            {
++                rlDrawRenderBatchActive();
++                ensureTarget(g_area, pictureW, pictureH);
++                const float srcSize[2] = {float(shown.width), float(shown.height)};
++                const float dstSize[2] = {float(pictureW), float(pictureH)};
++                SetShaderValue(g_areaDown, GetShaderLocation(g_areaDown, "srcSize"), srcSize, SHADER_UNIFORM_VEC2);
++                SetShaderValue(g_areaDown, GetShaderLocation(g_areaDown, "dstSize"), dstSize, SHADER_UNIFORM_VEC2);
++                SetTextureFilter(shown, TEXTURE_FILTER_BILINEAR);
++                BeginTextureMode(g_area);
++                ClearBackground(BLANK);
++                BeginShaderMode(g_areaDown);
++                DrawTexturePro(shown, Rectangle{0.0f, 0.0f, float(shown.width), -float(shown.height)},
++                               Rectangle{0.0f, 0.0f, float(pictureW), float(pictureH)}, Vector2{0, 0}, 0.0f, WHITE);
++                EndShaderMode();
++                EndTextureMode();
++                glViewport(0, 0, GetRenderWidth(), GetRenderHeight());
++                shown = g_area.texture;
++                source = Rectangle{0.0f, 0.0f, float(pictureW), float(pictureH)};
++            }
++        }
++
+         const Texture2D plainShown = shown;
+         const Rectangle plainSource = source;
+         // Debanding: on the picture at its own resolution, after the 2D filter, in 2D and 3D scenes alike.
+@@ -854,6 +1322,8 @@ namespace ga2_present
+         }
+         else
+             DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
++        if (g_textErased)
++            drawTextOverlay(textPieces, picture);
+         return picture;
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index 274e18c..80490bc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -11,6 +11,7 @@
+ // cell); descenders longer than the game's are compressed below the baseline, glyphs the game draws away from
+ // where the font does (~ ^ `) are moved to the game's height.
+ #include "runtime/ga2_hitext.h"
++#include "runtime/ga2_activity.h"
+ #include "runtime/ga2_sjis_table.h"
+ #include "gs_texregion.h"
+ 
+@@ -76,6 +77,9 @@ namespace ga2_hitext
+             bool workerStarted = false;
+             std::atomic<uint64_t> noted{0}, renderedCount{0}, servedCount{0}, atlasCount{0};
+             std::unordered_set<uint64_t> served;
++            // Native text pieces by ticket hash (oldest first in runOrder; bounded).
++            std::unordered_map<uint64_t, RunSpec> runs;
++            std::deque<uint64_t> runOrder;
+         };
+         // Leaked on purpose: the worker thread may still run at exit.
+         Registry &reg()
+@@ -370,18 +374,33 @@ namespace ga2_hitext
+             const Ink ink = glyphInk(glyph, s, s);
+             if (!ink.ok)
+                 return false;
+-            const float ow = (orig.x1 - orig.x0) * kf, vw = ink.x1 - ink.x0;
+-            float stretch = std::clamp(ow / vw, 0.5f, 1.15f);
+-            // Never wider than the cell (a wide glyph squeezed into a narrow game cell: % @ m w).
+-            stretch = std::min(stretch, (float(cell.width) - 0.3f) * kf / vw);
+-            const float sx = s * stretch;
+-            // Centre the ink on the game's ink.
+-            float ox = (orig.x0 + orig.x1) * 0.5f * kf - (ink.x0 + ink.x1) * 0.5f * stretch;
+             const float cw = float(cell.width) * kf, margin = 0.15f * kf;
+-            if (ox + ink.x0 * stretch < margin)
+-                ox += margin - (ox + ink.x0 * stretch);
+-            if (ox + ink.x1 * stretch > cw - margin)
+-                ox -= ox + ink.x1 * stretch - (cw - margin);
++            float stretch, ox;
++            if (nativeLayout())
++            {
++                // Native layout: the glyph at its own shape, its ink (the outline's box) centred in the cell; the game
++                // side puts the cell where that ink belongs (LatinLayout::inkCentre). Only a glyph wider than its
++                // cell is narrowed to fit.
++                int bx0, by0, bx1, by1;
++                stbtt_GetGlyphBox(&f.info, glyph, &bx0, &by0, &bx1, &by1);
++                const float fx0 = float(bx0) * s, fx1 = float(bx1) * s;
++                stretch = fx1 - fx0 > cw - 2.0f * margin ? (cw - 2.0f * margin) / (fx1 - fx0) : 1.0f;
++                ox = cw * 0.5f - (fx0 + fx1) * 0.5f * stretch;
++            }
++            else
++            {
++                const float ow = (orig.x1 - orig.x0) * kf, vw = ink.x1 - ink.x0;
++                stretch = std::clamp(ow / vw, 0.5f, 1.15f);
++                // Never wider than the cell (a wide glyph squeezed into a narrow game cell: % @ m w).
++                stretch = std::min(stretch, (float(cell.width) - 0.3f) * kf / vw);
++                // Centre the ink on the game's ink.
++                ox = (orig.x0 + orig.x1) * 0.5f * kf - (ink.x0 + ink.x1) * 0.5f * stretch;
++                if (ox + ink.x0 * stretch < margin)
++                    ox += margin - (ox + ink.x0 * stretch);
++                if (ox + ink.x1 * stretch > cw - margin)
++                    ox -= ox + ink.x1 * stretch - (cw - margin);
++            }
++            const float sx = s * stretch;
+             float oy = kLatinBaseline * kf;
+             // Glyphs the game draws at another height than the font does (~ ^ ` and the like).
+             const float cyo = (orig.y0 + orig.y1) * 0.5f * kf, cyv = oy + (ink.y0 + ink.y1) * 0.5f;
+@@ -512,6 +531,40 @@ namespace ga2_hitext
+         return on == 1;
+     }
+ 
++    const LatinLayout *latinLayout()
++    {
++        static const LatinLayout *layout = []() -> const LatinLayout * {
++            const Face &f = face();
++            if (!f.ok)
++                return nullptr;
++            auto *l = new LatinLayout{};
++            const float s = kLatinEm / f.unitsPerEm; // game pixels at size 18 per font unit
++            int glyphs[95];
++            for (int i = 0; i < 95; ++i)
++            {
++                glyphs[i] = stbtt_FindGlyphIndex(&f.info, int(latinCodepoint(i)));
++                int advance = 0, lsb = 0;
++                stbtt_GetGlyphHMetrics(&f.info, glyphs[i], &advance, &lsb);
++                l->advance[i] = float(advance) * s;
++                int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++                l->inkCentre[i] = stbtt_GetGlyphBox(&f.info, glyphs[i], &x0, &y0, &x1, &y1) ? float(x0 + x1) * 0.5f * s
++                                                                                            : l->advance[i] * 0.5f;
++            }
++            for (int a = 0; a < 95; ++a)
++                for (int b = 0; b < 95; ++b)
++                    l->kern[a][b] = glyphs[a] && glyphs[b] ? float(stbtt_GetGlyphKernAdvance(&f.info, glyphs[a], glyphs[b])) * s
++                                                           : 0.0f;
++            return l;
++        }();
++        return layout;
++    }
++
++    bool nativeLayout()
++    {
++        static const bool allowed = envInt("GA2_NATIVE_TEXT_LAYOUT", 1) != 0;
++        return allowed && enabled() && latinLayout() != nullptr;
++    }
++
+     void setMode(int m) { g_mode.store(m < 0 ? 2 : m > 2 ? 2 : m); }
+     int mode()
+     {
+@@ -683,6 +736,150 @@ namespace ga2_hitext
+         return ok;
+     }
+ 
++    namespace
++    {
++        std::mutex g_pieceMutex;
++        std::vector<TextPiece> g_piecesNow, g_piecesDone;
++        uint64_t g_piecesTag = 0;
++
++        // The pieces' glyphs at scale (sx, sy) with the piece's top left at (ox, oy) on the canvas.
++        void drawRun(Canvas &canvas, const RunSpec &spec, float sx, float sy, float ox, float oy)
++        {
++            const Face &f = face();
++            for (const RunGlyph &g : spec.glyphs)
++            {
++                const int glyph = stbtt_FindGlyphIndex(&f.info, int(g.codepoint));
++                if (glyph == 0)
++                    continue;
++                if (g.fullWidth)
++                {
++                    // The games' full-width cell is the em box (the fit at the top of the file), at the size drawn.
++                    const float px = g.size / float(kCell);
++                    const float em = kFullEm * px / f.unitsPerEm;
++                    drawGlyph(canvas, glyph, em * sx, em * sy, ox + (g.x + kFullOriginX * px) * sx,
++                              oy + (g.cellTop + kFullBaseline * px) * sy);
++                }
++                else
++                {
++                    const float sc = g.size / float(kLatinHeight);
++                    const float em = kLatinEm * sc / f.unitsPerEm;
++                    drawGlyph(canvas, glyph, em * sx, em * sy, ox + g.x * sx, oy + (g.cellTop + kLatinBaseline * sc) * sy);
++                }
++            }
++        }
++    }
++
++    void notePiece(const TextPiece &piece)
++    {
++        const uint64_t tag = ga2_activity::vsyncs.load(std::memory_order_relaxed);
++        std::lock_guard<std::mutex> lock(g_pieceMutex);
++        if (tag != g_piecesTag)
++        {
++            // A new frame's text: the previous frame's is complete.
++            g_piecesDone.swap(g_piecesNow);
++            g_piecesNow.clear();
++            g_piecesTag = tag;
++        }
++        if (g_piecesNow.size() < 512)
++            g_piecesNow.push_back(piece);
++    }
++
++    std::vector<TextPiece> textPieces()
++    {
++        const uint64_t now = ga2_activity::vsyncs.load(std::memory_order_relaxed);
++        std::lock_guard<std::mutex> lock(g_pieceMutex);
++        if (now > g_piecesTag + 3)
++            return {}; // no text lately
++        return g_piecesDone;
++    }
++
++    bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out)
++    {
++        if (!face().ok || w <= 0 || h <= 0 || w > 8192 || h > 2048)
++            return false;
++        Canvas canvas(w, h);
++        drawRun(canvas, spec, sx, sy, ox, oy);
++        out.w = canvas.w, out.h = canvas.h;
++        out.a = std::move(canvas.a);
++        return true;
++    }
++
++    bool fontHasGlyph(uint32_t codepoint)
++    {
++        const Face &f = face();
++        return f.ok && codepoint != 0 && stbtt_FindGlyphIndex(&f.info, int(codepoint)) != 0;
++    }
++
++    uint64_t noteRun(const RunSpec &spec, uint8_t *ticket)
++    {
++        // The piece's identity: FNV-1a over everything that shapes its image.
++        uint64_t key = 1469598103934665603ull;
++        auto mix = [&](const void *p, size_t n) {
++            const auto *b = static_cast<const uint8_t *>(p);
++            for (size_t i = 0; i < n; ++i)
++                key = (key ^ b[i]) * 1099511628211ull;
++        };
++        mix(&spec.width, sizeof(spec.width));
++        mix(&spec.height, sizeof(spec.height));
++        mix(&spec.insetX, sizeof(spec.insetX));
++        mix(&spec.insetY, sizeof(spec.insetY));
++        for (const RunGlyph &g : spec.glyphs)
++        {
++            mix(&g.codepoint, sizeof(g.codepoint));
++            mix(&g.x, sizeof(g.x));
++            mix(&g.cellTop, sizeof(g.cellTop));
++            mix(&g.size, sizeof(g.size));
++            const uint8_t full = g.fullWidth ? 1 : 0;
++            mix(&full, 1);
++        }
++        // The ticket: levels 0 and 1 only (no game glyph is that faint, and should a ticket ever show unreplaced it
++        // is a barely visible haze), one bit per pixel from the key.
++        uint64_t s = key | 1u;
++        for (int i = 0; i < 288; ++i)
++        {
++            s ^= s << 13, s ^= s >> 7, s ^= s << 17;
++            ticket[i] = uint8_t((s & 1u) | ((s >> 8) & 1u) << 4);
++        }
++        ticket[0] |= 0x11u; // never blank
++        const uint64_t hash = glyphHash(ticket);
++        Registry &r = reg();
++        std::lock_guard<std::mutex> lock(r.mutex);
++        if (r.runs.emplace(hash, spec).second)
++        {
++            r.runOrder.push_back(hash);
++            while (r.runOrder.size() > 8192)
++            {
++                r.runs.erase(r.runOrder.front());
++                r.runOrder.pop_front();
++            }
++        }
++        return hash;
++    }
++
++    bool runImage(uint64_t hash, Alpha &out)
++    {
++        RunSpec spec;
++        {
++            Registry &r = reg();
++            std::lock_guard<std::mutex> lock(r.mutex);
++            const auto it = r.runs.find(hash);
++            if (it == r.runs.end())
++                return false;
++            spec = it->second;
++        }
++        const Face &f = face();
++        const int k = renderScale();
++        if (!f.ok || spec.width <= 0 || spec.height <= 0 || spec.width > 1024 || spec.height > 256)
++            return false;
++        Canvas canvas(spec.width * k, spec.height * k);
++        const float kf = float(k);
++        drawRun(canvas, spec, kf, kf, spec.insetX * kf, spec.insetY * kf);
++        scaleToLevels(canvas);
++        out.w = canvas.w, out.h = canvas.h;
++        out.a = std::move(canvas.a);
++        return true;
++    }
++
+     bool glyphImage(uint64_t hash, Alpha &out)
+     {
+         const std::shared_ptr<const Alpha> made = renderCached(hash);
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 08eb163..119708c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -42,6 +42,8 @@ namespace ga2_text_icons
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
++#include <list>
+ #include <map>
+ #include <mutex>
+ #include <unordered_map>
+@@ -67,6 +69,9 @@ namespace ga2_texpacks
+         // as it runs, so every image handed out stays alive here (this also
+         // keeps PNGs from being decoded twice).
+         std::unordered_map<std::string, ImageHandle> g_images;
++        // Native text pieces (ga2_hitext::runImage), least recently used first.
++        std::list<std::string> g_runOrder;
++        std::unordered_map<std::string, std::pair<ImageHandle, std::list<std::string>::iterator>> g_runImages;
+         // Pack images (per device, file and style) in which no PS2 icon was found: used as they are.
+         std::unordered_set<std::string> g_packIconless;
+ 
+@@ -652,6 +657,39 @@ namespace ga2_texpacks
+                 {
+                     if (w == 24u && h == 24u)
+                     {
++                        // A native text piece's ticket (ga2_hitext::noteRun): its own image, kept in a small LRU (a
++                        // line being typed out makes a new piece every few frames).
++                        const std::string runKey = deviceKey(device) + "hrun" + name;
++                        if (const auto cached = g_runImages.find(runKey); cached != g_runImages.end())
++                        {
++                            g_runOrder.splice(g_runOrder.end(), g_runOrder, cached->second.second);
++                            return cached->second.first;
++                        }
++                        {
++                            ga2_hitext::Alpha alpha;
++                            if (ga2_hitext::runImage(hash, alpha))
++                            {
++                                static bool first = true;
++                                if (first)
++                                {
++                                    first = false;
++                                    std::fprintf(stderr, "[hitext] native text pieces rendered at %dx (first %dx%d)\n",
++                                                 ga2_hitext::renderScale(), alpha.w, alpha.h);
++                                }
++                                ::Image composed{};
++                                composeCoverage(alpha, composed);
++                                ImageHandle handle = upload(device, composed);
++                                UnloadImage(composed);
++                                g_runOrder.push_back(runKey);
++                                g_runImages.emplace(runKey, std::make_pair(handle, std::prev(g_runOrder.end())));
++                                while (g_runOrder.size() > 160)
++                                {
++                                    g_runImages.erase(g_runOrder.front());
++                                    g_runOrder.pop_front();
++                                }
++                                return handle;
++                            }
++                        }
+                         const std::string key = deviceKey(device) + "hglyph" + name;
+                         if (const auto cached = g_images.find(key); cached != g_images.end())
+                             return cached->second;
+-- 
+2.56.0
+

@@ -1,0 +1,1047 @@
+From 31a6fc18afac39edcb89284b74c8e522b1d761dc Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:24:02 -0600
+Subject: [PATCH] VIF1 + VU1 thread (opt-in, GA2_VU_THREAD=1): exact, but not
+ faster in GA2
+
+ga2_vuthread runs VIF1 and VU1 on their own thread, as PCSX2's MTVU: each
+DMA pass's PATH3 and VIF1 data is copied (DMA still completes at once on
+the game thread) and run there in order, ending with the arbiter's drain.
+Sync points (the EE waits for the thread): VU1 memory (mapVuMemory), the
+GIF/VIF registers and the VIF1/GIF FIFOs, GIF packets submitted from the
+game thread, the native GIF fast paths, VIF1 downloads, the GS entries and
+the paraLLEl-GS readback/vsync; the frame tick's scan-out marker goes
+through the thread's queue (at most one tick waiting). On the thread the
+MSCAL/MSCNT callbacks leave the EE context alone; passes with VU1 D/T stops
+enabled stay on the game thread.
+SIGNAL/FINISH/LABEL and the display registers keep their EE timing: the
+game thread scans each pass (gifRaisesCsr, and vif1RaisesCsr, a mirror of
+the VIF1 parser's command sizes with STCYCL tracked and checked against the
+real state after every pass) and splits it at the DIRECT that carries
+such a packet; the thread takes what comes before, the game thread waits
+and runs the rest. A CSR bit raised on the thread (only possible from a
+VU1 XGKICK packet) is reported. The governor's load is now the busiest of
+the game thread, the VU thread and the GS worker (ga2_vuthread busy time;
+native/compat/ga2_framerate.cpp).
+
+Measured (RTX 4090, Zettai ship map, 1x, 175 cap, governor off): 159.8
+frames/s with the thread, 167.7 without. Every frame's VIF1 chain in GA2
+ends with a 2-qword DIRECT writing FINISH, whose interrupt (IMR 0xfd00:
+enabled) the EE waits for 2000 cycles later, so with exact timing the VU
+work stays on the critical path and the copies and hand-off only add
+cost. Hence off by default; overlapping it would need a later FINISH
+delivery, which changes what the game sees.
+
+Proof (4x, GA2_FREERUN, research/run59/gpu-175/proof5): with the thread vs
+without, the GIF capture is byte-identical over 106 MB, frame signatures
+agree at all 15290 common game times, present shots identical, no scan
+resync and no CSR bit raised on the thread; English dialogue as before;
+ps2x_tests 641/641, gs_cache 45/45.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt                   |   1 +
+ ps2xRuntime/include/runtime/ga2_vuthread.h   |  65 ++++
+ ps2xRuntime/include/runtime/ps2_memory.h     |   4 +
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp   |  10 +
+ ps2xRuntime/src/lib/ga2_vuthread.cpp         | 339 +++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp       |  10 +
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp   |   4 +
+ ps2xRuntime/src/lib/ps2_memory.cpp           | 186 +++++++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  57 +++-
+ ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp |   4 +
+ ps2xTest/gs_cache/CMakeLists.txt             |   2 +
+ 11 files changed, 670 insertions(+), 12 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ga2_vuthread.h
+ create mode 100644 ps2xRuntime/src/lib/ga2_vuthread.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 4166a81..d1619ad 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -401,6 +401,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_mouse_menus.cpp
+     src/lib/ga2_present.cpp
+     src/lib/ga2_zerocopy.cpp
++    src/lib/ga2_vuthread.cpp
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
+diff --git a/ps2xRuntime/include/runtime/ga2_vuthread.h b/ps2xRuntime/include/runtime/ga2_vuthread.h
+new file mode 100644
+index 0000000..2f0f3c1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ga2_vuthread.h
+@@ -0,0 +1,65 @@
++// VIF1 and VU1 on their own thread (as PCSX2's MTVU). The game thread walks DMA as before and completes it at once;
++// what VIF1 and PATH3 receive (copied, so the EE may reuse its buffers) goes to this thread as one job per DMA pass:
++// PATH3 packets, VIF1 unpack/MPG/MSCAL (VU1 runs and its XGKICK packets) and the GIF arbiter's drain, in the order
++// the game thread used to run them. VIF1 state, VU1 memory and registers and the PATH3 mask then belong to this
++// thread; everything the EE can observe of them waits for it first (sync()): VU1 memory accesses, the GIF/VIF
++// registers and FIFOs, GIF packets from elsewhere, the native GIF fast paths, VIF1 downloads, the GS entries and the
++// paraLLEl-GS readback. The frame tick's scan-out marker goes through the same queue (postTick), so it follows the
++// frame's VU packets; the EE stays at most a frame ahead. Started by the runtime with the GS worker when
++// GA2_VU_THREAD=1 (off by default). A pass whose GIF data raises CSR bits is split at that packet's DIRECT: the VU
++// thread takes what comes before, the game thread waits for it and runs the rest, so SIGNAL/FINISH and their
++// interrupts keep their EE timing. The GA2 games end every frame's VIF1 chain with such a FINISH, which puts the VU
++// work back on the game thread's critical path: measured slower than without the thread (see ps2_runtime.cpp).
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++namespace ga2_vuthread
++{
++    // owner: the PS2Memory whose VIF1/VU1 the thread runs (other instances, e.g. in tests, are not affected).
++    void start(const void *owner);
++    void stop();
++    // True when the thread runs for `owner` and the caller is not that thread (nor the GS worker, which never waits
++    // for it): such a caller hands work over or syncs.
++    bool active(const void *owner);
++    bool onWorker();
++    // Runs `job` on the thread after everything posted before it.
++    void post(std::function<void()> job);
++    // The same for a frame tick: at most one tick waits or runs (the next waits for it).
++    void postTick(std::function<void()> job);
++    // Returns once everything posted so far has run. No-op on the thread itself and on the GS worker.
++    void sync();
++    // Whether this DMA pass may go to the thread (false: run it inline after sync()). Set by the runtime: VU1 D/T
++    // stop bits enabled (the EE would read VPU_STAT) keep the work on the game thread.
++    void setPostGuard(std::function<bool()> guard);
++    bool mayPost();
++
++    // Whether GIF data writes, by A+D, a register whose effect the EE sees at once (SIGNAL, FINISH, LABEL, the display
++    // registers 0x59-0x5F), or holds REGLIST A+D: such a pass stays on the game thread so CSR bits and the GS interrupt
++    // keep their EE timing. (Same rule as GifArbiter's inline packets.)
++    bool gifRaisesCsr(const uint8_t *data, uint32_t sizeBytes);
++    // The same for VIF1 data: the GIF data inside its DIRECT/DIRECTHL commands. The scan mirrors the VIF1 parser's
++    // sizes on the game thread (cycle and the DIRECT bytes still to come are its state, copied from the real VIF1 state
++    // whenever the EE has synced and written a VIF register; `carry` holds an unfinished DIRECT's GIF bytes).
++    struct Vif1Scan
++    {
++        uint32_t cycle = 0; // VIF1 CYCLE (STCYCL): an UNPACK's length depends on it
++        uint32_t directPending = 0;
++        std::vector<uint8_t> carry;
++        // Where the DIRECT being collected began (chunk index as passed, byte offset of its command), and once one is
++        // found to raise CSR bits, that position: the pass can go to the VU thread up to there.
++        uint32_t directChunk = 0, directOffset = 0;
++        uint32_t hitChunk = 0, hitOffset = 0;
++    };
++    // True when the chunk (index `chunk` of the pass) completes a DIRECT that raises CSR bits; scan.hitChunk/hitOffset
++    // then point at that DIRECT's command. Scanning stops there.
++    bool vif1RaisesCsr(Vif1Scan &scan, uint32_t chunk, const uint8_t *data, uint32_t sizeBytes);
++
++    // Busy time of the worker threads (nanoseconds, cumulative), for the frame-rate governor's load: the VU thread's
++    // jobs and the GS worker's batches (GifArbiter adds its own).
++    uint64_t busyNanos();
++    void addGsBusyNanos(uint64_t nanos);
++    uint64_t gsBusyNanos();
++}
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 6b8c907..19f8dcc 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -361,6 +361,10 @@ public:
+     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
+     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
++    // VU thread (ga2_vuthread.h): a DMA pass's PATH3/VIF1 copies, handed over or run here; counters for GA2_PERF.
++    void handOverVuPass(std::vector<std::vector<uint8_t>> path3, std::vector<std::vector<uint8_t>> vif1);
++    void resyncVif1Scan();
++    static void vuThreadStats(uint64_t &posted, uint64_t &split, uint64_t &path3, uint64_t &guard, uint32_t &mismatches);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
+     // Completions whose interrupt is delivered after a device latency (cause, EE cycles).
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 5813acf..8bc5973 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2610,6 +2610,16 @@ void EeScheduler::processEvent(const EeEvent &event)
+                                      w.waitMs / seconds, double(w.tasks) / seconds, double(w.taskWaits) / seconds,
+                                      w.taskWaitMs / seconds);
+                     }
++                    {
++                        uint64_t posted = 0, split = 0, path3 = 0, guard = 0;
++                        uint32_t mismatches = 0;
++                        PS2Memory::vuThreadStats(posted, split, path3, guard, mismatches);
++                        if (posted || split || path3 || guard)
++                            std::fprintf(stderr, "[ga2 perf] vu thread: DMA passes/s %.0f handed over, %.0f split at a CSR DIRECT, "
++                                                 "%.0f here for PATH3 CSR packets, %.0f here for D/T; %u scan resyncs so far\n",
++                                         double(posted) / seconds, double(split) / seconds, double(path3) / seconds,
++                                         double(guard) / seconds, mismatches);
++                    }
+                     // Where each live guest thread is (status, resume pc, ra).
+                     std::fprintf(stderr, "[ga2 perf] threads:");
+                     for (const auto &[id, thread] : m_threads)
+diff --git a/ps2xRuntime/src/lib/ga2_vuthread.cpp b/ps2xRuntime/src/lib/ga2_vuthread.cpp
+new file mode 100644
+index 0000000..f8c76a5
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_vuthread.cpp
+@@ -0,0 +1,339 @@
++#include "runtime/ga2_vuthread.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++#include "ThreadNaming.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstring>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <deque>
++#include <exception>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    thread_local bool t_onVuWorker = false;
++
++    struct Worker
++    {
++        std::thread thread;
++        std::mutex mutex;
++        std::condition_variable work, idle;
++        std::deque<std::function<void()>> jobs;
++        bool sleeping = false, stopping = false;
++        uint64_t posted = 0, ticksPosted = 0;
++        std::atomic<uint64_t> done{0}, ticksDone{0};
++        std::atomic<const void *> owner{nullptr};
++        std::atomic<bool> running{false};
++        std::atomic<uint64_t> busy{0}, gsBusy{0};
++        std::function<bool()> guard;
++    };
++
++    Worker &worker()
++    {
++        static Worker *w = new Worker; // outlives static destruction: the thread may still be stopping
++        return *w;
++    }
++
++    void loop()
++    {
++        t_onVuWorker = true;
++        ThreadNaming::SetCurrentThreadName("VUWorker");
++        Worker &w = worker();
++        std::unique_lock<std::mutex> lock(w.mutex);
++        std::deque<std::function<void()>> batch;
++        for (;;)
++        {
++            w.sleeping = true;
++            w.work.wait(lock, [&] { return !w.jobs.empty() || w.stopping; });
++            w.sleeping = false;
++            if (w.jobs.empty())
++                break;
++            batch.swap(w.jobs);
++            lock.unlock();
++            const auto t0 = std::chrono::steady_clock::now();
++            uint64_t count = 0;
++            for (auto &job : batch)
++            {
++                try
++                {
++                    job();
++                }
++                catch (const std::exception &e)
++                {
++                    std::fprintf(stderr, "[vu thread] job failed: %s\n", e.what());
++                }
++                catch (...)
++                {
++                    std::fprintf(stderr, "[vu thread] job failed\n");
++                }
++                ++count;
++            }
++            batch.clear();
++            w.busy.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
++                             std::memory_order_relaxed);
++            lock.lock();
++            w.done.fetch_add(count, std::memory_order_release);
++            w.idle.notify_all();
++        }
++    }
++
++    void push(std::function<void()> job)
++    {
++        Worker &w = worker();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        w.jobs.push_back(std::move(job));
++        ++w.posted;
++        if (w.sleeping)
++            w.work.notify_one();
++    }
++}
++
++namespace ga2_vuthread
++{
++    void start(const void *owner)
++    {
++        Worker &w = worker();
++        if (w.running.load())
++            return;
++        w.stopping = false;
++        w.owner.store(owner);
++        w.running.store(true);
++        w.thread = std::thread(loop);
++    }
++
++    void stop()
++    {
++        Worker &w = worker();
++        if (!w.running.load())
++            return;
++        {
++            std::lock_guard<std::mutex> lock(w.mutex);
++            w.stopping = true;
++            w.work.notify_one();
++        }
++        if (w.thread.joinable())
++            w.thread.join();
++        w.running.store(false);
++        w.owner.store(nullptr);
++    }
++
++    bool onWorker() { return t_onVuWorker; }
++
++    bool active(const void *owner)
++    {
++        Worker &w = worker();
++        return w.running.load(std::memory_order_acquire) && w.owner.load(std::memory_order_relaxed) == owner && !t_onVuWorker &&
++               !GifArbiter::onWorkerThread();
++    }
++
++    void post(std::function<void()> job)
++    {
++        if (!worker().running.load() || t_onVuWorker)
++        {
++            job();
++            return;
++        }
++        push(std::move(job));
++    }
++
++    void postTick(std::function<void()> job)
++    {
++        Worker &w = worker();
++        if (!w.running.load() || t_onVuWorker)
++        {
++            job();
++            return;
++        }
++        // At most one tick in the queue: wait for the previous one to run.
++        {
++            std::unique_lock<std::mutex> lock(w.mutex);
++            w.idle.wait(lock, [&] { return w.ticksDone.load(std::memory_order_acquire) >= w.ticksPosted; });
++            ++w.ticksPosted;
++        }
++        push([job = std::move(job)] {
++            job();
++            Worker &w2 = worker();
++            {
++                std::lock_guard<std::mutex> lock(w2.mutex);
++                w2.ticksDone.fetch_add(1, std::memory_order_release);
++            }
++            w2.idle.notify_all();
++        });
++    }
++
++    void sync()
++    {
++        Worker &w = worker();
++        if (!w.running.load(std::memory_order_acquire) || t_onVuWorker || GifArbiter::onWorkerThread())
++            return;
++        std::unique_lock<std::mutex> lock(w.mutex);
++        const uint64_t target = w.posted;
++        w.idle.wait(lock, [&] { return w.done.load(std::memory_order_acquire) >= target; });
++    }
++
++    void setPostGuard(std::function<bool()> guard) { worker().guard = std::move(guard); }
++
++    bool mayPost()
++    {
++        const auto &guard = worker().guard;
++        return !guard || guard();
++    }
++
++    uint64_t busyNanos() { return worker().busy.load(std::memory_order_relaxed); }
++    void addGsBusyNanos(uint64_t nanos) { worker().gsBusy.fetch_add(nanos, std::memory_order_relaxed); }
++    uint64_t gsBusyNanos() { return worker().gsBusy.load(std::memory_order_relaxed); }
++}
++
++namespace ga2_vuthread
++{
++    bool gifRaisesCsr(const uint8_t *data, uint32_t sizeBytes)
++    {
++        uint32_t offset = 0u;
++        while (offset + 16u <= sizeBytes)
++        {
++            uint64_t tagLo = 0, tagHi = 0;
++            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
++            std::memcpy(&tagHi, data + offset + 8u, sizeof(tagHi));
++            offset += 16u;
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
++            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            uint32_t adMask = 0u;
++            for (uint32_t r = 0; r < nreg; ++r)
++                if (((tagHi >> (r * 4u)) & 0xFu) == 0xEu)
++                    adMask |= 1u << r;
++            uint64_t bytes = 0u;
++            if (flg == 0u)
++            {
++                bytes = uint64_t(nloop) * nreg * 16u;
++                if (adMask != 0u)
++                {
++                    const uint64_t end = std::min<uint64_t>(sizeBytes, offset + bytes);
++                    uint32_t r = 0;
++                    for (uint64_t q = offset; q + 16u <= end; q += 16u)
++                    {
++                        if (adMask & (1u << r))
++                        {
++                            const uint8_t addr = data[q + 8u];
++                            if (addr >= 0x59u && addr <= 0x62u)
++                                return true;
++                        }
++                        if (++r == nreg)
++                            r = 0;
++                    }
++                }
++            }
++            else if (flg == 1u)
++            {
++                if (adMask != 0u)
++                    return true;
++                bytes = (uint64_t(nloop) * nreg * 8u + 15u) & ~uint64_t(15u);
++            }
++            else if (flg == 2u)
++                bytes = uint64_t(nloop) * 16u;
++            if (bytes > sizeBytes - offset)
++                return false;
++            offset += static_cast<uint32_t>(bytes);
++        }
++        return false;
++    }
++
++    // Mirrors processVIF1Data's command sizes and stops (ps2_vif1_interpreter.cpp): only DIRECT continues across
++    // chunks, and an UNPACK's length follows STCYCL, which the scan tracks from the stream.
++    bool vif1RaisesCsr(Vif1Scan &scan, uint32_t chunk, const uint8_t *data, uint32_t sizeBytes)
++    {
++        bool found = false;
++        uint32_t pos = 0;
++        while (pos < sizeBytes)
++        {
++            if (scan.directPending != 0u)
++            {
++                const uint32_t bytes = std::min(scan.directPending, sizeBytes - pos);
++                scan.carry.insert(scan.carry.end(), data + pos, data + pos + bytes);
++                pos += bytes;
++                scan.directPending -= bytes;
++                if (scan.directPending == 0u)
++                {
++                    found = gifRaisesCsr(scan.carry.data(), static_cast<uint32_t>(scan.carry.size()));
++                    scan.carry.clear();
++                    if (found)
++                    {
++                        scan.hitChunk = scan.directChunk;
++                        scan.hitOffset = scan.directOffset;
++                        return true;
++                    }
++                }
++                continue;
++            }
++            if (sizeBytes - pos < 4u)
++                break;
++            uint32_t cmd;
++            std::memcpy(&cmd, data + pos, 4);
++            pos += 4;
++            const uint8_t opcode = (cmd >> 24) & 0x7F;
++            const uint16_t imm = cmd & 0xFFFF;
++            const uint8_t num = (cmd >> 16) & 0xFF;
++            if (opcode == 0x01) // STCYCL
++                scan.cycle = imm;
++            else if (opcode == 0x20) // STMASK
++            {
++                if (pos + 4 > sizeBytes)
++                    break;
++                pos += 4;
++            }
++            else if (opcode == 0x30 || opcode == 0x31) // STROW, STCOL
++            {
++                if (pos + 16 > sizeBytes)
++                    break;
++                pos += 16;
++            }
++            else if (opcode == 0x4A) // MPG
++            {
++                pos += ((num == 0u) ? 256u : uint32_t(num)) * 8u;
++                if (pos > sizeBytes)
++                    break;
++            }
++            else if (opcode == 0x50 || opcode == 0x51) // DIRECT, DIRECTHL
++            {
++                scan.directPending = (imm == 0u ? 65536u : uint32_t(imm)) * 16u;
++                scan.directChunk = chunk;
++                scan.directOffset = pos - 4u;
++            }
++            else if ((opcode & 0x60) == 0x60) // UNPACK
++            {
++                const uint32_t vn = (opcode >> 2) & 0x3, vl = opcode & 0x3;
++                const uint32_t bitsPerComponent = vl == 0 ? 32 : vl == 1 ? 16 : vl == 2 ? 8 : (vn == 3 ? 4 : 16);
++                const uint32_t bitsPerVector = (vl == 3 && vn == 3) ? 16 : (vn + 1) * bitsPerComponent;
++                const uint32_t bytesPerVector = (bitsPerVector + 7) / 8;
++                const uint32_t writeVectorCount = (num == 0u) ? 256u : uint32_t(num);
++                uint32_t cl = scan.cycle & 0xFFu, wl = (scan.cycle >> 8) & 0xFFu;
++                if (cl == 0u)
++                    cl = 1u;
++                if (wl == 0u)
++                    wl = 1u;
++                uint32_t sourceVectorCount = writeVectorCount;
++                if (cl < wl)
++                {
++                    uint32_t remainder = writeVectorCount % wl;
++                    if (remainder > cl)
++                        remainder = cl;
++                    sourceVectorCount = (writeVectorCount / wl) * cl + remainder;
++                }
++                const uint32_t totalBytes = (sourceVectorCount * bytesPerVector + 3) & ~3u;
++                pos += totalBytes;
++                if (pos > sizeBytes)
++                    break;
++            }
++            // every other command is the 4 bytes read
++        }
++        return found;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 34d2410..f9da9e7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_pgs.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "runtime/ga2_vuthread.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+@@ -1654,6 +1655,15 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ // edge when the matching IMR mask bit (SIGMSK 8, FINISHMSK 9) is clear.
+ void GS::raiseCsrInterrupt(uint32_t bit, uint64_t maskBit)
+ {
++    // The VU thread hands passes with SIGNAL/FINISH/LABEL in their PATH3 or DIRECT data back to the game thread; one
++    // raised there came from a VU1 program's XGKICK, whose interrupt then arrives at an EE time that depends on the
++    // thread's progress. Reported once (GA2_VU_THREAD=0 runs it exactly).
++    if (ga2_vuthread::onWorker())
++    {
++        static std::atomic<bool> warned{false};
++        if (!warned.exchange(true))
++            std::fprintf(stderr, "[vu thread] GS CSR bit 0x%x raised from a VU1 XGKICK packet on the VU thread\n", bit);
++    }
+     const uint64_t previous = m_privRegs->csr.fetch_or(bit);
+     static const bool trace = std::getenv("GA2_DMA_TRACE") != nullptr;
+     if (trace)
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 9a8623b..7d2a4f5 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "ThreadNaming.h"
++#include "runtime/ga2_vuthread.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdio>
+@@ -324,6 +325,7 @@ void GifArbiter::workerLoop()
+         m_incomingCount = 0;
+         m_incomingBytes = 0;
+         lock.unlock();
++        const auto batchStart = std::chrono::steady_clock::now();
+         for (size_t i = 0; i < count; ++i)
+         {
+             GifArbiterPacket &job = m_working[i];
+@@ -362,6 +364,8 @@ void GifArbiter::workerLoop()
+             if (job.tapData.capacity() > kRetainBytes)
+                 std::vector<uint8_t>().swap(job.tapData);
+         }
++        ga2_vuthread::addGsBusyNanos(uint64_t(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - batchStart).count()));
+         lock.lock();
+         m_completed.fetch_add(count, std::memory_order_release);
+         m_idleCv.notify_all();
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e076321..ee28c29 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,6 +2,7 @@
+ #include <cstdlib>
+ #include <array>
+ #include "runtime/ps2_memory.h"
++#include "runtime/ga2_vuthread.h"
+ #include "ps2_ipu.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -14,6 +15,16 @@
+ #include <string>
+ #include <vector>
+ 
++namespace
++{
++    // The game thread's mirror of the VIF1 parser state that sizes its commands (ga2_vuthread::vif1RaisesCsr), and
++    // whether the VU thread found it wrong (then it is copied again from the real state after a sync).
++    ga2_vuthread::Vif1Scan g_vif1Scan;
++    std::atomic<bool> g_vif1ScanStale{true};
++    std::atomic<uint32_t> g_vif1ScanMismatches{0};
++    std::atomic<uint64_t> g_vuPostedPasses{0}, g_vuSplitPasses{0}, g_vuPath3Passes{0}, g_vuGuardPasses{0};
++}
++
+ // PATH2 GIF stream decoder state lives beside the VIF1 interpreter (ps2_vif1_interpreter.cpp).
+ void ps2Vif1ResetPath2Decoder(const PS2Memory *memory);
+ void ps2Vif1ForgetPath2Decoder(const PS2Memory *memory);
+@@ -332,6 +343,8 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_completedDmacCauses.clear();
+     }
+     m_codeRegions.clear();
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     m_path3Masked = false;
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
+@@ -568,6 +581,9 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+     {
+         return ptr;
+     }
++    // VU1 memory belongs to the VU thread while it runs: the EE sees it once the work handed over is done.
++    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE && ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
+     {
+         return ptr;
+@@ -1125,7 +1141,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+             std::fprintf(stderr, "[vif1] VIF1_FIFO direct write #%llu\n", static_cast<unsigned long long>(count));
+         alignas(16) uint8_t fifoData[16];
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+-        processVIF1Data(fifoData, sizeof(fifoData));
++        processVIF1Data(fifoData, sizeof(fifoData)); // (after the VU thread's work: processVIF1Data syncs)
++        if (ga2_vuthread::active(this))
++            g_vif1ScanStale.store(true, std::memory_order_relaxed);
+         return;
+     }
+ 
+@@ -1166,8 +1184,23 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     }
+ }
+ 
++namespace
++{
++    // GIF, VIF0/VIF1 registers and the VIF1/GIF FIFOs: VIF1 state and the PATH3 mask belong to the VU thread.
++    bool vuOwnedRegister(uint32_t address)
++    {
++        return (address >= 0x10003000u && address < 0x10004000u) || (address >= 0x10005000u && address < 0x10007000u);
++    }
++}
++
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (vuOwnedRegister(address) && ga2_vuthread::active(this))
++    {
++        ga2_vuthread::sync();
++        // VIF1 state written here (registers, FIFO, resets): the scan takes it afterwards.
++        g_vif1ScanStale.store(true, std::memory_order_relaxed);
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1984,6 +2017,8 @@ bool PS2Memory::processScratchpadDmaModes(uint32_t channelBase, uint32_t chcr, u
+ 
+ bool PS2Memory::drainVif1Download()
+ {
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     static constexpr uint32_t kVif1 = 0x10009000u;
+     if (!m_localToHostReader)
+         return false;
+@@ -2289,8 +2324,125 @@ void PS2Memory::pumpIpu()
+     throw IpuUnsupportedOperation("IPU pump did not settle");
+ }
+ 
++
++// After a sync (the VU thread idle): the scan takes the real VIF1 state.
++void PS2Memory::resyncVif1Scan()
++{
++    g_vif1Scan.cycle = vif1_regs.cycle;
++    g_vif1Scan.directPending = m_vif1PendingDirectBytes;
++    g_vif1Scan.carry.clear();
++    g_vif1ScanStale.store(false, std::memory_order_relaxed);
++}
++
++void PS2Memory::handOverVuPass(std::vector<std::vector<uint8_t>> path3, std::vector<std::vector<uint8_t>> vif1)
++{
++    if (g_vif1ScanStale.load(std::memory_order_relaxed))
++    {
++        ga2_vuthread::sync();
++        resyncVif1Scan();
++    }
++    const bool guardRefuses = !ga2_vuthread::mayPost();
++    bool path3Csr = false;
++    for (const auto &packet : path3)
++        path3Csr = path3Csr || ga2_vuthread::gifRaisesCsr(packet.data(), static_cast<uint32_t>(packet.size()));
++    ga2_vuthread::Vif1Scan next = g_vif1Scan;
++    bool vifCsr = false;
++    for (uint32_t i = 0; i < vif1.size() && !vifCsr; ++i)
++        vifCsr = ga2_vuthread::vif1RaisesCsr(next, i, vif1[i].data(), static_cast<uint32_t>(vif1[i].size()));
++
++    if (guardRefuses || path3Csr)
++    {
++        // PATH3 SIGNAL/FINISH/LABEL or display registers (they go first), or VU1 D/T stops: all of it here, after
++        // everything before it, as without the VU thread.
++        ga2_vuthread::sync();
++        for (const auto &packet : path3)
++            submitGifPacket(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
++        for (const auto &chunk : vif1)
++            processVIF1Data(chunk.data(), static_cast<uint32_t>(chunk.size()));
++        if (m_gifArbiter)
++            m_gifArbiter->drain();
++        resyncVif1Scan();
++        (guardRefuses ? g_vuGuardPasses : g_vuPath3Passes).fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    if (vifCsr)
++    {
++        // A DIRECT in the VIF1 data raises CSR bits: the VU thread takes everything before its command (a command
++        // boundary: UNPACK and MPG stay whole, only DIRECT state carries over), the rest runs here after it, ending
++        // with the drain, so the packet and its interrupt keep their EE timing.
++        const uint32_t cut = next.hitChunk, offset = next.hitOffset;
++        std::vector<std::vector<uint8_t>> before(vif1.begin(), vif1.begin() + cut);
++        if (offset != 0u)
++            before.emplace_back(vif1[cut].begin(), vif1[cut].begin() + offset);
++        g_vuSplitPasses.fetch_add(1, std::memory_order_relaxed);
++        ga2_vuthread::post([this, gif = std::move(path3), vif = std::move(before)]
++                           {
++                               for (const auto &packet : gif)
++                                   submitGifPacket(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
++                               for (const auto &chunk : vif)
++                                   processVIF1Data(chunk.data(), static_cast<uint32_t>(chunk.size()));
++                           });
++        ga2_vuthread::sync();
++        processVIF1Data(vif1[cut].data() + offset, static_cast<uint32_t>(vif1[cut].size() - offset));
++        for (size_t i = cut + 1u; i < vif1.size(); ++i)
++            processVIF1Data(vif1[i].data(), static_cast<uint32_t>(vif1[i].size()));
++        if (m_gifArbiter)
++            m_gifArbiter->drain();
++        resyncVif1Scan();
++        return;
++    }
++    g_vif1Scan = next;
++    g_vuPostedPasses.fetch_add(1, std::memory_order_relaxed);
++    const uint32_t expectCycle = next.cycle, expectDirect = next.directPending;
++    ga2_vuthread::post([this, gif = std::move(path3), vif = std::move(vif1), expectCycle, expectDirect]
++                       {
++                           for (const auto &packet : gif)
++                               submitGifPacket(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
++                           for (const auto &chunk : vif)
++                               processVIF1Data(chunk.data(), static_cast<uint32_t>(chunk.size()));
++                           if (m_gifArbiter)
++                               m_gifArbiter->drain();
++                           if ((vif1_regs.cycle & 0xFFFFu) != (expectCycle & 0xFFFFu) || m_vif1PendingDirectBytes != expectDirect)
++                           {
++                               if (g_vif1ScanMismatches.fetch_add(1, std::memory_order_relaxed) < 8u)
++                                   std::fprintf(stderr, "[vu thread] VIF1 scan out of step (cycle %x vs %x, direct %u vs %u); resynced\n",
++                                                vif1_regs.cycle, expectCycle, m_vif1PendingDirectBytes, expectDirect);
++                               g_vif1ScanStale.store(true, std::memory_order_relaxed);
++                           }
++                       });
++}
++
++void PS2Memory::vuThreadStats(uint64_t &posted, uint64_t &split, uint64_t &path3, uint64_t &guard, uint32_t &mismatches)
++{
++    posted = g_vuPostedPasses.exchange(0);
++    split = g_vuSplitPasses.exchange(0);
++    path3 = g_vuPath3Passes.exchange(0);
++    guard = g_vuGuardPasses.exchange(0);
++    mismatches = g_vif1ScanMismatches.load();
++}
++
+ void PS2Memory::processPendingTransfers()
+ {
++    // VU thread (ga2_vuthread): PATH3 and VIF1 data are copied (the DMA completes here as before, so the EE may reuse
++    // its buffers) and run there in one job, in this order, ending with the arbiter's drain. A pass whose GIF data
++    // raises CSR bits, or one the guard refuses (VU1 D/T stops), runs here after a sync instead.
++    const bool vuThread = ga2_vuthread::active(this);
++    const bool toVu = vuThread;
++    std::vector<std::vector<uint8_t>> path3Copies, vif1Copies;
++    auto path3 = [&](const uint8_t *data, uint32_t size)
++    {
++        if (toVu)
++            path3Copies.emplace_back(data, data + size);
++        else
++            submitGifPacket(GifPathId::Path3, data, size, false);
++    };
++    auto vif1 = [&](const uint8_t *data, uint32_t size)
++    {
++        if (toVu)
++            vif1Copies.emplace_back(data, data + size);
++        else
++            processVIF1Data(data, size);
++    };
+     const bool hadGif = !m_pendingGifTransfers.empty();
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+@@ -2315,7 +2467,7 @@ void PS2Memory::processPendingTransfers()
+         {
+             m_seenGifCopy = true;
+             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
++            path3(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+         }
+         else if (p.qwc > 0)
+         {
+@@ -2344,7 +2496,7 @@ void PS2Memory::processPendingTransfers()
+                         break;
+                     m_seenGifCopy = true;
+                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
++                    path3(m_scratchpad + srcPhys, chunk);
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+@@ -2363,7 +2515,7 @@ void PS2Memory::processPendingTransfers()
+                         break;
+                     m_seenGifCopy = true;
+                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
++                    path3(m_rdram + srcPhys, chunk);
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+@@ -2435,7 +2587,7 @@ void PS2Memory::processPendingTransfers()
+     {
+         if (!p.chainData.empty())
+         {
+-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
++            vif1(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+         }
+         else if (p.qwc > 0)
+         {
+@@ -2462,7 +2614,7 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
++                    vif1(m_scratchpad + srcPhys, chunk);
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+@@ -2479,7 +2631,7 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_RAM_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    processVIF1Data(srcPhys, chunk);
++                    vif1(m_rdram + srcPhys, chunk); // srcPhys + chunk stays inside RAM (as the address overload clamps)
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+@@ -2488,7 +2640,12 @@ void PS2Memory::processPendingTransfers()
+     }
+     m_pendingVif1Transfers.clear();
+ 
+-    if (m_gifArbiter)
++    if (toVu)
++    {
++        if (!path3Copies.empty() || !vif1Copies.empty())
++            handOverVuPass(std::move(path3Copies), std::move(vif1Copies));
++    }
++    else if (m_gifArbiter)
+         m_gifArbiter->drain();
+ 
+     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+@@ -2535,7 +2692,11 @@ void PS2Memory::processPendingTransfers()
+ 
+     const uint32_t vif1Chcr = m_ioRegisters[0x10009000u];
+     if ((vif1Chcr & 0x101u) == 0x100u && (m_ioRegisters[0x10009020u] & 0xFFFFu) != 0u)
++    {
++        if (vuThread)
++            ga2_vuthread::sync();
+         (void)drainVif1Download(); // resume a download that found the FIFO empty
++    }
+ }
+ 
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+@@ -2579,6 +2740,9 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl,
+                                 const uint8_t *tapData, uint32_t tapBytes)
+ {
++    // From the game thread while the VU thread runs: after the packets it was handed (the arbiter is its then).
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     if (!data || sizeBytes < 16)
+         return;
+ 
+@@ -2637,6 +2801,8 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
+ {
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+     static constexpr uint32_t D_STAT = 0x1000E010u;
+     static constexpr uint32_t D_CTRL = 0x1000E000u;
+@@ -2829,6 +2995,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
+ 
+ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
+ {
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+     static constexpr uint32_t D_STAT = 0x1000E010u;
+     static constexpr uint32_t D_CTRL = 0x1000E000u;
+@@ -2919,6 +3087,8 @@ bool PS2Memory::consumeIpuInterrupt()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (vuOwnedRegister(address) && ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 51df950..98dbe1b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
+ #include "ga2_zerocopy.h"
++#include "runtime/ga2_vuthread.h"
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/ga2_settings.h"
+ #include "ga2_vr.h"
+@@ -859,6 +860,7 @@ PS2Runtime::~PS2Runtime()
+         requestStop();
+         // The GS worker calls into m_gs, which is destroyed before the arbiter.
+         ga2_pgs::setTaskPoster({});
++        ga2_vuthread::stop(); // its jobs feed the GS worker
+         m_gifArbiter.stopWorker();
+         ga2_pgs::setPacketSync({});
+         m_gs.setPacketSync({});
+@@ -1132,13 +1134,38 @@ bool PS2Runtime::syncCoreSubsystems()
+         const char *thread = std::getenv("GA2_GS_THREAD");
+         if (!thread || std::strcmp(thread, "0") != 0)
+         {
+-            m_gs.setPacketSync([this] { m_gifArbiter.sync(); });
+-            ga2_pgs::setPacketSync([this] { m_gifArbiter.sync(); });
++            // GS entries see everything handed over before them: the VU thread's work, then the GS worker's.
++            m_gs.setPacketSync([this] { ga2_vuthread::sync(); m_gifArbiter.sync(); });
++            ga2_pgs::setPacketSync([this] { ga2_vuthread::sync(); m_gifArbiter.sync(); });
+             m_gifArbiter.startWorker();
+-            // The frame tick's scan-out goes into the worker's queue too (GA2_GS_SCANOUT_MARKER=0: on the game thread).
++            // VIF1 + VU1 on their own thread (ga2_vuthread.h): opt-in, GA2_VU_THREAD=1. Off by default: in the GA2 games
++            // every frame's VIF1 chain ends with a FINISH whose interrupt the EE waits for, so with exact interrupt
++            // timing the VU work stays on the critical path and the hand-off only adds cost (measured: Zettai ship
++            // map, 1x, 175 cap: 159.8 frames/s with it, 167.7 without).
++            const char *vuThread = std::getenv("GA2_VU_THREAD");
++            if (vuThread && std::strcmp(vuThread, "1") == 0)
++            {
++                ga2_vuthread::setPostGuard([this]
++                                           {
++                                               const R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
++                                               if (!ctx)
++                                                   ctx = &m_cpuContext;
++                                               return (ctx->vu0_fbrst & ((1u << 10) | (1u << 11))) == 0u;
++                                           });
++                ga2_vuthread::start(&m_memory);
++            }
++            // The frame tick's scan-out goes into the worker's queue too (GA2_GS_SCANOUT_MARKER=0: on the game thread),
++            // through the VU thread's queue when it runs, so it follows the frame's VU packets.
+             const char *marker = std::getenv("GA2_GS_SCANOUT_MARKER");
+             if (!marker || std::strcmp(marker, "0") != 0)
+-                ga2_pgs::setTaskPoster([this](std::function<void()> task) { m_gifArbiter.postTask(std::move(task)); });
++                ga2_pgs::setTaskPoster([this](std::function<void()> task)
++                                       {
++                                           if (ga2_vuthread::active(&m_memory))
++                                               ga2_vuthread::postTick([this, task = std::move(task)]() mutable
++                                                                      { m_gifArbiter.postTask(std::move(task)); });
++                                           else
++                                               m_gifArbiter.postTask(std::move(task));
++                                       });
+         }
+     }
+     m_memory.setGifArbiter(&m_gifArbiter);
+@@ -1149,6 +1176,17 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_memory.setLocalToHostReader([this](uint8_t *dst, uint32_t bytes) { return m_gs.consumeLocalToHostBytes(dst, bytes); });
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
++                                     // On the VU thread the EE context is not touched: D/T stops are off there (the post guard
++                                     // keeps passes with them enabled on the game thread), so VPU_STAT keeps reading idle.
++                                     if (ga2_vuthread::onWorker())
++                                     {
++                                         m_vu1.state().dBitEnabled = false;
++                                         m_vu1.state().tBitEnabled = false;
++                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                                                   m_gs, &m_memory, startPC, top, itop, 65536);
++                                         return;
++                                     }
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                      if (!cpuContext)
+                                      {
+@@ -1167,6 +1205,17 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
+                                  {
++                                     // On the VU thread the EE context is not touched: D/T stops are off there (the post guard
++                                     // keeps passes with them enabled on the game thread), so VPU_STAT keeps reading idle.
++                                     if (ga2_vuthread::onWorker())
++                                     {
++                                         m_vu1.state().dBitEnabled = false;
++                                         m_vu1.state().tBitEnabled = false;
++                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                                                  m_gs, &m_memory, top, itop, 65536);
++                                         return;
++                                     }
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                      if (!cpuContext)
+                                      {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 9636eee..f7c8efa 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,5 +1,6 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
++#include "runtime/ga2_vuthread.h"
+ #include <cstring>
+ #include <atomic>
+ #include <cstdio>
+@@ -410,6 +411,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
++    // From the game thread (the VIF1 FIFO) while the VU thread runs: after everything it was handed.
++    if (ga2_vuthread::active(this))
++        ga2_vuthread::sync();
+ 
+     uint32_t pos = 0;
+ 
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index 1db4cdf..cc91d76 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -16,6 +16,8 @@ add_library(ps2_gs_cache_backend_under_test STATIC
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_pgs.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gif_arbiter.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/ga2_vuthread.cpp"
+ )
+ target_include_directories(ps2_gs_cache_backend_under_test PUBLIC "${PS2_GS_RUNTIME_DIR}/include")
+ target_compile_features(ps2_gs_cache_backend_under_test PUBLIC cxx_std_20)
+-- 
+2.56.0
+

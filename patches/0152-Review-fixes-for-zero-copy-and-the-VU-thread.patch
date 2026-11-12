@@ -1,0 +1,280 @@
+From 65ecfad864dbf7d42b156493dd081016a1e84023 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:47:56 -0600
+Subject: [PATCH] Review fixes for zero copy and the VU thread
+
+From a review of 0146-0151:
+- Zero copy stopping mid-run (an image that cannot be created or exported)
+  left the shown shared image's slot taken: the readback ring stalled and
+  the picture froze. A read-back frame now retires it.
+- A shared image the window cannot import: zero copy now stops for good
+  (ga2_pgs::disableZeroCopy) instead of the slot never being shown and its
+  binary semaphore being signalled twice; shared frames replaced unseen are
+  released once zero copy is off. The fd goes back (closed) when OpenGL
+  refuses the import. GA2_ZEROCOPY_FAIL_AT=<n> makes the n-th import fail
+  (checked: 4x at a 175 cap keeps showing frames by read-back, none
+  dropped).
+- VU thread (opt-in): a CSR DIRECT that began in an earlier pass was split
+  with that pass's chunk index; such a pass now runs on the game thread
+  whole. After a resync in the middle of a DIRECT its end counts as CSR
+  (the bytes already gone are unknown). A tick job that throws is still
+  counted, so the next tick cannot wait forever.
+
+ps2x_tests 641/641, gs_cache 45/45; VU thread frames unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/ga2_vuthread.h |  5 ++-
+ ps2xRuntime/include/runtime/gs/gs_pgs.h    |  2 +
+ ps2xRuntime/src/lib/ga2_vuthread.cpp       | 14 +++++--
+ ps2xRuntime/src/lib/ga2_zerocopy.cpp       | 49 ++++++++++++++++++++--
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp          | 20 ++++++++-
+ ps2xRuntime/src/lib/ps2_memory.cpp         |  8 +++-
+ 6 files changed, 89 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_vuthread.h b/ps2xRuntime/include/runtime/ga2_vuthread.h
+index 2f0f3c1..895287f 100644
+--- a/ps2xRuntime/include/runtime/ga2_vuthread.h
++++ b/ps2xRuntime/include/runtime/ga2_vuthread.h
+@@ -50,8 +50,11 @@ namespace ga2_vuthread
+         std::vector<uint8_t> carry;
+         // Where the DIRECT being collected began (chunk index as passed, byte offset of its command), and once one is
+         // found to raise CSR bits, that position: the pass can go to the VU thread up to there.
+-        uint32_t directChunk = 0, directOffset = 0;
++        uint32_t directChunk = 0, directOffset = 0; // kFromEarlier: the DIRECT began in an earlier pass
+         uint32_t hitChunk = 0, hitOffset = 0;
++        // After a resync in the middle of a DIRECT the bytes already gone are unknown: its end counts as a hit.
++        bool carryUnknown = false;
++        static constexpr uint32_t kFromEarlier = 0xFFFFFFFFu;
+     };
+     // True when the chunk (index `chunk` of the pass) completes a DIRECT that raises CSR bits; scan.hitChunk/hitOffset
+     // then point at that DIRECT's command. Scanning stops there.
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index ca2da4b..f500d79 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -101,6 +101,8 @@ namespace ga2_pgs
+     // and can export images; frames then come through takeSharedFrame.
+     bool enableZeroCopy(const uint8_t uuid[16]);
+     bool zeroCopy();
++    // The window could not import a shared image: frames are read back from now on.
++    void disableZeroCopy();
+     // Newest frame of `eye` (0, or 1 in stereo): its shared image and the native-resolution copy for the CPU
+     // (opaque RGBA in `small`). The image stays the caller's until releaseSharedImage. Also true with smallWidth 0
+     // when only skipped images are handed over.
+diff --git a/ps2xRuntime/src/lib/ga2_vuthread.cpp b/ps2xRuntime/src/lib/ga2_vuthread.cpp
+index f8c76a5..ed6c154 100644
+--- a/ps2xRuntime/src/lib/ga2_vuthread.cpp
++++ b/ps2xRuntime/src/lib/ga2_vuthread.cpp
+@@ -157,8 +157,15 @@ namespace ga2_vuthread
+             ++w.ticksPosted;
+         }
+         push([job = std::move(job)] {
+-            job();
+-            Worker &w2 = worker();
++            try
++            {
++                job();
++            }
++            catch (...)
++            {
++                std::fprintf(stderr, "[vu thread] tick job failed\n");
++            }
++            Worker &w2 = worker(); // counted whatever happened, so the next tick never waits forever
+             {
+                 std::lock_guard<std::mutex> lock(w2.mutex);
+                 w2.ticksDone.fetch_add(1, std::memory_order_release);
+@@ -262,7 +269,8 @@ namespace ga2_vuthread
+                 scan.directPending -= bytes;
+                 if (scan.directPending == 0u)
+                 {
+-                    found = gifRaisesCsr(scan.carry.data(), static_cast<uint32_t>(scan.carry.size()));
++                    found = scan.carryUnknown || gifRaisesCsr(scan.carry.data(), static_cast<uint32_t>(scan.carry.size()));
++                    scan.carryUnknown = false;
+                     scan.carry.clear();
+                     if (found)
+                     {
+diff --git a/ps2xRuntime/src/lib/ga2_zerocopy.cpp b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+index d9bfaba..ae32c90 100644
+--- a/ps2xRuntime/src/lib/ga2_zerocopy.cpp
++++ b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+@@ -29,6 +29,9 @@ namespace ga2_zerocopy
+ 
+ // raylib's desktop platform links GLFW; its loader resolves the extension entry points glad does not carry.
+ extern "C" void *glfwGetProcAddress(const char *procname);
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #ifdef _WIN32
+ extern "C" __declspec(dllimport) int __stdcall CloseHandle(void *);
+ #define GA2_GLAPI __stdcall
+@@ -141,6 +144,20 @@ namespace
+         if (!si.import)
+             return im.texture != 0 && im.generation == si.generation;
+         freeImported(im);
++        // GA2_ZEROCOPY_FAIL_AT=<n> (test aid): the n-th import fails, to exercise the fall-back to read-back.
++        static int imports = 0;
++        static const int failAt = [] { const char *v = std::getenv("GA2_ZEROCOPY_FAIL_AT"); return v ? std::atoi(v) : 0; }();
++        if (failAt > 0 && ++imports == failAt)
++        {
++            std::fprintf(stderr, "[zerocopy] GA2_ZEROCOPY_FAIL_AT: import %d fails on purpose\n", imports);
++            closeHandle(si.memory);
++            closeHandle(si.ready);
++#ifndef _WIN32
++            close(int(si.memory));
++            close(int(si.ready));
++#endif
++            return false;
++        }
+         while (glGetError() != GL_NO_ERROR)
+         {
+         }
+@@ -151,10 +168,12 @@ namespace
+             g_gl.memoryObjectParameteriv(im.memory, kDedicatedMemory, &dedicated);
+ #ifdef _WIN32
+             g_gl.importMemoryWin32(im.memory, si.memorySize, kHandleOpaqueWin32, reinterpret_cast<void *>(si.memory));
++            closeHandle(si.memory);
+ #else
+             g_gl.importMemoryFd(im.memory, si.memorySize, kHandleOpaqueFd, GLint(si.memory));
++            if (glGetError() != GL_NO_ERROR)
++                close(int(si.memory)); // OpenGL takes the fd only when the import succeeds
+ #endif
+-            closeHandle(si.memory);
+             glGenTextures(1, &im.texture);
+             glBindTexture(GL_TEXTURE_2D, im.texture);
+             glTexParameteri(GL_TEXTURE_2D, kTextureTiling, GLint(kOptimalTiling));
+@@ -171,10 +190,16 @@ namespace
+             g_gl.genSemaphores(1, &im.semaphore);
+ #ifdef _WIN32
+             g_gl.importSemaphoreWin32(im.semaphore, kHandleOpaqueWin32, reinterpret_cast<void *>(si.ready));
++            closeHandle(si.ready);
+ #else
+             g_gl.importSemaphoreFd(im.semaphore, kHandleOpaqueFd, GLint(si.ready));
++            if (glGetError() != GL_NO_ERROR)
++            {
++                close(int(si.ready));
++                g_gl.deleteSemaphores(1, &im.semaphore);
++                im.semaphore = 0;
++            }
+ #endif
+-            closeHandle(si.ready);
+         }
+         const GLenum error = glGetError();
+         if (error != GL_NO_ERROR || !im.texture || !im.semaphore)
+@@ -291,11 +316,29 @@ namespace ga2_zerocopy
+         if (gameTime)
+             *gameTime = frame.gameTime;
+         if (!frame.shared)
++        {
++            // A read-back frame (zero copy just started or stopped): the shared image shown so far goes back to
++            // the GS, or that slot would stay taken and the ring would stall.
++            if (smallWidth != 0 && g_current[eye] >= 0)
++            {
++                retire(eye, uint32_t(g_current[eye]));
++                g_current[eye] = -1;
++            }
+             return smallWidth != 0;
++        }
+         const ga2_pgs::SharedImage &si = frame.image;
+         if (!importSlot(eye, si))
+         {
++            // The slot cannot be shown (and its semaphore was not waited on): zero copy stops for good and frames
++            // are read back from here on; the shared images still held go back as their fences pass.
+             retire(eye, si.slot);
++            if (g_current[eye] >= 0)
++            {
++                retire(eye, uint32_t(g_current[eye]));
++                g_current[eye] = -1;
++            }
++            g_active = false;
++            ga2_pgs::disableZeroCopy();
+             return false;
+         }
+         waitReady(eye, si.slot);
+@@ -311,7 +354,7 @@ namespace ga2_zerocopy
+ 
+     void endFrame()
+     {
+-        if (g_active)
++        if (g_active || !g_retiring.empty())
+             releaseFinished();
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index c6ea3f7..059ba32 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -741,7 +741,8 @@ namespace
+             // converted it (takeEyeFrame / takeUiFrame release it). A frame it never saw is replaced and released.
+             if (eye.freshSlot)
+             {
+-                if (eye.frameShared)
++                // Unseen shared frames wait for the window to consume their semaphore, unless zero copy has stopped.
++                if (eye.frameShared && s.zeroCopy.load(std::memory_order_acquire))
+                     eye.skippedShared.push_back(uint32_t(eye.freshSlot - eye.slots));
+                 else
+                     eye.freshSlot->pending.store(false, std::memory_order_release);
+@@ -1592,6 +1593,22 @@ namespace ga2_pgs
+ 
+     bool zeroCopy() { return state().zeroCopy.load(std::memory_order_acquire); }
+ 
++    void disableZeroCopy()
++    {
++        State &s = state();
++        s.zeroCopy.store(false, std::memory_order_release);
++        std::fprintf(stderr, "[pgs] zero copy off: the window could not import a shared image; frames are read back\n");
++        // Shared frames replaced unseen are not waited on any more: their slots return to the ring now (their
++        // semaphores are never signalled again, as fills read back from here on).
++        std::lock_guard<std::mutex> lock(s.frameMutex);
++        for (uint32_t e = 0; e < s.eyeCount; ++e)
++        {
++            for (uint32_t index : s.eyes[e].skippedShared)
++                s.eyes[e].slots[index].pending.store(false, std::memory_order_release);
++            s.eyes[e].skippedShared.clear();
++        }
++    }
++
+     namespace
+     {
+         // The slot's image for the presentation thread; its handles go along once (they are the caller's then).
+@@ -1739,6 +1756,7 @@ namespace ga2_pgs
+     void setTaskPoster(std::function<void(std::function<void()>)>) {}
+     bool enableZeroCopy(const uint8_t *) { return false; }
+     bool zeroCopy() { return false; }
++    void disableZeroCopy() {}
+     bool takeSharedFrame(int, SharedFrame &, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *)
+     {
+         return false;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index ee28c29..c0185b3 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2331,6 +2331,8 @@ void PS2Memory::resyncVif1Scan()
+     g_vif1Scan.cycle = vif1_regs.cycle;
+     g_vif1Scan.directPending = m_vif1PendingDirectBytes;
+     g_vif1Scan.carry.clear();
++    g_vif1Scan.carryUnknown = g_vif1Scan.directPending != 0u;
++    g_vif1Scan.directChunk = ga2_vuthread::Vif1Scan::kFromEarlier;
+     g_vif1ScanStale.store(false, std::memory_order_relaxed);
+ }
+ 
+@@ -2346,11 +2348,15 @@ void PS2Memory::handOverVuPass(std::vector<std::vector<uint8_t>> path3, std::vec
+     for (const auto &packet : path3)
+         path3Csr = path3Csr || ga2_vuthread::gifRaisesCsr(packet.data(), static_cast<uint32_t>(packet.size()));
+     ga2_vuthread::Vif1Scan next = g_vif1Scan;
++    if (next.directPending != 0u)
++        next.directChunk = ga2_vuthread::Vif1Scan::kFromEarlier; // carried over: it began before this pass
+     bool vifCsr = false;
+     for (uint32_t i = 0; i < vif1.size() && !vifCsr; ++i)
+         vifCsr = ga2_vuthread::vif1RaisesCsr(next, i, vif1[i].data(), static_cast<uint32_t>(vif1[i].size()));
+ 
+-    if (guardRefuses || path3Csr)
++    // A CSR DIRECT that began in an earlier pass (part of it already ran on the thread) cannot be split here.
++    const bool vifCsrFromEarlier = vifCsr && next.hitChunk == ga2_vuthread::Vif1Scan::kFromEarlier;
++    if (guardRefuses || path3Csr || vifCsrFromEarlier)
+     {
+         // PATH3 SIGNAL/FINISH/LABEL or display registers (they go first), or VU1 D/T stops: all of it here, after
+         // everything before it, as without the VU thread.
+-- 
+2.56.0
+

@@ -60,7 +60,11 @@ needs a keyboard.
   - 4x is the highest setting (16 samples per pixel), so the panels' own
     2160x2160 is not reached.
   - Whether the Frame's GPU keeps 72 Hz at 4x in VR is not yet measured. If
-    VR stutters, try 2x.
+    VR stutters, try 2x. Both eyes' pictures now go straight from the
+    graphics card to the headset view instead of through main memory
+    (checked on a desktop PC with a simulated headset); whether that also
+    works with the Frame's graphics driver is not yet known, and without it
+    4x costs much more.
   - The 2D scenes are the games' own 640x448 art at every setting.
 - **Frame rate:** 60 (PS2) is the safe choice. Higher rates draw more frames
   and cost battery.

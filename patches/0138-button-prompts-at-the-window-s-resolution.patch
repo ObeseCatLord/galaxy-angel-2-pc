@@ -1,0 +1,475 @@
+From b54d90e3f7cae7879e2c7fffa1cb668989a48cdb Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:04:47 -0600
+Subject: [PATCH] button prompts at the window's resolution
+
+gs_texpacks records where each composed texture's icons and prompt words went; paraLLEl-GS reports the sprites that draw them (replaced_sprite), and the presentation draws each one again from its image file (mipmapped), where the picture shows it as the GS drew it.
+---
+ ps2xRuntime/include/runtime/ga2_hitext.h |  12 +++
+ ps2xRuntime/src/lib/ga2_present.cpp      | 106 ++++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_buttonpack.h   |  30 +++++-
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp     |  30 ++++++
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp   | 117 +++++++++++++++++++----
+ 5 files changed, 272 insertions(+), 23 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_hitext.h b/ps2xRuntime/include/runtime/ga2_hitext.h
+index 605c54b..74ac722 100644
+--- a/ps2xRuntime/include/runtime/ga2_hitext.h
++++ b/ps2xRuntime/include/runtime/ga2_hitext.h
+@@ -17,6 +17,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ #include <vector>
+ 
+ namespace ga2_hitext
+@@ -96,6 +97,17 @@ namespace ga2_hitext
+     };
+     void notePiece(const TextPiece &piece);
+     std::vector<TextPiece> textPieces();
++    // Button prompts and prompt words the texture replacement drew into the games' textures, where the GS drew them
++    // this frame (gs_texpacks.cpp, GS thread): the presentation draws them again at the window's resolution.
++    struct PromptDraw
++    {
++        std::string file;            // the icon or label image
++        float sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0; // its visible part in that image (pixels)
++        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;     // where it lands: game 2D coordinates (window pixels of the GS)
++        uint32_t rgba = 0x80808080u;              // the sprite's colour (0x80 = 1.0)
++    };
++    void notePromptDraw(const PromptDraw &draw);
++    std::vector<PromptDraw> promptDraws();
+     // A piece drawn at any scale (game pixels -> pixels: sx, sy) with its rectangle's top left at (ox, oy) pixels,
+     // into w x h: plain coverage 0..255 (not the GS levels), no inset.
+     bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out);
+diff --git a/ps2xRuntime/src/lib/ga2_present.cpp b/ps2xRuntime/src/lib/ga2_present.cpp
+index 2e873e7..b515455 100644
+--- a/ps2xRuntime/src/lib/ga2_present.cpp
++++ b/ps2xRuntime/src/lib/ga2_present.cpp
+@@ -565,6 +565,109 @@ void main() {
+             EndShaderMode();
+         }
+ 
++        // ---- button prompts (ga2_hitext::promptDraws) --------------------------------------------------------------
++        // The icons and prompt words the texture replacement drew into the games' textures, drawn again at the window's
++        // resolution from their image files (mipmapped). Only where the picture shows the icon as the GS drew it (a 4x4
++        // grid of its opaque pixels compared), so a menu or a fade over it keeps the GS's.
++        const char *kPromptOverlay = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0; // the icon, premultiplied
++uniform sampler2D picture;  // the GS's picture, with its own rendering of the icon
++uniform vec4 srcRect;       // the icon's visible part (uv)
++uniform vec4 pictureRect;   // where it is in the picture (uv)
++uniform vec4 tint;          // the sprite colour
++out vec4 finalColor;
++void main() {
++    float diff = 0.0, n = 0.0;
++    for (int y = 0; y < 4; ++y)
++        for (int x = 0; x < 4; ++x) {
++            vec2 g = (vec2(x, y) + 0.5) / 4.0;
++            vec4 ic = textureLod(texture0, mix(srcRect.xy, srcRect.zw, g), 2.0);
++            if (ic.a > 0.9) {
++                vec3 d = abs(texture(picture, mix(pictureRect.xy, pictureRect.zw, g)).rgb - ic.rgb / ic.a * tint.rgb);
++                diff += max(d.r, max(d.g, d.b));
++                n += 1.0;
++            }
++        }
++    float shown = n > 0.0 ? 1.0 - smoothstep(0.18, 0.35, diff / n) : 0.0;
++    vec4 c = texture(texture0, fragTexCoord);
++    float k = tint.a * shown;
++    finalColor = vec4(c.rgb * tint.rgb * k, c.a * k);
++})";
++        Shader g_promptShader{};
++        int g_promptLoaded = -1;
++        std::unordered_map<std::string, Texture2D> g_promptTextures;
++
++        void drawPromptOverlay(const Texture2D &gsPicture, Rect picture)
++        {
++            static const bool allowed = [] {
++                const char *v = std::getenv("GA2_PROMPT_OVERLAY");
++                return !(v && std::string(v) == "0");
++            }();
++            if (!allowed)
++                return;
++            const std::vector<ga2_hitext::PromptDraw> draws = ga2_hitext::promptDraws();
++            if (draws.empty())
++                return;
++            if (g_promptLoaded < 0)
++            {
++                g_promptShader = LoadShaderFromMemory(nullptr, kPromptOverlay);
++                g_promptLoaded = IsShaderValid(g_promptShader) ? 1 : 0;
++            }
++            if (g_promptLoaded != 1)
++                return;
++            const float sx = picture.width / 640.0f, sy = picture.height / 480.0f;
++            rlDrawRenderBatchActive();
++            BeginBlendMode(BLEND_ALPHA_PREMULTIPLY);
++            BeginShaderMode(g_promptShader);
++            const int srcLoc = GetShaderLocation(g_promptShader, "srcRect"), picLoc = GetShaderLocation(g_promptShader, "pictureRect");
++            const int tintLoc = GetShaderLocation(g_promptShader, "tint"), pictureLoc = GetShaderLocation(g_promptShader, "picture");
++            for (const ga2_hitext::PromptDraw &d : draws)
++            {
++                auto it = g_promptTextures.find(d.file);
++                if (it == g_promptTextures.end())
++                {
++                    ::Image image = LoadImage(d.file.c_str());
++                    Texture2D texture{};
++                    if (image.data)
++                    {
++                        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                        ImageAlphaPremultiply(&image);
++                        texture = LoadTextureFromImage(image);
++                        GenTextureMipmaps(&texture);
++                        SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
++                        UnloadImage(image);
++                    }
++                    it = g_promptTextures.emplace(d.file, texture).first;
++                }
++                const Texture2D &texture = it->second;
++                if (!texture.id)
++                    continue;
++                const float tw = float(texture.width), th = float(texture.height);
++                const float src[4] = {d.sx0 / tw, d.sy0 / th, d.sx1 / tw, d.sy1 / th};
++                const float where[4] = {d.x0 / 640.0f, d.y0 / 480.0f, d.x1 / 640.0f, d.y1 / 480.0f};
++                auto c = [&](int shift) { return std::min(1.0f, float((d.rgba >> shift) & 0xFFu) / 128.0f); };
++                const Vector4 tint{c(0), c(8), c(16), c(24)};
++                SetShaderValue(g_promptShader, srcLoc, src, SHADER_UNIFORM_VEC4);
++                SetShaderValue(g_promptShader, picLoc, where, SHADER_UNIFORM_VEC4);
++                SetShaderValue(g_promptShader, tintLoc, &tint, SHADER_UNIFORM_VEC4);
++                SetShaderValueTexture(g_promptShader, pictureLoc, gsPicture); // dropped at every flush
++                // A few source pixels past the visible part (the edges' anti-aliasing fades out there, and the GS's
++                // own drawing of it has that soft edge too), the destination grown to match.
++                const float m = 4.0f;
++                const float ex0 = std::min(m, d.sx0), ey0 = std::min(m, d.sy0);
++                const float ex1 = std::min(m, tw - d.sx1), ey1 = std::min(m, th - d.sy1);
++                const float kx = (d.x1 - d.x0) * sx / (d.sx1 - d.sx0), ky = (d.y1 - d.y0) * sy / (d.sy1 - d.sy0);
++                DrawTexturePro(texture, Rectangle{d.sx0 - ex0, d.sy0 - ey0, d.sx1 - d.sx0 + ex0 + ex1, d.sy1 - d.sy0 + ey0 + ey1},
++                               Rectangle{picture.x + d.x0 * sx - ex0 * kx, picture.y + d.y0 * sy - ey0 * ky,
++                                         (d.x1 - d.x0) * sx + (ex0 + ex1) * kx, (d.y1 - d.y0) * sy + (ey0 + ey1) * ky},
++                               Vector2{0, 0}, 0.0f, WHITE);
++                rlDrawRenderBatchActive();
++            }
++            EndShaderMode();
++            EndBlendMode();
++        }
++
+         RenderTexture2D g_blur[3]{};
+         Texture2D g_skybox{};
+ 
+@@ -1322,6 +1425,9 @@ namespace ga2_present
+         }
+         else
+             DrawTexturePro(shown, source, dst, Vector2{0, 0}, 0.0f, WHITE);
++        // Button prompts at the window's resolution (2D pictures; under the text, which may overlap their words).
++        if (g_ready && !scene3d && !g_wide && sizesMatch && gsFrame.width % 640 == 0)
++            drawPromptOverlay(gsFrame, picture);
+         if (g_textErased)
+             drawTextOverlay(textPieces, picture);
+         return picture;
+diff --git a/ps2xRuntime/src/lib/gs/gs_buttonpack.h b/ps2xRuntime/src/lib/gs/gs_buttonpack.h
+index 8c200e9..ed48a17 100644
+--- a/ps2xRuntime/src/lib/gs/gs_buttonpack.h
++++ b/ps2xRuntime/src/lib/gs/gs_buttonpack.h
+@@ -29,14 +29,29 @@ namespace ga2_buttonmatch
+     inline bool wideSpot(int w, int h) { return w * 10 >= h * 15; }
+ 
+     // The visible part of the icon fitted, keeping its shape, into the rectangle (output pixels).
+-    inline void drawIconFitted(::Image &out, const ::Image &art, float x, float y, float w, float h)
++    // Where drawIconFitted puts the icon's visible part (src, in the icon's pixels) inside (x, y, w, h): dst.
++    inline void iconFit(const ::Image &art, float x, float y, float w, float h, Rectangle &src, Rectangle &dst)
+     {
+-        const Rectangle src = GetImageAlphaBorder(art, 0.05f);
++        src = GetImageAlphaBorder(art, 0.05f);
+         const float scale = std::min(w / src.width, h / src.height);
+         const float dw = src.width * scale, dh = src.height * scale;
+-        ImageDraw(&out, art, src, Rectangle{x + (w - dw) * 0.5f, y + (h - dh) * 0.5f, dw, dh}, WHITE);
++        dst = Rectangle{x + (w - dw) * 0.5f, y + (h - dh) * 0.5f, dw, dh};
++    }
++
++    inline void drawIconFitted(::Image &out, const ::Image &art, float x, float y, float w, float h)
++    {
++        Rectangle src, dst;
++        iconFit(art, x, y, w, h, src, dst);
++        ImageDraw(&out, art, src, dst, WHITE);
+     }
+ 
++    // An icon placed into a composed texture: the art, its visible part and where it went (output pixels).
++    struct Placed
++    {
++        const ::Image *art = nullptr;
++        Rectangle src{}, dst{};
++    };
++
+     // `pack`: the pack image (RGBA8, alpha 255 = opaque). `orig`: the original texture's pixels as decoded from
+     // GS memory (alpha 0x80 = opaque), ow x oh, which the spots refer to. The result is the pack image, scaled
+     // up to at least `scale` times the original's size, with every confidently found PS2 icon replaced. False
+@@ -44,7 +59,7 @@ namespace ga2_buttonmatch
+     // given, receives the icons found (pack pixels).
+     inline bool composePackButtons(const ::Image &pack, const std::vector<uint32_t> &orig, int ow, int oh,
+                                    const std::vector<IconSpot> &spots, int scale, const IconLookup &lookup, ::Image &out,
+-                                   std::vector<Match> *matchesOut = nullptr)
++                                   std::vector<Match> *matchesOut = nullptr, std::vector<Placed> *placed = nullptr)
+     {
+         out = ::Image{};
+         if (!pack.data || pack.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 || pack.width <= 0 || pack.height <= 0 ||
+@@ -94,7 +109,12 @@ namespace ga2_buttonmatch
+                          int(std::ceil((r.y + r.h) * fy)) - int(std::floor(r.y * fy))};
+             // The PS2 icon's anti-aliased edge reaches one pack pixel past the matched disc.
+             coverStadium(static_cast<uint32_t *>(out.data), out.width, out.height, o, std::max(fx, fy), fills[i]);
+-            drawIconFitted(out, *art, float(o.x), float(o.y), float(o.w), float(o.h));
++            Placed p;
++            p.art = art;
++            iconFit(*art, float(o.x), float(o.y), float(o.w), float(o.h), p.src, p.dst);
++            ImageDraw(&out, *art, p.src, p.dst, WHITE);
++            if (placed)
++                placed->push_back(p);
+             drew = true;
+         }
+         if (!drew)
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index 80490bc..f12cfc5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -793,6 +793,36 @@ namespace ga2_hitext
+         return g_piecesDone;
+     }
+ 
++    namespace
++    {
++        std::mutex g_promptMutex;
++        std::vector<PromptDraw> g_promptsNow, g_promptsDone;
++        uint64_t g_promptsTag = 0;
++    }
++
++    void notePromptDraw(const PromptDraw &draw)
++    {
++        const uint64_t tag = ga2_activity::vsyncs.load(std::memory_order_relaxed);
++        std::lock_guard<std::mutex> lock(g_promptMutex);
++        if (tag != g_promptsTag)
++        {
++            g_promptsDone.swap(g_promptsNow);
++            g_promptsNow.clear();
++            g_promptsTag = tag;
++        }
++        if (g_promptsNow.size() < 256)
++            g_promptsNow.push_back(draw);
++    }
++
++    std::vector<PromptDraw> promptDraws()
++    {
++        const uint64_t now = ga2_activity::vsyncs.load(std::memory_order_relaxed);
++        std::lock_guard<std::mutex> lock(g_promptMutex);
++        if (now > g_promptsTag + 3)
++            return {};
++        return g_promptsDone;
++    }
++
+     bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out)
+     {
+         if (!face().ok || w <= 0 || h <= 0 || w > 8192 || h > 2048)
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index 119708c..0b7871d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -118,6 +118,19 @@ namespace ga2_texpacks
+         constexpr const char *kLabelPrefix = "label:";
+         bool isLabel(const std::string &button) { return button.rfind(kLabelPrefix, 0) == 0; }
+ 
++        // The file each loaded icon came from (by its pixel data): the presentation draws the same file again.
++        std::unordered_map<const void *, std::string> g_iconFile;
++        ::Image loadIcon(const std::filesystem::path &file)
++        {
++            ::Image image = LoadImage(file.string().c_str());
++            if (image.data)
++            {
++                ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
++                g_iconFile[image.data] = file.string();
++            }
++            return image;
++        }
++
+         const ::Image *icon(const std::string &button, bool wide = false)
+         {
+             if (isLabel(button))
+@@ -126,10 +139,7 @@ namespace ga2_texpacks
+                 auto it = g_icons.find("labels/" + name);
+                 if (it == g_icons.end())
+                 {
+-                    ::Image image = LoadImage((std::filesystem::path(g_buttonDir) / "labels" / (name + ".png")).string().c_str());
+-                    if (image.data)
+-                        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+-                    it = g_icons.emplace("labels/" + name, image).first;
++                    it = g_icons.emplace("labels/" + name, loadIcon(std::filesystem::path(g_buttonDir) / "labels" / (name + ".png"))).first;
+                 }
+                 return it->second.data ? &it->second : nullptr;
+             }
+@@ -140,11 +150,7 @@ namespace ga2_texpacks
+                 auto it = g_icons.find(wideKey);
+                 if (it == g_icons.end())
+                 {
+-                    ::Image image = LoadImage(
+-                        (std::filesystem::path(g_buttonDir) / g_style / (button + "_wide.png")).string().c_str());
+-                    if (image.data)
+-                        ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+-                    it = g_icons.emplace(wideKey, image).first;
++                    it = g_icons.emplace(wideKey, loadIcon(std::filesystem::path(g_buttonDir) / g_style / (button + "_wide.png"))).first;
+                 }
+                 if (it->second.data)
+                     return &it->second;
+@@ -153,10 +159,7 @@ namespace ga2_texpacks
+             auto it = g_icons.find(key);
+             if (it == g_icons.end())
+             {
+-                ::Image image = LoadImage((std::filesystem::path(g_buttonDir) / g_style / (button + ".png")).string().c_str());
+-                if (image.data)
+-                    ImageFormat(&image, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+-                it = g_icons.emplace(key, image).first;
++                it = g_icons.emplace(key, loadIcon(std::filesystem::path(g_buttonDir) / g_style / (button + ".png"))).first;
+             }
+             return it->second.data ? &it->second : nullptr;
+         }
+@@ -164,7 +167,7 @@ namespace ga2_texpacks
+         // The texture at the icon scale (4x or the internal resolution, ga2_hitext::iconScale) with the
+         // device's icons over the PS2 ones; RGBA with alpha 255 = opaque.
+         bool composeButtons(const std::vector<uint32_t> &px, uint32_t w, uint32_t h, const std::vector<IconSpot> &spots,
+-                            ::Image &out)
++                            ::Image &out, std::vector<ga2_buttonmatch::Placed> *placed = nullptr)
+         {
+             const int k = ga2_hitext::iconScale();
+             std::vector<uint32_t> base(px);
+@@ -227,8 +230,13 @@ namespace ga2_texpacks
+                 // The icon's visible part, fitted into the spot keeping its shape. A label's spot reaches one pixel
+                 // past the game's lettering (its anti-aliased edge), the label itself fills the lettering's box.
+                 const float inset = label ? float(k) : 0.0f;
+-                ga2_buttonmatch::drawIconFitted(out, *art, float(spot.x * k) + inset, float(spot.y * k) + inset,
+-                                                float(spot.w * k) - 2.0f * inset, float(spot.h * k) - 2.0f * inset);
++                ga2_buttonmatch::Placed p;
++                p.art = art;
++                ga2_buttonmatch::iconFit(*art, float(spot.x * k) + inset, float(spot.y * k) + inset,
++                                         float(spot.w * k) - 2.0f * inset, float(spot.h * k) - 2.0f * inset, p.src, p.dst);
++                ImageDraw(&out, *art, p.src, p.dst, WHITE);
++                if (placed)
++                    placed->push_back(p);
+                 drew = true;
+             }
+             return drew;
+@@ -482,9 +490,75 @@ namespace ga2_texpacks
+             return key;
+         }
+ 
++        // Icons placed into composed textures, by the uploaded image (its handle keeps the image, so the pointer is
++        // never another image's): file, visible part, and where in the texture (texels of the game's region).
++        struct Placement
++        {
++            std::string file;
++            Rectangle src;
++            float x0, y0, x1, y1;
++        };
++        struct ImagePlacements
++        {
++            ImageHandle keep;
++            float rx = 0, ry = 0; // the region's first texel (sprites address the whole texture)
++            std::vector<Placement> placements;
++        };
++        std::unordered_map<const Vulkan::Image *, ImagePlacements> g_placements;
++
++        // `placed` (pixels of an image `scale` times the region's texels) -> placements of `handle`.
++        void notePlacements(const ImageHandle &handle, const std::vector<ga2_buttonmatch::Placed> &placed, float scaleX,
++                            float scaleY, uint32_t rx, uint32_t ry)
++        {
++            if (!handle || placed.empty())
++                return;
++            ImagePlacements &entry = g_placements[handle.get()];
++            entry.keep = handle;
++            entry.rx = float(rx), entry.ry = float(ry);
++            entry.placements.clear();
++            for (const ga2_buttonmatch::Placed &p : placed)
++            {
++                const auto file = g_iconFile.find(p.art ? p.art->data : nullptr);
++                if (file == g_iconFile.end())
++                    continue;
++                entry.placements.push_back({file->second, p.src, p.dst.x / scaleX, p.dst.y / scaleY,
++                                            (p.dst.x + p.dst.width) / scaleX, (p.dst.y + p.dst.height) / scaleY});
++            }
++        }
++
+         class Replacement final : public TextureReplacementInterface
+         {
+         public:
++            // Where the GS drew a composed texture's icons this frame, for the presentation (window resolution).
++            void replaced_sprite(const Vulkan::Image &image, const float xy[4], const float uv[4], uint32_t rgba,
++                                 uint32_t) override
++            {
++                const auto it = g_placements.find(&image);
++                if (it == g_placements.end() || uv[2] == uv[0] || uv[3] == uv[1])
++                    return;
++                // Texel t lands at x0 + (t - u0) / du; the GS samples a pixel at its integer coordinates, which is
++                // half a pixel right and down of a pixel's centre elsewhere.
++                const float ax = (xy[2] - xy[0]) / (uv[2] - uv[0]), ay = (xy[3] - xy[1]) / (uv[3] - uv[1]);
++                for (const Placement &p : it->second.placements)
++                {
++                    ga2_hitext::PromptDraw d;
++                    d.file = p.file;
++                    d.sx0 = p.src.x, d.sy0 = p.src.y, d.sx1 = p.src.x + p.src.width, d.sy1 = p.src.y + p.src.height;
++                    const float rx = it->second.rx, ry = it->second.ry;
++                    float x0 = xy[0] + (rx + p.x0 - uv[0]) * ax + 0.5f, x1 = xy[0] + (rx + p.x1 - uv[0]) * ax + 0.5f;
++                    float y0 = xy[1] + (ry + p.y0 - uv[1]) * ay + 0.5f, y1 = xy[1] + (ry + p.y1 - uv[1]) * ay + 0.5f;
++                    // Only what the sprite shows.
++                    const float lo = std::min(xy[0], xy[2]), hi = std::max(xy[0], xy[2]);
++                    const float top = std::min(xy[1], xy[3]), bottom = std::max(xy[1], xy[3]);
++                    if (std::min(x0, x1) < lo - 1.0f || std::max(x0, x1) > hi + 1.0f || std::min(y0, y1) < top - 1.0f ||
++                        std::max(y0, y1) > bottom + 1.0f)
++                        continue;
++                    d.x0 = x0, d.y0 = y0, d.x1 = x1, d.y1 = y1;
++                    d.rgba = rgba;
++                    ga2_hitext::notePromptDraw(d);
++                }
++            }
++
+             ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, Device &device) override
+             {
+                 if (!g_stats)
+@@ -764,13 +838,16 @@ namespace ga2_texpacks
+                     if (const auto cached = g_images.find(key); cached != g_images.end())
+                         return cached->second;
+                     ::Image composed{};
+-                    if (!composeButtons(pixels(), w, h, spots->second, composed))
++                    std::vector<ga2_buttonmatch::Placed> placed;
++                    if (!composeButtons(pixels(), w, h, spots->second, composed, &placed))
+                     {
+                         UnloadImage(composed);
+                         return {};
+                     }
++                    const float k = float(composed.width) / float(w);
+                     ImageHandle handle = upload(device, composed);
+                     UnloadImage(composed);
++                    notePlacements(handle, placed, k, float(composed.height) / float(h), rx, ry);
+                     g_images.emplace(key, handle);
+                     return handle;
+                 }
+@@ -795,17 +872,21 @@ namespace ga2_texpacks
+                             for (const IconSpot &spot : packSpots->second)
+                                 if (!isLabel(spot.button) && spot.button != "blank")
+                                     iconSpots.push_back(spot);
++                            std::vector<ga2_buttonmatch::Placed> placed;
+                             const bool done = !iconSpots.empty() && ga2_buttonmatch::composePackButtons(
+                                 packImage, pixels(), int(w), int(h), iconSpots, ga2_hitext::iconScale(),
+-                                [](const std::string &button, bool wide) { return icon(button, wide); }, composed);
++                                [](const std::string &button, bool wide) { return icon(button, wide); }, composed,
++                                nullptr, &placed);
+                             std::fprintf(stderr, "[texpacks] pack %s (%s): %s (%.1f ms)\n", name, g_style.c_str(),
+                                          done ? "PS2 icons replaced" : "no PS2 icon found, image kept as is",
+                                          double(nowNs() - c0) / 1e6);
+                             UnloadImage(packImage);
+                             if (done)
+                             {
++                                const float sx = float(composed.width) / float(w), sy = float(composed.height) / float(h);
+                                 ImageHandle handle = upload(device, composed);
+                                 UnloadImage(composed);
++                                notePlacements(handle, placed, sx, sy, rx, ry);
+                                 g_images.emplace(key, handle);
+                                 return handle;
+                             }
+-- 
+2.56.0
+

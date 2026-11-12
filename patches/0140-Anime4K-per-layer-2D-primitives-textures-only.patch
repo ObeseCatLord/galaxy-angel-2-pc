@@ -1,0 +1,64 @@
+From 65889920a50d7de55cb6188f36f02a5f34b84ba4 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:18:06 -0600
+Subject: [PATCH] Anime4K per layer: 2D primitives' textures only
+
+A texture is upscaled only when the primitive that needs it is 2D (paraLLEl-GS replace(for_2d)): 3D renders natively at the internal resolution, 2D art (also the HUD over 3D scenes) is upscaled.
+---
+ ps2xRuntime/src/lib/gs/gs_texpacks.cpp | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+index d0b6675..cc78616 100644
+--- a/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_texpacks.cpp
+@@ -222,8 +222,6 @@ namespace ga2_layers
+             if (image.data)
+                 UnloadImage(image);
+         }
+-        if (ga2_activity::scene3d())
+-            return nullptr; // 3D scenes' textures are not 2D art
+         Job job;
+         job.hash = hash, job.w = w, job.h = h;
+         job.rgba = pixels();
+@@ -744,13 +742,13 @@ namespace ga2_texpacks
+                 }
+             }
+ 
+-            ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, Device &device) override
++            ImageHandle replace(const TextureDescriptor &desc, uint64_t tex0, uint64_t, bool for2d, Device &device) override
+             {
+                 if (!g_stats)
+-                    return replaceInner(desc, tex0, device, nullptr);
++                    return replaceInner(desc, tex0, for2d, device, nullptr);
+                 TexStat local;
+                 const uint64_t t0 = nowNs();
+-                ImageHandle result = replaceInner(desc, tex0, device, &local);
++                ImageHandle result = replaceInner(desc, tex0, for2d, device, &local);
+                 const uint64_t dt = nowNs() - t0;
+                 std::lock_guard<std::mutex> lock(g_mutex);
+                 g_statCalls++;
+@@ -780,7 +778,7 @@ namespace ga2_texpacks
+                 return result;
+             }
+ 
+-            ImageHandle replaceInner(const TextureDescriptor &desc, uint64_t tex0, Device &device, TexStat *st)
++            ImageHandle replaceInner(const TextureDescriptor &desc, uint64_t tex0, bool for2d, Device &device, TexStat *st)
+             {
+                 // Render targets (post-process inputs, frame copies) are not
+                 // art: new pixels every frame, and the CPU VRAM mirror does not
+@@ -804,8 +802,9 @@ namespace ga2_texpacks
+                                          (psmRaw == 0x14u || psmRaw == 0x24u || psmRaw == 0x2Cu)))
+                                            ? ga2_hitext::enabled()
+                                            : false;
+-                // Per-layer upscaling: 8, 16 and 32-bit textures of some size (the 4-bit ones are fonts and UI glyphs).
+-                const bool layers = ga2_layers::enabled() && desc.rect.width >= 32u && desc.rect.height >= 32u &&
++                // Per-layer upscaling: 2D art only (a 3D primitive's texture renders natively at the internal
++                // resolution); 8, 16 and 32-bit textures of some size (the 4-bit ones are fonts and UI glyphs).
++                const bool layers = for2d && ga2_layers::enabled() && desc.rect.width >= 32u && desc.rect.height >= 32u &&
+                                     !(psmRaw == 0x14u || psmRaw == 0x24u || psmRaw == 0x2Cu);
+                 if (g_index.empty() && g_dumpDir.empty() && !buttons && !textIcons && !sharpText && !layers)
+                     return {};
+-- 
+2.56.0
+

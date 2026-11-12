@@ -1,0 +1,97 @@
+From 8b0e344c7080bd38e591e01a82106be7f7d0bd8c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:46:52 -0600
+Subject: [PATCH] Hacks: jitter_x/y (geometry moved by a fraction of a sample),
+ report_replaced
+
+Several instances fed the same packets, each moved by a fraction of a sample, can be interleaved by the host into a picture above the super-sampling limit. A primitive sampling a buffer the GS rendered gets its texel coordinates moved too, so the shift is not applied twice. report_replaced: only one of several instances reports replaced sprites.
+---
+ gs/gs_interface.cpp | 30 +++++++++++++++++++++++++-----
+ gs/gs_interface.hpp |  9 +++++++++
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 9cd1488..7e938f0 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -874,8 +874,8 @@ void GSInterface::vertex_kick_xyz(Reg64<XYZBits> xyz)
+ 	auto &pos = vertex_queue.pos[vertex_queue.count];
+ 	auto &attr = vertex_queue.attr[vertex_queue.count];
+ 
+-	pos.pos.x = stereo_x(int(xyz.desc.X)) - render_pass.ofx;
+-	pos.pos.y = int(xyz.desc.Y) - render_pass.ofy;
++	pos.pos.x = stereo_x(int(xyz.desc.X)) - render_pass.ofx + hacks.jitter_x;
++	pos.pos.y = int(xyz.desc.Y) - render_pass.ofy + hacks.jitter_y;
+ 	pos.z = xyz.desc.Z;
+ 
+ 	attr.st.x = registers.st.desc.S;
+@@ -896,8 +896,8 @@ void GSInterface::vertex_kick_xyzf(Reg64<XYZFBits> xyzf)
+ 	auto &pos = vertex_queue.pos[vertex_queue.count];
+ 	auto &attr = vertex_queue.attr[vertex_queue.count];
+ 
+-	pos.pos.x = stereo_x(int(xyzf.desc.X)) - render_pass.ofx;
+-	pos.pos.y = int(xyzf.desc.Y) - render_pass.ofy;
++	pos.pos.x = stereo_x(int(xyzf.desc.X)) - render_pass.ofx + hacks.jitter_x;
++	pos.pos.y = int(xyzf.desc.Y) - render_pass.ofy + hacks.jitter_y;
+ 	pos.z = xyzf.desc.Z;
+ 
+ 	attr.st.x = registers.st.desc.S;
+@@ -2737,7 +2737,7 @@ void GSInterface::drawing_kick_append()
+ 
+ 	// [texreplace] sprites drawn with a host replacement image are reported (the host may draw parts of them again at
+ 	// a higher resolution, e.g. button prompts).
+-	if (quad && prim.desc.TME && prim.desc.FST)
++	if (quad && prim.desc.TME && prim.desc.FST && hacks.report_replaced)
+ 	{
+ 		if (auto *iface = renderer.get_texture_replacement_interface())
+ 		{
+@@ -2757,6 +2757,26 @@ void GSInterface::drawing_kick_append()
+ 		}
+ 	}
+ 
++	// [jitter] Reading a buffer the GS rendered (with the same shift): the texel coordinates move with it.
++	if ((hacks.jitter_x || hacks.jitter_y) && prim.desc.TME && state_tracker.last_texture_descriptor.rendered_source)
++	{
++		const int count = quad ? 2 : int(num_vertices);
++		for (int i = 0; i < count; i++)
++		{
++			if (prim.desc.FST)
++			{
++				attr[i].uv.x = uint16_t(std::max(0, std::min(0x3fff, int(attr[i].uv.x) + hacks.jitter_x)));
++				attr[i].uv.y = uint16_t(std::max(0, std::min(0x3fff, int(attr[i].uv.y) + hacks.jitter_y)));
++			}
++			else
++			{
++				const float tw = float(1u << uint32_t(ctx.tex0.desc.TW)), th = float(1u << uint32_t(ctx.tex0.desc.TH));
++				attr[i].st.x += float(hacks.jitter_x) / 16.0f / tw * attr[i].q;
++				attr[i].st.y += float(hacks.jitter_y) / 16.0f / th * attr[i].q;
++			}
++		}
++	}
++
+ 	auto &fb_instance = render_pass.instances[render_pass.current_instance];
+ 
+ 	const auto &prim_state = state_tracker.prim_template;
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index ec1b1ae..224d749 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -226,6 +226,15 @@ struct Hacks
+ 	float stereo_shift_q = 0.0f;
+ 	float stereo_shift_flat = 0.0f;
+ 
++	// [jitter] Several instances fed the same packets, each with its geometry moved by a fraction of a sample
++	// (1/16 pixel units), are interleaved by the host into a picture above the super-sampling limit. A primitive
++	// that samples a texture the GS rendered (a buffer drawn with the same shift) gets its texel coordinates moved
++	// too, so the shift is not applied twice.
++	int jitter_x = 0;
++	int jitter_y = 0;
++	// [texreplace] This instance reports sprites drawn with replacement images (one instance of several).
++	bool report_replaced = true;
++
+ 	// [vrhud] UI layer split: the 2D overlay (HUD, dialogue boxes, menus) is drawn by its own GS instance into an image
+ 	// with alpha while the scene instances leave it out, so a host can show it on a separate panel. All instances get
+ 	// the same packets. ui_layer: 0 = off, 1 = scene instance (skips UI primitives), 2 = UI instance (draws only UI
+-- 
+2.56.0
+

@@ -1,0 +1,1207 @@
+From 20bcbcc2895e0b465eb9deea6ecfa2c315e37fd9 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:47:23 -0600
+Subject: [PATCH] Zero-copy presentation: the GS's frames shared with the
+ window's OpenGL
+
+At 4x the picture (2560x1792, 18 MB) went GPU -> host memory -> per-pixel
+conversion -> glTexSubImage2D every frame, which capped 4x at about 84
+frames/s (the swap blocked 10 ms per frame behind the upload).
+
+Now eye 0 (and eye 1 in VR stereo) is blitted into one of five exportable
+Vulkan images per eye (Granite external memory, dedicated allocation, plus
+an exported binary semaphore signalled after the blit, the image released
+to the external queue family). ga2_zerocopy imports them once per image
+with GL_EXT_memory_object/_semaphore (_fd on Linux, _win32 on Windows),
+waits on the semaphore with glWaitSemaphoreEXT and samples the texture in
+place; a GL fence decides when an image goes back to the GS. Frames the
+window never showed are waited on and released too. The readback ring
+(three -> five slots: zero copy holds the shown image until its fence
+passes) still delivers a native-size copy (scaled to at most 1024 wide)
+for the mouse menus, frame signatures and shots.
+
+The readback path stays: GA2_PGS_ZERO_COPY=0, no extension, a different
+GPU (device UUID compared), the jittered 8x mode, and the HUD panel layer.
+GA2_PRESENT_SHOTS=<dir>@<s>,... writes the texture about to be drawn for
+the first frame at or after each game time, in either mode.
+
+RTX 4090, gamescope headless 2560x1440 (research/run59/gpu-175): 4x cap
+175: title/load screens 174.8 made / 174.4 shown per second (was 90), ship
+map 120 with no drops (was 84; now CPU-bound like 1x), GPU 48 %, swap
+0.09 ms. GA2_FREERUN runs: the presented 2560x1792 picture is identical to
+the readback path's at 7 game times (title, load screen, ship map).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/CMakeLists.txt              |   1 +
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |  41 ++-
+ ps2xRuntime/src/lib/ga2_zerocopy.cpp    | 361 ++++++++++++++++++++++++
+ ps2xRuntime/src/lib/ga2_zerocopy.h      |  37 +++
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       | 359 ++++++++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp     | 123 +++++++-
+ 6 files changed, 908 insertions(+), 14 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/ga2_zerocopy.cpp
+ create mode 100644 ps2xRuntime/src/lib/ga2_zerocopy.h
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1bccd96..4166a81 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -400,6 +400,7 @@ add_library(ps2_runtime ${PS2X_RUNTIME_LIBRARY_TYPE}
+     src/lib/ps2_mouse.cpp
+     src/lib/ps2_mouse_menus.cpp
+     src/lib/ga2_present.cpp
++    src/lib/ga2_zerocopy.cpp
+     src/lib/ga2_mpv_shader.cpp
+     src/lib/ga2_vr.cpp
+     src/lib/ga2_vr_platform.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 4a47020..723e222 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -58,14 +58,53 @@ namespace ga2_pgs
+     // eye's newest frame with the stereo setup it was rendered with.
+     bool stereo();
+     // uiSplit (optional): the frame was drawn without its UI layer (see takeUiFrame).
++    // gameTime (optional): the game time of the iteration that drew it (GA2_PRESENT_SHOTS).
+     bool takeEyeFrame(int eye, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup, bool *uiSplit = nullptr);
++                      ga2_stereo::Setup &setup, bool *uiSplit = nullptr, double *gameTime = nullptr);
+     // HUD panel (GA2_VR_HUD_PANEL=1 with the stereo instances): a third GS instance draws the 2D overlay (HUD,
+     // dialogue, menus) alone into an RGBA image, alpha as the game wrote it (0x80 = opaque), transparent black
+     // elsewhere; while a frame is split (3D stereo scene) the eye frames leave the overlay out.
+     bool uiLayer();
+     // Newest UI layer image; uiSplit: the eye frames of the same game frame lack their overlay.
+     bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit);
++    // Zero-copy presentation (GA2_PGS_ZERO_COPY=0 turns it off): each frame of eye 0 (and eye 1 in VR stereo) is
++    // blitted into one of three exportable images per eye that the window's OpenGL imports (GL_EXT_memory_object,
++    // GL_EXT_semaphore) and samples in place, instead of the whole picture going to host memory and being uploaded
++    // again (18 MB per frame at 4x). The readback still delivers a native-resolution copy for what the CPU reads
++    // (mouse menus, frame signatures, shots), and stays the whole path when zero copy is off, unsupported, on
++    // another GPU than the window's, with the jittered 8x mode, and for the HUD panel layer.
++    // Frames in flight per eye: being written, finished, shown and waiting for the window's OpenGL to let go (zero
++    // copy holds the shown image until its fence passes, so three were not enough: every other frame was dropped).
++    constexpr uint32_t kReadbackSlots = 5;
++    struct SharedImage
++    {
++        uint32_t slot = 0;        // the eye's pool index (0..kReadbackSlots-1)
++        uint64_t generation = 0;  // new when the slot's image was recreated (another size): import it again
++        uint32_t width = 0, height = 0;
++        bool import = false;      // the handles below are new; the caller owns them from now
++        intptr_t memory = -1;     // fd (Linux) or HANDLE (Windows) of the image's dedicated memory
++        uint64_t memorySize = 0;
++        intptr_t ready = -1;      // binary semaphore the GPU signals once the image is written
++    };
++    struct SharedFrame
++    {
++        bool shared = false;      // false: a frame made before zero copy started; `small` holds all of it
++        SharedImage image;
++        double gameTime = 0.0;    // of the iteration that drew it
++        // Finished images replaced before they were taken: wait on their semaphore once, then release them.
++        std::vector<SharedImage> skipped;
++    };
++    // Present thread, once the window's OpenGL exists: its device UUID. True when the GS's Vulkan device is that GPU
++    // and can export images; frames then come through takeSharedFrame.
++    bool enableZeroCopy(const uint8_t uuid[16]);
++    bool zeroCopy();
++    // Newest frame of `eye` (0, or 1 in stereo): its shared image and the native-resolution copy for the CPU
++    // (opaque RGBA in `small`). The image stays the caller's until releaseSharedImage. Also true with smallWidth 0
++    // when only skipped images are handed over.
++    bool takeSharedFrame(int eye, SharedFrame &frame, std::vector<uint8_t> &small, uint32_t &smallWidth,
++                         uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit = nullptr);
++    // The present thread is done with that image (its OpenGL fence passed): the GS may write it again.
++    void releaseSharedImage(int eye, uint32_t slot);
+     // Above 4x (GA2_PGS_JITTER=1): four instances, eye 0 and three moved by half an internal pixel right, down and
+     // both; their newest frames of the same game frame (index = x + 2 y of the half-pixel offset) to interleave.
+     bool jittered();
+diff --git a/ps2xRuntime/src/lib/ga2_zerocopy.cpp b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+new file mode 100644
+index 0000000..d9bfaba
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_zerocopy.cpp
+@@ -0,0 +1,361 @@
++#include "ga2_zerocopy.h"
++#include "runtime/gs/gs_pgs.h"
++#include "runtime/ga2_stereo.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#if defined(PLATFORM_VITA)
++
++namespace ga2_zerocopy
++{
++    bool init() { return false; }
++    bool active() { return false; }
++    bool take(int, unsigned &, uint32_t &, uint32_t &, bool &, std::vector<uint8_t> &, uint32_t &, uint32_t &,
++              ga2_stereo::Setup &, bool *, double *)
++    {
++        return false;
++    }
++    void endFrame() {}
++    void presentShot(unsigned, int, int, double) {}
++}
++
++#else
++
++#include "raylib.h"
++#include "external/glad.h"
++
++// raylib's desktop platform links GLFW; its loader resolves the extension entry points glad does not carry.
++extern "C" void *glfwGetProcAddress(const char *procname);
++#ifdef _WIN32
++extern "C" __declspec(dllimport) int __stdcall CloseHandle(void *);
++#define GA2_GLAPI __stdcall
++#else
++#define GA2_GLAPI
++#endif
++
++namespace
++{
++    constexpr GLenum kTextureTiling = 0x9580;     // GL_TEXTURE_TILING_EXT
++    constexpr GLenum kDedicatedMemory = 0x9581;   // GL_DEDICATED_MEMORY_OBJECT_EXT
++    constexpr GLenum kOptimalTiling = 0x9584;     // GL_OPTIMAL_TILING_EXT
++    constexpr GLenum kHandleOpaqueFd = 0x9586;    // GL_HANDLE_TYPE_OPAQUE_FD_EXT
++    constexpr GLenum kHandleOpaqueWin32 = 0x9587; // GL_HANDLE_TYPE_OPAQUE_WIN32_EXT
++    constexpr GLenum kNumDeviceUuids = 0x9596;    // GL_NUM_DEVICE_UUIDS_EXT
++    constexpr GLenum kDeviceUuid = 0x9597;        // GL_DEVICE_UUID_EXT
++    constexpr GLenum kLayoutShaderRead = 0x9591;  // GL_LAYOUT_SHADER_READ_ONLY_EXT
++
++    using PfnGetUnsignedBytei = void(GA2_GLAPI *)(GLenum, GLuint, GLubyte *);
++    using PfnCreateMemoryObjects = void(GA2_GLAPI *)(GLsizei, GLuint *);
++    using PfnDeleteMemoryObjects = void(GA2_GLAPI *)(GLsizei, const GLuint *);
++    using PfnMemoryObjectParameteriv = void(GA2_GLAPI *)(GLuint, GLenum, const GLint *);
++    using PfnTexStorageMem2D = void(GA2_GLAPI *)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
++    using PfnImportMemoryFd = void(GA2_GLAPI *)(GLuint, GLuint64, GLenum, GLint);
++    using PfnImportMemoryWin32 = void(GA2_GLAPI *)(GLuint, GLuint64, GLenum, void *);
++    using PfnGenSemaphores = void(GA2_GLAPI *)(GLsizei, GLuint *);
++    using PfnDeleteSemaphores = void(GA2_GLAPI *)(GLsizei, const GLuint *);
++    using PfnWaitSemaphore = void(GA2_GLAPI *)(GLuint, GLuint, const GLuint *, GLuint, const GLuint *, const GLenum *);
++    using PfnImportSemaphoreFd = void(GA2_GLAPI *)(GLuint, GLenum, GLint);
++    using PfnImportSemaphoreWin32 = void(GA2_GLAPI *)(GLuint, GLenum, void *);
++
++    struct Gl
++    {
++        PfnGetUnsignedBytei getUnsignedBytei = nullptr;
++        PfnCreateMemoryObjects createMemoryObjects = nullptr;
++        PfnDeleteMemoryObjects deleteMemoryObjects = nullptr;
++        PfnMemoryObjectParameteriv memoryObjectParameteriv = nullptr;
++        PfnTexStorageMem2D texStorageMem2D = nullptr;
++        PfnImportMemoryFd importMemoryFd = nullptr;
++        PfnImportMemoryWin32 importMemoryWin32 = nullptr;
++        PfnGenSemaphores genSemaphores = nullptr;
++        PfnDeleteSemaphores deleteSemaphores = nullptr;
++        PfnWaitSemaphore waitSemaphore = nullptr;
++        PfnImportSemaphoreFd importSemaphoreFd = nullptr;
++        PfnImportSemaphoreWin32 importSemaphoreWin32 = nullptr;
++    } g_gl;
++
++    // One eye's pool slot as imported into OpenGL.
++    struct Imported
++    {
++        uint64_t generation = 0;
++        GLuint memory = 0, texture = 0, semaphore = 0;
++        uint32_t width = 0, height = 0;
++    };
++
++    struct Retiring
++    {
++        int eye;
++        uint32_t slot;
++        GLsync fence;
++    };
++
++    bool g_tried = false, g_active = false;
++    Imported g_slots[2][ga2_pgs::kReadbackSlots];
++    int g_current[2] = {-1, -1}; // the slot each eye shows now
++    std::vector<Retiring> g_retiring;
++
++    template <typename T>
++    bool load(T &fn, const char *name)
++    {
++        fn = reinterpret_cast<T>(glfwGetProcAddress(name));
++        return fn != nullptr;
++    }
++
++    bool hasExtension(const char *name)
++    {
++        GLint count = 0;
++        glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++        for (GLint i = 0; i < count; ++i)
++            if (const auto *ext = reinterpret_cast<const char *>(glGetStringi(GL_EXTENSIONS, GLuint(i))); ext && std::strcmp(ext, name) == 0)
++                return true;
++        return false;
++    }
++
++    void closeHandle(intptr_t handle)
++    {
++#ifdef _WIN32
++        if (handle && handle != -1)
++            CloseHandle(reinterpret_cast<void *>(handle));
++#else
++        (void)handle; // OpenGL took the fd
++#endif
++    }
++
++    void freeImported(Imported &im)
++    {
++        if (im.texture)
++            glDeleteTextures(1, &im.texture);
++        if (im.memory)
++            g_gl.deleteMemoryObjects(1, &im.memory);
++        if (im.semaphore)
++            g_gl.deleteSemaphores(1, &im.semaphore);
++        im = Imported{};
++    }
++
++    // Imports a slot's image and semaphore when the GS handed over new handles.
++    bool importSlot(int eye, const ga2_pgs::SharedImage &si)
++    {
++        Imported &im = g_slots[eye][si.slot];
++        if (!si.import)
++            return im.texture != 0 && im.generation == si.generation;
++        freeImported(im);
++        while (glGetError() != GL_NO_ERROR)
++        {
++        }
++        if (si.memory != -1 && si.memory != 0)
++        {
++            g_gl.createMemoryObjects(1, &im.memory);
++            const GLint dedicated = GL_TRUE;
++            g_gl.memoryObjectParameteriv(im.memory, kDedicatedMemory, &dedicated);
++#ifdef _WIN32
++            g_gl.importMemoryWin32(im.memory, si.memorySize, kHandleOpaqueWin32, reinterpret_cast<void *>(si.memory));
++#else
++            g_gl.importMemoryFd(im.memory, si.memorySize, kHandleOpaqueFd, GLint(si.memory));
++#endif
++            closeHandle(si.memory);
++            glGenTextures(1, &im.texture);
++            glBindTexture(GL_TEXTURE_2D, im.texture);
++            glTexParameteri(GL_TEXTURE_2D, kTextureTiling, GLint(kOptimalTiling));
++            g_gl.texStorageMem2D(GL_TEXTURE_2D, 1, GL_RGBA8, GLsizei(si.width), GLsizei(si.height), im.memory, 0);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE); // the readback path forced alpha too
++            glBindTexture(GL_TEXTURE_2D, 0);
++        }
++        if (si.ready != -1 && si.ready != 0)
++        {
++            g_gl.genSemaphores(1, &im.semaphore);
++#ifdef _WIN32
++            g_gl.importSemaphoreWin32(im.semaphore, kHandleOpaqueWin32, reinterpret_cast<void *>(si.ready));
++#else
++            g_gl.importSemaphoreFd(im.semaphore, kHandleOpaqueFd, GLint(si.ready));
++#endif
++            closeHandle(si.ready);
++        }
++        const GLenum error = glGetError();
++        if (error != GL_NO_ERROR || !im.texture || !im.semaphore)
++        {
++            std::fprintf(stderr, "[zerocopy] import of a %ux%u image failed (GL error 0x%x)\n", si.width, si.height, unsigned(error));
++            freeImported(im);
++            return false;
++        }
++        im.generation = si.generation;
++        im.width = si.width;
++        im.height = si.height;
++        std::fprintf(stderr, "[zerocopy] eye %d slot %u: imported %ux%u (%.1f MB)\n", eye, si.slot, si.width, si.height,
++                     double(si.memorySize) / 1048576.0);
++        return true;
++    }
++
++    // Waits (on the GPU) for the GS to finish writing the image, then hands it to `retire` behind a fence.
++    void waitReady(int eye, uint32_t slot)
++    {
++        Imported &im = g_slots[eye][slot];
++        const GLenum layout = kLayoutShaderRead;
++        g_gl.waitSemaphore(im.semaphore, 0, nullptr, 1, &im.texture, &layout);
++    }
++
++    void retire(int eye, uint32_t slot)
++    {
++        g_retiring.push_back(Retiring{eye, slot, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)});
++    }
++
++    void releaseFinished()
++    {
++        for (size_t i = 0; i < g_retiring.size();)
++        {
++            const GLenum state = glClientWaitSync(g_retiring[i].fence, 0, 0);
++            if (state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED)
++            {
++                glDeleteSync(g_retiring[i].fence);
++                ga2_pgs::releaseSharedImage(g_retiring[i].eye, g_retiring[i].slot);
++                g_retiring.erase(g_retiring.begin() + std::ptrdiff_t(i));
++            }
++            else
++                ++i;
++        }
++    }
++}
++
++namespace ga2_zerocopy
++{
++    bool init()
++    {
++        if (g_tried)
++            return g_active;
++        if (!ga2_pgs::rendering())
++            return false; // asked again once the GS renders
++        g_tried = true;
++#ifdef _WIN32
++        const char *memoryExt = "GL_EXT_memory_object_win32", *semaphoreExt = "GL_EXT_semaphore_win32";
++#else
++        const char *memoryExt = "GL_EXT_memory_object_fd", *semaphoreExt = "GL_EXT_semaphore_fd";
++#endif
++        if (!hasExtension("GL_EXT_memory_object") || !hasExtension("GL_EXT_semaphore") || !hasExtension(memoryExt) ||
++            !hasExtension(semaphoreExt))
++        {
++            std::fprintf(stderr, "[zerocopy] the window's OpenGL lacks %s/%s: frames are read back\n", memoryExt, semaphoreExt);
++            return false;
++        }
++        bool ok = load(g_gl.getUnsignedBytei, "glGetUnsignedBytei_vEXT") &&
++                  load(g_gl.createMemoryObjects, "glCreateMemoryObjectsEXT") &&
++                  load(g_gl.deleteMemoryObjects, "glDeleteMemoryObjectsEXT") &&
++                  load(g_gl.memoryObjectParameteriv, "glMemoryObjectParameterivEXT") &&
++                  load(g_gl.texStorageMem2D, "glTexStorageMem2DEXT") && load(g_gl.genSemaphores, "glGenSemaphoresEXT") &&
++                  load(g_gl.deleteSemaphores, "glDeleteSemaphoresEXT") && load(g_gl.waitSemaphore, "glWaitSemaphoreEXT");
++#ifdef _WIN32
++        ok = ok && load(g_gl.importMemoryWin32, "glImportMemoryWin32HandleEXT") &&
++             load(g_gl.importSemaphoreWin32, "glImportSemaphoreWin32HandleEXT");
++#else
++        ok = ok && load(g_gl.importMemoryFd, "glImportMemoryFdEXT") && load(g_gl.importSemaphoreFd, "glImportSemaphoreFdEXT");
++#endif
++        if (!ok)
++        {
++            std::fprintf(stderr, "[zerocopy] extension entry points missing: frames are read back\n");
++            return false;
++        }
++        GLint devices = 0;
++        glGetIntegerv(kNumDeviceUuids, &devices);
++        GLubyte uuid[16] = {};
++        for (GLint i = 0; i < devices && !g_active; ++i)
++        {
++            g_gl.getUnsignedBytei(kDeviceUuid, GLuint(i), uuid);
++            g_active = ga2_pgs::enableZeroCopy(uuid);
++        }
++        return g_active;
++    }
++
++    bool active() { return g_active; }
++
++    bool take(int eye, unsigned &texture, uint32_t &width, uint32_t &height, bool &shared, std::vector<uint8_t> &small,
++              uint32_t &smallWidth, uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime)
++    {
++        if (eye < 0 || eye > 1)
++            return false;
++        releaseFinished();
++        ga2_pgs::SharedFrame frame;
++        if (!ga2_pgs::takeSharedFrame(eye, frame, small, smallWidth, smallHeight, setup, uiSplit))
++            return false;
++        // Images the GS finished but nobody showed: their semaphore is consumed before they are written again.
++        for (const ga2_pgs::SharedImage &si : frame.skipped)
++        {
++            if (importSlot(eye, si))
++                waitReady(eye, si.slot);
++            retire(eye, si.slot);
++        }
++        shared = frame.shared;
++        if (gameTime)
++            *gameTime = frame.gameTime;
++        if (!frame.shared)
++            return smallWidth != 0;
++        const ga2_pgs::SharedImage &si = frame.image;
++        if (!importSlot(eye, si))
++        {
++            retire(eye, si.slot);
++            return false;
++        }
++        waitReady(eye, si.slot);
++        if (g_current[eye] >= 0)
++            retire(eye, uint32_t(g_current[eye]));
++        g_current[eye] = int(si.slot);
++        const Imported &im = g_slots[eye][si.slot];
++        texture = im.texture;
++        width = im.width;
++        height = im.height;
++        return true;
++    }
++
++    void endFrame()
++    {
++        if (g_active)
++            releaseFinished();
++    }
++
++    void presentShot(unsigned texture, int width, int height, double gameTime)
++    {
++        static std::string dir;
++        static std::vector<double> times;
++        static size_t next = 0;
++        static bool parsed = false;
++        if (!parsed)
++        {
++            parsed = true;
++            if (const char *spec = std::getenv("GA2_PRESENT_SHOTS"); spec && std::strchr(spec, '@'))
++            {
++                dir.assign(spec, size_t(std::strchr(spec, '@') - spec));
++                for (const char *v = std::strchr(spec, '@') + 1; v && *v;)
++                {
++                    char *end = nullptr;
++                    times.push_back(std::strtod(v, &end));
++                    v = end && *end == ',' ? end + 1 : nullptr;
++                }
++            }
++        }
++        if (!texture || width <= 0 || height <= 0)
++            return;
++        while (next < times.size() && gameTime >= times[next] - 1e-6)
++        {
++            std::vector<uint8_t> pixels(size_t(width) * size_t(height) * 4u);
++            glBindTexture(GL_TEXTURE_2D, texture);
++            glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++            glBindTexture(GL_TEXTURE_2D, 0);
++            for (size_t i = 3; i < pixels.size(); i += 4)
++                pixels[i] = 0xFF;
++            Image image{pixels.data(), width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            char name[64];
++            std::snprintf(name, sizeof(name), "/present-%.3f.png", times[next]);
++            const std::string path = dir + name;
++            ExportImage(image, path.c_str());
++            std::fprintf(stderr, "[zerocopy] present shot %s (%dx%d, frame game time %.3f, %s)\n", path.c_str(), width, height,
++                         gameTime, g_active ? "zero copy" : "read back");
++            ++next;
++        }
++    }
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/ga2_zerocopy.h b/ps2xRuntime/src/lib/ga2_zerocopy.h
+new file mode 100644
+index 0000000..5024cbe
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ga2_zerocopy.h
+@@ -0,0 +1,37 @@
++// Zero-copy presentation, the window's side (OpenGL). The GS (gs_pgs.cpp) blits each frame into exportable Vulkan
++// images; this imports them with GL_EXT_memory_object / GL_EXT_semaphore (_fd on Linux, _win32 on Windows) and the
++// presentation samples them in place. Without the extensions, on another GPU, or with GA2_PGS_ZERO_COPY=0 the GS
++// keeps reading frames back and the presentation uploads them as before.
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace ga2_stereo
++{
++    struct Setup;
++}
++
++namespace ga2_zerocopy
++{
++    // Present thread, once the window's OpenGL exists (repeat calls return the first answer).
++    bool init();
++    bool active();
++
++    // The newest frame of `eye` (0, or 1 in VR stereo). True with a new picture. shared: `texture` is the frame's
++    // OpenGL texture (width x height, RGBA8 with alpha read as 1), valid until a later take() of the same eye;
++    // `small` holds the native-size copy for the CPU (mouse menus). Not shared: `small` is the whole picture
++    // (a frame read back before zero copy started) and the caller uploads it.
++    // gameTime (optional): the game time of the iteration that drew it.
++    bool take(int eye, unsigned &texture, uint32_t &width, uint32_t &height, bool &shared, std::vector<uint8_t> &small,
++              uint32_t &smallWidth, uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit = nullptr,
++              double *gameTime = nullptr);
++
++    // After the frame's drawing: images whose last use has finished go back to the GS.
++    void endFrame();
++
++    // GA2_PRESENT_SHOTS=<dir>@<seconds>[,...] (zero copy or not): the texture the window is about to draw, as the GS
++    // delivered it (before the presentation's filters), for the first frame drawn at or after each game time:
++    // <dir>/present-<seconds>.png. For checking that both paths show the same picture (GA2_FREERUN runs).
++    void presentShot(unsigned texture, int width, int height, double gameTime);
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index df266c9..613b662 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -33,6 +33,11 @@
+ #include <thread>
+ #include <string>
+ #include <vector>
++#ifdef _WIN32
++extern "C" __declspec(dllimport) int __stdcall CloseHandle(void *);
++#else
++#include <unistd.h>
++#endif
+ 
+ using namespace Vulkan;
+ using namespace ParallelGS;
+@@ -138,6 +143,19 @@ namespace
+         std::shared_ptr<const ga2_hitext::FrameText> text; // the port's text and prompts drawn in it
+         uint64_t flip = 0;       // the guest flip it shows and that iteration's game time (GA2_FRAMETRACE_FRAMES)
+         double flipTime = 0.0;
++        // Zero copy (ga2_pgs::enableZeroCopy): the slot's exportable image (the whole picture, RGBA8, for the
++        // window's OpenGL), the semaphore the GPU signals once it is written, and a native-size image the buffer is
++        // copied from. Handles are exported once per image and handed to the presentation thread with its first
++        // frame. While the slot is pending the presentation thread owns everything below.
++        ImageHandle shared, small;
++        Semaphore ready;
++        uint64_t generation = 0;
++        uint32_t sharedWidth = 0, sharedHeight = 0;
++        uint64_t memorySize = 0;
++        ExternalHandle memoryHandle, readyHandle;
++        bool memoryExported = false, readyExported = false; // exported, not handed over yet
++        bool readyEverExported = false;
++        bool sharedFrame = false; // the frame now in this slot came through the shared image
+     };
+ 
+     // One GS instance per eye. Eye 0 is the only one outside VR stereo; eye
+@@ -152,7 +170,7 @@ namespace
+         Device device;
+         GSInterface gs;
+         Hacks hacks;
+-        ReadbackSlot slots[3];
++        ReadbackSlot slots[ga2_pgs::kReadbackSlots];
+         uint32_t slotIndex = 0;
+ 
+         // The newest finished frame, not yet taken by the presentation thread (guarded by State::frameMutex):
+@@ -165,6 +183,12 @@ namespace
+         bool frameUiSplit = false;
+         std::shared_ptr<const ga2_hitext::FrameText> frameText;
+         ga2_stereo::Setup frameSetup, takenSetup;
++        // Zero copy: whether the fresh frame came through its slot's shared image, and the slots of finished shared
++        // frames a newer one replaced before the presentation thread took them (it still has to wait on their
++        // semaphore before they are written again). Guarded by State::frameMutex.
++        bool frameShared = false;
++        std::vector<uint32_t> skippedShared;
++        double frameGameTime = 0.0; // game time of the iteration that drew the fresh frame
+     };
+ 
+     // A thread that runs one GS instance's work in order: the jitter instances' vsync (flush, scan-out, readback),
+@@ -274,6 +298,9 @@ namespace
+         // is shown; for measuring the scan-out pass apart from the picture's transport). All instances.
+         std::atomic<uint64_t> readbacks{0}, droppedReadbacks{0}, skippedReadbacks{0};
+         bool noReadback = false;
++        // Zero copy on (enableZeroCopy) and the generation counter of shared images.
++        std::atomic<bool> zeroCopy{false};
++        uint64_t sharedGeneration = 0;
+         // paraLLEl-GS's own counters for eye 0: flush statistics, and with GA2_PGS_TIMESTAMPS=1 its GPU timestamps
+         // (seconds, accumulated; the report shows the difference since the last one).
+         FlushStats flushAcc = {};
+@@ -711,8 +738,15 @@ namespace
+             // No copy: the readback buffer stays mapped and owned by the frame until the presentation thread has
+             // converted it (takeEyeFrame / takeUiFrame release it). A frame it never saw is replaced and released.
+             if (eye.freshSlot)
+-                eye.freshSlot->pending.store(false, std::memory_order_release);
++            {
++                if (eye.frameShared)
++                    eye.skippedShared.push_back(uint32_t(eye.freshSlot - eye.slots));
++                else
++                    eye.freshSlot->pending.store(false, std::memory_order_release);
++            }
+             eye.freshSlot = &slot;
++            eye.frameShared = slot.sharedFrame;
++            eye.frameGameTime = slot.flipTime;
+             eye.frameSrc = src;
+             eye.frameBgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+             eye.frameWidth = slot.width;
+@@ -747,14 +781,169 @@ namespace
+     // Consume finished readbacks oldest first so the newest finished frame is the one presented.
+     void pollReadbackLocked(State &s, Eye &eye)
+     {
+-        for (int k = 0; k < 3; ++k)
++        for (uint32_t k = 0; k < ga2_pgs::kReadbackSlots; ++k)
+         {
+-            ReadbackSlot &old = eye.slots[(eye.slotIndex + k) % 3];
++            ReadbackSlot &old = eye.slots[(eye.slotIndex + k) % ga2_pgs::kReadbackSlots];
+             if (old.pending && old.fence && old.fence->wait_timeout(0))
+                 consumeSlotLocked(s, eye, old);
+         }
+     }
+ 
++    bool validHandle(const ExternalHandle &h)
++    {
++#ifdef _WIN32
++        return h.handle != nullptr;
++#else
++        return h.handle >= 0;
++#endif
++    }
++
++    void closeHandle(ExternalHandle &h)
++    {
++        if (!validHandle(h))
++            return;
++#ifdef _WIN32
++        CloseHandle(h.handle);
++        h.handle = nullptr;
++#else
++        close(h.handle);
++        h.handle = -1;
++#endif
++    }
++
++    intptr_t handOver(ExternalHandle &h)
++    {
++#ifdef _WIN32
++        const intptr_t v = reinterpret_cast<intptr_t>(h.handle);
++        h.handle = nullptr;
++#else
++        const intptr_t v = h.handle;
++        h.handle = -1;
++#endif
++        return v;
++    }
++
++    // The native-size copy for the CPU: halved until it is at most 1024 wide (2560 -> 640 at 4x).
++    void smallSize(uint32_t w, uint32_t h, uint32_t &sw, uint32_t &sh)
++    {
++        sw = w;
++        sh = h;
++        while (sw > 1024u && sh > 1u)
++        {
++            sw = (sw + 1u) / 2u;
++            sh = (sh + 1u) / 2u;
++        }
++    }
++
++    // (Re)creates the slot's shared image for a picture of w x h. The slot is not pending: the presentation thread
++    // released it, so its old image and handles are no longer used.
++    bool ensureSharedLocked(State &s, Eye &eye, ReadbackSlot &slot, uint32_t w, uint32_t h)
++    {
++        uint32_t sw = 0, sh = 0;
++        smallSize(w, h, sw, sh);
++        if (slot.shared && slot.sharedWidth == w && slot.sharedHeight == h && slot.small)
++            return true;
++        closeHandle(slot.memoryHandle);
++        closeHandle(slot.readyHandle);
++        slot.memoryExported = slot.readyExported = slot.readyEverExported = false;
++        slot.shared.reset();
++        slot.small.reset();
++        slot.ready.reset();
++        ImageCreateInfo info = ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
++        info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++        info.misc = IMAGE_MISC_EXTERNAL_MEMORY_BIT;
++        info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++        info.domain = ImageDomain::Physical;
++        ImageHandle image = eye.device.create_image(info);
++        Semaphore ready = image ? eye.device.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY,
++                                                                         ExternalHandle::get_opaque_semaphore_handle_type())
++                                : Semaphore{};
++        ImageCreateInfo smallInfo = ImageCreateInfo::render_target(sw, sh, VK_FORMAT_R8G8B8A8_UNORM);
++        smallInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++        smallInfo.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++        ImageHandle small = ready ? eye.device.create_image(smallInfo) : ImageHandle{};
++        ExternalHandle memory = small ? image->export_handle() : ExternalHandle{};
++        if (!validHandle(memory))
++        {
++            std::fprintf(stderr, "[pgs] zero copy: could not create or export a %ux%u image; reading back instead\n", w, h);
++            s.zeroCopy.store(false, std::memory_order_release);
++            return false;
++        }
++        VkMemoryRequirements req = {};
++        eye.device.get_device_table().vkGetImageMemoryRequirements(eye.device.get_device(), image->get_image(), &req);
++        slot.shared = std::move(image);
++        slot.small = std::move(small);
++        slot.ready = std::move(ready);
++        slot.memoryHandle = memory;
++        slot.memoryExported = true;
++        slot.memorySize = req.size;
++        slot.sharedWidth = w;
++        slot.sharedHeight = h;
++        slot.generation = ++s.sharedGeneration;
++        return true;
++    }
++
++    // Zero copy: the scan-out goes into the slot's shared image (for the window) and, scaled down, into its
++    // buffer (for the CPU). Called by readbackLocked for a slot that is not pending.
++    bool sharedReadbackLocked(State &s, Eye &eye, ReadbackSlot &slot, const ScanoutResult &result)
++    {
++        const uint32_t w = result.image->get_width(), h = result.image->get_height();
++        if (!ensureSharedLocked(s, eye, slot, w, h))
++            return false;
++        const uint32_t sw = slot.small->get_width(), sh = slot.small->get_height();
++        if (!slot.buffer || slot.width != sw || slot.height != sh)
++        {
++            BufferCreateInfo info = {};
++            info.size = VkDeviceSize(sw) * sh * 4u;
++            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            info.domain = BufferDomain::CachedHost;
++            slot.buffer = eye.device.create_buffer(info);
++            slot.width = sw;
++            slot.height = sh;
++        }
++        slot.format = VK_FORMAT_R8G8B8A8_UNORM;
++        auto cmd = eye.device.request_command_buffer();
++        cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_BLIT_BIT,
++                           VK_ACCESS_2_TRANSFER_READ_BIT);
++        // The old contents are not needed (the window's OpenGL finished with them: the slot was released).
++        cmd->image_barrier(*slot.shared, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++        cmd->image_barrier(*slot.small, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++        cmd->blit_image(*slot.shared, *result.image, {0, 0, 0}, {int(w), int(h), 1}, {0, 0, 0}, {int(w), int(h), 1}, 0, 0, 0,
++                        0, 1, VK_FILTER_NEAREST);
++        cmd->blit_image(*slot.small, *result.image, {0, 0, 0}, {int(sw), int(sh), 1}, {0, 0, 0}, {int(w), int(h), 1}, 0, 0,
++                        0, 0, 1, VK_FILTER_LINEAR);
++        // To the window's OpenGL: shader-read layout, released to the external queue family.
++        cmd->release_image_barrier(*slot.shared, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++        cmd->image_barrier(*slot.small, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                           VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
++                           VK_ACCESS_2_TRANSFER_READ_BIT);
++        cmd->copy_image_to_buffer(*slot.buffer, *slot.small, 0, {}, {sw, sh, 1}, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
++                     VK_ACCESS_2_HOST_READ_BIT);
++        eye.device.submit(cmd);
++        Fence fence;
++        eye.device.submit_empty(CommandBuffer::Type::Generic, &fence, slot.ready.get());
++        if (!slot.readyEverExported)
++        {
++            // A binary semaphore exports once a signal is queued; the handle refers to it from then on.
++            slot.readyHandle = slot.ready->export_to_handle();
++            if (!validHandle(slot.readyHandle))
++            {
++                std::fprintf(stderr, "[pgs] zero copy: semaphore export failed; reading back instead\n");
++                s.zeroCopy.store(false, std::memory_order_release);
++            }
++            slot.readyExported = slot.readyEverExported = true;
++        }
++        slot.fence = std::move(fence);
++        slot.image = result.image;
++        slot.sharedFrame = true;
++        return true;
++    }
++
+     // Asynchronous readback ring: never wait for the GPU on the game thread.
+     void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup, bool uiSplit,
+                         std::shared_ptr<const ga2_hitext::FrameText> text = nullptr)
+@@ -773,6 +962,19 @@ namespace
+             return; // GPU is behind; drop this frame's copy
+         }
+         s.readbacks.fetch_add(1, std::memory_order_relaxed);
++        if (s.zeroCopy.load(std::memory_order_acquire) && (&eye == &s.eyes[0] || (s.eyeCount == 2 && &eye == &s.eyes[1])) &&
++            sharedReadbackLocked(s, eye, slot, result))
++        {
++            slot.setup = setup;
++            slot.uiSplit = uiSplit;
++            slot.text = std::move(text);
++            slot.flip = ga2_framepace::flips();
++            slot.flipTime = ga2_framepace::flipGameTime();
++            slot.pending = true;
++            eye.slotIndex = (eye.slotIndex + 1u) % ga2_pgs::kReadbackSlots;
++            return;
++        }
++        slot.sharedFrame = false;
+         const uint32_t w = result.image->get_width(), h = result.image->get_height();
+         if (!slot.buffer || slot.width != w || slot.height != h)
+         {
+@@ -803,7 +1005,7 @@ namespace
+         slot.flip = ga2_framepace::flips();
+         slot.flipTime = ga2_framepace::flipGameTime();
+         slot.pending = true;
+-        eye.slotIndex = (eye.slotIndex + 1u) % 3u;
++        eye.slotIndex = (eye.slotIndex + 1u) % ga2_pgs::kReadbackSlots;
+     }
+ 
+     template <typename T>
+@@ -1188,6 +1390,7 @@ namespace ga2_pgs
+             bool uiSplit = false;
+             ga2_stereo::Setup setup;
+             std::shared_ptr<const ga2_hitext::FrameText> text;
++            double gameTime = 0.0;
+         };
+ 
+         bool acquireFrame(State &s, Eye &eye, TakenFrame &out)
+@@ -1203,6 +1406,7 @@ namespace ga2_pgs
+             out.uiSplit = eye.frameUiSplit;
+             out.setup = eye.frameSetup;
+             out.text = eye.frameText;
++            out.gameTime = eye.frameGameTime;
+             eye.freshSlot = nullptr; // now owned by the caller; a newer frame will not release it
+             eye.frameSrc = nullptr;
+             eye.frameFresh = false;
+@@ -1288,8 +1492,140 @@ namespace ga2_pgs
+         return true;
+     }
+ 
++    bool enableZeroCopy(const uint8_t uuid[16])
++    {
++        State &s = state();
++        std::lock_guard<std::mutex> lock(s.mutex);
++        if (!initLocked(s))
++            return false;
++        if (envInt("GA2_PGS_ZERO_COPY", 1) == 0)
++        {
++            std::fprintf(stderr, "[pgs] zero copy off (GA2_PGS_ZERO_COPY=0): frames are read back\n");
++            return false;
++        }
++        if (s.jitterCount)
++        {
++            std::fprintf(stderr, "[pgs] zero copy not used with the jittered 8x mode: frames are read back\n");
++            return false;
++        }
++        const auto &features = s.eyes[0].device.get_device_features();
++        if (!features.supports_external)
++        {
++            std::fprintf(stderr, "[pgs] zero copy unavailable (no external memory/semaphore support): frames are read back\n");
++            return false;
++        }
++        if (std::memcmp(features.vk11_props.deviceUUID, uuid, 16) != 0)
++        {
++            std::fprintf(stderr, "[pgs] zero copy unavailable (the window's OpenGL is on another GPU): frames are read back\n");
++            return false;
++        }
++        s.zeroCopy.store(true, std::memory_order_release);
++        std::fprintf(stderr, "[pgs] zero copy on: frames go to the window's OpenGL as shared images\n");
++        return true;
++    }
++
++    bool zeroCopy() { return state().zeroCopy.load(std::memory_order_acquire); }
++
++    namespace
++    {
++        // The slot's image for the presentation thread; its handles go along once (they are the caller's then).
++        SharedImage describeShared(ReadbackSlot &slot, uint32_t index)
++        {
++            SharedImage out;
++            out.slot = index;
++            out.generation = slot.generation;
++            out.width = slot.sharedWidth;
++            out.height = slot.sharedHeight;
++            out.memorySize = slot.memorySize;
++            if (slot.memoryExported || slot.readyExported)
++            {
++                out.import = true;
++                out.memory = handOver(slot.memoryHandle);
++                out.ready = handOver(slot.readyHandle);
++                slot.memoryExported = slot.readyExported = false;
++            }
++            return out;
++        }
++    }
++
++    bool takeSharedFrame(int eyeIndex, SharedFrame &frame, std::vector<uint8_t> &small, uint32_t &smallWidth,
++                         uint32_t &smallHeight, ga2_stereo::Setup &setup, bool *uiSplit)
++    {
++        State &s = state();
++        frame = SharedFrame{};
++        if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
++            return false;
++        Eye &eye = s.eyes[eyeIndex];
++        TakenFrame taken;
++        bool shared = false;
++        {
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            for (uint32_t index : eye.skippedShared)
++                frame.skipped.push_back(describeShared(eye.slots[index], index));
++            eye.skippedShared.clear();
++            if (!eye.frameFresh || !eye.freshSlot)
++            {
++                // No new picture; skipped images (if any) still go to the caller (smallWidth 0: nothing to show).
++                smallWidth = smallHeight = 0;
++                return !frame.skipped.empty();
++            }
++            shared = eye.frameShared;
++            taken.slot = eye.freshSlot;
++            taken.src = eye.frameSrc;
++            taken.width = eye.frameWidth;
++            taken.height = eye.frameHeight;
++            taken.bgra = eye.frameBgra;
++            taken.uiSplit = eye.frameUiSplit;
++            taken.setup = eye.frameSetup;
++            taken.text = eye.frameText;
++            taken.gameTime = eye.frameGameTime;
++            eye.freshSlot = nullptr;
++            eye.frameSrc = nullptr;
++            eye.frameFresh = false;
++            eye.frameShared = false;
++            if (shared)
++                frame.image = describeShared(*taken.slot, uint32_t(taken.slot - eye.slots));
++        }
++        frame.shared = shared;
++        frame.gameTime = taken.gameTime;
++        smallWidth = taken.width;
++        smallHeight = taken.height;
++        setup = taken.setup;
++        if (uiSplit)
++            *uiSplit = taken.uiSplit;
++        if (eyeIndex == 0)
++            ga2_hitext::setPresented(taken.text);
++        const size_t pixels = size_t(taken.width) * taken.height;
++        small.resize(pixels * 4u);
++        auto *dst = reinterpret_cast<uint32_t *>(small.data());
++        if (taken.bgra)
++            for (size_t i = 0; i < pixels; ++i)
++            {
++                const uint32_t p = taken.src[i];
++                dst[i] = ((p >> 16) & 0xFFu) | (p & 0xFF00u) | ((p & 0xFFu) << 16) | 0xFF000000u;
++            }
++        else
++            for (size_t i = 0; i < pixels; ++i)
++                dst[i] = taken.src[i] | 0xFF000000u;
++        if (!shared)
++            releaseFrame(taken); // a read-back frame: its pixels are in `small`
++        return true;
++    }
++
++    void releaseSharedImage(int eyeIndex, uint32_t index)
++    {
++        State &s = state();
++        if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount || index >= ga2_pgs::kReadbackSlots)
++            return;
++        ReadbackSlot &slot = s.eyes[eyeIndex].slots[index];
++        // The window's OpenGL waited on the semaphore: unsignalled again for the next fill.
++        if (slot.ready)
++            slot.ready->wait_external();
++        slot.pending.store(false, std::memory_order_release);
++    }
++
+     bool takeEyeFrame(int eyeIndex, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+-                      ga2_stereo::Setup &setup, bool *uiSplit)
++                      ga2_stereo::Setup &setup, bool *uiSplit, double *gameTime)
+     {
+         State &s = state();
+         if (eyeIndex < 0 || uint32_t(eyeIndex) >= s.eyeCount)
+@@ -1302,6 +1638,8 @@ namespace ga2_pgs
+         setup = frame.setup;
+         if (uiSplit)
+             *uiSplit = frame.uiSplit;
++        if (gameTime)
++            *gameTime = frame.gameTime;
+         if (eyeIndex == 0)
+             ga2_hitext::setPresented(frame.text);
+         // Convert to opaque RGBA here, on the present thread, straight from the mapped readback buffer.
+@@ -1332,6 +1670,13 @@ namespace ga2_pgs
+     void captureNow() {}
+     void setVramMirror(const uint8_t *) {}
+     void setPacketSync(std::function<void()>) {}
++    bool enableZeroCopy(const uint8_t *) { return false; }
++    bool zeroCopy() { return false; }
++    bool takeSharedFrame(int, SharedFrame &, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *)
++    {
++        return false;
++    }
++    void releaseSharedImage(int, uint32_t) {}
+     void setTexturePacks(const std::vector<std::string> &) {}
+     void setButtonStyle(const std::string &) {}
+     void applySettings() {}
+@@ -1341,7 +1686,7 @@ namespace ga2_pgs
+     bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+     bool stereo() { return false; }
+     bool waitFreshFrame(int) { return false; }
+-    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *) { return false; }
++    bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *, double *) { return false; }
+     bool uiLayer() { return false; }
+     bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
+     bool jittered() { return false; }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 69f87c0..345c089 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_mouse.h"
+ #include "ps2_mouse_menus.h"
+ #include "ga2_present.h"
++#include "ga2_zerocopy.h"
+ #include "runtime/ga2_framepace.h"
+ #include "runtime/ga2_settings.h"
+ #include "ga2_vr.h"
+@@ -496,8 +497,112 @@ namespace
+     }
+ }
+ 
+-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
++// shown: the texture to draw this loop. With zero copy (ga2_zerocopy) it is the GS's shared image, else `tex`.
++static void UploadFrame(Texture2D &tex, Texture2D &shown, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
++    if (ga2_pgs::rendering() && !ga2_pgs::jittered() && ga2_zerocopy::init())
++    {
++        static std::vector<uint8_t> s_small, s_eyeSmall;
++        static uint32_t s_width = 0u, s_height = 0u;
++        static bool s_sharedShown = false;
++        static Texture2D s_eyeTex{}; // eye 1's upload texture when a frame was read back
++        if (ga2_pgs::stereo())
++        {
++            unsigned id = 0u;
++            uint32_t ew = 0u, eh = 0u, sw = 0u, sh = 0u;
++            bool shared = false, split = false;
++            ga2_stereo::Setup eyeSetup;
++            if (ga2_zerocopy::take(1, id, ew, eh, shared, s_eyeSmall, sw, sh, eyeSetup, &split))
++            {
++                if (!shared)
++                {
++                    if (s_eyeTex.width != int(sw) || s_eyeTex.height != int(sh))
++                    {
++                        if (s_eyeTex.id)
++                            UnloadTexture(s_eyeTex);
++                        Image image = GenImageColor(int(sw), int(sh), BLACK);
++                        s_eyeTex = LoadTextureFromImage(image);
++                        UnloadImage(image);
++                        SetTextureFilter(s_eyeTex, TEXTURE_FILTER_BILINEAR);
++                    }
++                    UpdateTexture(s_eyeTex, s_eyeSmall.data());
++                    id = s_eyeTex.id;
++                    ew = sw;
++                    eh = sh;
++                }
++                ga2_vr::setEyeFrame(1, id, int(ew), int(eh), float(ew), float(eh), eyeSetup, split);
++            }
++            // The HUD panel's layer is still read back (its alpha matters; not shared yet).
++            static std::vector<uint8_t> s_uiFrame;
++            static Texture2D s_uiTex{};
++            uint32_t uw = 0u, uh = 0u;
++            bool uiSplit = false;
++            if (ga2_pgs::uiLayer() && ga2_pgs::takeUiFrame(s_uiFrame, uw, uh, uiSplit) && uw && uh &&
++                s_uiFrame.size() >= size_t(uw) * uh * 4u)
++            {
++                if (s_uiTex.width != int(uw) || s_uiTex.height != int(uh))
++                {
++                    if (s_uiTex.id)
++                        UnloadTexture(s_uiTex);
++                    Image image = GenImageColor(int(uw), int(uh), BLANK);
++                    s_uiTex = LoadTextureFromImage(image);
++                    UnloadImage(image);
++                    SetTextureFilter(s_uiTex, TEXTURE_FILTER_BILINEAR);
++                }
++                UpdateTexture(s_uiTex, s_uiFrame.data());
++                ga2_vr::setUiFrame(s_uiTex.id, s_uiTex.width, s_uiTex.height, uiSplit);
++            }
++        }
++        unsigned id = 0u;
++        uint32_t fw = 0u, fh = 0u, sw = 0u, sh = 0u;
++        bool shared = false, split = false;
++        ga2_stereo::Setup setup;
++        const auto takeStart = std::chrono::steady_clock::now();
++        double gameTime = 0.0;
++        const bool took = ga2_zerocopy::take(0, id, fw, fh, shared, s_small, sw, sh, setup, &split, &gameTime);
++        g_presentStats.takeMs += msSince(takeStart);
++        if (took)
++        {
++            const auto uploadStart = std::chrono::steady_clock::now();
++            if (shared)
++            {
++                shown = Texture2D{id, int(fw), int(fh), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                s_sharedShown = true;
++            }
++            else
++            {
++                // A frame read back before zero copy started: uploaded as before.
++                if (tex.width != int(sw) || tex.height != int(sh))
++                {
++                    UnloadTexture(tex);
++                    Image image = GenImageColor(int(sw), int(sh), BLACK);
++                    tex = LoadTextureFromImage(image);
++                    UnloadImage(image);
++                    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
++                }
++                UpdateTexture(tex, s_small.data());
++                shown = tex;
++                s_sharedShown = false;
++                fw = sw;
++                fh = sh;
++                ++g_presentStats.uploads;
++            }
++            g_presentStats.uploadMs += msSince(uploadStart);
++            ga2_framepace::notePresented();
++            s_width = fw;
++            s_height = fh;
++            if (ga2_pgs::stereo())
++                ga2_vr::setEyeFrame(0, shown.id, shown.width, shown.height, float(fw), float(fh), setup, split);
++            ps2_mouse::setFrame(s_small.data(), sw, sh);
++            ga2_zerocopy::presentShot(shown.id, shown.width, shown.height, gameTime);
++        }
++        else if (!s_sharedShown)
++            shown = tex;
++        outWidth = s_width ? s_width : FB_WIDTH;
++        outHeight = s_height ? s_height : DEFAULT_DISPLAY_HEIGHT;
++        return;
++    }
++    shown = tex;
+     if (ga2_pgs::rendering())
+     {
+         // GPU GS: present the newest scanout; the texture follows its size.
+@@ -514,6 +619,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             }
+             outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+             outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
++            shown = tex;
+             return;
+         }
+         uint32_t w = 0u, h = 0u;
+@@ -566,7 +672,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+         bool eye0Split = false;
+         const auto takeStart = std::chrono::steady_clock::now();
+-        const bool took = ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split);
++        double gameTime = 0.0;
++        const bool took = ga2_pgs::takeEyeFrame(0, s_pgsFrame, w, h, setup, &eye0Split, &gameTime);
+         g_presentStats.takeMs += msSince(takeStart);
+         if (took && w && h && s_pgsFrame.size() >= size_t(w) * h * 4u)
+         {
+@@ -588,7 +695,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             if (ga2_pgs::stereo())
+                 ga2_vr::setEyeFrame(0, tex.id, tex.width, tex.height, float(w), float(h), setup, eye0Split);
+             ps2_mouse::setFrame(s_pgsFrame.data(), w, h);
++            ga2_zerocopy::presentShot(tex.id, tex.width, tex.height, gameTime);
+         }
++        shown = tex;
+         outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
+         outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
+         return;
+@@ -3113,6 +3222,7 @@ void PS2Runtime::run()
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+     Texture2D frameTex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
++    Texture2D shownTex = frameTex; // what the loop draws: frameTex, or a zero-copy shared image (UploadFrame)
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -3180,7 +3290,7 @@ void PS2Runtime::run()
+         if (ga2_framepace::enabled() && ga2_pgs::rendering() && !ga2_vr::headsetRunning())
+             ga2_pgs::waitFreshFrame(16);
+         g_presentStats.waitMs += msSince(waitStart);
+-        UploadFrame(frameTex, this, presentWidth, presentHeight);
++        UploadFrame(frameTex, shownTex, this, presentWidth, presentHeight);
+         const auto drawStart = std::chrono::steady_clock::now();
+ 
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+@@ -3188,7 +3298,7 @@ void PS2Runtime::run()
+         // VR headset: both eyes first (paced by the headset); the window
+         // keeps the flat picture.
+         if (ga2_vr::headsetRunning())
+-            ga2_vr::renderHeadset(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight,
++            ga2_vr::renderHeadset(shownTex.id, shownTex.width, shownTex.height, srcWidth, srcHeight,
+                                   ga2_activity::wideFrame());
+         BeginDrawing();
+         ClearBackground(BLACK);
+@@ -3196,11 +3306,11 @@ void PS2Runtime::run()
+         ga2_present::Rect dstRect;
+         if (ga2_vr::mode() == ga2_vr::Mode::Preview)
+         {
+-            ga2_vr::drawPreview(frameTex.id, frameTex.width, frameTex.height, srcWidth, srcHeight, ga2_activity::wideFrame());
++            ga2_vr::drawPreview(shownTex.id, shownTex.width, shownTex.height, srcWidth, srcHeight, ga2_activity::wideFrame());
+             dstRect = ga2_present::Rect{0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight())};
+         }
+         else
+-            dstRect = ga2_present::draw(frameTex, srcWidth, srcHeight);
++            dstRect = ga2_present::draw(shownTex, srcWidth, srcHeight);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+@@ -3210,6 +3320,7 @@ void PS2Runtime::run()
+         const auto swapStart = std::chrono::steady_clock::now();
+         g_presentStats.drawMs += std::chrono::duration<double, std::milli>(swapStart - drawStart).count();
+         EndDrawing();
++        ga2_zerocopy::endFrame(); // shared images the GPU finished with go back to the GS
+         g_presentStats.swapMs += msSince(swapStart);
+         ++g_presentStats.loops;
+         if (presentPerf())
+-- 
+2.56.0
+

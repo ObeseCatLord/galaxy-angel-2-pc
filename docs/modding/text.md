@@ -272,8 +272,9 @@ resolution that looks blocky next to the sharp 3D and the 4x texture packs. With
 sharp text on, every glyph texture the GS samples is replaced by the same
 character drawn from the bundled vector font (`native/fonts/NotoSansJP-Medium.otf`,
 shipped as `<app>/fonts/`; `GA2_UI_FONT=<file>` overrides) at the internal
-resolution. The layout is untouched: positions, advances and line breaks come
-from the game's own drawers.
+resolution. Full-width (Japanese) text keeps the game's layout. Latin text is
+laid out natively: the font's own advances and kerning, placed to 1/16 pixel
+(below); line breaks stay the game's.
 
 **Mechanism** (runtime `gs_hitext.cpp`, `gs_texpacks.cpp`, game side
 `native/compat/ga2_text.cpp`):
@@ -292,10 +293,72 @@ from the game's own drawers.
    one small 4-bit region per character (`w x 18`: 9x18, 5x18, ...). A region
    whose position and width are a metrics cell, in a texture that looks like the
    atlas (128 wide, ink inside the cells, decoded from the same registers), is
-   answered with that character drawn from the vector font at 4x/2x, fitted to
-   the game's glyph ink in the cell. The rest of the atlas (the solid block
-   below the last row) is never replaced.
-4. Software GS (`GA2_GS=cpu`) never runs the replacement; nothing changes there.
+   answered with that character drawn from the vector font at 4x/2x, at its own
+   shape with its ink centred in the cell (narrowed only if wider than the
+   cell). The rest of the atlas (the solid block below the last row) is never
+   replaced.
+4. **Native text.** With sharp text on, the port draws the text itself instead
+   of the games' glyph sprites. The drawers place half-width characters by the
+   bitmap font's widths + 1 and every space 10 pixels apart, in whole pixels,
+   and the GS snaps a sprite's coverage to whole PS2 pixels, so per-glyph
+   sprites can be neither spaced nor placed finely. The message drawer and the
+   two string drawers (`0x111c70`, `0x110c78` without padding, `0x111298` on
+   Zettai) are laid out again before they run: Latin characters with the font's
+   advances and kerning (`ga2_hitext::latinLayout`), full-width ones at the
+   game's advance, keeping the drawer's anchor (left, right edge or centre) and
+   its line breaks. Each piece of a line in one colour (the typewriter's fading
+   characters are pieces of their own) is rendered whole from the vector font at
+   the internal resolution, Japanese at the size it is drawn and Latin with full
+   descenders (`ga2_hitext::noteRun` / `runImage`). The original drawer then
+   draws one "ticket" character per piece: a reserved code (lead 0xF8, trail
+   0x40 + slot) whose 24x24 bitmap, written to a ring of 184 slots at
+   0x52000 (kernel RAM; the games upload glyphs by DMA reference, so a slot
+   must outlive the frame), the texture replacement answers with the piece's
+   image. The screen-rect setter (`0x233308`; 0x88 past the colour setter on
+   every disc) hook moves each ticket sprite onto its piece's rectangle (by
+   difference, so the widescreen HUD placement still applies). The games'
+   texel setter puts u, v half a texel in, so a ticket stretched across a piece
+   shows its image from 1/48 of the piece in, and the glyph texture is clamped
+   at texel 23 of 24: the glyphs are rendered 1/48 further in and the piece is
+   48/45 of its content, so everything drawn lies where the image maps cleanly
+   (exact texel coordinates instead make the GS read past the image's start,
+   next to the glyph texture). Each
+   piece (its rectangle, colour and layout) is also reported to the
+   presentation (`ga2_hitext::notePiece`, below). The GS still
+   composes the text, so colours, fades, layers and VR work as before. Button
+   icons and characters the font lacks stay the game's glyphs at their new
+   place. The string drawers' return value (end x / width), which callers use
+   to place what follows (the dots after a speaker's name), is the native one.
+   The number drawer keeps its fixed digit slots. Measured over the English
+   script: wrapped at 372 pixels with the game's widths, no dialogue line
+   overflows with the font's (the 12 that do, unbreakable "Momomomo...!" lines,
+   overflow with the game's widths too). `GA2_NATIVE_TEXT_LAYOUT=0` keeps the
+   game's layout and glyph sprites.
+5. **Window-resolution text** (`ga2_present.cpp`, 2D pictures above 640x448
+   on the desktop). The GS's rendering of text is bound to the internal
+   resolution and goes through the GS's sampling, the 2D filters and the
+   scaling to the window; text is instead drawn again at the window's own
+   pixels, like any desktop text:
+   - The pieces of the last frame are drawn into a layer at the internal
+     resolution exactly as the GS drew them (same images, colours, the GS's
+     half-pixel sample offset), so it is known what the GS put where.
+   - Occlusion, per PS2 pixel: inside the strokes (coverage k >= 0.8) a
+     visible text pixel lies within 1 - k of colour * k, whatever lies behind;
+     each stroke sample is matched within half a PS2 pixel (the GS's own
+     rendering has sub-pixel combs), and an area vote (PS2 pixels within 3)
+     decides, so a menu or a fade over the text counts and a stray mismatch
+     does not.
+   - Where not occluded, the text's footprint (half a PS2 pixel wider) is
+     filled from its surroundings: the 2D filters, debanding and the scaling
+     then work on the art alone.
+   - Each piece is rendered at the window's scale from the vector font and
+     drawn over the shown picture pixel for pixel, in its colour, except where
+     occluded (there the GS's text stays).
+   `GA2_TEXT_OVERLAY=0` keeps the GS's text; `GA2_TEXT_OVERLAY_DEBUG=1` draws
+   the overlay in magenta over the picture with the text taken out;
+   `GA2_TEXT_OVERLAY_DUMP=<dir>` writes the layers now and then. In 3D scenes
+   and in VR the GS's text is shown.
+6. Software GS (`GA2_GS=cpu`) never runs the replacement; nothing changes there.
 
 **Fit.** Calibrated by comparing all 6,355 ideographs of the games' font with
 Noto Sans JP Medium (`tools/modding/make_sjis_table.py` makes the Shift-JIS to
@@ -307,8 +370,8 @@ Unicode table, code page 932):
   0.75 px from the game's glyph (punctuation the game font draws elsewhere) are
   moved to the game's position; nothing is rescaled.
 - Half-width: one vertical transform (em 17.1 px, baseline row 15.75 of the
-  18-pixel cell), per-glyph horizontal fit to the game's ink box (stretch 0.5 to
-  1.15, never wider than the metrics' cell), descenders longer than the game's
+  18-pixel cell), each glyph at its own width (with `GA2_NATIVE_TEXT_LAYOUT=0`:
+  fitted to the game's ink box, stretch 0.5 to 1.15), descenders longer than the game's
   are compressed below the baseline, glyphs drawn at another height than the font
   does (tilde, caret, grave accent) go to the game's height. The backslash cell is a yen sign.
 - Characters the font lacks keep the game's own glyph.

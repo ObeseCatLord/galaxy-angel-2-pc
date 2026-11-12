@@ -1,0 +1,620 @@
+From e2cc82b3e886acef515563c5d7139d6ca8a26c3b Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 16:03:10 -0600
+Subject: [PATCH] GS worker: GIF packets processed off the EE thread
+
+The GIF arbiter hands drained packets to one worker thread, which runs the
+paraLLEl-GS tap and the CPU GS frontend for each in stream order (the
+texture replacement still decodes from GS memory exactly as the packet saw
+it). Packets with an A+D write the EE sees at once (SIGNAL, FINISH, LABEL,
+display registers 0x59-0x5F) run on the draining thread after the queue
+empties, so CSR bits and the GS interrupt keep their timing. GS public
+entries, ga2_pgs::vsync and local-to-host reads wait for the worker first.
+The worker is woken per 64 packets or by a sync. Only with paraLLEl-GS;
+GA2_GS_THREAD=0 keeps the old path. GA2_PERF reports queued/inline packets
+and time spent waiting.
+
+Zettai ship map, 1x: game thread 54% -> 45% of a core at 60 fps (worker
+14%), frames identical; at a 175 fps cap it holds 120 fps (143 iterations/s
+at 175, was 124).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ps2xRuntime/include/runtime/gs/gs_frontend.h  |   9 +
+ ps2xRuntime/include/runtime/gs/gs_pgs.h       |   3 +
+ .../include/runtime/gs/ps2_gif_arbiter.h      |  52 +++-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   7 +
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        |  13 +
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp             |  15 ++
+ ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    | 227 +++++++++++++++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  15 ++
+ 8 files changed, 332 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index ead0993..51b50f3 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -185,8 +185,17 @@ public:
+     // Called with the CSR bits (SIGNAL=1, FINISH=2) that became set while
+     // unmasked in IMR; the runtime raises INTC cause 0 (GS) for them.
+     void setInterruptSink(std::function<void(uint32_t)> sink) { m_interruptSink = std::move(sink); }
++    // Waits for the GS worker (GifArbiter::sync): every public entry the EE side
++    // uses calls it first, so it sees the packets handed over before it.
++    void setPacketSync(std::function<void()> sync) { m_packetSync = std::move(sync); }
+ private:
++    void syncPackets() const
++    {
++        if (m_packetSync)
++            m_packetSync();
++    }
+     std::function<void(uint32_t)> m_interruptSink;
++    std::function<void()> m_packetSync;
+     void raiseCsrInterrupt(uint32_t bit, uint64_t maskBit);
+     mutable std::recursive_mutex m_stateMutex;
+     mutable std::mutex m_backendLifetimeMutex;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 20a6d38..4a47020 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -10,6 +10,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -35,6 +36,8 @@ namespace ga2_pgs
+     // Texture packs (gs_texpacks.h): the CPU copy of GS memory to identify
+     // textures from, and the pack folders to use (highest priority first).
+     void setVramMirror(const uint8_t *vram);
++    // Waits for the GS worker (GifArbiter::sync); vsync and readLocalToHost call it before they touch the GS.
++    void setPacketSync(std::function<void()> sync);
+     void setTexturePacks(const std::vector<std::string> &dirs);
+     // Button prompt style for the detected input device (gs_texpacks.h).
+     void setButtonStyle(const std::string &style);
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 0c818db..1a0426c 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -1,8 +1,12 @@
+ #ifndef PS2_GIF_ARBITER_H
+ #define PS2_GIF_ARBITER_H
+ 
++#include <atomic>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
++#include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ enum class GifPathId : uint8_t
+@@ -31,11 +35,40 @@ public:
+ 
+     GifArbiter() = default;
+     explicit GifArbiter(ProcessPacketFn processFn);
++    ~GifArbiter();
++    GifArbiter(const GifArbiter &) = delete;
++    GifArbiter &operator=(const GifArbiter &) = delete;
+ 
+-    void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
++    void setProcessPacketFn(ProcessPacketFn fn)
++    {
++        sync();
++        m_processFn = std::move(fn);
++    }
+     // Observes every packet in final stream order, with its path (GPU GS tee).
+     using TapFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+-    void setTapFn(TapFn fn) { m_tapFn = std::move(fn); }
++    void setTapFn(TapFn fn)
++    {
++        sync();
++        m_tapFn = std::move(fn);
++    }
++
++    // The GS worker: drained packets go to one thread that runs the tap and the
++    // process function for each, in stream order. A packet whose effects the EE
++    // can see at once (SIGNAL, FINISH, LABEL, the display registers) runs on the
++    // draining thread after everything before it. sync() returns once every
++    // packet handed over so far has been processed (at once on the worker).
++    void startWorker();
++    void stopWorker();
++    void sync();
++    bool workerRunning() const { return m_workerRunning; }
++    static bool onWorkerThread();
++    // Packets run inline vs. handed to the worker, and syncs that waited (since the last call).
++    struct WorkerStats
++    {
++        uint64_t inlinePackets = 0, queuedPackets = 0, waits = 0;
++        double waitMs = 0.0;
++    };
++    WorkerStats takeWorkerStats();
+ 
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false,
+                 const uint8_t *tapData = nullptr, uint32_t tapBytes = 0u);
+@@ -50,7 +83,22 @@ private:
+     size_t m_count = 0;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
++    static bool needsInline(const uint8_t *data, uint32_t sizeBytes);
+     static uint8_t pathPriority(GifPathId id);
++    void runPacket(GifPathId pathId, const std::vector<uint8_t> &data, bool hasTapData, const std::vector<uint8_t> &tapData);
++    void enqueue(GifArbiterPacket &pkt);
++    void workerLoop();
++
++    std::thread m_worker;
++    bool m_workerRunning = false;
++    std::mutex m_workerMutex;
++    std::condition_variable m_workCv, m_idleCv;
++    std::vector<GifArbiterPacket> m_incoming, m_working; // jobs keep their buffers between batches
++    size_t m_incomingCount = 0;
++    size_t m_incomingBytes = 0;
++    bool m_workerSleeping = false, m_stopWorker = false;
++    std::atomic<uint64_t> m_submitted{0}, m_completed{0};
++    WorkerStats m_stats;
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c7072a3..a471720 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2599,6 +2599,13 @@ void EeScheduler::processEvent(const EeEvent &event)
+                                  double(vu1.runs) / seconds, double(vu1.cycles) / seconds / 1e6,
+                                  double(vu1.nanos) / seconds / 1e6,
+                                  vu1.cycles ? double(vu1.nanos) / double(vu1.cycles) : 0.0);
++                    if (m_runtime.gifArbiter().workerRunning())
++                    {
++                        const auto w = m_runtime.gifArbiter().takeWorkerStats();
++                        std::fprintf(stderr, "[ga2 perf] gs worker: %.0f packets/s queued, %.0f/s inline, %.0f waits/s, %.2f ms/s waiting\n",
++                                     double(w.queuedPackets) / seconds, double(w.inlinePackets) / seconds, double(w.waits) / seconds,
++                                     w.waitMs / seconds);
++                    }
+                     // Where each live guest thread is (status, resume pc, ra).
+                     std::fprintf(stderr, "[ga2 perf] threads:");
+                     for (const auto &[id, thread] : m_threads)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 4d94518..34d2410 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -125,6 +125,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ 
+ void GS::reset()
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::memset(m_ctx, 0, sizeof(m_ctx));
+     m_prim = {};
+@@ -203,6 +204,7 @@ GSContext &GS::activeContext()
+ 
+ void GS::snapshotVRAM()
+ {
++    syncPackets();
+     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
+     // feeding the GS while a backend performs host-side conversion. Keep the
+     // selected backend alive and unswappable for the duration of the call.
+@@ -231,6 +233,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
+ 
+ GSDebugSnapshot GS::getDebugSnapshot() const
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+ 
+     GSDebugSnapshot snapshot{};
+@@ -646,6 +649,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+@@ -746,6 +750,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+@@ -792,6 +797,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            const uint8_t *data,
+                            uint32_t sizeBytes)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     ga2_pgs::imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+@@ -1071,6 +1077,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     {
+         // Direct register writes from HLE stubs: forward as a one-register A+D packet.
+@@ -1631,12 +1638,14 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+@@ -1656,6 +1665,7 @@ void GS::raiseCsrInterrupt(uint32_t bit, uint64_t maskBit)
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (ga2_pgs::active())
+     {
+@@ -1677,6 +1687,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ 
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
++    syncPackets();
+     if (!backend)
+         backend = std::make_unique<GSCpuBackend>();
+ 
+@@ -1706,12 +1717,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
+ }
+ 
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    syncPackets();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (m_backend)
+         m_backend->WriteVram(psm, base, bw, x, y, value);
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index f00f7c9..0c4ed2d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -785,6 +785,18 @@ namespace
+ 
+ namespace ga2_pgs
+ {
++    namespace
++    {
++        std::function<void()> g_packetSync;
++        void syncPackets()
++        {
++            if (g_packetSync)
++                g_packetSync();
++        }
++    }
++
++    void setPacketSync(std::function<void()> sync) { g_packetSync = std::move(sync); }
++
+     bool rendering() { return g_rendering.load(std::memory_order_acquire); }
+ 
+     bool active()
+@@ -894,6 +906,7 @@ namespace ga2_pgs
+ 
+     void readLocalToHost(uint8_t *dst, uint32_t qwords)
+     {
++        syncPackets();
+         State &s = state();
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+@@ -910,6 +923,7 @@ namespace ga2_pgs
+ 
+     void vsync(const GSRegisters &r)
+     {
++        syncPackets();
+         State &s = state();
+         std::lock_guard<std::mutex> lock(s.mutex);
+         if (!initLocked(s))
+@@ -1254,6 +1268,7 @@ namespace ga2_pgs
+     void gifTransfer(uint32_t, const uint8_t *, size_t) {}
+     void captureNow() {}
+     void setVramMirror(const uint8_t *) {}
++    void setPacketSync(std::function<void()>) {}
+     void setTexturePacks(const std::vector<std::string> &) {}
+     void setButtonStyle(const std::string &) {}
+     void applySettings() {}
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 0a9dd57..51a73ab 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,6 +1,14 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
+ #include <cstring>
++#include <exception>
++
++namespace
++{
++    thread_local bool t_onGsWorker = false;
++}
+ 
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+@@ -90,17 +98,19 @@ void GifArbiter::drain()
+     for (size_t i = 0; i < m_count; ++i)
+     {
+         auto &pkt = m_queue[i];
+-        if (!pkt.data.empty())
++        if (pkt.data.empty())
++            continue;
++        if (m_workerRunning && !t_onGsWorker)
+         {
+-            if (m_tapFn)
++            if (!needsInline(pkt.data.data(), static_cast<uint32_t>(pkt.data.size())))
+             {
+-                if (!pkt.hasTapData)
+-                    m_tapFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+-                else if (!pkt.tapData.empty())
+-                    m_tapFn(pkt.pathId, pkt.tapData.data(), static_cast<uint32_t>(pkt.tapData.size()));
++                enqueue(pkt);
++                continue;
+             }
+-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            sync();
++            ++m_stats.inlinePackets;
+         }
++        runPacket(pkt.pathId, pkt.data, pkt.hasTapData, pkt.tapData);
+     }
+     m_count = 0;
+     // The queue keeps its slots (and their buffers) between drains so steady
+@@ -123,3 +133,206 @@ uint8_t GifArbiter::pathPriority(GifPathId id)
+ {
+     return static_cast<uint8_t>(id);
+ }
++
++void GifArbiter::runPacket(GifPathId pathId, const std::vector<uint8_t> &data, bool hasTapData, const std::vector<uint8_t> &tapData)
++{
++    if (m_tapFn)
++    {
++        if (!hasTapData)
++            m_tapFn(pathId, data.data(), static_cast<uint32_t>(data.size()));
++        else if (!tapData.empty())
++            m_tapFn(pathId, tapData.data(), static_cast<uint32_t>(tapData.size()));
++    }
++    m_processFn(data.data(), static_cast<uint32_t>(data.size()));
++}
++
++// A packet the EE sees the effect of at once: an A+D write to SIGNAL, FINISH or
++// LABEL (CSR bits, SIGLBLID, the GS interrupt) or to the display registers
++// (0x59-0x5F, kept in the privileged registers). Such a packet runs on the
++// draining thread. A REGLIST naming A+D is taken inline too (no GS defines it).
++bool GifArbiter::needsInline(const uint8_t *data, uint32_t sizeBytes)
++{
++    uint32_t offset = 0u;
++    while (offset + 16u <= sizeBytes)
++    {
++        uint64_t tagLo = 0, tagHi = 0;
++        std::memcpy(&tagLo, data + offset, sizeof(tagLo));
++        std::memcpy(&tagHi, data + offset + 8u, sizeof(tagHi));
++        offset += 16u;
++        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
++        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++        if (nreg == 0u)
++            nreg = 16u;
++        uint32_t adMask = 0u; // descriptor slots that are A+D
++        for (uint32_t r = 0; r < nreg; ++r)
++            if (((tagHi >> (r * 4u)) & 0xFu) == 0xEu)
++                adMask |= 1u << r;
++        if (flg == 0u) // PACKED
++        {
++            const uint64_t bytes = uint64_t(nloop) * nreg * 16u;
++            if (adMask != 0u)
++            {
++                const uint64_t end = std::min<uint64_t>(sizeBytes, offset + bytes);
++                uint32_t r = 0;
++                for (uint64_t q = offset; q + 16u <= end; q += 16u)
++                {
++                    if (adMask & (1u << r))
++                    {
++                        const uint8_t addr = data[q + 8u];
++                        if ((addr >= 0x59u && addr <= 0x5Fu) || (addr >= 0x60u && addr <= 0x62u))
++                            return true;
++                    }
++                    if (++r == nreg)
++                        r = 0;
++                }
++            }
++            if (bytes > sizeBytes - offset)
++                return false;
++            offset += static_cast<uint32_t>(bytes);
++        }
++        else if (flg == 1u) // REGLIST
++        {
++            if (adMask != 0u)
++                return true;
++            const uint64_t bytes = (uint64_t(nloop) * nreg * 8u + 15u) & ~uint64_t(15u);
++            if (bytes > sizeBytes - offset)
++                return false;
++            offset += static_cast<uint32_t>(bytes);
++        }
++        else if (flg == 2u) // IMAGE
++        {
++            const uint64_t bytes = uint64_t(nloop) * 16u;
++            if (bytes > sizeBytes - offset)
++                return false;
++            offset += static_cast<uint32_t>(bytes);
++        }
++    }
++    return false;
++}
++
++void GifArbiter::enqueue(GifArbiterPacket &pkt)
++{
++    bool backlog = false;
++    {
++        std::lock_guard<std::mutex> lock(m_workerMutex);
++        if (m_incomingCount == m_incoming.size())
++            m_incoming.emplace_back();
++        GifArbiterPacket &job = m_incoming[m_incomingCount++];
++        job.pathId = pkt.pathId;
++        job.hasTapData = pkt.hasTapData;
++        job.data.swap(pkt.data); // the packet slot takes the job's old buffer
++        job.tapData.swap(pkt.tapData);
++        m_incomingBytes += job.data.size() + job.tapData.size();
++        m_submitted.fetch_add(1, std::memory_order_relaxed);
++        // Woken per batch, not per packet (a frame is thousands of small XGKICK packets); sync() wakes it for the rest.
++        if (m_workerSleeping && m_incomingCount >= 64u)
++            m_workCv.notify_one();
++        // Bound what waits: a frame's packets are a few MB at most.
++        backlog = m_incomingCount >= 16384u || m_incomingBytes >= (64u << 20);
++    }
++    ++m_stats.queuedPackets;
++    if (backlog)
++        sync();
++}
++
++void GifArbiter::workerLoop()
++{
++    t_onGsWorker = true;
++    std::unique_lock<std::mutex> lock(m_workerMutex);
++    for (;;)
++    {
++        m_workerSleeping = true;
++        m_workCv.wait(lock, [this] { return m_incomingCount != 0u || m_stopWorker; });
++        m_workerSleeping = false;
++        if (m_incomingCount == 0u)
++            break; // stopping, nothing left
++        m_working.swap(m_incoming);
++        const size_t count = m_incomingCount;
++        m_incomingCount = 0;
++        m_incomingBytes = 0;
++        lock.unlock();
++        for (size_t i = 0; i < count; ++i)
++        {
++            GifArbiterPacket &job = m_working[i];
++            try
++            {
++                runPacket(job.pathId, job.data, job.hasTapData, job.tapData);
++            }
++            catch (const std::exception &e)
++            {
++                std::fprintf(stderr, "[gs worker] packet failed: %s\n", e.what());
++            }
++            catch (...)
++            {
++                std::fprintf(stderr, "[gs worker] packet failed\n");
++            }
++            constexpr size_t kRetainBytes = 256u * 1024u;
++            if (job.data.capacity() > kRetainBytes)
++                std::vector<uint8_t>().swap(job.data);
++            if (job.tapData.capacity() > kRetainBytes)
++                std::vector<uint8_t>().swap(job.tapData);
++        }
++        lock.lock();
++        m_completed.fetch_add(count, std::memory_order_release);
++        m_idleCv.notify_all();
++    }
++}
++
++void GifArbiter::startWorker()
++{
++    if (m_workerRunning)
++        return;
++    m_stopWorker = false;
++    m_workerRunning = true;
++    m_worker = std::thread([this] { workerLoop(); });
++}
++
++void GifArbiter::stopWorker()
++{
++    if (!m_workerRunning)
++        return;
++    {
++        std::lock_guard<std::mutex> lock(m_workerMutex);
++        m_stopWorker = true;
++        m_workCv.notify_one();
++    }
++    if (m_worker.joinable())
++        m_worker.join();
++    m_workerRunning = false;
++}
++
++GifArbiter::~GifArbiter()
++{
++    stopWorker();
++}
++
++bool GifArbiter::onWorkerThread()
++{
++    return t_onGsWorker;
++}
++
++void GifArbiter::sync()
++{
++    if (!m_workerRunning || t_onGsWorker)
++        return;
++    const uint64_t target = m_submitted.load(std::memory_order_relaxed);
++    if (m_completed.load(std::memory_order_acquire) >= target)
++        return;
++    const auto t0 = std::chrono::steady_clock::now();
++    {
++        std::unique_lock<std::mutex> lock(m_workerMutex);
++        if (m_workerSleeping && m_incomingCount != 0u)
++            m_workCv.notify_one();
++        m_idleCv.wait(lock, [&] { return m_completed.load(std::memory_order_acquire) >= target; });
++    }
++    ++m_stats.waits;
++    m_stats.waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++
++GifArbiter::WorkerStats GifArbiter::takeWorkerStats()
++{
++    const WorkerStats out = m_stats;
++    m_stats = WorkerStats{};
++    return out;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 6e77437..fc8770e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -721,6 +721,10 @@ PS2Runtime::~PS2Runtime()
+     try
+     {
+         requestStop();
++        // The GS worker calls into m_gs, which is destroyed before the arbiter.
++        m_gifArbiter.stopWorker();
++        ga2_pgs::setPacketSync({});
++        m_gs.setPacketSync({});
+         if (m_eeScheduler) m_eeScheduler->discardInvocations();
+         ps2_syscalls::resetDeci2State(this);
+     }
+@@ -983,8 +987,19 @@ bool PS2Runtime::syncCoreSubsystems()
+                                     { m_gs.processGIFPacket(data, size); });
+     ga2_pgs::setVramMirror(m_memory.getGSVRAM());
+     if (ga2_pgs::active())
++    {
+         m_gifArbiter.setTapFn([](GifPathId path, const uint8_t *data, uint32_t size)
+                               { ga2_pgs::gifTransfer(static_cast<uint32_t>(path), data, size); });
++        // Both GS consumers (paraLLEl-GS and the CPU's copy of GS memory) run on the GS worker; GA2_GS_THREAD=0
++        // keeps them on the thread that drains the packets.
++        const char *thread = std::getenv("GA2_GS_THREAD");
++        if (!thread || std::strcmp(thread, "0") != 0)
++        {
++            m_gs.setPacketSync([this] { m_gifArbiter.sync(); });
++            ga2_pgs::setPacketSync([this] { m_gifArbiter.sync(); });
++            m_gifArbiter.startWorker();
++        }
++    }
+     m_memory.setGifArbiter(&m_gifArbiter);
+     // The disc changer counts guest vsyncs, not wall time.
+     static PS2Runtime *s_clockOwner = nullptr;
+-- 
+2.56.0
+

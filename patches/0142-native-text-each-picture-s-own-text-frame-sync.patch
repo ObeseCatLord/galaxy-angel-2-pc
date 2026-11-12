@@ -1,0 +1,270 @@
+From d6acf4f86cc6e35c8e645404c9714c4ddcf103e1 Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:52:40 -0600
+Subject: [PATCH] native text: each picture's own text (frame sync)
+
+The port's text pieces and prompt draws noted for a frame are sealed at the vsync after the game flipped to it and kept with that frame's readback; the presentation takes them with the picture, so the text drawn over a picture is exactly that picture's (no doubled glyphs when the picture lags a frame).
+---
+ ps2xRuntime/include/runtime/ga2_hitext.h | 11 ++++
+ ps2xRuntime/src/lib/gs/gs_hitext.cpp     | 75 +++++++++++-------------
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp        | 22 ++++++-
+ 3 files changed, 66 insertions(+), 42 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ga2_hitext.h b/ps2xRuntime/include/runtime/ga2_hitext.h
+index 74ac722..c99f35a 100644
+--- a/ps2xRuntime/include/runtime/ga2_hitext.h
++++ b/ps2xRuntime/include/runtime/ga2_hitext.h
+@@ -96,6 +96,7 @@ namespace ga2_hitext
+         uint8_t r = 0x80, g = 0x80, b = 0x80, a = 0x80;
+     };
+     void notePiece(const TextPiece &piece);
++    // The text of the frame the presentation shows (set by setPresented).
+     std::vector<TextPiece> textPieces();
+     // Button prompts and prompt words the texture replacement drew into the games' textures, where the GS drew them
+     // this frame (gs_texpacks.cpp, GS thread): the presentation draws them again at the window's resolution.
+@@ -108,6 +109,16 @@ namespace ga2_hitext
+     };
+     void notePromptDraw(const PromptDraw &draw);
+     std::vector<PromptDraw> promptDraws();
++    // Frame sync: the GS bridge seals what was noted for a frame at the vsync after the game flipped to it
++    // (newFrame), and keeps the sealed text with that frame's picture; the presentation hands it back when it takes
++    // the picture, so the text drawn over a picture is exactly that picture's.
++    struct FrameText
++    {
++        std::vector<TextPiece> pieces;
++        std::vector<PromptDraw> prompts;
++    };
++    std::shared_ptr<const FrameText> sealFrame(bool newFrame);
++    void setPresented(std::shared_ptr<const FrameText> text);
+     // A piece drawn at any scale (game pixels -> pixels: sx, sy) with its rectangle's top left at (ox, oy) pixels,
+     // into w x h: plain coverage 0..255 (not the GS levels), no inset.
+     bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out);
+diff --git a/ps2xRuntime/src/lib/gs/gs_hitext.cpp b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+index f12cfc5..c389ec9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_hitext.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_hitext.cpp
+@@ -738,10 +738,6 @@ namespace ga2_hitext
+ 
+     namespace
+     {
+-        std::mutex g_pieceMutex;
+-        std::vector<TextPiece> g_piecesNow, g_piecesDone;
+-        uint64_t g_piecesTag = 0;
+-
+         // The pieces' glyphs at scale (sx, sy) with the piece's top left at (ox, oy) on the canvas.
+         void drawRun(Canvas &canvas, const RunSpec &spec, float sx, float sy, float ox, float oy)
+         {
+@@ -769,58 +765,57 @@ namespace ga2_hitext
+         }
+     }
+ 
+-    void notePiece(const TextPiece &piece)
++    namespace
+     {
+-        const uint64_t tag = ga2_activity::vsyncs.load(std::memory_order_relaxed);
+-        std::lock_guard<std::mutex> lock(g_pieceMutex);
+-        if (tag != g_piecesTag)
+-        {
+-            // A new frame's text: the previous frame's is complete.
+-            g_piecesDone.swap(g_piecesNow);
+-            g_piecesNow.clear();
+-            g_piecesTag = tag;
+-        }
+-        if (g_piecesNow.size() < 512)
+-            g_piecesNow.push_back(piece);
++        std::mutex g_frameMutex;
++        FrameText g_now;                                  // noted since the last sealed frame
++        std::shared_ptr<const FrameText> g_sealed = std::make_shared<FrameText>();
++        std::shared_ptr<const FrameText> g_presented = std::make_shared<FrameText>();
+     }
+ 
+-    std::vector<TextPiece> textPieces()
++    void notePiece(const TextPiece &piece)
+     {
+-        const uint64_t now = ga2_activity::vsyncs.load(std::memory_order_relaxed);
+-        std::lock_guard<std::mutex> lock(g_pieceMutex);
+-        if (now > g_piecesTag + 3)
+-            return {}; // no text lately
+-        return g_piecesDone;
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        if (g_now.pieces.size() < 512)
++            g_now.pieces.push_back(piece);
+     }
+ 
+-    namespace
++    void notePromptDraw(const PromptDraw &draw)
+     {
+-        std::mutex g_promptMutex;
+-        std::vector<PromptDraw> g_promptsNow, g_promptsDone;
+-        uint64_t g_promptsTag = 0;
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        if (g_now.prompts.size() < 256)
++            g_now.prompts.push_back(draw);
+     }
+ 
+-    void notePromptDraw(const PromptDraw &draw)
++    std::shared_ptr<const FrameText> sealFrame(bool newFrame)
+     {
+-        const uint64_t tag = ga2_activity::vsyncs.load(std::memory_order_relaxed);
+-        std::lock_guard<std::mutex> lock(g_promptMutex);
+-        if (tag != g_promptsTag)
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        if (newFrame)
+         {
+-            g_promptsDone.swap(g_promptsNow);
+-            g_promptsNow.clear();
+-            g_promptsTag = tag;
++            g_sealed = std::make_shared<FrameText>(std::move(g_now));
++            g_now = FrameText{};
+         }
+-        if (g_promptsNow.size() < 256)
+-            g_promptsNow.push_back(draw);
++        return g_sealed; // no new frame: the picture on screen is still the last one
++    }
++
++    void setPresented(std::shared_ptr<const FrameText> text)
++    {
++        if (!text)
++            return;
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        g_presented = std::move(text);
++    }
++
++    std::vector<TextPiece> textPieces()
++    {
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        return g_presented->pieces;
+     }
+ 
+     std::vector<PromptDraw> promptDraws()
+     {
+-        const uint64_t now = ga2_activity::vsyncs.load(std::memory_order_relaxed);
+-        std::lock_guard<std::mutex> lock(g_promptMutex);
+-        if (now > g_promptsTag + 3)
+-            return {};
+-        return g_promptsDone;
++        std::lock_guard<std::mutex> lock(g_frameMutex);
++        return g_presented->prompts;
+     }
+ 
+     bool renderRunScaled(const RunSpec &spec, float sx, float sy, float ox, float oy, int w, int h, Alpha &out)
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 4372c37..f00f7c9 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -9,6 +9,7 @@
+ #include "runtime/ga2_settings.h"
+ #include "runtime/ps2_memory.h"
+ #include "gs_texpacks.h"
++#include "runtime/ga2_hitext.h"
+ 
+ #include "context.hpp"
+ #include "device.hpp"
+@@ -133,6 +134,7 @@ namespace
+         std::atomic<bool> pending{false};
+         ga2_stereo::Setup setup; // the stereo setup of the copied frame
+         bool uiSplit = false;    // the frame was drawn without its UI layer (HUD panel)
++        std::shared_ptr<const ga2_hitext::FrameText> text; // the port's text and prompts drawn in it
+         uint64_t flip = 0;       // the guest flip it shows and that iteration's game time (GA2_FRAMETRACE_FRAMES)
+         double flipTime = 0.0;
+     };
+@@ -160,6 +162,7 @@ namespace
+         bool frameFresh = false;
+         bool frameBgra = false;
+         bool frameUiSplit = false;
++        std::shared_ptr<const ga2_hitext::FrameText> frameText;
+         ga2_stereo::Setup frameSetup, takenSetup;
+     };
+ 
+@@ -256,6 +259,7 @@ namespace
+         uint32_t field = 0;
+         int hiresShift = -1; // GA2_PGS_HIRES, read once
+         uint64_t totalSwaps = 0;
++        uint64_t lastFlip = ~0ull; // the guest flip of the last sealed frame text
+ 
+         std::mutex frameMutex;
+         std::condition_variable frameCv; // a new frame is ready for the presentation thread (waitFreshFrame)
+@@ -693,6 +697,7 @@ namespace
+             eye.frameHeight = slot.height;
+             eye.frameSetup = slot.setup;
+             eye.frameUiSplit = slot.uiSplit;
++            eye.frameText = slot.text;
+             eye.frameFresh = true;
+             s.frameCv.notify_all();
+             if (s.hudDebug && (&eye == &s.eyes[0] || &eye == &s.eyes[2]))
+@@ -729,7 +734,8 @@ namespace
+     }
+ 
+     // Asynchronous readback ring: never wait for the GPU on the game thread.
+-    void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup, bool uiSplit)
++    void readbackLocked(State &s, Eye &eye, const ScanoutResult &result, const ga2_stereo::Setup &setup, bool uiSplit,
++                        std::shared_ptr<const ga2_hitext::FrameText> text = nullptr)
+     {
+         // slotIndex is the oldest submission.
+         pollReadbackLocked(s, eye);
+@@ -762,6 +768,7 @@ namespace
+         slot.image = result.image;
+         slot.setup = setup;
+         slot.uiSplit = uiSplit;
++        slot.text = std::move(text);
+         slot.flip = ga2_framepace::flips();
+         slot.flipTime = ga2_framepace::flipGameTime();
+         slot.pending = true;
+@@ -979,6 +986,11 @@ namespace ga2_pgs
+         // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
+         // renders them in stereo.
+         const bool split = s.uiLayer && (next.active || s.hudDebug);
++        // The port's text and prompts of the frame being scanned out (the game flipped to a new one since the last
++        // vsync, or it is still the last one), kept with its picture.
++        const uint64_t flip = ga2_framepace::flips();
++        const auto frameText = ga2_hitext::sealFrame(flip != s.lastFlip);
++        s.lastFlip = flip;
+         // The jitter instances scan out and read back side by side with eye 0 (their workers).
+         for (uint32_t j = 0; j < s.jitterCount; ++j)
+         {
+@@ -994,7 +1006,8 @@ namespace ga2_pgs
+             Eye &eye = s.eyes[e];
+             const ScanoutResult result = eye.gs.vsync(info);
+             if (result.image)
+-                readbackLocked(s, eye, result, shown, s.uiLayer && eye.gs.displayed_frame_ui_split());
++                readbackLocked(s, eye, result, shown, s.uiLayer && eye.gs.displayed_frame_ui_split(),
++                               e == 0 ? frameText : nullptr);
+             const float shift = ga2_stereo::shiftPerQ(next, int(e));
+             if (shift != eye.hacks.stereo_shift_q || split != eye.hacks.ui_layer_active)
+             {
+@@ -1097,6 +1110,7 @@ namespace ga2_pgs
+             bool bgra = false;
+             bool uiSplit = false;
+             ga2_stereo::Setup setup;
++            std::shared_ptr<const ga2_hitext::FrameText> text;
+         };
+ 
+         bool acquireFrame(State &s, Eye &eye, TakenFrame &out)
+@@ -1111,6 +1125,7 @@ namespace ga2_pgs
+             out.bgra = eye.frameBgra;
+             out.uiSplit = eye.frameUiSplit;
+             out.setup = eye.frameSetup;
++            out.text = eye.frameText;
+             eye.freshSlot = nullptr; // now owned by the caller; a newer frame will not release it
+             eye.frameSrc = nullptr;
+             eye.frameFresh = false;
+@@ -1175,6 +1190,7 @@ namespace ga2_pgs
+             }
+         width = frames[0].width;
+         height = frames[0].height;
++        ga2_hitext::setPresented(frames[0].text);
+         const size_t pixels = size_t(width) * height;
+         for (int i = 0; i < 4; ++i)
+         {
+@@ -1209,6 +1225,8 @@ namespace ga2_pgs
+         setup = frame.setup;
+         if (uiSplit)
+             *uiSplit = frame.uiSplit;
++        if (eyeIndex == 0)
++            ga2_hitext::setPresented(frame.text);
+         // Convert to opaque RGBA here, on the present thread, straight from the mapped readback buffer.
+         const size_t pixels = size_t(width) * height;
+         rgba.resize(pixels * 4u);
+-- 
+2.56.0
+

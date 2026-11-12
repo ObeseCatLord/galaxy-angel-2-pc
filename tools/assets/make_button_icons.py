@@ -132,13 +132,31 @@ def arrow_symbol(direction, inner):
     return draw
 
 
+def return_symbol(inner):
+    """The Enter key's return arrow (↵): readable at prompt size, where the word ENTER is not."""
+    def draw(d, color):
+        x0, y0, x1, y1 = inner
+        w, h = x1 - x0, y1 - y0
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        stroke = int(w * 0.11)
+        right, top, base = cx + w * 0.24, cy - h * 0.26, cy + h * 0.10
+        head = w * 0.17
+        tip = cx - w * 0.30
+        d.line([(right, top), (right, base), (tip + head * 0.8, base)], fill=color, width=stroke, joint="curve")
+        d.polygon([(tip, base), (tip + head * 1.15, base - head), (tip + head * 1.15, base + head)], fill=color)
+    return draw
+
+
 def finish(img, out):
     img.resize((SIZE, SIZE), Image.LANCZOS).save(out)
 
 
 def make(kind, label, color, fnt, out, accent=None, arrow=None):
     img, inner = glossy_base(kind, accent or color[:3])
-    draw = arrow_symbol(arrow, inner) if arrow else text_symbol(label, fnt, inner)
+    if label == "↵":
+        draw = return_symbol(inner)
+    else:
+        draw = arrow_symbol(arrow, inner) if arrow else text_symbol(label, fnt, inner)
     glowing(img, draw, color)
     sheen(img, kind, inner)
     finish(img, out)
@@ -169,7 +187,7 @@ def draw_style(style, out, ttf):
                 label = {"l1": "L GRIP", "r1": "R GRIP", "l2": "L2", "r2": "R2", "start": "MENU", "select": "STICK"}[name]
                 make("pill", label, blue, mid if len(label) == 2 else small, path)
         else:  # keyboard
-            keys = {"circle": "ENTER", "cross": "X", "square": "Z", "triangle": "V", "l1": "Q", "r1": "E",
+            keys = {"circle": "↵", "cross": "X", "square": "Z", "triangle": "V", "l1": "Q", "r1": "E",
                     "l2": "L⇧", "r2": "R⇧", "start": "P", "select": "TAB"}
             label = keys[name]
             make("key", label, white, big if len(label) == 1 else (mid if len(label) == 2 else small), path,
@@ -184,6 +202,7 @@ def draw_style(style, out, ttf):
 # Word and the width/height of the games' lettering (dialogue box, 11 pixels tall), which the label matches.
 LABELS = {"auto": ("Auto", 39 / 11), "back": ("Back", 38 / 11), "menu": ("Menu", 40 / 11)}
 LABEL_HEIGHT = 96   # pixels of lettering height in the PNG (the games' is 11)
+LABEL_MARGIN = 8    # transparent pixels around the lettering
 
 
 def draw_labels(out, ttf):
@@ -198,7 +217,12 @@ def draw_labels(out, ttf):
         img = Image.new("RGBA", (r - l + 2 * pad, b - t + 2 * pad), (255, 255, 255, 0))
         ImageDraw.Draw(img).text((pad - l, pad - t), text, font=fnt, fill=(255, 255, 255, 255))
         img = img.crop(img.getchannel("A").getbbox())
-        img.resize((round(LABEL_HEIGHT * aspect), LABEL_HEIGHT), Image.LANCZOS).save(out / f"{name}.png")
+        img = img.resize((round(LABEL_HEIGHT * aspect), LABEL_HEIGHT), Image.LANCZOS)
+        # A transparent margin, so the edges' anti-aliasing has room when the label is drawn with filtering (the
+        # engine fits the visible part, so the margin changes nothing about the size).
+        padded = Image.new("RGBA", (img.width + 2 * LABEL_MARGIN, img.height + 2 * LABEL_MARGIN), (255, 255, 255, 0))
+        padded.paste(img, (LABEL_MARGIN, LABEL_MARGIN))
+        padded.save(out / f"{name}.png")
 
 
 def main():

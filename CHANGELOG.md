@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.10.0
+
+- Native text rendering at 2x and 4x: the port lays out and draws the
+  games' English and Japanese text itself from the vector font, with the
+  font's own letter spacing and kerning (instead of the old bitmap font's
+  widths and 10-pixel spaces), full descenders, and Japanese at the size it
+  is shown. In 2D scenes the text is drawn at the window's own resolution
+  over the picture, like any other text on the desktop: the 2D filters
+  (Anime4K, Smooth), debanding and scaling never touch it. Line breaks,
+  alignment, colours, fades, menus over the text and the typewriter effect
+  are the games'. Names sit centred between their dots.
+- Button prompts and the prompt words (Auto, Back, Menu) are drawn at the
+  window's own resolution in 2D scenes too, from their high-resolution
+  images.
+- Anime4K at 2x and 4x works per layer: every CG, background, character
+  sprite and UI picture is upscaled on its own and the game composes the
+  upscaled layers, instead of one pass over the finished 640x448 picture, so
+  fine detail and line art stay crisp. Upscaled pictures are cached on disk.
+- A picture rendered larger than the window (2x or 4x in a smaller window) is
+  shrunk with an area-averaged filter instead of a bilinear one, so the strokes
+  of text and thin lines keep an even weight.
+- High-resolution replacement images (texture packs, button prompts, text in
+  3D scenes) are sampled smoothly, without combs along their edges.
+- Faster 3D scenes: graphics commands are processed on their own thread, and
+  texture uploads and model data are unpacked faster. In the Zettai ship map
+  the game's own thread does about a third less work per frame, so high
+  frame-rate caps hold 120 fps where they used to fall back to 60.
+- 4x at high frame rates: the picture now goes from the graphics card to the
+  window without a round trip through main memory. At 4x the menus and
+  loading screens reach 175 frames per second (about 90 before), and the ship
+  map is no longer held back by the picture's transport (84 before). In VR
+  both eyes' pictures take the same route.
+- Choosing 4x with a frame rate above about 85 no longer runs the game in slow
+  motion when the graphics card is the limit: the frame rate steps down
+  instead, as it already did when the processor was the limit.
+- When the PC can't keep up with the chosen frame rate, it steps down to the
+  next rate in the settings list (165, 144, 120, ...) instead of straight to
+  120 or 60: the Zettai ship map runs at 144 with a 175 cap.
+- The game hands each frame to the graphics thread without waiting for it,
+  and the 3D geometry programs finish their packets faster.
+- The keyboard's Enter prompt shows the return arrow (↵) instead of the word
+  ENTER, which was unreadable at the size of the message marker.
+
 ## 0.9.0
 
 - English translation included (Options > Language > English): story

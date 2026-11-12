@@ -1,0 +1,73 @@
+From 3d2f755adcbbf31167fe1b5c595ade64d6c86d5d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:04:47 -0600
+Subject: [PATCH] Hacks: report sprites drawn with a replacement image
+
+TextureReplacementInterface::replaced_sprite gets each UV sprite that samples a host replacement image (corners, texel coordinates, colour, frame page), so the host can draw parts of it again at a higher resolution.
+---
+ gs/gs_interface.cpp | 22 ++++++++++++++++++++++
+ gs/gs_renderer.hpp  |  8 ++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index 1ed5ef4..dbd6753 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -2734,6 +2734,28 @@ void GSInterface::drawing_kick_append()
+ 
+ 	drawing_kick_update_state(feedback_mode, uv_bb, bb);
+ 
++	// [texreplace] sprites drawn with a host replacement image are reported (the host may draw parts of them again at
++	// a higher resolution, e.g. button prompts).
++	if (quad && prim.desc.TME && prim.desc.FST)
++	{
++		if (auto *iface = renderer.get_texture_replacement_interface())
++		{
++			const uint32_t tex_index = (state_tracker.prim_template.tex >> TEX_TEXTURE_INDEX_OFFSET) &
++			                           ((1u << TEX_TEXTURE_INDEX_BITS) - 1u);
++			if (tex_index < render_pass.tex_infos.size() && render_pass.tex_infos[tex_index].view &&
++			    (render_pass.tex_infos[tex_index].info.flags & TEX_INFO_REPLACED) != 0)
++			{
++				// pos[1] is the first vertex, pos[0] the second (see above).
++				const float xy[4] = { float(pos[1].pos.x) / 16.0f, float(pos[1].pos.y) / 16.0f,
++				                      float(pos[0].pos.x) / 16.0f, float(pos[0].pos.y) / 16.0f };
++				const float uv[4] = { float(attr[1].uv.x) / 16.0f, float(attr[1].uv.y) / 16.0f,
++				                      float(attr[0].uv.x) / 16.0f, float(attr[0].uv.y) / 16.0f };
++				iface->replaced_sprite(render_pass.tex_infos[tex_index].view->get_image(), xy, uv, attr[0].rgba,
++				                       ctx.frame.desc.FBP);
++			}
++		}
++	}
++
+ 	auto &fb_instance = render_pass.instances[render_pass.current_instance];
+ 
+ 	const auto &prim_state = state_tracker.prim_template;
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index 7b85502..ca7073c 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -181,6 +181,13 @@ class TextureReplacementInterface
+ public:
+ 	virtual ~TextureReplacementInterface() = default;
+ 	virtual Vulkan::ImageHandle replace(const TextureDescriptor &desc, uint64_t live_tex0, uint64_t live_texclut, Vulkan::Device &device) = 0;   // live_*: raw TEX0/TEXCLUT at the miss (the descriptor zeroes CBP/CPSM/CSA)
++	// A sprite drawn with a replacement image (UV addressing): its corners in window pixels (XYOFFSET taken off) with
++	// their texel coordinates, the vertex colour (RGBA, 0x80 = 1.0) and the frame buffer page. The host may draw
++	// parts of the image again at a higher resolution. Called on the GS thread, in draw order.
++	virtual void replaced_sprite(const Vulkan::Image &image, const float xy[4], const float uv[4], uint32_t rgba, uint32_t fbp)
++	{
++		(void)image, (void)xy, (void)uv, (void)rgba, (void)fbp;
++	}
+ };
+ 
+ struct TextureInfo
+@@ -263,6 +270,7 @@ class GSRenderer
+ {
+ public:
+ 	void set_texture_replacement_interface(TextureReplacementInterface *iface) { replacement_iface = iface; }
++	TextureReplacementInterface *get_texture_replacement_interface() const { return replacement_iface; }
+ 	void set_texture_replacement_source(uint64_t tex0, uint64_t texclut) { replacement_tex0 = tex0; replacement_texclut = texclut; }
+ 	// A host image covers the WHOLE PS2 texture at its own resolution (never the cached crop): the sampling setup must
+ 	// normalise by the PS2 size with no rect offset. Pointers stay valid: the host keeps its images alive.
+-- 
+2.56.0
+

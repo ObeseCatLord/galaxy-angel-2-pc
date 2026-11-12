@@ -86,7 +86,9 @@ class IsoAndElfTests(unittest.TestCase):
             disc_dir = private / "discs" / "zettai"
             disc_dir.mkdir(parents=True)
             synthetic_iso(disc_dir / "disc.iso")
-            manifest_path = import_discs.import_disc("zettai", private)
+            # The synthetic program is not a verified retail build: opt out of
+            # that check here (the --unverified path); the next test covers it.
+            manifest_path = import_discs.import_disc("zettai", private, verify=False)
             manifest = __import__("json").loads(manifest_path.read_text())
             self.assertEqual([file["path"] for file in manifest["files"]],
                              ["/GAME/BOOT.ELF", "/GAME/IOP.IRX", "/SYSTEM.CNF"])
@@ -95,6 +97,16 @@ class IsoAndElfTests(unittest.TestCase):
             self.assertEqual(manifest["boot"]["elf"]["symbol_presence"]["defined_entry_count"], 1)
             self.assertEqual(manifest["irx_modules"][0]["path"], "/GAME/IOP.IRX")
             self.assertTrue((private / "extracted/zettai/GAME/BOOT.ELF").is_file())
+
+    def test_unverified_program_is_rejected_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            private = Path(temporary)
+            disc_dir = private / "discs" / "zettai"
+            disc_dir.mkdir(parents=True)
+            synthetic_iso(disc_dir / "disc.iso")
+            with self.assertRaisesRegex(import_discs.InventoryError, "not the verified build"):
+                import_discs.import_disc("zettai", private)
+            self.assertFalse((private / "manifests" / "zettai.json").exists())
 
     def test_elf_parser_rejects_out_of_bounds_program_header(self) -> None:
         malformed = bytearray(minimal_elf(with_symbol=False))

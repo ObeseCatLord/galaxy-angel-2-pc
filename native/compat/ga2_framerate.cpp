@@ -29,6 +29,7 @@
 // native cadence: see gate<>, effectHold<>, rng<> and DiscRate::gates. Every scene
 // runs at N (nativeScenes() lists the exceptions: scene 12, the disc-change notice).
 // Unset or 60: none of these is installed (the trace hooks only read).
+#include "runtime/ga2_vuthread.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -601,25 +602,32 @@ namespace
 
     // The rate governor. GA2_FPS=N is the maximum: when the guest falls behind real time (game time per wall second
     // below 97 %, or iterations below 85 % of the rate) for half a second while the game thread is saturated (more
-    // than 85 % of a core), the effective rate drops at an iteration boundary to the highest rung whose estimated cost
+    // than 85 % busy: its CPU time, or its wall time outside the scheduler's idle waits, whichever is larger, so time
+    // blocked on the GS worker or on a saturated GPU counts; and the VU thread and GS worker count as well, the busiest
+    // of them deciding; GA2_FPS_GOVERNOR_LOAD=cpu uses the game thread's CPU time alone, as before), the effective rate drops at an iteration boundary to the highest rung whose estimated cost
     // fits, else to the native cadence (iterations at 59.94 Hz with the game's own limits, the 30 fps views included:
-    // the code path of the scenes that run native). Rungs: N, the multiples of 60 below it, 60 (full-rate iterations),
-    // native. The cost of a rung is estimated from what the game thread spent per guest second (CPU time of the thread,
+    // the code path of the scenes that run native). Rungs: N, the settings menu's rates below it (240, 200, 180, 175,
+    // 165, 144, 120, 100, 90, 75), 60 (full-rate iterations), native. The cost of a rung is estimated from what the game thread spent per guest second (CPU time of the thread,
     // the IOP and audio work it does while waiting included): C(R') = C * R' / (iterations per guest second), i.e.
     // every iteration costs what it did, which leans high. It climbs, at most two rungs at a time, when the
     // optimistic estimate (45 % of the cost follows the iteration count, the rest follows guest time) is under 80 % of
     // a core for 3 s at full speed; after a climb that failed within 10 s the next one is held off for 10 s, 20 s, ...
-    // up to 60 s. The game's time stays exact across a change (dt follows the rate). GA2_FPS_GOVERNOR=off pins the
+    // up to 120 s (a GPU-bound rate, e.g. 4x, does not follow the CPU estimate; a climb that held clears it). The
+    // game's time stays exact across a change (dt follows the rate). GA2_FPS_GOVERNOR=off pins the
     // maximum; GA2_FPS_GOVERNOR_TEST=<seconds> steps through the rungs by game time instead (a deterministic
     // sequence for the oracle). Every change is logged: "[ga2 fps] governor: a -> b fps (...)".
     struct Governor
     {
         bool adaptive = true;
+        bool cpuLoadOnly = false; // GA2_FPS_GOVERNOR_LOAD=cpu
         double testPeriod = 0.0;
         std::vector<int> ladder; // frame rates, highest first; 0 = native
         size_t idx = 0;
         double lastEntry = -1.0;
         double accWall = 0.0, accGdt = 0.0, cpuStart = -1.0;
+        double wallStart = 0.0;     // when cpuStart was taken
+        uint64_t idleStart = 0;     // ga2_framepace::idleNanos() then
+        uint64_t vuBusyStart = 0, gsBusyStart = 0; // the VU thread's and GS worker's busy time then
         int accIters = 0, behind = 0, headroom = 0;
         double holdUntil = 0.0, lastClimb = -100.0;
         int failStreak = 0;
@@ -645,19 +653,20 @@ namespace
 #endif
     }
 
-    // The frame rates the governor moves between, highest first: `top`, then the multiples of 60 below it (the game's
-    // frame limits scale exactly there), then 60 (full-rate iterations: what the 30 fps views of the native game do not
-    // give), then the native cadence (0). A top of 60 or less is the native cadence alone.
+    // The frame rates the governor moves between, highest first: `top`, then the settings menu's rates below it (any
+    // rate works as the top already, so these do as rungs: a scene that just misses 175 runs at 165 or 144 instead of
+    // falling to 120), down to 60 (full-rate iterations: what the 30 fps views of the native game do not give), then
+    // the native cadence (0). A top of 60 or less is the native cadence alone.
     void govLadder(int top)
     {
+        static constexpr int kRungs[] = {240, 200, 180, 175, 165, 144, 120, 100, 90, 75, 60};
         g_gov.ladder.clear();
         if (top > 60)
         {
             g_gov.ladder.push_back(top);
-            for (int r = (top - 1) / 60 * 60; r >= 60; r -= 60)
-                g_gov.ladder.push_back(r);
-            if (g_gov.ladder.back() != 60)
-                g_gov.ladder.push_back(60);
+            for (const int r : kRungs)
+                if (r < top)
+                    g_gov.ladder.push_back(r);
         }
         g_gov.ladder.push_back(0);
     }
@@ -669,6 +678,8 @@ namespace
         g_govNative = g_gov.ladder[0] == 0; // started at 60: the native cadence until the settings menu raises the cap
         if (const char *v = std::getenv("GA2_FPS_GOVERNOR"); v && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0))
             g_gov.adaptive = false;
+        if (const char *v = std::getenv("GA2_FPS_GOVERNOR_LOAD"); v && std::strcmp(v, "cpu") == 0)
+            g_gov.cpuLoadOnly = true;
         if (const char *v = std::getenv("GA2_FPS_GOVERNOR_TEST"); v && *v)
         {
             g_gov.testPeriod = std::atof(v);
@@ -692,7 +703,7 @@ namespace
         char a[16], b[16];
         name(from, a);
         name(rate, b);
-        std::fprintf(stderr, "[ga2 fps] governor: %s -> %s fps (%s; guest speed %.0f%%, %.0f iterations/s, game thread %.0f%% of a core, game time %.1f s)\n", a, b, why,
+        std::fprintf(stderr, "[ga2 fps] governor: %s -> %s fps (%s; guest speed %.0f%%, %.0f iterations/s, busiest thread %.0f%%, game time %.1f s)\n", a, b, why,
                      speed * 100.0, itRate, load * 100.0, g_gameTime);
         ga2_trace::line("E", "kind=governor from=%s to=%s", a, b);
     }
@@ -736,7 +747,13 @@ namespace
             return;
         }
         if (g.cpuStart < 0.0)
+        {
             g.cpuStart = threadCpuSeconds();
+            g.wallStart = now;
+            g.idleStart = ga2_framepace::idleNanos();
+            g.vuBusyStart = ga2_vuthread::busyNanos();
+            g.gsBusyStart = ga2_vuthread::gsBusyNanos();
+        }
         else
         {
             g.accWall += wall;
@@ -746,12 +763,26 @@ namespace
         if (g.accWall < 0.25)
             return;
         const double cpu = threadCpuSeconds() - g.cpuStart;
-        const double speed = g.accGdt / g.accWall, itRate = g.accIters / g.accWall, load = cpu / g.accWall;
+        // The load is the larger of the thread's CPU time and its wall-clock busy share (all but the scheduler's idle
+        // waits): time blocked on the GS worker or inside a scan-out that waits for a saturated GPU is not CPU time,
+        // and the game is just as far behind for it.
+        const double span = std::max(now - g.wallStart, 1e-3);
+        const double idle = double(ga2_framepace::idleNanos() - g.idleStart) * 1e-9;
+        const double busy = std::clamp(1.0 - idle / span, 0.0, 1.0);
+        // The busiest thread: the VU thread and the GS worker carry part of each iteration too (ga2_vuthread.h).
+        const double vuLoad = double(ga2_vuthread::busyNanos() - g.vuBusyStart) * 1e-9 / span;
+        const double gsLoad = double(ga2_vuthread::gsBusyNanos() - g.gsBusyStart) * 1e-9 / span;
+        const double speed = g.accGdt / g.accWall, itRate = g.accIters / g.accWall,
+                     load = g.cpuLoadOnly ? cpu / g.accWall : std::max({cpu / g.accWall, busy, vuLoad, gsLoad});
         const double perGuest = load / std::max(speed, 0.05);              // core seconds per guest second
         const double itsPerGuest = std::max(1.0, itRate / std::max(speed, 0.05)); // iterations per guest second
         g.accWall = g.accGdt = 0.0;
         g.accIters = 0;
         g.cpuStart = threadCpuSeconds();
+        g.wallStart = now;
+        g.idleStart = ga2_framepace::idleNanos();
+        g.vuBusyStart = ga2_vuthread::busyNanos();
+        g.gsBusyStart = ga2_vuthread::gsBusyNanos();
         const size_t last = g.ladder.size() - 1;
         const int rate = g.ladder[g.idx];
         // core seconds per guest second at rung k: pessimistic (all of it follows the iteration count) and optimistic
@@ -772,10 +803,13 @@ namespace
                         to = k;
                         break;
                     }
-                // a climb that failed within 10 s holds the next one off for longer each time
+                // a climb that failed within 10 s holds the next one off for longer each time (10 s, 20 s, ...
+                // 120 s); one that held longer clears the streak
                 if (now - g.lastClimb < 10.0)
-                    g.failStreak = std::min(g.failStreak + 1, 4);
-                g.holdUntil = now + std::min(60.0, 5.0 * double(1 << g.failStreak));
+                    g.failStreak = std::min(g.failStreak + 1, 5);
+                else
+                    g.failStreak = 0;
+                g.holdUntil = now + std::min(120.0, 5.0 * double(1 << g.failStreak));
                 govApply(runtime, rdram, sys, to, "behind real time", speed, itRate, load);
                 return;
             }
@@ -790,12 +824,14 @@ namespace
                     break;
                 }
             up = std::max(up, g.idx >= 2 ? g.idx - 2 : size_t(0)); // at most two rungs at a time
+            // One rung up is tried on a looser estimate (under 90 %): with rungs close together (165, 144, ...) the
+            // step is small, and a climb that fails falls back within half a second and holds off longer each time.
+            if (up == g.idx && g.idx > 0 && hope(g.idx - 1) <= 0.9)
+                up = g.idx - 1;
             const bool fits = up < g.idx && speed >= 0.985 && now >= g.holdUntil;
             g.headroom = fits ? g.headroom + 1 : 0;
             if (g.headroom >= 12)
             {
-                if (now - g.lastClimb > 60.0)
-                    g.failStreak = 0;
                 g.lastClimb = now;
                 govApply(runtime, rdram, sys, up, "headroom", speed, itRate, load);
             }

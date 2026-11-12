@@ -1,0 +1,463 @@
+From 27231c4e483a112de25938d9428e9bb7c8e9e9be Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:46:52 -0600
+Subject: [PATCH] rendering above 4x (experimental): jittered GS instances
+ interleaved to 8x
+
+GA2_PGS_JITTER=1 with GA2_PGS_SSAA=16 on the desktop: three more GS instances moved by half an internal pixel; their vsync runs on worker threads; the presentation interleaves the four frames into an 8x picture. Off by default (docs/rendering/above-4x.md: in 3D it costs about half the frame rate for slightly cleaner edges at 4K).
+---
+ ps2xRuntime/include/runtime/gs/gs_pgs.h |   4 +
+ ps2xRuntime/src/lib/gs/gs_pgs.cpp       | 211 ++++++++++++++++++++++--
+ ps2xRuntime/src/lib/ps2_runtime.cpp     |  90 ++++++++++
+ 3 files changed, 287 insertions(+), 18 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_pgs.h b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+index 6a9e06b..20a6d38 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_pgs.h
++++ b/ps2xRuntime/include/runtime/gs/gs_pgs.h
+@@ -63,4 +63,8 @@ namespace ga2_pgs
+     bool uiLayer();
+     // Newest UI layer image; uiSplit: the eye frames of the same game frame lack their overlay.
+     bool takeUiFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, bool &uiSplit);
++    // Above 4x (GA2_PGS_JITTER=1): four instances, eye 0 and three moved by half an internal pixel right, down and
++    // both; their newest frames of the same game frame (index = x + 2 y of the half-pixel offset) to interleave.
++    bool jittered();
++    bool takeJitterFrames(std::vector<uint8_t> (&rgba)[4], uint32_t &width, uint32_t &height);
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_pgs.cpp b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+index 64f83ee..4372c37 100644
+--- a/ps2xRuntime/src/lib/gs/gs_pgs.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_pgs.cpp
+@@ -24,6 +24,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
++#include <functional>
++#include <memory>
+ #include <mutex>
+ #include <thread>
+ #include <string>
+@@ -160,6 +163,55 @@ namespace
+         ga2_stereo::Setup frameSetup, takenSetup;
+     };
+ 
++    // A thread that runs one GS instance's work in order: the jitter instances' vsync (flush, scan-out, readback),
++    // side by side with eye 0's (each instance has its own device). Packets stay on the calling thread (see
++    // gifTransfer).
++    struct InstanceWorker
++    {
++        std::thread thread;
++        std::mutex mutex;
++        std::condition_variable wake, done;
++        std::deque<std::function<void()>> tasks;
++        bool busy = false;
++
++        void start()
++        {
++            thread = std::thread([this] {
++                for (;;)
++                {
++                    std::function<void()> task;
++                    {
++                        std::unique_lock<std::mutex> lock(mutex);
++                        wake.wait(lock, [&] { return !tasks.empty(); });
++                        task = std::move(tasks.front());
++                        tasks.pop_front();
++                        busy = true;
++                    }
++                    task();
++                    {
++                        std::lock_guard<std::mutex> lock(mutex);
++                        busy = false;
++                    }
++                    done.notify_all();
++                }
++            });
++            thread.detach(); // runs until the process ends, like the GS itself
++        }
++        void post(std::function<void()> task)
++        {
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                tasks.push_back(std::move(task));
++            }
++            wake.notify_one();
++        }
++        void wait()
++        {
++            std::unique_lock<std::mutex> lock(mutex);
++            done.wait(lock, [&] { return tasks.empty() && !busy; });
++        }
++    };
++
+     struct State
+     {
+         std::mutex mutex;
+@@ -167,11 +219,27 @@ namespace
+         bool ok = false;
+         // eyes[2] is the HUD panel's UI layer instance (GA2_VR_HUD_PANEL=1): same packets, draws only the 2D
+         // overlay into an image with alpha; the eye instances leave that overlay out.
+-        Eye eyes[3];
++        // eyes[3..5]: jitter instances (GA2_PGS_JITTER, the desktop at 4x): the same packets with the geometry moved
++        // by half an internal pixel right, down, and both; with eye 0 they interleave into a picture at 8x.
++        Eye eyes[6];
+         uint32_t eyeCount = 1;
++        uint32_t jitterCount = 0; // 0 or 3
++        InstanceWorker jitterWorkers[3];
+         bool uiLayer = false;
+-        uint32_t instanceCount() const { return eyeCount + (uiLayer ? 1u : 0u); }
+-        Eye &instance(uint32_t i) { return i < eyeCount ? eyes[i] : eyes[2]; }
++        uint32_t instanceCount() const { return eyeCount + jitterCount + (uiLayer ? 1u : 0u); }
++        // The worker of instance i, or null when the calling thread runs it.
++        InstanceWorker *worker(uint32_t i)
++        {
++            return i >= eyeCount && i < eyeCount + jitterCount ? &jitterWorkers[i - eyeCount] : nullptr;
++        }
++        Eye &instance(uint32_t i)
++        {
++            if (i < eyeCount)
++                return eyes[i];
++            if (i < eyeCount + jitterCount)
++                return eyes[3 + (i - eyeCount)];
++            return eyes[2];
++        }
+         uint32_t uiSsaa = 1;
+         int uiHiresShift = 0;
+         // GA2_VR_HUD_DEBUG=1 (no headset needed): scene instance + UI layer instance on the desktop, always split;
+@@ -491,6 +559,25 @@ namespace
+             else
+                 std::fprintf(stderr, "[pgs] second GS instance failed; VR stays in theater mode\n");
+         }
++        // Above 4x on the desktop (GA2_PGS_JITTER=1 with GA2_PGS_SSAA=16): three more instances, each moved by half
++        // an internal pixel, interleaved with eye 0 into an 8x picture (a GS renders at most 16 samples per pixel).
++        if (s.eyeCount == 1 && s.ssaa >= 16 && envInt("GA2_PGS_JITTER", 0) == 1)
++        {
++            uint32_t made = 0;
++            for (uint32_t j = 0; j < 3; ++j)
++                if (initDevice(s.eyes[3 + j]) && s.eyes[3 + j].gs.init(&s.eyes[3 + j].device, options))
++                    ++made;
++                else
++                    break;
++            if (made == 3)
++            {
++                s.jitterCount = 3;
++                for (InstanceWorker &w : s.jitterWorkers)
++                    w.start();
++            }
++            else
++                std::fprintf(stderr, "[pgs] jitter instances failed; rendering stays at 4x\n");
++        }
+         // HUD panel: a third instance for the 2D overlay (GA2_VR_HUD_PANEL=1, only with the two eye instances).
+         // It renders the overlay at its own super-sampling (GA2_VR_HUD_SSAA, default 1: the game's 640x480; 4 scans
+         // it out at 1280x960, smoother on a panel close to the eyes, for about 2 ms of EE-thread time per vsync).
+@@ -522,6 +609,17 @@ namespace
+             eye.hacks = hacks;
+             if (s.uiLayer)
+                 eye.hacks.ui_layer = e < s.eyeCount ? 1u : 2u;
++            // Jitter instance k (1..3) samples (k & 1, k >> 1) eighths of a PS2 pixel right/down of eye 0: its
++            // geometry moves the other way (1/16 pixel units); only eye 0 reports the prompt sprites.
++            if (e >= s.eyeCount && e < s.eyeCount + s.jitterCount)
++            {
++                const uint32_t k = e - s.eyeCount + 1;
++                eye.hacks.jitter_x = (k & 1u) ? -2 : 0;
++                eye.hacks.jitter_y = (k & 2u) ? -2 : 0;
++                eye.hacks.report_replaced = false;
++            }
++            else if (e != 0)
++                eye.hacks.report_replaced = false;
+             eye.gs.set_hacks(eye.hacks);
+             eye.gs.set_texture_replacement_interface(ga2_texpacks::interface());
+         }
+@@ -530,6 +628,7 @@ namespace
+         std::fprintf(stderr, "[pgs] paraLLEl-GS active on %s, ssaa=%u, dither=%s%s\n",
+                      s.eyes[0].device.get_gpu_properties().deviceName, s.ssaa, hacks.disable_dither ? "off" : "on",
+                      s.eyeCount == 2 ? (s.uiLayer ? ", stereo (two instances) + HUD panel layer" : ", stereo (two instances)")
++                     : s.jitterCount ? ", 8x (four jittered instances)"
+                                      : "");
+         if (s.uiLayer)
+             std::fprintf(stderr, "[pgs] HUD panel: UI layer instance ssaa=%u, scanout %ux\n", s.uiSsaa, 1u << s.uiHiresShift);
+@@ -699,6 +798,8 @@ namespace ga2_pgs
+         gifCapture().write(path, data, size & ~size_t(15));
+         const bool changed = ga2_texpacks::takeChanged();
+         const auto t0 = std::chrono::steady_clock::now();
++        // Every instance takes the packet here, in turn: a texture an instance first samples is decoded (texture
++        // replacement) from the CPU's copy of GS memory, which is only what this packet saw now.
+         for (uint32_t e = 0; e < s.instanceCount(); ++e)
+         {
+             Eye &eye = s.instance(e);
+@@ -792,7 +893,7 @@ namespace ga2_pgs
+             return;
+         s.eyes[0].gs.read_transfer_fifo(dst, qwords);
+         // The other instances' GS complete the same download into scratch.
+-        if (s.eyeCount == 2)
++        if (s.instanceCount() > 1)
+         {
+             s.downloadScratch.resize(size_t(qwords) * 16u);
+             for (uint32_t e = 1; e < s.instanceCount(); ++e)
+@@ -808,24 +909,38 @@ namespace ga2_pgs
+             return;
+         gifCapture().write(0xFFFFFFFFu, &r, sizeof(r));
+         const auto t0 = std::chrono::steady_clock::now();
+-        for (uint32_t e = 0; e < s.instanceCount(); ++e)
++        // The CRTC registers by value (the workers run later).
++        struct Crtc
+         {
+-            Eye &inst = s.instance(e);
++            uint64_t pmode, smode1, smode2, syncv, dispfb1, display1, dispfb2, display2, extbuf, extdata, extwrite, bgcolor;
++        };
++        const Crtc c{uint64_t(r.pmode), uint64_t(r.smode1), uint64_t(r.smode2), uint64_t(r.syncv), uint64_t(r.dispfb1),
++                     uint64_t(r.display1), uint64_t(r.dispfb2), uint64_t(r.display2), uint64_t(r.extbuf), uint64_t(r.extdata),
++                     uint64_t(r.extwrite), uint64_t(r.bgcolor)};
++        auto setRegisters = [c](Eye &inst) {
+             inst.gs.flush();
+             auto &p = inst.gs.get_priv_register_state();
+-            put(p.pmode, r.pmode);
++            put(p.pmode, c.pmode);
+             // NTSC default when the CRTC was never programmed.
+-            put(p.smode1, r.smode1 ? r.smode1 : 0x0000000740814504ull);
+-            put(p.smode2, r.smode2);
+-            put(p.syncv, r.syncv);
+-            put(p.dispfb1, r.dispfb1);
+-            put(p.display1, r.display1);
+-            put(p.dispfb2, r.dispfb2);
+-            put(p.display2, r.display2);
+-            put(p.extbuf, r.extbuf);
+-            put(p.extdata, r.extdata);
+-            put(p.extwrite, r.extwrite);
+-            put(p.bgcolor, r.bgcolor);
++            put(p.smode1, c.smode1 ? c.smode1 : 0x0000000740814504ull);
++            put(p.smode2, c.smode2);
++            put(p.syncv, c.syncv);
++            put(p.dispfb1, c.dispfb1);
++            put(p.display1, c.display1);
++            put(p.dispfb2, c.dispfb2);
++            put(p.display2, c.display2);
++            put(p.extbuf, c.extbuf);
++            put(p.extdata, c.extdata);
++            put(p.extwrite, c.extwrite);
++            put(p.bgcolor, c.bgcolor);
++        };
++        for (uint32_t e = 0; e < s.instanceCount(); ++e)
++        {
++            Eye &inst = s.instance(e);
++            if (InstanceWorker *w = s.worker(e))
++                w->post([&inst, setRegisters] { setRegisters(inst); });
++            else
++                setRegisters(inst);
+         }
+ 
+         // PS2 dithering changed in the settings menu: every instance takes it before the next frame's draws.
+@@ -864,6 +979,16 @@ namespace ga2_pgs
+         // HUD panel: the frames the instances are about to draw are split into scene and UI layer while the game
+         // renders them in stereo.
+         const bool split = s.uiLayer && (next.active || s.hudDebug);
++        // The jitter instances scan out and read back side by side with eye 0 (their workers).
++        for (uint32_t j = 0; j < s.jitterCount; ++j)
++        {
++            Eye &eye = s.eyes[3 + j];
++            s.jitterWorkers[j].post([&s, &eye, info, shown] {
++                const ScanoutResult result = eye.gs.vsync(info);
++                if (result.image)
++                    readbackLocked(s, eye, result, shown, false);
++            });
++        }
+         for (uint32_t e = 0; e < s.eyeCount; ++e)
+         {
+             Eye &eye = s.eyes[e];
+@@ -912,6 +1037,9 @@ namespace ga2_pgs
+         }
+         if (s.uiLayer && s.hudDebug)
+             dumpHudDebugLocked(s);
++        // Every instance has its frame before the next one starts.
++        for (uint32_t j = 0; j < s.jitterCount; ++j)
++            s.jitterWorkers[j].wait();
+         const auto t1 = std::chrono::steady_clock::now();
+         s.vsyncMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+         ++s.swaps;
+@@ -955,6 +1083,8 @@ namespace ga2_pgs
+ 
+     bool uiLayer() { return state().uiLayer; }
+ 
++    bool jittered() { return state().jitterCount == 3; }
++
+     namespace
+     {
+         // Takes the newest unseen frame of `eye`: the pointer to its mapped pixels (valid until releaseFrame) and
+@@ -1022,6 +1152,49 @@ namespace ga2_pgs
+         return true;
+     }
+ 
++    bool takeJitterFrames(std::vector<uint8_t> (&rgba)[4], uint32_t &width, uint32_t &height)
++    {
++        State &s = state();
++        if (s.jitterCount != 3)
++            return false;
++        Eye *eyes[4] = {&s.eyes[0], &s.eyes[3], &s.eyes[4], &s.eyes[5]};
++        TakenFrame frames[4];
++        {
++            // All four of the same game frame, or none.
++            std::lock_guard<std::mutex> lock(s.frameMutex);
++            for (Eye *eye : eyes)
++                if (!eye->frameFresh || eye->frameWidth != eyes[0]->frameWidth || eye->frameHeight != eyes[0]->frameHeight)
++                    return false;
++        }
++        for (int i = 0; i < 4; ++i)
++            if (!acquireFrame(s, *eyes[i], frames[i]))
++            {
++                for (TakenFrame &f : frames)
++                    releaseFrame(f);
++                return false;
++            }
++        width = frames[0].width;
++        height = frames[0].height;
++        const size_t pixels = size_t(width) * height;
++        for (int i = 0; i < 4; ++i)
++        {
++            rgba[i].resize(pixels * 4u);
++            auto *dst = reinterpret_cast<uint32_t *>(rgba[i].data());
++            const uint32_t *src = frames[i].src;
++            if (frames[i].bgra)
++                for (size_t p = 0; p < pixels; ++p)
++                {
++                    const uint32_t c = src[p];
++                    dst[p] = ((c >> 16) & 0xFFu) | (c & 0xFF00u) | ((c & 0xFFu) << 16) | 0xFF000000u;
++                }
++            else
++                for (size_t p = 0; p < pixels; ++p)
++                    dst[p] = src[p] | 0xFF000000u;
++            releaseFrame(frames[i]);
++        }
++        return true;
++    }
++
+     bool takeEyeFrame(int eyeIndex, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+                       ga2_stereo::Setup &setup, bool *uiSplit)
+     {
+@@ -1075,6 +1248,8 @@ namespace ga2_pgs
+     bool takeEyeFrame(int, std::vector<uint8_t> &, uint32_t &, uint32_t &, ga2_stereo::Setup &, bool *) { return false; }
+     bool uiLayer() { return false; }
+     bool takeUiFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, bool &) { return false; }
++    bool jittered() { return false; }
++    bool takeJitterFrames(std::vector<uint8_t> (&)[4], uint32_t &, uint32_t &) { return false; }
+ }
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4898d90..6e77437 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -51,6 +51,7 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include "rlgl.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -398,6 +399,82 @@ namespace
+     }
+ }
+ 
++// Above 4x (GA2_PGS_JITTER=1): the four jittered instances' frames interleaved into one at twice the width and
++// height: output pixel (2x + i, 2y + j) is instance i + 2 j's pixel (x, y).
++static const char *kJitterJoin = R"(#version 330
++in vec2 fragTexCoord;
++uniform sampler2D texture0;
++uniform sampler2D part1;
++uniform sampler2D part2;
++uniform sampler2D part3;
++uniform vec2 outSize;
++out vec4 finalColor;
++void main() {
++    ivec2 p = ivec2(floor(fragTexCoord * outSize));
++    ivec2 q = p / 2;
++    int k = (p.x & 1) + 2 * (p.y & 1);
++    vec4 c = k == 0 ? texelFetch(texture0, q, 0) : k == 1 ? texelFetch(part1, q, 0) : k == 2 ? texelFetch(part2, q, 0)
++                                                                                     : texelFetch(part3, q, 0);
++    finalColor = vec4(c.rgb, 1.0);
++})";
++
++static bool UploadJitteredFrame(Texture2D &tex, uint32_t &width, uint32_t &height)
++{
++    static std::vector<uint8_t> s_frames[4];
++    static Texture2D s_parts[4]{};
++    static RenderTexture2D s_joined{};
++    static Shader s_join{};
++    static int s_joinLoaded = -1;
++    uint32_t w = 0u, h = 0u;
++    if (!ga2_pgs::takeJitterFrames(s_frames, w, h) || !w || !h)
++        return false;
++    if (s_joinLoaded < 0)
++    {
++        s_join = LoadShaderFromMemory(nullptr, kJitterJoin);
++        s_joinLoaded = IsShaderValid(s_join) ? 1 : 0;
++    }
++    if (s_joinLoaded != 1)
++        return false;
++    for (int i = 0; i < 4; ++i)
++    {
++        if (s_parts[i].width != int(w) || s_parts[i].height != int(h))
++        {
++            if (s_parts[i].id)
++                UnloadTexture(s_parts[i]);
++            Image image = GenImageColor(int(w), int(h), BLACK);
++            s_parts[i] = LoadTextureFromImage(image);
++            UnloadImage(image);
++            SetTextureFilter(s_parts[i], TEXTURE_FILTER_POINT);
++        }
++        UpdateTexture(s_parts[i], s_frames[i].data());
++    }
++    if (s_joined.texture.width != int(2u * w) || s_joined.texture.height != int(2u * h))
++    {
++        if (s_joined.id)
++            UnloadRenderTexture(s_joined);
++        s_joined = LoadRenderTexture(int(2u * w), int(2u * h));
++        SetTextureFilter(s_joined.texture, TEXTURE_FILTER_BILINEAR);
++    }
++    rlDrawRenderBatchActive();
++    BeginTextureMode(s_joined);
++    BeginShaderMode(s_join);
++    const float outSize[2] = {float(2u * w), float(2u * h)};
++    SetShaderValue(s_join, GetShaderLocation(s_join, "outSize"), outSize, SHADER_UNIFORM_VEC2);
++    SetShaderValueTexture(s_join, GetShaderLocation(s_join, "part1"), s_parts[1]);
++    SetShaderValueTexture(s_join, GetShaderLocation(s_join, "part2"), s_parts[2]);
++    SetShaderValueTexture(s_join, GetShaderLocation(s_join, "part3"), s_parts[3]);
++    // Upside down into the render target, so its texture has the frames' orientation.
++    DrawTexturePro(s_parts[0], Rectangle{0.0f, 0.0f, float(w), -float(h)}, Rectangle{0.0f, 0.0f, outSize[0], outSize[1]},
++                   Vector2{0, 0}, 0.0f, WHITE);
++    EndShaderMode();
++    EndTextureMode();
++    tex = s_joined.texture;
++    width = 2u * w;
++    height = 2u * h;
++    ps2_mouse::setFrame(s_frames[0].data(), w, h);
++    return true;
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     if (ga2_pgs::rendering())
+@@ -405,6 +482,19 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         // GPU GS: present the newest scanout; the texture follows its size.
+         static std::vector<uint8_t> s_pgsFrame;
+         static uint32_t s_pgsWidth = 0u, s_pgsHeight = 0u;
++        if (ga2_pgs::jittered())
++        {
++            uint32_t jw = 0u, jh = 0u;
++            if (UploadJitteredFrame(tex, jw, jh))
++            {
++                ga2_framepace::notePresented();
++                s_pgsWidth = jw;
++                s_pgsHeight = jh;
++            }
++            outWidth = s_pgsWidth ? s_pgsWidth : FB_WIDTH;
++            outHeight = s_pgsHeight ? s_pgsHeight : DEFAULT_DISPLAY_HEIGHT;
++            return;
++        }
+         uint32_t w = 0u, h = 0u;
+         ga2_stereo::Setup setup;
+         // VR stereo: the right eye's frame goes to its own texture.
+-- 
+2.56.0
+

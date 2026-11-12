@@ -27,7 +27,9 @@ dialogue box's continue marker pulses a glow copy of the puck
 over the puck's icon.
 
 The keyboard icons show the keys of the port's keyboard map (ps2_pad_keys.h
-in the runtime; docs/PLAYING.md): Circle = ENTER (C and Esc also work),
+in the runtime; docs/PLAYING.md): Circle = Enter, drawn as the return arrow
+↵ because the word is unreadable at the size of the message marker (C and Esc
+also work),
 Cross = X, Square = Z, Triangle = V, L1/R1 = Q/E, L2/R2 = left/right Shift,
 Start = P, Select = TAB, L3/R3 = R/F, arrows = D-pad. Enter is the confirm
 button because it advances messages; Start moved to P (Alt+Enter stays the

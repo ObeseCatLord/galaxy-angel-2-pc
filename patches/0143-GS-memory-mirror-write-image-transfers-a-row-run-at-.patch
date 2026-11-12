@@ -1,0 +1,130 @@
+From 5c9b2a508404fe9bd24cdad2fd03f3766337351c Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:18:05 -0600
+Subject: [PATCH] GS memory mirror: write image transfers a row run at a time
+
+GSCpuBackend::UploadImage swizzled every pixel through the generic
+per-pixel switch. GSMem::WriteRun writes a run of pixels along one row
+with the format's address function inlined (32/16/8/4-bit formats; 24-bit
+keeps the pixel path). A 4-bit byte that straddles two rows still goes
+through the pixel path. Zettai ship map at 1x, 60 fps: game thread 68% ->
+56% of a core; frames identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../include/runtime/gs/ps2_gs_memory.h        |  5 +++
+ ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp     | 29 +++++++++++++++
+ ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp      | 35 +++++++++++++++++++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+index c784ff7..b340aad 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+@@ -563,6 +563,11 @@ namespace GSMem
+ 
+ 	void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+ 
++	// A run of `count` consecutive pixels of one row (x .. x + count - 1 at y) from `src` packed as an image transfer
++	// sends them (32 or 16-bit little endian, one byte per 8-bit index, two 4-bit indices per byte starting with the
++	// low nibble), the swizzle inlined. False (nothing written) for the formats it does not cover (24-bit).
++	bool WriteRun(u32 psm, u8* data, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 count);
++
+ 	u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
+ 	u32 ReadZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 9f5f1e3..90040f2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1532,8 +1532,37 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
+     };
+ 
++    // Bits per pixel of the formats GSMem::WriteRun takes (0: the pixel-by-pixel path below).
++    uint32_t runBits = 0u;
++    switch (dpsm)
++    {
++    case GS_PSM_CT32: case GS_PSM_Z32: runBits = 32u; break;
++    case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: runBits = 16u; break;
++    case GS_PSM_T8: case GS_PSM_T8H: runBits = 8u; break;
++    case GS_PSM_T4: case GS_PSM_T4HL: case GS_PSM_T4HH: runBits = 4u; break;
++    default: break;
++    }
++
+     while (offset < sizeBytes && m_transferState.direction == 0u)
+     {
++        // Whole runs of a row at a time, the swizzle inlined (a pixel at a time cost a fifth of the game thread in
++        // 3D scenes). 4-bit runs start on a whole byte.
++        if (runBits && (runBits != 4u || (m_transferState.copiedPixels & 1u) == 0u))
++        {
++            const uint32_t availablePixels = runBits == 4u ? (sizeBytes - offset) * 2u
++                                                           : (sizeBytes - offset) / (runBits / 8u);
++            const uint32_t rowLeft = dsax + rrw - m_transferState.x;
++            const uint32_t left = m_transferState.totalPixels - m_transferState.copiedPixels;
++            uint32_t count = std::min(std::min(availablePixels, rowLeft), left);
++            if (runBits == 4u && (count & 1u) && count < left)
++                --count; // a byte that straddles two rows goes to the pixel path below
++            if (count && GSMem::WriteRun(dpsm, m_vram, dbp, dbw, m_transferState.x, m_transferState.y, data + offset, count))
++            {
++                offset += runBits == 4u ? (count + 1u) / 2u : count * (runBits / 8u);
++                advancePixel(count);
++                continue;
++            }
++        }
+         switch (dpsm)
+         {
+         case GS_PSM_CT32:
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+index a8f9fa8..0d66be2 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+@@ -1,3 +1,4 @@
++#include <cstring>
+ #include <array>
+ 
+ #include "runtime/gs/ps2_gs_memory.h"
+@@ -295,6 +296,40 @@ namespace GSMem
+         PixelStorageTraits<Z16S>::Write(PageTableZ16S, data, bp, bw, x, y, value);
+     }
+ 
++    namespace
++    {
++        template <PixelStorageMode M, class Table, class Value>
++        inline void writeRun(const Table &table, u8 *data, u32 bp, u32 bw, u32 x, u32 y, u32 count, Value value)
++        {
++            for (u32 i = 0; i < count; ++i)
++                PixelStorageTraits<M>::Write(table, data, bp, bw, x + i, y,
++                                             static_cast<typename PixelStorageTraits<M>::PackedT>(value(i)));
++        }
++    }
++
++    bool WriteRun(u32 psm, u8* data, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 count)
++    {
++        auto u32At = [src](u32 i) { u32 v; std::memcpy(&v, src + 4u * i, 4); return v; };
++        auto u16At = [src](u32 i) { u16 v; std::memcpy(&v, src + 2u * i, 2); return u32(v); };
++        auto u8At = [src](u32 i) { return u32(src[i]); };
++        auto u4At = [src](u32 i) { return u32((src[i >> 1] >> ((i & 1u) * 4u)) & 0x0Fu); };
++        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
++        {
++        case C32: writeRun<C32>(PageTableC32, data, bp, bw, x, y, count, u32At); return true;
++        case Z32: writeRun<Z32>(PageTableZ32, data, bp, bw, x, y, count, u32At); return true;
++        case C16: writeRun<C16>(PageTableC16, data, bp, bw, x, y, count, u16At); return true;
++        case C16S: writeRun<C16S>(PageTableC16S, data, bp, bw, x, y, count, u16At); return true;
++        case Z16: writeRun<Z16>(PageTableZ16, data, bp, bw, x, y, count, u16At); return true;
++        case Z16S: writeRun<Z16S>(PageTableZ16S, data, bp, bw, x, y, count, u16At); return true;
++        case P8: writeRun<P8>(PageTableP8, data, bp, bw, x, y, count, u8At); return true;
++        case P8H: writeRun<P8H>(PageTableC32, data, bp, bw, x, y, count, u8At); return true;
++        case P4: writeRun<P4>(PageTableP4, data, bp, bw, x, y, count, u4At); return true;
++        case P4HL: writeRun<P4HL>(PageTableC32, data, bp, bw, x, y, count, u4At); return true;
++        case P4HH: writeRun<P4HH>(PageTableC32, data, bp, bw, x, y, count, u4At); return true;
++        default: return false;
++        }
++    }
++
+     void WriteP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
+     {
+         PixelStorageTraits<P8>::Write(PageTableP8, data, bp, bw, x, y, value);
+-- 
+2.56.0
+

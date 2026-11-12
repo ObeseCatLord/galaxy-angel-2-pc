@@ -1,0 +1,116 @@
+From 24a33e8b5b835008d182044d2c330eaa3798eb4d Mon Sep 17 00:00:00 2001
+From: ObeseCatLord <6099645+ObeseCatLord@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:18:06 -0600
+Subject: [PATCH] Hacks: tell the replacement hook whether the primitive is 2D
+
+TextureReplacementInterface::replace gets for_2d: the primitive that needs the texture is 2D (GIF path 2/3, or screen-space path 1 geometry: Q == 1 on every vertex, no depth test), so a host can treat 2D art and 3D textures differently.
+---
+ gs/gs_interface.cpp | 19 ++++++++++++++++++-
+ gs/gs_interface.hpp |  1 +
+ gs/gs_renderer.cpp  |  2 +-
+ gs/gs_renderer.hpp  | 13 +++++++++++--
+ 4 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index dbd6753..9cd1488 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -1724,7 +1724,8 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		{
+ 			TRACE("CACHE IMAGE", desc);
+ 			desc.hash = hasher.get();
+-			renderer.set_texture_replacement_source(registers.ctx[registers.prim.desc.CTXT].tex0.bits, registers.texclut.bits);   // [texreplace]
++			renderer.set_texture_replacement_source(registers.ctx[registers.prim.desc.CTXT].tex0.bits, registers.texclut.bits,
++			                                        texture_for_2d_primitive());   // [texreplace]
+ 			image = renderer.create_cached_texture(desc);
+ 
+ 			// Long-term references can persist across render passes, and intended for normal resource textures.
+@@ -2994,6 +2995,22 @@ bool GSInterface::ui_is_scene_target(uint32_t block) const
+ // except what spans the whole target: the frame clear, the glow pass copy and fades are the scene's. Orthographic VU1
+ // models (radar blips) are screen-space UI on path 1: Q == 1 everywhere (a perspective vertex has Q = 1/w) and no
+ // depth test (ZTE off or ZTST ALWAYS; 3D geometry that is untextured, so Q == 1 as well, tests depth).
++// [texreplace] The primitive being drawn is 2D: GIF path 2/3 (the EE's 2D drawing), or path 1 geometry in screen space
++// (Q == 1 on every vertex, no depth test); 3D (perspective, depth-tested) is not.
++bool GSInterface::texture_for_2d_primitive() const
++{
++	if (current_path != 1)
++		return true;
++	const auto &ctx = registers.ctx[registers.prim.desc.CTXT];
++	const bool depth_ignored = !ctx.test.desc.ZTE || ctx.test.desc.ZTST == TESTBits::ZTST_ALWAYS;
++	if (!depth_ignored)
++		return false;
++	for (uint32_t i = 0; i < vertex_queue.count; i++)
++		if (vertex_queue.attr[i].q != 1.0f)
++			return false;
++	return true;
++}
++
+ GSInterface::UiClass GSInterface::ui_classify(unsigned nv) const
+ {
+ 	const auto &prim = registers.prim.desc;
+diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
+index d8e8fa0..ec1b1ae 100644
+--- a/gs/gs_interface.hpp
++++ b/gs/gs_interface.hpp
+@@ -654,6 +654,7 @@ private:
+ 	enum UiClass { UI_CLASS_SCENE = 0, UI_CLASS_UI = 1, UI_CLASS_CLEAR = 2 };
+ 	bool ui_layer_filtered(unsigned num_vertices);
+ 	UiClass ui_classify(unsigned num_vertices) const;
++	bool texture_for_2d_primitive() const;   // [texreplace]
+ 	void ui_scanout_blit(uint32_t tbp, uint32_t tbw, uint32_t tpsm, int src_x, int src_y, int src_h);
+ 	bool ui_is_scene_target(uint32_t block) const;
+ 	uint32_t current_path = 0;
+diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
+index 8cf4a0c..3a446ef 100644
+--- a/gs/gs_renderer.cpp
++++ b/gs/gs_renderer.cpp
+@@ -1373,7 +1373,7 @@ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &d
+ 	Vulkan::ImageHandle img;
+ 	if (replacement_iface && desc.samples == 1 && !desc.alpha_only_write)
+ 	{
+-		img = replacement_iface->replace(desc, replacement_tex0, replacement_texclut, *device);
++		img = replacement_iface->replace(desc, replacement_tex0, replacement_texclut, replacement_2d, *device);
+ 		replaced = bool(img);
+ 		if (replaced) replaced_images.insert(&*img);
+ 	}
+diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
+index ca7073c..51cd0fb 100644
+--- a/gs/gs_renderer.hpp
++++ b/gs/gs_renderer.hpp
+@@ -180,7 +180,10 @@ class TextureReplacementInterface
+ {
+ public:
+ 	virtual ~TextureReplacementInterface() = default;
+-	virtual Vulkan::ImageHandle replace(const TextureDescriptor &desc, uint64_t live_tex0, uint64_t live_texclut, Vulkan::Device &device) = 0;   // live_*: raw TEX0/TEXCLUT at the miss (the descriptor zeroes CBP/CPSM/CSA)
++	// live_*: raw TEX0/TEXCLUT at the miss (the descriptor zeroes CBP/CPSM/CSA); for_2d: the primitive that needs the
++	// texture is 2D (GIF path 2/3, or screen-space path 1 geometry: Q == 1, no depth test), not 3D.
++	virtual Vulkan::ImageHandle replace(const TextureDescriptor &desc, uint64_t live_tex0, uint64_t live_texclut, bool for_2d,
++	                                    Vulkan::Device &device) = 0;
+ 	// A sprite drawn with a replacement image (UV addressing): its corners in window pixels (XYOFFSET taken off) with
+ 	// their texel coordinates, the vertex colour (RGBA, 0x80 = 1.0) and the frame buffer page. The host may draw
+ 	// parts of the image again at a higher resolution. Called on the GS thread, in draw order.
+@@ -271,7 +274,12 @@ class GSRenderer
+ public:
+ 	void set_texture_replacement_interface(TextureReplacementInterface *iface) { replacement_iface = iface; }
+ 	TextureReplacementInterface *get_texture_replacement_interface() const { return replacement_iface; }
+-	void set_texture_replacement_source(uint64_t tex0, uint64_t texclut) { replacement_tex0 = tex0; replacement_texclut = texclut; }
++	void set_texture_replacement_source(uint64_t tex0, uint64_t texclut, bool for_2d = false)
++	{
++		replacement_tex0 = tex0;
++		replacement_texclut = texclut;
++		replacement_2d = for_2d;
++	}
+ 	// A host image covers the WHOLE PS2 texture at its own resolution (never the cached crop): the sampling setup must
+ 	// normalise by the PS2 size with no rect offset. Pointers stay valid: the host keeps its images alive.
+ 	bool is_replaced_image(const Vulkan::Image *img) const { return replaced_images.count(img) != 0; }   // [texreplace]
+@@ -488,6 +496,7 @@ private:
+ 	void upload_texture(const TextureUpload &upload);
+ 	TextureReplacementInterface *replacement_iface = nullptr;
+ 	uint64_t replacement_tex0 = 0, replacement_texclut = 0;
++	bool replacement_2d = false;
+ 	std::unordered_set<const Vulkan::Image *> replaced_images;
+ 	void bind_textures(Vulkan::CommandBuffer &cmd, const RenderPass &rp);
+ 
+-- 
+2.56.0
+
