@@ -12,6 +12,42 @@ Your own disc images (`.iso`) of the Japanese PlayStation 2 releases:
 
 A GPU with Vulkan 1.3 (the PS2 graphics run on the GPU through paraLLEl-GS).
 
+## Installing and updating
+
+The installer sets up the newest release and keeps it up to date:
+[Windows](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-windows-x86_64.exe),
+[Linux x86-64](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-x86_64),
+[Linux ARM64](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-arm64)
+(on Linux, `chmod +x` the file first).
+
+- It shows the installed and the newest version with the release notes;
+  **Install** / **Update** downloads the release, checks it against the
+  release's SHA-256, and puts it in the install folder (default
+  `%LOCALAPPDATA%\Programs\Galaxy Angel II PC` on Windows,
+  `~/.local/share/galaxy-angel-2-pc` on Linux; any empty folder works).
+- It adds **Galaxy Angel II PC** and **Galaxy Angel II PC Updater** to the
+  Start menu (and the desktop) or the Linux application menu, and on Windows
+  an entry in Apps & features to uninstall.
+- An update replaces only the files the release ships and removes the ones a
+  newer version dropped. If something goes wrong (say the game is still
+  running), the old files are put back. **Saves, settings, imported discs and
+  mods are in the data folder (below) and are never touched**, nor is anything
+  you added to the install folder yourself.
+- Every install has the updater as `ga2-installer` (`ga2-installer.exe`) next
+  to `ga2`; it updates the folder it is in. It also updates itself when a
+  newer installer comes out.
+- **Uninstall** removes what the installer installed and its shortcuts; the
+  data folder stays.
+- Without a window (SSH, scripts): `ga2-installer --check` (exit code 10 when
+  an update is available), `--update`, `--install`, `--uninstall --yes`,
+  `--dir <folder>`, `--no-shortcuts`; `--help` lists them.
+
+On Linux it uses `curl` (or `wget`) and `tar` with `xz`, which nearly every
+distribution has. Windows needs nothing extra.
+
+The release archives work without the installer too: extract one anywhere
+and run `ga2`.
+
 ## First start
 
 1. Run `ga2` (`ga2.exe` on Windows).

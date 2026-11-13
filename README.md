@@ -20,9 +20,18 @@ game data is included.
 
 ## Playing
 
-1. Download the build for your system from
-   [Releases](../../releases) and extract it.
-2. Run `ga2` (`ga2.exe` on Windows).
+1. Download the installer for your system and run it:
+   [Windows](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-windows-x86_64.exe) ·
+   [Linux x86-64](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-x86_64) ·
+   [Linux ARM64 / Steam Frame](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-arm64).
+   It installs the newest release, adds the game to the Start menu or the
+   application menu, and later updates it (run it again, or the
+   **Galaxy Angel II PC Updater** shortcut). On Linux, make the download
+   executable first (`chmod +x galaxy-angel-2-pc-installer-*`, or in the
+   file's properties). Prefer no installer? Download the archive for your
+   system from [Releases](../../releases) and extract it; it holds the same
+   updater (`ga2-installer`).
+2. Run `ga2` (`ga2.exe` on Windows), or **Galaxy Angel II PC** from the menu.
 3. Drag your `.iso` files onto the window (or put them in the `isos` folder
    of the data folder), then pick a game.
 

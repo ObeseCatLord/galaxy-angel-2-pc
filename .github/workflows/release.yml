@@ -4,7 +4,9 @@
 # (owner/name), read with the deploy key in secret GA2_PRIVATE_DEPLOY_KEY
 # (tools/ci/fetch-private.sh). Language packs found in release-mods/ ship in
 # each build's mods/ folder. The archives are attached to the release named
-# by the tag input (which must exist, as a draft or published).
+# by the tag input (which must exist, as a draft or published). Then the
+# installer workflow (installer.yml) adds the installer and updater to each
+# archive and attaches it, ga2-manifest.json and the final SHA256SUMS.txt.
 name: Release builds
 
 on:
@@ -107,3 +109,11 @@ jobs:
         run: |
           cd artifacts && mv */* . && sha256sum galaxy-angel-2-pc-* > SHA256SUMS.txt && cat SHA256SUMS.txt
           gh release upload "${{ inputs.tag }}" galaxy-angel-2-pc-* SHA256SUMS.txt --clobber --repo "${{ github.repository }}"
+
+  installer:
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/installer.yml
+    with:
+      tag: ${{ inputs.tag }}

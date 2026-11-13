@@ -20,8 +20,17 @@ Windows と Linux（x86-64 / ARM64）で動作します。
 
 ## 遊び方
 
-1. [Releases](../../releases) からお使いのシステム用のビルドをダウンロードして展開します。
-2. `ga2`（Windows では `ga2.exe`）を起動します。
+1. お使いのシステム用のインストーラーをダウンロードして起動します:
+   [Windows](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-windows-x86_64.exe) ·
+   [Linux x86-64](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-x86_64) ·
+   [Linux ARM64 / Steam Frame](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-arm64)。
+   最新リリースをインストールし、スタートメニュー（Linux ではアプリケーション
+   メニュー）に追加します。アップデートもインストーラー（または
+   **Galaxy Angel II PC Updater** ショートカット）から行えます。Linux では
+   先にファイルに実行権限を付けてください（`chmod +x galaxy-angel-2-pc-installer-*`）。
+   インストーラーを使わない場合は [Releases](../../releases) からビルドを
+   ダウンロードして展開します（同じアップデーター `ga2-installer` が入っています）。
+2. `ga2`（Windows では `ga2.exe`）、またはメニューの **Galaxy Angel II PC** を起動します。
 3. `.iso` ファイルをウィンドウにドラッグする（またはデータフォルダの `isos`
    フォルダに入れる）と、ゲームを選べるようになります。
 

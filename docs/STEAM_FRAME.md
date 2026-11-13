@@ -10,15 +10,20 @@ headset, or in VR.
 
 ## Installing
 
-1. Download `galaxy-angel-2-pc-<version>-linux-arm64.tar.xz` from
-   [Releases](../../../releases) on the headset, or copy it over.
-   - To copy it, use Desktop Mode, or SSH once Developer Mode is on.
-   - Extract it somewhere in your home folder, for example
-     `~/Games/galaxy-angel-2-pc`.
+1. Install it with the
+   [Linux ARM64 installer](https://github.com/ObeseCatLord/galaxy-angel-2-pc/releases/latest/download/galaxy-angel-2-pc-installer-linux-arm64)
+   in Desktop Mode (`chmod +x` it, then run it), or over SSH once Developer
+   Mode is on: `./galaxy-angel-2-pc-installer-linux-arm64 --update`. It
+   installs to `~/.local/share/galaxy-angel-2-pc` (`--dir` picks another
+   folder) and updates the same way later; `ga2-installer --update` in that
+   folder does too.
+   - Or download `galaxy-angel-2-pc-<version>-linux-arm64.tar.xz` from
+     [Releases](../../../releases) and extract it somewhere in your home
+     folder, for example `~/Games/galaxy-angel-2-pc`.
 2. Copy your disc images (`.iso`) into `~/.local/share/ga2/isos/`. The
    launcher creates this folder the first time it runs.
 3. In Desktop Mode, open Steam, choose **Add a Game > Add a Non-Steam Game**
-   and pick `ga2` from the folder you extracted.
+   and pick `ga2` from the install folder.
    - Leave the compatibility tool unset: this is a native build.
    - It needs glibc 2.31 or newer and the usual X11/OpenGL libraries.
      SteamOS has all of them, so it also runs inside the Steam Linux

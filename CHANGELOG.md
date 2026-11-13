@@ -2,6 +2,15 @@
 
 ## 0.10.0
 
+- An installer and updater for Windows, Linux x86-64 and Linux ARM64: it
+  installs the newest release (checked against its SHA-256), adds menu and
+  desktop shortcuts (and an Apps & features entry on Windows), shows the
+  release notes, updates in place (removing files a newer version dropped
+  and putting the old files back if an update fails), updates itself, and
+  uninstalls. Saves, settings, discs and mods in the data folder are never
+  touched. Each release archive carries it as `ga2-installer`, the updater
+  of that install; it also works from the command line (`--check`,
+  `--update`, `--uninstall`).
 - Native text rendering at 2x and 4x: the port lays out and draws the
   games' English and Japanese text itself from the vector font, with the
   font's own letter spacing and kerning (instead of the old bitmap font's

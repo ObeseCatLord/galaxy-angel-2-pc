@@ -1,0 +1,90 @@
+# The installer and updater (native/installer) for a release: built for Windows x86-64 and Linux x86-64/ARM64,
+# put into each of the release's archives (ga2-installer[.exe], the updater of that install) and attached as
+# standalone downloads (galaxy-angel-2-pc-installer-<platform>), with ga2-manifest.json (what the installer reads
+# from the newest release) and a new SHA256SUMS.txt. Runs at the end of "Release builds", or alone for a release
+# whose archives exist already (draft or published).
+name: Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.10.0)
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+
+jobs:
+  linux:
+    name: Installer Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ubuntu:20.04
+    timeout-minutes: 60
+    steps:
+      - name: Git
+        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q git
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: tools/ci/deps-ubuntu.sh release
+      - name: Build
+        run: |
+          export CC=gcc-13 CXX=g++-13 GA2_INSTALLER_REPO="${{ github.repository }}"
+          tools/ci/build-installer.sh linux "out/galaxy-angel-2-pc-installer-linux-${{ matrix.arch }}"
+          "out/galaxy-angel-2-pc-installer-linux-${{ matrix.arch }}" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-linux-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+
+  windows:
+    name: Installer Windows x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q cmake ninja-build
+          curl -sSfL https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "GA2_LLVM_MINGW=$RUNNER_TEMP/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64" >> "$GITHUB_ENV"
+      - name: Build
+        run: GA2_INSTALLER_REPO="${{ github.repository }}" tools/ci/build-installer.sh windows out/galaxy-angel-2-pc-installer-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows-x86_64
+          path: out/
+          retention-days: 7
+
+  attach:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: installers
+          merge-multiple: true
+      - name: Add to the release
+        run: |
+          mkdir assets
+          gh release download "$TAG" --repo "${{ github.repository }}" -D assets -p "galaxy-angel-2-pc-$TAG-*"
+          gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body > notes.md
+          date="$(gh release view "$TAG" --repo "${{ github.repository }}" --json createdAt -q .createdAt | cut -c1-10)"
+          python3 tools/ci/add_installer.py assets installers
+          (cd assets && sha256sum galaxy-angel-2-pc-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          python3 tools/release_manifest.py assets --tag "$TAG" --repo "${{ github.repository }}" --notes notes.md --date "$date"
+          gh release upload "$TAG" assets/* --clobber --repo "${{ github.repository }}"
